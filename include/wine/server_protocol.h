@@ -6073,6 +6073,7 @@ struct get_inproc_sync_fd_reply
     unsigned int access;
     unsigned int shm_idx;
     char __pad_20[4];
+    unsigned __int64 export_id;
 };
 
 
@@ -6246,6 +6247,19 @@ struct alpc_create_port_reply
     struct reply_header __header;
     obj_handle_t        handle;
     char __pad_12[4];
+};
+
+
+
+struct close_inproc_sync_export_request
+{
+    struct request_header __header;
+    unsigned int shm_idx;
+    unsigned __int64 export_id;
+};
+struct close_inproc_sync_export_reply
+{
+    struct reply_header __header;
 };
 
 
@@ -6559,6 +6573,7 @@ enum request
     REQ_d3dkmt_mutex_acquire,
     REQ_d3dkmt_mutex_release,
     REQ_alpc_create_port,
+    REQ_close_inproc_sync_export,
     REQ_NB_REQUESTS
 };
 
@@ -6874,6 +6889,7 @@ union generic_request
     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
     struct alpc_create_port_request alpc_create_port_request;
+    struct close_inproc_sync_export_request close_inproc_sync_export_request;
 };
 union generic_reply
 {
@@ -7187,8 +7203,9 @@ union generic_reply
     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
     struct alpc_create_port_reply alpc_create_port_reply;
+    struct close_inproc_sync_export_reply close_inproc_sync_export_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 966
+#define SERVER_PROTOCOL_VERSION 968
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

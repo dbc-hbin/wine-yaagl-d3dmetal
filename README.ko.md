@@ -107,6 +107,17 @@ Native layout **v14**는 dispatch 항목 25개(일반 hook 21개와 특수 hook 
 
 현재 소스는 완료된 execution lease를 allocator Reset 전에 회수하되, 미제출 작업이나 callback 등록 실패에서는 owner의 안전한 보유를 유지합니다. SR은 더 작은 active input에서 호환되는 scaler capacity를 재사용하며 history reset과 동기화된 edge staging을 수행합니다. [메모리 측정 결과와 한계](docs/screenshot-sr-analysis-2026-09-23.ko.md)는 bounded reuse와 즉시 물리 메모리 반환, 아직 검증하지 않은 게임 전체 메모리 차이를 구분합니다.
 
+### 미배포 수명 관리 수정
+
+- MSync 스레드 종료 시 빌린 alert 인덱스를 Unix descriptor로 닫지 않습니다. 캐시 참조에 프로세스별 일회성 export ID를 부여하고 native 프로세스 종료 후 회수합니다. `ntdll`과 `wineserver`를 함께 빌드해야 합니다. 서버 프로토콜은 **968**, MSync Mach wire는 **3**이며 기존 요청 번호는 유지합니다.
+- macdrv는 창 데이터 잠금 안에서 상태를 분리한 뒤 잠금 밖에서 Cocoa 창과 대기 중인 surface 이벤트를 정리합니다. 창 파괴와 최상위 창의 자식 창 전환에 같은 순서를 적용합니다.
+- Native FG 콜백은 소유 context의 callback scope에 진입해 configure/dispatch 잠금 역전을 피합니다. 콜백이 같으면 할당·present 대기 없이 binding을 재사용하고, 이전 binding은 교체 성공과 필요한 drain 이후에만 회수합니다.
+- FG bridge **v4**는 콜백 실패·생성 생략에도 완료된 frame ID를 정리합니다. 이전 미완료 프레임과 기록된 명령의 snapshot은 보존합니다. FG PE/Unix 모듈과 native sidecar를 함께 다시 빌드해야 합니다.
+- SR 준비 프레임마다 scaler 활성화 번호를 보관해 지연 실행이나 전환 직후 프레임 폐기로 reactive variant 복귀에 필요한 reset이 사라지지 않게 합니다.
+- MF 비동기 명령에 초기 소유 참조를 부여하고 소스 오류 시 대기 중인 읽기·seek를 실패 완료합니다. WM parser 재초기화 실패는 disconnect 후 읽기 스레드를 join합니다. IOHID 시작은 런루프 잠금 대기 없이 상태를 원자적으로 게시합니다.
+
+현재 소스의 수정이며 설치된 Beta나 기존 archive를 바꾸지 않습니다. 실제 게임 FPS 개선을 입증한 것은 아닙니다.
+
 ### 과거 검증 기록
 
 아래는 과거 릴리스 검사 기록이며 현재 실게임 합격 판정이 아닙니다. 여기서 언급하는 합성 테스트는 이후 제거했습니다.

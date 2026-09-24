@@ -343,7 +343,8 @@ struct ScalerGeneration {
     MTLTextureUsage motionUsage = MTLTextureUsageUnknown;
     MTLTextureUsage outputUsage = MTLTextureUsageUnknown;
     MTLTextureUsage reactiveUsage = MTLTextureUsageUnknown;
-    bool generationFresh = true;
+    uint64_t activation = 1; /* protected by the feature mutex */
+    uint64_t encodedActivation = 0; /* protected by encodeMutex */
     bool hasLastInputContent = false;
     NSUInteger lastInputContentWidth = 0;
     NSUInteger lastInputContentHeight = 0;
@@ -664,6 +665,7 @@ struct PreparedFrame::Impl {
     std::weak_ptr<PreparedFrame::Impl> self;
     std::shared_ptr<ScalerGeneration> generation;
     FrameInfo frame{};
+    uint64_t activation = 0;
     TextureSet textures{};
     FrameOperations operations{};
     id<MTLTexture> color = nil;
@@ -1102,10 +1104,9 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
         generationMatches(*feature.alternateGeneration, frame, color, depth, motion, output, reactive,
                           operations, temporal)) {
         std::swap(feature.currentGeneration, feature.alternateGeneration);
-        // This scaler's earlier history belongs to a nonconsecutive sequence.
-        // Synchronize with any encode of a previously prepared frame.
-        std::lock_guard<std::mutex> lock(feature.currentGeneration->encodeMutex);
-        feature.currentGeneration->generationFresh = true;
+        // Prepared frames retain their activation so an older encode cannot
+        // consume the reset owed to this nonconsecutive sequence.
+        ++feature.currentGeneration->activation;
         return feature.currentGeneration;
     }
 
@@ -1988,6 +1989,7 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(
         frame->self = frame;
         frame->generation = generation;
         frame->frame = info;
+        frame->activation = generation->activation;
         frame->textures = textures;
         frame->operations = operations;
         if (info.exposureMode != ExposureMode::Texture) frame->textures.exposure = nullptr;
@@ -2118,11 +2120,12 @@ bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
         Feature::Impl& feature = *impl_->feature;
         ScalerGeneration& generation = *impl_->generation;
         std::lock_guard<std::mutex> lock(generation.encodeMutex);
-        const bool generationInitialized = !generation.generationFresh;
+        const bool generationInitialized = generation.encodedActivation != 0;
         const bool inputExtentChanged = generation.hasLastInputContent &&
             (generation.lastInputContentWidth != impl_->frame.inputContent.width ||
              generation.lastInputContentHeight != impl_->frame.inputContent.height);
-        const bool effectiveReset = impl_->frame.resetHistory.value || generation.generationFresh ||
+        const bool effectiveReset = impl_->frame.resetHistory.value ||
+                                    generation.encodedActivation != impl_->activation ||
                                     inputExtentChanged;
         lease->effectiveReset = effectiveReset;
         lease->generationInitialized = generationInitialized;
@@ -2258,7 +2261,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
         generation.lastInputContentWidth = impl_->frame.inputContent.width;
         generation.lastInputContentHeight = impl_->frame.inputContent.height;
         generation.hasLastInputContent = true;
-        generation.generationFresh = false;
+        generation.encodedActivation = impl_->activation;
         observation.completed();
         lease->replayEligible = true;
         return true;

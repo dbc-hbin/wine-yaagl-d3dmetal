@@ -169,6 +169,7 @@ struct source_reader
     unsigned int flags;
     DWORD queue;
     enum media_source_state source_state;
+    HRESULT source_error;
     struct media_stream *streams;
     struct list responses;
     CRITICAL_SECTION cs;
@@ -314,6 +315,7 @@ static HRESULT source_reader_create_async_op(enum source_reader_async_op op, str
         return E_OUTOFMEMORY;
 
     command->IUnknown_iface.lpVtbl = &source_reader_async_command_vtbl;
+    command->refcount = 1;
     command->op = op;
 
     *ret = command;
@@ -570,6 +572,41 @@ static HRESULT source_reader_source_state_handler(struct source_reader *reader, 
     return S_OK;
 }
 
+static HRESULT source_reader_source_error_handler(struct source_reader *reader, IMFMediaEvent *event)
+{
+    unsigned int i;
+    HRESULT hr, status;
+
+    if (FAILED(hr = IMFMediaEvent_GetStatus(event, &status))) status = hr;
+    if (SUCCEEDED(status)) status = E_UNEXPECTED;
+
+    EnterCriticalSection(&reader->cs);
+    reader->source_error = status;
+    reader->flags &= ~SOURCE_READER_SEEKING;
+    for (i = 0; i < reader->stream_count; ++i)
+    {
+        struct media_stream *stream = &reader->streams[i];
+
+        if (!reader->async_callback) stream->requests = 0;
+        while (stream->requests)
+        {
+            if (FAILED(hr = source_reader_queue_response(reader, stream, status, MF_SOURCE_READERF_ERROR, 0, NULL)))
+            {
+                WARN("Failed to queue source error, hr %#lx.\n", hr);
+                break;
+            }
+        }
+    }
+    WakeAllConditionVariable(&reader->state_event);
+    WakeAllConditionVariable(&reader->sample_event);
+    WakeAllConditionVariable(&reader->stop_event);
+    LeaveCriticalSection(&reader->cs);
+
+    if (reader->async_callback)
+        IMFSourceReaderCallback_OnEvent(reader->async_callback, MF_SOURCE_READER_MEDIASOURCE, event);
+    return S_OK;
+}
+
 static HRESULT WINAPI source_reader_source_events_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
 {
     struct source_reader *reader = impl_from_source_callback_IMFAsyncCallback(iface);
@@ -591,6 +628,9 @@ static HRESULT WINAPI source_reader_source_events_callback_Invoke(IMFAsyncCallba
 
     switch (event_type)
     {
+        case MEError:
+            hr = source_reader_source_error_handler(reader, event);
+            break;
         case MENewStream:
             hr = source_reader_new_stream_handler(reader, event);
             break;
@@ -1245,6 +1285,8 @@ static HRESULT source_reader_start_source(struct source_reader *reader)
     HRESULT hr = S_OK;
     unsigned int i;
 
+    if (FAILED(reader->source_error)) return reader->source_error;
+
     for (i = 0; i < reader->stream_count; ++i)
     {
         source_reader_get_stream_selection(reader, i, &selected);
@@ -1523,6 +1565,13 @@ static HRESULT WINAPI source_reader_async_commands_callback_Invoke(IMFAsyncCallb
                     source_reader_queue_response(reader, &stub_stream, hr, MF_SOURCE_READERF_ERROR, 0, NULL);
                 }
             }
+            else
+            {
+                report_sample = TRUE;
+                status = hr;
+                stream_index = command->u.read.stream_index;
+                stream_flags = MF_SOURCE_READERF_ERROR;
+            }
 
             LeaveCriticalSection(&reader->cs);
 
@@ -1542,6 +1591,7 @@ static HRESULT WINAPI source_reader_async_commands_callback_Invoke(IMFAsyncCallb
                     &command->u.seek.position)))
             {
                 reader->flags &= ~SOURCE_READER_SEEKING;
+                WakeAllConditionVariable(&reader->state_event);
             }
             LeaveCriticalSection(&reader->cs);
 
@@ -1625,6 +1675,8 @@ static ULONG WINAPI src_reader_AddRef(IMFSourceReaderEx *iface)
 static BOOL source_reader_is_source_stopped(const struct source_reader *reader)
 {
     unsigned int i;
+
+    if (FAILED(reader->source_error)) return TRUE;
 
     if (reader->source_state != SOURCE_STATE_STOPPED)
         return FALSE;
@@ -2272,6 +2324,7 @@ static HRESULT WINAPI src_reader_SetCurrentPosition(IMFSourceReaderEx *iface, RE
         return MF_E_INVALIDREQUEST;
 
     EnterCriticalSection(&reader->cs);
+    if (FAILED(hr = reader->source_error)) goto done;
 
     /* Check if we got pending requests. */
     for (i = 0; i < reader->stream_count; ++i)
@@ -2305,16 +2358,23 @@ static HRESULT WINAPI src_reader_SetCurrentPosition(IMFSourceReaderEx *iface, RE
         }
         else
         {
-            if (SUCCEEDED(IMFMediaSource_Start(reader->source, reader->descriptor, format, position)))
+            if (SUCCEEDED(hr = IMFMediaSource_Start(reader->source, reader->descriptor, format, position)))
             {
                 while (reader->flags & SOURCE_READER_SEEKING)
                 {
                     SleepConditionVariableCS(&reader->state_event, &reader->cs, INFINITE);
                 }
+                hr = reader->source_error;
             }
         }
     }
 
+    if (FAILED(hr))
+    {
+        reader->flags &= ~SOURCE_READER_SEEKING;
+        WakeAllConditionVariable(&reader->state_event);
+    }
+done:
     LeaveCriticalSection(&reader->cs);
 
     return hr;
@@ -2339,6 +2399,9 @@ static HRESULT source_reader_read_sample(struct source_reader *reader, DWORD ind
 
     if (!actual_index)
         actual_index = &actual_index_tmp;
+    *actual_index = index;
+    *stream_flags = 0;
+    *timestamp = 0;
 
     if (SUCCEEDED(hr = source_reader_start_source(reader)))
     {
@@ -2351,7 +2414,8 @@ static HRESULT source_reader_read_sample(struct source_reader *reader, DWORD ind
             if (!source_reader_get_read_result(reader, stream, flags, &hr, actual_index, stream_flags,
                    timestamp, sample))
             {
-                while (!source_reader_got_response_for_stream(reader, stream) && stream->state != STREAM_STATE_EOS)
+                while (SUCCEEDED(reader->source_error) && !source_reader_got_response_for_stream(reader, stream)
+                        && stream->state != STREAM_STATE_EOS)
                 {
                     stream->requests++;
                     if (FAILED(hr = source_reader_request_sample(reader, stream)))
@@ -2364,6 +2428,7 @@ static HRESULT source_reader_read_sample(struct source_reader *reader, DWORD ind
                     }
                     SleepConditionVariableCS(&reader->sample_event, &reader->cs, INFINITE);
                 }
+                if (FAILED(reader->source_error)) hr = reader->source_error;
                 if (SUCCEEDED(hr))
                     source_reader_get_read_result(reader, stream, flags, &hr, actual_index, stream_flags,
                        timestamp, sample);
@@ -2377,6 +2442,7 @@ static HRESULT source_reader_read_sample(struct source_reader *reader, DWORD ind
         }
     }
 
+    if (FAILED(hr)) *stream_flags = MF_SOURCE_READERF_ERROR;
     TRACE("Stream %lu, got sample %p, flags %#lx.\n", *actual_index, *sample, *stream_flags);
 
     return hr;
@@ -2390,6 +2456,8 @@ static HRESULT source_reader_read_sample_async(struct source_reader *reader, uns
 
     if (actual_index || stream_flags || timestamp || sample)
         return E_INVALIDARG;
+
+    if (FAILED(reader->source_error)) return reader->source_error;
 
     if (reader->flags & SOURCE_READER_FLUSHING)
         hr = MF_E_NOTACCEPTING;

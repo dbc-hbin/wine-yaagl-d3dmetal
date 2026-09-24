@@ -1155,6 +1155,25 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                 state->frames.clear();
                 return finish(Ok);
             }
+            if (operation == YAAGL_FSR_FG_RETIRE_FRAME) {
+                if (header.size != sizeof(yaagl_fsr_fg_retire_frame_packet))
+                    return finish(Parameter);
+                auto state = lookup(header.context);
+                if (!state) return finish(Parameter);
+                std::lock_guard lock(state->mutex);
+                if (state->retired) return finish(Parameter);
+                auto& retire =
+                    *static_cast<yaagl_fsr_fg_retire_frame_packet*>(arguments);
+                state->frames.erase(retire.frame_id);
+                retire.has_pending_frame = !state->frames.empty();
+                if (retire.has_pending_frame) {
+                    retire.oldest_pending_frame_id = state->frames.begin()->first;
+                    for (const auto& pending : state->frames)
+                        retire.oldest_pending_frame_id = std::min(
+                            retire.oldest_pending_frame_id, pending.first);
+                }
+                return finish(Ok);
+            }
             if (operation == YAAGL_FSR_FG_CONFIGURE) {
                 if (header.size != sizeof(yaagl_fsr_fg_configure_packet))
                     return finish(Parameter);

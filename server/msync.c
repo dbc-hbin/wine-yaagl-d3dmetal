@@ -28,6 +28,8 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdarg.h>
 #include <sys/mman.h>
 #ifdef HAVE_SYS_STAT_H
@@ -594,23 +596,27 @@ static void retire_message_refs( mach_register_message_t *message, unsigned int 
     }
 }
 
-static inline void destroy_all_internal( unsigned int shm_idx )
-{
-    release_shm_ref( shm_idx );
-}
+/* Only the server may retire references. The public Mach send right is also held
+ * by clients, so a bare shared index is not authority to close a reused slot. */
+static uint64_t close_cookie;
 
-/* Client registration and unregister messages are ordered on the Mach port. Shared
- * state publication still uses release/acquire ordering for weakly ordered CPUs. */
 static inline mach_msg_return_t destroy_all( unsigned int shm_idx )
 {
-    static mach_msg_header_t send_header;
-    send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
-    send_header.msgh_id = (shm_idx & MSYNC_SHM_INDEX_MASK) | MSYNC_SHM_CLOSE_FLAG;
-    send_header.msgh_size = sizeof(send_header);
-    send_header.msgh_remote_port = receive_port;
+    struct { mach_msg_header_t header; uint64_t cookie; } message = {0};
 
-    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
-                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0);
+    message.header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
+    message.header.msgh_id = (shm_idx & MSYNC_SHM_INDEX_MASK) | MSYNC_SHM_CLOSE_FLAG;
+    message.header.msgh_size = sizeof(message);
+    message.header.msgh_remote_port = receive_port;
+    message.cookie = close_cookie;
+
+    return mach_msg2( &message.header, MACH_SEND_MSG, message.header.msgh_size,
+                      0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+}
+
+int msync_release_export( unsigned int shm_idx )
+{
+    return destroy_all( shm_idx ) == MACH_MSG_SUCCESS;
 }
 
 static inline mach_msg_return_t signal_all( unsigned int shm_idx, int *shm )
@@ -792,16 +798,20 @@ static void *mach_message_pump( void *args )
             continue;
         }
 
-        /* Header-only messages carry a 28-bit shared index and a signal or close flag. */
+        if (receive_message.header.msgh_id & MSYNC_SHM_CLOSE_FLAG)
+        {
+            uint64_t cookie = 0;
+
+            if (receive_message.header.msgh_size == sizeof(mach_msg_header_t) + sizeof(cookie))
+                memcpy( &cookie, receive_message.shm_idx, sizeof(cookie) );
+            if (cookie && cookie == close_cookie)
+                release_shm_ref( receive_message.header.msgh_id & MSYNC_SHM_INDEX_MASK );
+            continue;
+        }
+
         if (receive_message.header.msgh_size == sizeof(mach_msg_header_t))
         {
-            unsigned int message_id = receive_message.header.msgh_id;
-            unsigned int shm_idx = message_id & MSYNC_SHM_INDEX_MASK;
-
-            if (message_id & MSYNC_SHM_CLOSE_FLAG)
-                destroy_all_internal( shm_idx );
-            else
-                signal_all_internal( shm_idx );
+            signal_all_internal( receive_message.header.msgh_id & MSYNC_SHM_INDEX_MASK );
             continue;
         }
 
@@ -944,6 +954,9 @@ void msync_init(void)
 
     if (!do_msync()) return;
 
+    arc4random_buf( &close_cookie, sizeof(close_cookie) );
+    if (!close_cookie) close_cookie = 1;
+
     if (fstat( config_dir_fd, &st ) == -1)
         fatal_error( "cannot stat config dir\n" );
 
@@ -996,7 +1009,8 @@ void msync_destroy( struct msync *msync )
         list_remove( &msync->mutex_entry );
     if (!msync->shm_idx) return;
 
-    destroy_all( msync->shm_idx );
+    if (!msync_release_export( msync->shm_idx ))
+        fatal_error( "could not release msync object %u\n", msync->shm_idx );
     free( msync );
 }
 

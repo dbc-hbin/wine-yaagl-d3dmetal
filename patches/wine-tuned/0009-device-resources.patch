@@ -229,7 +229,7 @@
  };
  
  static inline struct iohid_device *impl_from_unix_device(struct unix_device *iface)
-@@ -148,8 +148,10 @@
+@@ -148,8 +148,11 @@
          IOReturn result, void *sender, IOHIDReportType type,
          uint32_t reportID, uint8_t *report, CFIndex report_length)
  {
@@ -237,12 +237,13 @@
 -    bus_event_queue_input_report(&event_queue, iface, report, report_length);
 +    struct iohid_device *impl = find_device_from_iohid(sender);
 +
-+    if (impl && impl->started && report_length > 0 && report_length <= 0xffff)
++    if (impl && __atomic_load_n(&impl->started, __ATOMIC_ACQUIRE)
++            && report_length > 0 && report_length <= 0xffff)
 +        bus_event_queue_input_report(&event_queue, &impl->unix_device, report, report_length);
  }
  
  static void iohid_device_destroy(struct unix_device *iface)
-@@ -158,15 +160,11 @@
+@@ -158,15 +161,9 @@
  
  static NTSTATUS iohid_device_start(struct unix_device *iface)
  {
@@ -257,9 +258,7 @@
 -    IOHIDDeviceRegisterInputReportCallback(impl->device, impl->buffer, length, handle_IOHIDDeviceIOHIDReportCallback, iface);
 +    struct iohid_device *impl = impl_from_unix_device(iface);
 +
-+    pthread_mutex_lock(&iohid_cs);
-+    impl->started = TRUE;
-+    pthread_mutex_unlock(&iohid_cs);
++    __atomic_store_n(&impl->started, TRUE, __ATOMIC_RELEASE);
      return STATUS_SUCCESS;
  }
  
@@ -270,7 +269,7 @@
 -    IOHIDDeviceRegisterInputReportCallback(impl->device, NULL, 0, NULL, NULL);
 -
      pthread_mutex_lock(&iohid_cs);
-+    impl->started = FALSE;
++    __atomic_store_n(&impl->started, FALSE, __ATOMIC_RELEASE);
      list_remove(&impl->unix_device.entry);
 +    if (impl->open)
 +    {
@@ -329,7 +328,7 @@
 -    if (impl) bus_event_queue_device_removed(&event_queue, &impl->unix_device);
 +    if (impl)
 +    {
-+        impl->started = FALSE;
++        __atomic_store_n(&impl->started, FALSE, __ATOMIC_RELEASE);
 +        if (impl->open)
 +        {
 +            IOHIDDeviceClose(IOHIDDevice, 0);

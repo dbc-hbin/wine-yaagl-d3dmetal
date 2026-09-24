@@ -1,0 +1,611 @@
+diff --git a/dlls/ntdll/unix/msync.c b/dlls/ntdll/unix/msync.c
+index b8cab37..d39181e 100644
+--- a/dlls/ntdll/unix/msync.c
++++ b/dlls/ntdll/unix/msync.c
+@@ -617,25 +617,6 @@ static inline void *get_shm( const unsigned int idx )
+     return (void *)((unsigned long)addr + offset);
+ }
+ 
+-void msync_close( int obj )
+-{
+-    static __thread mach_msg_header_t send_header;
+-    mach_msg_return_t mr;
+-
+-    TRACE( "obj=%d.\n", obj );
+-
+-    send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
+-    send_header.msgh_id = (obj & MSYNC_SHM_INDEX_MASK) | MSYNC_SHM_CLOSE_FLAG;
+-    send_header.msgh_size = sizeof(send_header);
+-    send_header.msgh_remote_port = server_port;
+-
+-    mr = mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
+-                    0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0);
+-
+-    if (mr != MACH_MSG_SUCCESS)
+-        ERR( "Failed to send message to server to close msync object %d: %#x\n", obj, mr );
+-}
+-
+ void msync_init(void)
+ {
+     struct stat st;
+@@ -1227,8 +1208,4 @@ void msync_init(void)
+ {
+ }
+ 
+-void msync_close( int obj )
+-{
+-}
+-
+ #endif /* __APPLE__ */
+diff --git a/dlls/ntdll/unix/msync.h b/dlls/ntdll/unix/msync.h
+index 953ed8e..dd91463 100644
+--- a/dlls/ntdll/unix/msync.h
++++ b/dlls/ntdll/unix/msync.h
+@@ -23,7 +23,6 @@
+ 
+ extern int do_msync(void);
+ extern void msync_init(void);
+-extern void msync_close( int obj );
+ 
+ #ifdef __APPLE__
+ 
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 0bf1332..dedd308 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -586,7 +586,8 @@ static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_
+ struct inproc_sync
+ {
+     LONG           refcount;  /* reference count of the sync object */
+-    int            fd;        /* unix file descriptor */
++    int            fd;        /* unix file descriptor or MSync shared index */
++    unsigned __int64 export_id; /* server-owned MSync export, zero for fd */
+     unsigned int   access;    /* handle access rights */
+     unsigned short type;      /* enum inproc_sync_type as short to save space */
+     unsigned short closed;    /* fd has been closed but sync is still referenced */
+@@ -649,6 +650,7 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync
+     }
+ 
+     cache->fd = sync->fd;
++    cache->export_id = sync->export_id;
+     cache->access = sync->access;
+     cache->type = sync->type;
+     cache->closed = sync->closed;
+@@ -681,15 +683,23 @@ static void release_inproc_sync( struct inproc_sync *sync )
+     /* save the fd now; as soon as the refcount hits 0 we cannot
+      * access the cache anymore */
+     int fd = sync->fd;
++    unsigned __int64 export_id = sync->export_id;
+     LONG ref = InterlockedDecrement( &sync->refcount );
+ 
+     assert( ref >= 0 );
+     if (!ref)
+     {
+         if (do_msync())
+-            msync_close( fd );
+-        else
+-            close( fd );
++        {
++            SERVER_START_REQ( close_inproc_sync_export )
++            {
++                req->shm_idx = fd;
++                req->export_id = export_id;
++                if (wine_server_call( req )) ERR( "Failed to release MSync export %llu for %d\n", (unsigned long long)export_id, fd );
++            }
++            SERVER_END_REQ;
++        }
++        else close( fd );
+     }
+ }
+ 
+@@ -734,10 +744,12 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
+             if (do_msync())
+             {
+                 sync->fd = reply->shm_idx;
++                sync->export_id = reply->export_id;
+             }
+             else
+             {
+                 sync->fd = wine_server_receive_fd( &fd_handle );
++                sync->export_id = 0;
+                 assert( wine_server_ptr_handle(fd_handle) == handle );
+             }
+             sync->access = reply->access;
+diff --git a/include/wine/msync.h b/include/wine/msync.h
+index e3da976..f5d34bb 100644
+--- a/include/wine/msync.h
++++ b/include/wine/msync.h
+@@ -8,7 +8,7 @@
+ #ifndef __WINE_WINE_MSYNC_H
+ #define __WINE_WINE_MSYNC_H
+ 
+-#define MSYNC_SHM_WIRE_VERSION 2u
++#define MSYNC_SHM_WIRE_VERSION 3u
+ #define MSYNC_SHM_PAGE_SIZE 16384u
+ #define MSYNC_SHM_OBJECT_SIZE 16u
+ #define MSYNC_SHM_INDEX_BITS 28u
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 582b4a4..74fba4a 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6073,6 +6073,7 @@ struct get_inproc_sync_fd_reply
+     unsigned int access;
+     unsigned int shm_idx;
+     char __pad_20[4];
++    unsigned __int64 export_id;
+ };
+ 
+ 
+@@ -6249,6 +6250,19 @@ struct alpc_create_port_reply
+ };
+ 
+ 
++
++struct close_inproc_sync_export_request
++{
++    struct request_header __header;
++    unsigned int shm_idx;
++    unsigned __int64 export_id;
++};
++struct close_inproc_sync_export_reply
++{
++    struct reply_header __header;
++};
++
++
+ enum request
+ {
+     REQ_new_process,
+@@ -6559,6 +6573,7 @@ enum request
+     REQ_d3dkmt_mutex_acquire,
+     REQ_d3dkmt_mutex_release,
+     REQ_alpc_create_port,
++    REQ_close_inproc_sync_export,
+     REQ_NB_REQUESTS
+ };
+ 
+@@ -6874,6 +6889,7 @@ union generic_request
+     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
+     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
+     struct alpc_create_port_request alpc_create_port_request;
++    struct close_inproc_sync_export_request close_inproc_sync_export_request;
+ };
+ union generic_reply
+ {
+@@ -7187,8 +7203,9 @@ union generic_reply
+     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
+     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
+     struct alpc_create_port_reply alpc_create_port_reply;
++    struct close_inproc_sync_export_reply close_inproc_sync_export_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 966
++#define SERVER_PROTOCOL_VERSION 968
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/inproc_sync.c b/server/inproc_sync.c
+index 23d6f67..824a7bb 100644
+--- a/server/inproc_sync.c
++++ b/server/inproc_sync.c
+@@ -23,6 +23,7 @@
+ #include <assert.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ 
+ #include "ntstatus.h"
+ #include "winternl.h"
+@@ -31,6 +32,7 @@
+ #include "handle.h"
+ #include "request.h"
+ #include "thread.h"
++#include "process.h"
+ #include "user.h"
+ #include "msync.h"
+ 
+@@ -207,7 +209,7 @@ void abandon_inproc_mutexes( thread_id_t tid )
+         ioctl( mutex->fd, NTSYNC_IOC_MUTEX_KILL, &tid );
+ }
+ 
+-static int get_obj_inproc_sync( struct object *obj, int *type )
++static int get_obj_inproc_sync( struct object *obj, int *type, unsigned __int64 *export_id )
+ {
+     struct object *sync;
+     int fd = -1;
+@@ -377,9 +379,19 @@ void abandon_inproc_mutexes( thread_id_t tid )
+     if (do_msync()) msync_abandon_mutexes( tid );
+ }
+ 
+-static int get_obj_inproc_sync( struct object *obj, int *type )
++struct msync_export
++{
++    struct list entry;
++    unsigned __int64 id;
++    unsigned int shm_idx;
++};
++
++static unsigned __int64 next_export_id;
++
++static int get_obj_inproc_sync( struct object *obj, int *type, unsigned __int64 *export_id )
+ {
+     struct object *sync;
++    struct msync_export *export;
+     int shm_idx = -1;
+ 
+     if (!do_msync()) return -1;
+@@ -388,12 +400,23 @@ static int get_obj_inproc_sync( struct object *obj, int *type )
+     {
+         struct inproc_sync *inproc = (struct inproc_sync *)sync;
+ 
+-        if (!msync_grab_object( inproc->msync ))
++        if (!(export = mem_alloc( sizeof(*export) )))
+             set_error( STATUS_NO_MEMORY );
++        else if (!msync_grab_object( inproc->msync ))
++        {
++            free( export );
++            set_error( STATUS_NO_MEMORY );
++        }
+         else
+         {
++            if (next_export_id == ~(unsigned __int64)0)
++                fatal_error( "msync export id space exhausted\n" );
++            export->id = ++next_export_id;
++            export->shm_idx = inproc->msync->shm_idx;
++            list_add_tail( &current->process->msync_exports, &export->entry );
++            *export_id = export->id;
+             *type = inproc->type;
+-            shm_idx = (int)inproc->msync->shm_idx;
++            shm_idx = (int)export->shm_idx;
+         }
+     }
+ 
+@@ -401,6 +424,19 @@ static int get_obj_inproc_sync( struct object *obj, int *type )
+     return shm_idx;
+ }
+ 
++void release_process_msync_exports( struct process *process )
++{
++    struct msync_export *export, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( export, next, &process->msync_exports, struct msync_export, entry )
++    {
++        if (!msync_release_export( export->shm_idx ))
++            fatal_error( "could not release msync export %llu\n", (unsigned long long)export->id );
++        list_remove( &export->entry );
++        free( export );
++    }
++}
++
+ #else /* NTSYNC_IOC_EVENT_READ */
+ 
+ int get_inproc_device_fd(void)
+@@ -445,13 +481,20 @@ void abandon_inproc_mutexes( thread_id_t tid )
+ {
+ }
+ 
+-static int get_obj_inproc_sync( struct object *obj, int *type )
++static int get_obj_inproc_sync( struct object *obj, int *type, unsigned __int64 *export_id )
+ {
+     return -1;
+ }
+ 
+ #endif /* NTSYNC_IOC_EVENT_READ */
+ 
++#if !defined(__APPLE__)
++void release_process_msync_exports( struct process *process )
++{
++    assert( list_empty( &process->msync_exports ) );
++}
++#endif
++
+ DECL_HANDLER(get_inproc_sync_fd)
+ {
+     struct object *obj;
+@@ -461,7 +504,7 @@ DECL_HANDLER(get_inproc_sync_fd)
+ 
+     reply->access = get_handle_access( current->process, req->handle );
+ 
+-    if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0)
++    if ((fd = get_obj_inproc_sync( obj, &reply->type, &reply->export_id )) < 0)
+     {
+         if (!get_error()) set_error( STATUS_NOT_IMPLEMENTED );
+     }
+@@ -473,3 +516,24 @@ DECL_HANDLER(get_inproc_sync_fd)
+ 
+     release_object( obj );
+ }
++
++DECL_HANDLER(close_inproc_sync_export)
++{
++#ifdef __APPLE__
++    struct msync_export *export;
++
++    LIST_FOR_EACH_ENTRY( export, &current->process->msync_exports, struct msync_export, entry )
++    {
++        if (export->id != req->export_id || export->shm_idx != req->shm_idx) continue;
++        if (!msync_release_export( export->shm_idx ))
++        {
++            set_error( STATUS_UNSUCCESSFUL );
++            return;
++        }
++        list_remove( &export->entry );
++        free( export );
++        return;
++    }
++#endif
++    set_error( STATUS_INVALID_HANDLE );
++}
+diff --git a/server/msync.c b/server/msync.c
+index 4cb45b9..0fac577 100644
+--- a/server/msync.c
++++ b/server/msync.c
+@@ -28,6 +28,8 @@
+ #include <inttypes.h>
+ #include <limits.h>
+ #include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <stdarg.h>
+ #include <sys/mman.h>
+ #ifdef HAVE_SYS_STAT_H
+@@ -594,23 +596,27 @@ static void retire_message_refs( mach_register_message_t *message, unsigned int
+     }
+ }
+ 
+-static inline void destroy_all_internal( unsigned int shm_idx )
+-{
+-    release_shm_ref( shm_idx );
+-}
++/* Only the server may retire references. The public Mach send right is also held
++ * by clients, so a bare shared index is not authority to close a reused slot. */
++static uint64_t close_cookie;
+ 
+-/* Client registration and unregister messages are ordered on the Mach port. Shared
+- * state publication still uses release/acquire ordering for weakly ordered CPUs. */
+ static inline mach_msg_return_t destroy_all( unsigned int shm_idx )
+ {
+-    static mach_msg_header_t send_header;
+-    send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
+-    send_header.msgh_id = (shm_idx & MSYNC_SHM_INDEX_MASK) | MSYNC_SHM_CLOSE_FLAG;
+-    send_header.msgh_size = sizeof(send_header);
+-    send_header.msgh_remote_port = receive_port;
++    struct { mach_msg_header_t header; uint64_t cookie; } message = {0};
+ 
+-    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
+-                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0);
++    message.header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
++    message.header.msgh_id = (shm_idx & MSYNC_SHM_INDEX_MASK) | MSYNC_SHM_CLOSE_FLAG;
++    message.header.msgh_size = sizeof(message);
++    message.header.msgh_remote_port = receive_port;
++    message.cookie = close_cookie;
++
++    return mach_msg2( &message.header, MACH_SEND_MSG, message.header.msgh_size,
++                      0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
++}
++
++int msync_release_export( unsigned int shm_idx )
++{
++    return destroy_all( shm_idx ) == MACH_MSG_SUCCESS;
+ }
+ 
+ static inline mach_msg_return_t signal_all( unsigned int shm_idx, int *shm )
+@@ -792,16 +798,20 @@ static void *mach_message_pump( void *args )
+             continue;
+         }
+ 
+-        /* Header-only messages carry a 28-bit shared index and a signal or close flag. */
+-        if (receive_message.header.msgh_size == sizeof(mach_msg_header_t))
++        if (receive_message.header.msgh_id & MSYNC_SHM_CLOSE_FLAG)
+         {
+-            unsigned int message_id = receive_message.header.msgh_id;
+-            unsigned int shm_idx = message_id & MSYNC_SHM_INDEX_MASK;
++            uint64_t cookie = 0;
+ 
+-            if (message_id & MSYNC_SHM_CLOSE_FLAG)
+-                destroy_all_internal( shm_idx );
+-            else
+-                signal_all_internal( shm_idx );
++            if (receive_message.header.msgh_size == sizeof(mach_msg_header_t) + sizeof(cookie))
++                memcpy( &cookie, receive_message.shm_idx, sizeof(cookie) );
++            if (cookie && cookie == close_cookie)
++                release_shm_ref( receive_message.header.msgh_id & MSYNC_SHM_INDEX_MASK );
++            continue;
++        }
++
++        if (receive_message.header.msgh_size == sizeof(mach_msg_header_t))
++        {
++            signal_all_internal( receive_message.header.msgh_id & MSYNC_SHM_INDEX_MASK );
+             continue;
+         }
+ 
+@@ -944,6 +954,9 @@ void msync_init(void)
+ 
+     if (!do_msync()) return;
+ 
++    arc4random_buf( &close_cookie, sizeof(close_cookie) );
++    if (!close_cookie) close_cookie = 1;
++
+     if (fstat( config_dir_fd, &st ) == -1)
+         fatal_error( "cannot stat config dir\n" );
+ 
+@@ -996,7 +1009,8 @@ void msync_destroy( struct msync *msync )
+         list_remove( &msync->mutex_entry );
+     if (!msync->shm_idx) return;
+ 
+-    destroy_all( msync->shm_idx );
++    if (!msync_release_export( msync->shm_idx ))
++        fatal_error( "could not release msync object %u\n", msync->shm_idx );
+     free( msync );
+ }
+ 
+diff --git a/server/msync.h b/server/msync.h
+index fc0a39e..98165f2 100644
+--- a/server/msync.h
++++ b/server/msync.h
+@@ -46,6 +46,7 @@ struct msync
+ 
+ extern struct msync *create_msync( int low, int high, enum msync_type type );
+ extern int msync_grab_object( struct msync *msync );
++extern int msync_release_export( unsigned int shm_idx );
+ extern void msync_destroy( struct msync *msync );
+ extern void msync_set_event( struct msync *msync );
+ extern void msync_reset_event( struct msync *msync );
+diff --git a/server/process.c b/server/process.c
+index 94adb19..4c6d12d 100644
+--- a/server/process.c
++++ b/server/process.c
+@@ -554,6 +554,9 @@ static void process_died( struct process *process )
+         if (!--user_processes && !shutdown_stage && master_socket_timeout != TIMEOUT_INFINITE)
+             shutdown_timeout = add_timeout_user( master_socket_timeout, server_shutdown_timeout, NULL );
+     }
++    /* The Unix process is now dead: no new wait registrations can race the
++     * Mach-port-ordered release of its exported shared indices. */
++    release_process_msync_exports( process );
+     release_object( process );
+     if (!--running_processes && shutdown_stage) close_master_socket( 0 );
+ }
+@@ -644,6 +647,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
+     list_init( &process->rawinput_entry );
+     list_init( &process->kernel_object );
+     list_init( &process->thread_list );
++    list_init( &process->msync_exports );
+     list_init( &process->locks );
+     list_init( &process->asyncs );
+     list_init( &process->classes );
+@@ -725,6 +729,7 @@ static void process_destroy( struct object *obj )
+     assert( !process->sigkill_timeout );  /* timeout should hold a reference to the process */
+ 
+     close_process_handles( process );
++    release_process_msync_exports( process );
+     set_process_startup_state( process, STARTUP_ABORTED );
+ 
+     if (process->job)
+diff --git a/server/process.h b/server/process.h
+index dff766d..40de6cd 100644
+--- a/server/process.h
++++ b/server/process.h
+@@ -40,6 +40,7 @@ struct process
+     struct list          entry;           /* entry in system-wide process list */
+     process_id_t         parent_id;       /* parent process id (at the time of creation) */
+     struct list          thread_list;     /* thread list */
++    struct list          msync_exports;   /* shared-index exports owned by this process */
+     struct debug_obj    *debug_obj;       /* debug object debugging this process */
+     struct debug_event  *debug_event;     /* debug event being sent to debugger */
+     struct handle_table *handles;         /* handle entries */
+@@ -94,6 +95,7 @@ struct process
+ 
+ /* process functions */
+ 
++extern void release_process_msync_exports( struct process *process );
+ extern unsigned int alloc_ptid( void *ptr );
+ extern void free_ptid( unsigned int id );
+ extern void *get_ptid_entry( unsigned int id );
+diff --git a/server/protocol.def b/server/protocol.def
+index 681b538..5afa403 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4233,6 +4233,7 @@ enum inproc_sync_type
+     int           type;         /* inproc sync type */
+     unsigned int access;        /* handle access rights */
+     unsigned int shm_idx;       /* optional for index-based sync implementations */
++    unsigned __int64 export_id; /* process-owned reference to the shared index */
+ @END
+ 
+ 
+@@ -4343,3 +4344,10 @@ enum inproc_sync_type
+ @REPLY
+     obj_handle_t        handle;         /* handle to the ALPC port */
+ @END
++
++
++/* Release a process-owned in-process synchronization export. */
++@REQ(close_inproc_sync_export)
++    unsigned int shm_idx;
++    unsigned __int64 export_id;
++@END
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 90b59cb..e088baa 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -315,6 +315,7 @@ DECL_HANDLER(d3dkmt_object_open_name);
+ DECL_HANDLER(d3dkmt_mutex_acquire);
+ DECL_HANDLER(d3dkmt_mutex_release);
+ DECL_HANDLER(alpc_create_port);
++DECL_HANDLER(close_inproc_sync_export);
+ 
+ typedef void (*req_handler)( const void *req, void *reply );
+ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+@@ -627,6 +628,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_d3dkmt_mutex_acquire,
+     (req_handler)req_d3dkmt_mutex_release,
+     (req_handler)req_alpc_create_port,
++    (req_handler)req_close_inproc_sync_export,
+ };
+ 
+ C_ASSERT( sizeof(abstime_t) == 8 );
+@@ -2334,7 +2336,8 @@ C_ASSERT( sizeof(struct get_inproc_sync_fd_request) == 16 );
+ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, type) == 8 );
+ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, access) == 12 );
+ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, shm_idx) == 16 );
+-C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 24 );
++C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, export_id) == 24 );
++C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 32 );
+ C_ASSERT( sizeof(struct get_inproc_alert_fd_request) == 16 );
+ C_ASSERT( offsetof(struct get_inproc_alert_fd_reply, handle) == 8 );
+ C_ASSERT( sizeof(struct get_inproc_alert_fd_reply) == 16 );
+@@ -2396,3 +2399,6 @@ C_ASSERT( offsetof(struct alpc_create_port_request, max_msg_len) == 16 );
+ C_ASSERT( sizeof(struct alpc_create_port_request) == 24 );
+ C_ASSERT( offsetof(struct alpc_create_port_reply, handle) == 8 );
+ C_ASSERT( sizeof(struct alpc_create_port_reply) == 16 );
++C_ASSERT( offsetof(struct close_inproc_sync_export_request, shm_idx) == 12 );
++C_ASSERT( offsetof(struct close_inproc_sync_export_request, export_id) == 16 );
++C_ASSERT( sizeof(struct close_inproc_sync_export_request) == 24 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 9b8bba1..eb2825d 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3415,6 +3415,7 @@ static void dump_get_inproc_sync_fd_reply( const struct get_inproc_sync_fd_reply
+     fprintf( stderr, " type=%d", req->type );
+     fprintf( stderr, ", access=%08x", req->access );
+     fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
++    dump_uint64( ", export_id=", &req->export_id );
+ }
+ 
+ static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_request *req )
+@@ -3540,6 +3541,12 @@ static void dump_alpc_create_port_reply( const struct alpc_create_port_reply *re
+     fprintf( stderr, " handle=%04x", req->handle );
+ }
+ 
++static void dump_close_inproc_sync_export_request( const struct close_inproc_sync_export_request *req )
++{
++    fprintf( stderr, " shm_idx=%08x", req->shm_idx );
++    dump_uint64( ", export_id=", &req->export_id );
++}
++
+ typedef void (*dump_func)( const void *req );
+ 
+ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+@@ -3852,6 +3859,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_d3dkmt_mutex_acquire_request,
+     (dump_func)dump_d3dkmt_mutex_release_request,
+     (dump_func)dump_alpc_create_port_request,
++    (dump_func)dump_close_inproc_sync_export_request,
+ };
+ 
+ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+@@ -4164,6 +4172,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_d3dkmt_mutex_acquire_reply,
+     NULL,
+     (dump_func)dump_alpc_create_port_reply,
++    NULL,
+ };
+ 
+ static const char * const req_names[REQ_NB_REQUESTS] =
+@@ -4476,6 +4485,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "d3dkmt_mutex_acquire",
+     "d3dkmt_mutex_release",
+     "alpc_create_port",
++    "close_inproc_sync_export",
+ };
+ 
+ static const struct

@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#define YAAGL_FSR_FG_BRIDGE_VERSION 3u
+#define YAAGL_FSR_FG_BRIDGE_VERSION 4u
 
 enum yaagl_fsr_fg_create_flags
 {
@@ -20,7 +20,8 @@ enum yaagl_fsr_fg_operation
     YAAGL_FSR_FG_PREPARE = 2,
     YAAGL_FSR_FG_DISPATCH = 3,
     YAAGL_FSR_FG_DESTROY = 4,
-    YAAGL_FSR_FG_CONFIGURE = 5
+    YAAGL_FSR_FG_CONFIGURE = 5,
+    YAAGL_FSR_FG_RETIRE_FRAME = 6
 };
 
 struct yaagl_fsr_fg_packet_header
@@ -112,6 +113,15 @@ struct yaagl_fsr_fg_configure_packet
 {
     struct yaagl_fsr_fg_packet_header header;
     uint32_t enabled;
+};
+
+/* Retire one completed or skipped generation callback; encoded work owns its snapshot. */
+struct yaagl_fsr_fg_retire_frame_packet
+{
+    struct yaagl_fsr_fg_packet_header header;
+    uint64_t frame_id;
+    uint64_t oldest_pending_frame_id;
+    uint32_t has_pending_frame;
 };
 
 struct yaagl_fsr_fg_destroy_packet

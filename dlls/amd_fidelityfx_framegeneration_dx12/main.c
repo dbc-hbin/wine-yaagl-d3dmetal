@@ -133,6 +133,7 @@ struct fg_context;
 
 struct callback_binding
 {
+    struct callback_binding *next;
     struct fg_context *context;
     FfxApiPresentCallbackFunc present;
     void *present_user;
@@ -175,7 +176,7 @@ struct fg_context
     struct fg_context *next;
     ffxAllocationCallbacks allocation;
     BOOL custom_allocation;
-    enum context_mode mode;
+    LONG mode;
 
     ffxContext original;
     uint64_t translated;
@@ -189,6 +190,8 @@ struct fg_context
 
     struct stable_swapchain *swapchain;
     struct callback_binding *binding;
+    struct callback_binding *native_bindings;
+    struct callback_binding *active_native_binding;
     struct ffxConfigureDescFrameGeneration native_config;
     BOOL native_config_valid;
 
@@ -207,6 +210,11 @@ struct fg_context
     BOOL depth_infinite;
     BOOL enabled;
 };
+
+static enum context_mode context_mode(const struct fg_context *context)
+{
+    return InterlockedCompareExchange((LONG *)&context->mode, 0, 0);
+}
 
 static SRWLOCK contexts_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE contexts_changed = CONDITION_VARIABLE_INIT;
@@ -298,6 +306,23 @@ static ffxReturnCode_t bridge_call(void *packet)
     struct yaagl_fsr_fg_packet_header *header = packet;
     NTSTATUS status = WINE_UNIX_CALL(unix_fsr_fg_api, packet);
     return status ? FFX_API_RETURN_ERROR_RUNTIME_ERROR : header->result;
+}
+
+static ffxReturnCode_t retire_translation_frame(uint64_t context, uint64_t frame_id,
+                                                 uint64_t *oldest_pending, BOOL *has_pending)
+{
+    struct yaagl_fsr_fg_retire_frame_packet packet;
+    ffxReturnCode_t result;
+    memset(&packet, 0, sizeof(packet));
+    initialize_packet(&packet.header, sizeof(packet), YAAGL_FSR_FG_RETIRE_FRAME, context);
+    packet.frame_id = frame_id;
+    result = bridge_call(&packet);
+    if (result == FFX_API_RETURN_OK)
+    {
+        *oldest_pending = packet.oldest_pending_frame_id;
+        *has_pending = packet.has_pending_frame;
+    }
+    return result;
 }
 
 static ffxReturnCode_t configure_translation(uint64_t context, BOOL enabled)
@@ -398,8 +423,8 @@ static ffxReturnCode_t snapshot_frame_config(
         }
         ++count;
     }
-    /* No callback means no safe retirement point. Preserve future frame IDs
-     * and reject further configuration rather than silently remapping them. */
+    /* Without a generation callback, future frame IDs have no safe retirement
+     * point. Reject growth rather than silently remapping them. */
     if (count >= 64)
     {
         LeaveCriticalSection(&context->dispatch_lock);
@@ -427,20 +452,26 @@ static struct frame_config_snapshot *find_frame_config(
     return best;
 }
 
-/*
- * A completed generation callback establishes the newest configuration at or
- * below frame_id as the fallback for later frame IDs.  Older snapshots can no
- * longer be selected; the fallback itself and every future configuration must
- * remain available.
- */
-static void retire_frame_configs(struct fg_context *context, uint64_t frame_id)
+/* Keep the newest fallback for the oldest outstanding Prepare, plus every
+ * future configuration. A newer callback may finish before an older one. */
+static void retire_frame_configs(struct fg_context *context, uint64_t completed_frame)
 {
     struct frame_config_snapshot **link, *snapshot, *floor = NULL, *discard = NULL;
+    uint64_t oldest_pending = 0, boundary = completed_frame;
+    BOOL has_pending = FALSE;
 
     EnterCriticalSection(&context->dispatch_lock);
+    /* Keep the native pending-frame snapshot and PE pruning atomic with Prepare. */
+    if (retire_translation_frame(context->translated, completed_frame,
+                                 &oldest_pending, &has_pending) != FFX_API_RETURN_OK)
+    {
+        LeaveCriticalSection(&context->dispatch_lock);
+        return;
+    }
+    if (has_pending && oldest_pending < boundary) boundary = oldest_pending;
     for (snapshot = context->frame_configs; snapshot; snapshot = snapshot->next)
     {
-        if (snapshot->frame_id <= frame_id &&
+        if (snapshot->frame_id <= boundary &&
             (!floor || snapshot->frame_id > floor->frame_id))
             floor = snapshot;
     }
@@ -550,6 +581,15 @@ static BOOL in_callback(void)
     return callback_tls != TLS_OUT_OF_INDEXES && TlsGetValue(callback_tls) != NULL;
 }
 
+static BOOL in_context_callback(const struct fg_context *context)
+{
+    const struct callback_scope *scope;
+    for (scope = callback_tls == TLS_OUT_OF_INDEXES ? NULL : TlsGetValue(callback_tls);
+         scope; scope = scope->previous)
+        if (scope->context == context) return TRUE;
+    return FALSE;
+}
+
 static void enter_callback(struct callback_scope *scope, struct fg_context *context)
 {
     scope->previous = TlsGetValue(callback_tls);
@@ -565,6 +605,120 @@ static void leave_callback(struct callback_scope *scope)
 {
     TlsSetValue(callback_tls, scope->previous);
     release_context(scope->context);
+}
+
+static void clear_native_bindings(struct fg_context *context)
+{
+    struct callback_binding *binding = context->native_bindings, *next;
+
+    context->native_bindings = NULL;
+    context->active_native_binding = NULL;
+    while (binding)
+    {
+        next = binding->next;
+        free_memory(context_allocator(context), binding);
+        binding = next;
+    }
+}
+
+/* A successful native configure installs the new target; only after the
+ * presenter wait succeeds may callbacks from older configurations be freed. */
+static void reclaim_native_bindings(struct fg_context *context)
+{
+    struct callback_binding **link = &context->native_bindings, *old;
+
+    while (*link)
+    {
+        if (*link == context->active_native_binding)
+        {
+            link = &(*link)->next;
+            continue;
+        }
+        old = *link;
+        *link = old->next;
+        free_memory(context_allocator(context), old);
+    }
+}
+
+static ffxReturnCode_t native_present_callback(ffxCallbackDescFrameGenerationPresent *desc, void *user)
+{
+    struct callback_binding *binding = user;
+    struct callback_scope scope;
+    ffxReturnCode_t result;
+
+    enter_callback(&scope, binding->context);
+    result = binding->present(desc, binding->present_user);
+    leave_callback(&scope);
+    return result;
+}
+
+static ffxReturnCode_t native_generation_callback(ffxDispatchDescFrameGeneration *desc, void *user)
+{
+    struct callback_binding *binding = user;
+    struct callback_scope scope;
+    ffxReturnCode_t result;
+
+    enter_callback(&scope, binding->context);
+    result = binding->generate(desc, binding->generate_user);
+    leave_callback(&scope);
+    return result;
+}
+
+/* Keep immutable callback targets until the native presenter has drained. */
+static ffxReturnCode_t configure_native_callbacks(
+    struct fg_context *context, const struct ffxConfigureDescFrameGeneration *desc)
+{
+    struct ffxConfigureDescFrameGeneration config = *desc;
+    struct callback_binding *binding = NULL;
+    struct callback_binding *previous = context->active_native_binding;
+    ffxReturnCode_t result;
+
+    if (desc->presentCallback || desc->frameGenerationCallback)
+    {
+        binding = previous;
+        if (!binding_matches(binding, desc))
+            for (binding = context->native_bindings; binding; binding = binding->next)
+                if (binding_matches(binding, desc)) break;
+        if (!binding)
+        {
+            binding = allocate_memory(context_allocator(context), sizeof(*binding));
+            if (!binding) return FFX_API_RETURN_ERROR_MEMORY;
+            memset(binding, 0, sizeof(*binding));
+            binding->context = context;
+            binding->present = desc->presentCallback;
+            binding->present_user = desc->presentCallbackUserContext;
+            binding->generate = desc->frameGenerationCallback;
+            binding->generate_user = desc->frameGenerationCallbackUserContext;
+            binding->next = context->native_bindings;
+            context->native_bindings = binding;
+        }
+        if (binding->present)
+        {
+            config.presentCallback = native_present_callback;
+            config.presentCallbackUserContext = binding;
+        }
+        if (binding->generate)
+        {
+            config.frameGenerationCallback = native_generation_callback;
+            config.frameGenerationCallbackUserContext = binding;
+        }
+    }
+    result = native.configure(&context->original, &config.header);
+    if (result == FFX_API_RETURN_OK)
+    {
+        context->active_native_binding = binding;
+        /* Direct contexts have no presenter callbacks. Otherwise an actual
+         * binding change needs a drain barrier; failure keeps old targets. */
+        if (!context->swapchain)
+        {
+            if (context->native_bindings != binding || (binding && binding->next))
+                reclaim_native_bindings(context);
+        }
+        else if (binding != previous &&
+                 context->swapchain->lpVtbl->wait_for_presents(context->swapchain))
+            reclaim_native_bindings(context);
+    }
+    return result;
 }
 
 static void release_swapchain(struct stable_swapchain *swapchain)
@@ -593,7 +747,7 @@ static BOOL claim_swapchain(struct fg_context *context,
     AcquireSRWLockExclusive(&contexts_lock);
     for (other = contexts; other; other = other->next)
     {
-        if (other != context && other->mode != CONTEXT_SWAPCHAIN &&
+        if (other != context && context_mode(other) != CONTEXT_SWAPCHAIN &&
             other->swapchain == swapchain)
         {
             available = FALSE;
@@ -801,7 +955,7 @@ static ffxReturnCode_t select_native(struct fg_context *context)
 {
     ffxReturnCode_t result = FFX_API_RETURN_OK;
 
-    context->mode = CONTEXT_NATIVE;
+    InterlockedExchange(&context->mode, CONTEXT_NATIVE);
     if (context->native_config_valid)
     {
         struct ffxConfigureDescFrameGeneration config = context->native_config;
@@ -820,7 +974,7 @@ static ffxReturnCode_t validate_public_dispatch(
 
         unsigned int i;
 
-        if (context->mode == CONTEXT_METALFX && header->pNext)
+        if (context_mode(context) == CONTEXT_METALFX && header->pNext)
             return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
         if (!desc->commandList || !desc->presentColor.resource ||
             !desc->numGeneratedFrames || desc->numGeneratedFrames > 4 ||
@@ -835,7 +989,7 @@ static ffxReturnCode_t validate_public_dispatch(
             return FFX_API_RETURN_ERROR_PARAMETER;
         for (i = 0; i < desc->numGeneratedFrames; ++i)
             if (!desc->outputs[i].resource) return FFX_API_RETURN_ERROR_PARAMETER;
-        if (context->mode == CONTEXT_METALFX &&
+        if (context_mode(context) == CONTEXT_METALFX &&
             (desc->numGeneratedFrames != 1 ||
              desc->outputs[0].resource == desc->presentColor.resource))
             return FFX_API_RETURN_ERROR_PARAMETER;
@@ -873,7 +1027,7 @@ static ffxReturnCode_t validate_public_dispatch(
         if (header->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2)
         {
             const struct ffxDispatchDescFrameGenerationPrepareV2 *desc = (const void *)header;
-            if (context->mode == CONTEXT_METALFX && header->pNext)
+            if (context_mode(context) == CONTEXT_METALFX && header->pNext)
                 return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
             COPY_PREPARE_FIELDS(packet, desc);
             COPY_CAMERA_FIELDS(packet, desc);
@@ -888,7 +1042,7 @@ static ffxReturnCode_t validate_public_dispatch(
                 const struct ffxDispatchDescFrameGenerationPrepareCameraInfo *camera;
                 if (entry->type != FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO)
                 {
-                    if (context->mode == CONTEXT_METALFX)
+                    if (context_mode(context) == CONTEXT_METALFX)
                         return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
                     break;
                 }
@@ -954,10 +1108,10 @@ static ffxReturnCode_t dispatch_context(struct fg_context *context,
     BOOL direct_generation = FALSE;
     uint64_t direct_frame = 0;
 
-    if (!in_callback())
+    if (!in_context_callback(context))
     {
         AcquireSRWLockExclusive(&context->configure_lock);
-        if (context->mode == MODE_PENDING)
+        if (context_mode(context) == MODE_PENDING)
         {
             if (desc->type != FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE &&
                 desc->type != FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2)
@@ -988,7 +1142,7 @@ static ffxReturnCode_t dispatch_context(struct fg_context *context,
             }
             else if (result == FFX_API_RETURN_OK)
             {
-                context->mode = CONTEXT_METALFX;
+                InterlockedExchange(&context->mode, CONTEXT_METALFX);
                 if (context->native_config_valid)
                 {
                     struct ffxConfigureDescFrameGeneration config = context->native_config;
@@ -1002,7 +1156,7 @@ static ffxReturnCode_t dispatch_context(struct fg_context *context,
     }
 
     EnterCriticalSection(&context->dispatch_lock);
-    if (context->mode != CONTEXT_METALFX)
+    if (context_mode(context) != CONTEXT_METALFX)
     {
         result = native.dispatch(&context->original, desc);
     }
@@ -1034,8 +1188,9 @@ static ffxReturnCode_t dispatch_context(struct fg_context *context,
         }
     }
     LeaveCriticalSection(&context->dispatch_lock);
-    /* Direct dispatch has no generation callback to retire its frame-ID floor. */
-    if (direct_generation) retire_frame_configs(context, direct_frame);
+    /* Direct dispatch has no presenter callback to retire its frame metadata. */
+    if (direct_generation)
+        retire_frame_configs(context, direct_frame);
     return result;
 }
 
@@ -1067,8 +1222,10 @@ static ffxReturnCode_t generation_callback(ffxDispatchDescFrameGeneration *desc,
     struct callback_binding *binding = user;
     struct callback_scope scope;
     ffxReturnCode_t result;
+    uint64_t frame_id;
 
     if (!binding || !desc) return FFX_API_RETURN_ERROR_PARAMETER;
+    frame_id = desc->frameID;
 
     enter_callback(&scope, binding->context);
 
@@ -1091,12 +1248,12 @@ static ffxReturnCode_t generation_callback(ffxDispatchDescFrameGeneration *desc,
         TRACE("MetalFX generation frame=%llu result=%u generated=%u\n",
               (unsigned long long)desc->frameID, result, desc->numGeneratedFrames);
 
-    /*
-     * translated_dispatch establishes its native execution lease before it
-     * returns.  Retire only configurations older than the completed frame's
-     * fallback after the application callback has finished using them.
+    /* The callback has finished with its config. Encoded work owns its own
+     * snapshot; retire the original frame ID even if the app edited the
+     * descriptor, including on failure or a skip,
+     * preserving other callbacks that may finish out of order.
      */
-    retire_frame_configs(binding->context, desc->frameID);
+    retire_frame_configs(binding->context, frame_id);
     leave_callback(&scope);
     return result;
 }
@@ -1148,7 +1305,7 @@ static ffxReturnCode_t detach_swapchain(struct fg_context *context)
 
     if (!swapchain) return FFX_API_RETURN_OK;
 
-    if (context->mode == CONTEXT_NATIVE && context->native_config_valid)
+    if (context_mode(context) == CONTEXT_NATIVE && context->native_config_valid)
     {
         struct ffxConfigureDescFrameGeneration config = context->native_config;
         config.header.pNext = NULL;
@@ -1174,12 +1331,14 @@ static ffxReturnCode_t detach_swapchain(struct fg_context *context)
 
     clear_swapchain_claim(context);
     release_swapchain(swapchain);
+    /* Native configure may have failed; retain its callback user data until
+     * the original context itself has been destroyed. */
     free_memory(context_allocator(context), context->binding);
     context->binding = NULL;
     context->native_config_valid = FALSE;
     release_resource(&context->hudless);
     clear_frame_configs(context);
-    if (context->mode == CONTEXT_METALFX)
+    if (context_mode(context) == CONTEXT_METALFX)
     {
         native_result = configure_translation(context->translated, FALSE);
         if (native_result != FFX_API_RETURN_OK) result = native_result;
@@ -1226,7 +1385,7 @@ static ffxReturnCode_t configure_frame_generation(
             return FFX_API_RETURN_ERROR_PARAMETER;
     }
 
-    if (context->mode == MODE_PENDING)
+    if (context_mode(context) == MODE_PENDING)
     {
         if (desc->header.pNext || (desc->flags & unsupported_generation_flags))
         {
@@ -1245,17 +1404,21 @@ static ffxReturnCode_t configure_frame_generation(
         }
     }
 
-    if (context->mode == CONTEXT_METALFX && desc->header.pNext)
+    if (context_mode(context) == CONTEXT_METALFX && desc->header.pNext)
         return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
 
-    if (context->mode == CONTEXT_METALFX &&
+    if (context_mode(context) == CONTEXT_METALFX &&
         (desc->flags & unsupported_generation_flags))
         return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
 
     if (!notify)
     {
-        if (context->mode == CONTEXT_NATIVE)
-            return native.configure(&context->original, &desc->header);
+        if (context_mode(context) == CONTEXT_NATIVE)
+        {
+            result = configure_native_callbacks(context, desc);
+            if (result == FFX_API_RETURN_OK) store_native_config(context, desc);
+            return result;
+        }
         if (desc->frameGenerationEnabled)
         {
             result = configure_translation(context->translated, TRUE);
@@ -1302,7 +1465,7 @@ static ffxReturnCode_t configure_frame_generation(
         }
     }
 
-    if (context->mode == CONTEXT_METALFX)
+    if (context_mode(context) == CONTEXT_METALFX)
     {
         binding_changed = !binding_matches(context->binding, desc);
         if (binding_changed)
@@ -1344,9 +1507,9 @@ static ffxReturnCode_t configure_frame_generation(
         swapchain = context->swapchain;
     }
 
-    if (context->mode == CONTEXT_NATIVE)
+    if (context_mode(context) == CONTEXT_NATIVE)
     {
-        result = native.configure(&context->original, &desc->header);
+        result = configure_native_callbacks(context, desc);
         if (result == FFX_API_RETURN_OK)
         {
             store_native_config(context, desc);
@@ -1410,11 +1573,6 @@ static ffxReturnCode_t configure_frame_generation(
         result = configure_translation(context->translated, FALSE);
         if (result != FFX_API_RETURN_OK) return result;
     }
-    else if (binding_changed)
-    {
-        /* The retired binding was drained; keep its last fallback and futures. */
-        retire_frame_configs(context, desc->frameID);
-    }
 
     return FFX_API_RETURN_OK;
 }
@@ -1425,6 +1583,7 @@ static void free_context_storage(struct fg_context *context)
     BOOL custom = context->custom_allocation;
 
     clear_frame_configs(context);
+    clear_native_bindings(context);
     release_resource(&context->hudless);
     if (context->device) IUnknown_Release(context->device);
     DeleteCriticalSection(&context->dispatch_lock);
@@ -1469,7 +1628,7 @@ static ffxReturnCode_t select_translation(
     if (!create.header.context) return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
 
     context->translated = create.header.context;
-    context->mode = MODE_PENDING;
+    InterlockedExchange(&context->mode, MODE_PENDING);
     return FFX_API_RETURN_OK;
 }
 
@@ -1645,7 +1804,7 @@ ffxReturnCode_t WINAPI ffxCreateContext(ffxContext *output,
     }
 
     if (result == FFX_API_RETURN_OK &&
-        context->mode != CONTEXT_METALFX && !context->original)
+        context_mode(context) != CONTEXT_METALFX && !context->original)
         result = FFX_API_RETURN_ERROR_RUNTIME_ERROR;
 
     if (result != FFX_API_RETURN_OK)
@@ -1809,7 +1968,7 @@ ffxReturnCode_t WINAPI ffxConfigure(ffxContext *handle,
     {
         result = FFX_API_RETURN_ERROR_PARAMETER;
     }
-    else if (context->mode == CONTEXT_SWAPCHAIN)
+    else if (context_mode(context) == CONTEXT_SWAPCHAIN)
     {
         /*
          * This includes UI resources, premultiplied alpha, double buffering,
@@ -1822,10 +1981,10 @@ ffxReturnCode_t WINAPI ffxConfigure(ffxContext *handle,
     {
         result = configure_frame_generation(context, (const void *)desc);
     }
-    else if (context->mode == CONTEXT_NATIVE || context->mode == MODE_PENDING)
+    else if (context_mode(context) == CONTEXT_NATIVE || context_mode(context) == MODE_PENDING)
     {
         result = native.configure(&context->original, desc);
-        if (result == FFX_API_RETURN_OK && context->mode == MODE_PENDING)
+        if (result == FFX_API_RETURN_OK && context_mode(context) == MODE_PENDING)
             result = select_native(context);
     }
     else
@@ -1910,7 +2069,7 @@ ffxReturnCode_t WINAPI ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
     context = acquire_context(handle);
     if (!context) return FFX_API_RETURN_ERROR_PARAMETER;
 
-    if (context->mode != CONTEXT_METALFX && context->mode != MODE_PENDING)
+    if (context_mode(context) != CONTEXT_METALFX && context_mode(context) != MODE_PENDING)
     {
         /*
          * Always unwrap context queries, including provider-version queries.
@@ -1925,9 +2084,9 @@ ffxReturnCode_t WINAPI ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
             result = FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
         else
         {
-            query->versionId = context->mode == MODE_PENDING ?
+            query->versionId = context_mode(context) == MODE_PENDING ?
                 AUTOMATIC_PROVIDER_ID : METALFX_PROVIDER_ID;
-            query->versionName = context->mode == MODE_PENDING ?
+            query->versionName = context_mode(context) == MODE_PENDING ?
                 automatic_provider_name : metalfx_provider_name;
             result = FFX_API_RETURN_OK;
         }
@@ -1964,7 +2123,9 @@ ffxReturnCode_t WINAPI ffxDispatch(ffxContext *handle,
      * Waiting from a presenter callback would wait for itself.  Normal
      * Prepare/Dispatch callback reentry is required and remains permitted.
      */
+    if (!in_context_callback(context)) AcquireSRWLockShared(&context->configure_lock);
     result = validate_public_dispatch(context, desc);
+    if (!in_context_callback(context)) ReleaseSRWLockShared(&context->configure_lock);
     if (result == FFX_API_RETURN_OK)
     {
         if (in_callback() &&

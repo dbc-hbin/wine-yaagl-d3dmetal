@@ -71,16 +71,17 @@ PATCH_INVENTORY='0001-msync-tuned.patch
 0011-audio-resources.patch
 0012-msync-shared-pages.patch
 0013-window-resources.patch
-0014-core-resources.patch'
+0014-core-resources.patch
+0015-msync-owned-exports.patch'
 
 # key|build tree|make target|installed path|architecture|format|changed sources (comma-separated)
 # This is the single authoritative source/artifact inventory. Source exclusions,
 # build state, install overlay, and provenance are all derived from it.
-ARTIFACT_INVENTORY='ntdll|x86_64|dlls/ntdll/ntdll.so|lib/wine/x86_64-unix/ntdll.so|x86_64|macho|dlls/ntdll/unix/msync.c,dlls/ntdll/unix/msync.h,dlls/ntdll/unix/loader.c,server/protocol.def,include/wine/server_protocol.h,include/wine/msync.h,include/Makefile.in,dlls/ntdll/unix/signal_arm.c,dlls/ntdll/unix/signal_arm64.c,dlls/ntdll/unix/signal_i386.c,dlls/ntdll/unix/signal_x86_64.c,dlls/ntdll/unix/thread.c,dlls/ntdll/unix/unix_private.h
+ARTIFACT_INVENTORY='ntdll|x86_64|dlls/ntdll/ntdll.so|lib/wine/x86_64-unix/ntdll.so|x86_64|macho|dlls/ntdll/unix/msync.c,dlls/ntdll/unix/msync.h,dlls/ntdll/unix/loader.c,server/protocol.def,include/wine/server_protocol.h,include/wine/msync.h,include/Makefile.in,dlls/ntdll/unix/signal_arm.c,dlls/ntdll/unix/signal_arm64.c,dlls/ntdll/unix/signal_i386.c,dlls/ntdll/unix/signal_x86_64.c,dlls/ntdll/unix/thread.c,dlls/ntdll/unix/unix_private.h,dlls/ntdll/unix/sync.c
 winemac|x86_64|dlls/winemac.drv/winemac.so|lib/wine/x86_64-unix/winemac.so|x86_64|macho|dlls/winemac.drv/cocoa_app.h,dlls/winemac.drv/cocoa_app.m,dlls/winemac.drv/cocoa_event.h,dlls/winemac.drv/cocoa_event.m,dlls/winemac.drv/cocoa_window.h,dlls/winemac.drv/cocoa_window.m,dlls/winemac.drv/macdrv.h,dlls/winemac.drv/macdrv_cocoa.h,dlls/winemac.drv/event.c,dlls/winemac.drv/mouse.c,dlls/winemac.drv/surface.c,dlls/winemac.drv/window.c,include/wine/gdi_driver.h
 winemac64|x86_64|dlls/winemac.drv/x86_64-windows/winemac.drv|lib/wine/x86_64-windows/winemac.drv|x86_64|pe|dlls/winemac.drv/cocoa_app.h,dlls/winemac.drv/cocoa_app.m,dlls/winemac.drv/cocoa_event.h,dlls/winemac.drv/cocoa_event.m,dlls/winemac.drv/cocoa_window.h,dlls/winemac.drv/cocoa_window.m,dlls/winemac.drv/surface.c,include/wine/gdi_driver.h
 winemac32|x86_64|dlls/winemac.drv/i386-windows/winemac.drv|lib/wine/i386-windows/winemac.drv|i386|pe|dlls/winemac.drv/cocoa_app.h,dlls/winemac.drv/cocoa_app.m,dlls/winemac.drv/cocoa_event.h,dlls/winemac.drv/cocoa_event.m,dlls/winemac.drv/cocoa_window.h,dlls/winemac.drv/cocoa_window.m,dlls/winemac.drv/surface.c,include/wine/gdi_driver.h
-wineserver|arm64|server/wineserver|bin/wineserver|arm64|macho|server/msync.c,server/msync.h,server/main.c,include/wine/msync.h,include/Makefile.in,server/thread.c,server/thread.h,server/request.c,server/sock.c,server/mach.c,server/registry.c,server/inproc_sync.c,server/queue.c,server/request_handlers.h,server/request_trace.h,server/user.h,server/window.c,server/protocol.def,include/wine/server_protocol.h
+wineserver|arm64|server/wineserver|bin/wineserver|arm64|macho|server/msync.c,server/msync.h,server/main.c,include/wine/msync.h,include/Makefile.in,server/thread.c,server/thread.h,server/request.c,server/sock.c,server/mach.c,server/registry.c,server/inproc_sync.c,server/queue.c,server/request_handlers.h,server/request_trace.h,server/user.h,server/window.c,server/protocol.def,include/wine/server_protocol.h,server/process.c,server/process.h
 win32u|x86_64|dlls/win32u/win32u.so|lib/wine/x86_64-unix/win32u.so|x86_64|macho|dlls/win32u/opengl.c,dlls/win32u/dce.c,dlls/win32u/message.c,server/protocol.def,include/wine/server_protocol.h,include/wine/gdi_driver.h
 win32u64|x86_64|dlls/win32u/x86_64-windows/win32u.dll|lib/wine/x86_64-windows/win32u.dll|x86_64|pe|dlls/win32u/dce.c,dlls/win32u/message.c,include/wine/gdi_driver.h
 win32u32|x86_64|dlls/win32u/i386-windows/win32u.dll|lib/wine/i386-windows/win32u.dll|i386|pe|dlls/win32u/dce.c,dlls/win32u/message.c,include/wine/gdi_driver.h
@@ -127,9 +128,10 @@ if [ "$WINE_BUILD_PROFILE" = safe-msync ]; then
 0002-native-x86-server.patch
 0003-msync-reliability.patch
 0007-msync-resource-reuse.patch
-0012-msync-shared-pages.patch'
-  ARTIFACT_INVENTORY='ntdll|x86_64|dlls/ntdll/ntdll.so|lib/wine/x86_64-unix/ntdll.so|x86_64|macho|dlls/ntdll/unix/msync.c,dlls/ntdll/unix/msync.h,include/wine/msync.h
-wineserver|arm64|server/wineserver|bin/wineserver|arm64|macho|server/msync.c,server/msync.h,server/thread.c,server/inproc_sync.c,server/main.c,server/registry.c,server/mach.c,include/wine/msync.h,include/Makefile.in'
+0012-msync-shared-pages.patch
+0015-msync-owned-exports.patch'
+  ARTIFACT_INVENTORY='ntdll|x86_64|dlls/ntdll/ntdll.so|lib/wine/x86_64-unix/ntdll.so|x86_64|macho|dlls/ntdll/unix/msync.c,dlls/ntdll/unix/msync.h,include/wine/msync.h,dlls/ntdll/unix/sync.c,dlls/ntdll/unix/thread.c,server/protocol.def,include/wine/server_protocol.h
+wineserver|arm64|server/wineserver|bin/wineserver|arm64|macho|server/msync.c,server/msync.h,server/thread.c,server/inproc_sync.c,server/main.c,server/registry.c,server/mach.c,include/wine/msync.h,include/Makefile.in,server/process.c,server/process.h,server/protocol.def,include/wine/server_protocol.h,server/request_handlers.h,server/request_trace.h'
 fi
 
 usage() {

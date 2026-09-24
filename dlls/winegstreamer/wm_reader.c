@@ -1658,7 +1658,7 @@ static HRESULT reinit_stream(struct wm_reader *reader, bool read_compressed)
         if (stream->selection == WMT_ON
                 && FAILED(hr = wg_parser_stream_enable(stream->wg_stream,
                 read_compressed ? &format : &stream->format)))
-            goto out_shutdown_thread;
+            goto out_disconnect_parser;
     }
 
     /* We probably discarded events because streams weren't enabled yet.
@@ -1668,10 +1668,14 @@ static HRESULT reinit_stream(struct wm_reader *reader, bool read_compressed)
     if (WaitForSingleObject(reader->read_sem, INFINITE) != WAIT_OBJECT_0)
     {
         ERR("Failed to wait for read semaphore.\n");
-        goto out_shutdown_thread;
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        goto out_disconnect_parser;
     }
 
     return S_OK;
+
+out_disconnect_parser:
+    wg_parser_disconnect(reader->wg_parser);
 
 out_shutdown_thread:
     EnterCriticalSection(&reader->shutdown_cs);

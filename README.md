@@ -107,6 +107,17 @@ Earlier isolated runs exercised stock NGX in Metal4 and legacy modes with Metal 
 
 The current source retires completed execution leases without waiting for allocator Reset, while retaining owner-based fallback for unsubmitted work or failed callback registration. SR also reuses compatible scaler capacity for smaller active inputs, with history resets and synchronized edge staging. [Measured memory results and limits](docs/screenshot-sr-analysis-2026-09-23.ko.md) distinguish bounded allocation reuse from immediate physical release and from the unverified game-wide memory difference.
 
+### Unreleased lifecycle corrections
+
+- MSync leaves the borrowed alert index alone at thread exit. Cache exports have process-owned, one-shot IDs and are reclaimed after native process death. Rebuild `ntdll` and `wineserver` together: server protocol **968**, MSync Mach wire **3**; existing request numbers are preserved.
+- macdrv detaches window state under the window-data lock, then closes the Cocoa window and releases queued surface events outside that lock, for both destruction and top-level-to-child reparenting.
+- Native FG callbacks enter their owning context's callback scope, avoiding configure/dispatch lock inversion. Unchanged callbacks reuse a binding without allocation or presenter waits; obsolete bindings are reclaimed only after successful replacement and the required drain.
+- FG bridge **v4** retires the exact completed frame after failed/skipped generation too. Older pending frames and recorded commands keep their snapshots. Rebuild the FG PE/Unix modules and native sidecar together.
+- SR prepared frames retain their scaler activation number, preserving reactive-variant resets across delayed encodes and dropped activation frames.
+- MF async commands start with an owned reference; source errors complete pending reads/seeks with failure. WM parser reinitialization disconnects before joining the reader thread on failure. IOHID startup publishes its state atomically without waiting for the run-loop mutex.
+
+These current-source corrections do not update installed Beta or existing archives and do not establish a game-FPS improvement.
+
 ### Historical verification status
 
 The following records earlier release checks, not current game acceptance. The synthetic harnesses described here have since been removed.

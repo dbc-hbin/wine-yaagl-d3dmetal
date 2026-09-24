@@ -40,6 +40,7 @@ struct process
     struct list          entry;           /* entry in system-wide process list */
     process_id_t         parent_id;       /* parent process id (at the time of creation) */
     struct list          thread_list;     /* thread list */
+    struct list          msync_exports;   /* shared-index exports owned by this process */
     struct debug_obj    *debug_obj;       /* debug object debugging this process */
     struct debug_event  *debug_event;     /* debug event being sent to debugger */
     struct handle_table *handles;         /* handle entries */
@@ -94,6 +95,7 @@ struct process
 
 /* process functions */
 
+extern void release_process_msync_exports( struct process *process );
 extern unsigned int alloc_ptid( void *ptr );
 extern void free_ptid( unsigned int id );
 extern void *get_ptid_entry( unsigned int id );
