@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refresh final-byte metadata in the staged FSR-only runtime tree.
+"""Refresh final-byte metadata in the staged FSR/NGX runtime tree.
 
 Rewrites ONLY the four metadata files of the staged runtime:
   yaagl-wine-p3-graphics-artifacts.json
@@ -29,7 +29,7 @@ import subprocess
 import sys
 
 STAGE_MANIFEST = 'zzz-frame-probe-stage.json'
-SUPPORTED_STAGE_SCHEMAS = (3, 4)
+SUPPORTED_STAGE_SCHEMAS = (3, 4, 5)
 GRAPHICS_MANIFEST = 'yaagl-wine-p3-graphics-artifacts.json'
 PROVENANCE_MANIFEST = 'yaagl-wine-p3-provenance.json'
 RUNTIME_MANIFEST = 'yaagl-wine-runtime-files.json'
@@ -45,7 +45,15 @@ GPTK_SOURCE_SHA256 = 'f8640e6b0974277068821d44bd398dcc0f42cbb730d07f3afad97843e7
 CONVERTER_SHA256 = '5c5619ef17a7d62e84db0a7f5181d746623b47364379271fd5827e6bd961ba34'
 DEVICE_LIFETIME = {'scope': 'per-native-device', 'retention': 'device-lifetime'}
 FRAMEWORK_DEPENDENCY = '@loader_path/Resources/libYaaglNativePsoCache.dylib'
-DLSS_MODULE_RELS = ('lib/wine/x86_64-windows/nvngx.dll', 'lib/wine/x86_64-unix/nvngx.so')
+NGX_MODULE_RELS = ('lib/wine/x86_64-windows/nvngx.dll', 'lib/wine/x86_64-unix/nvngx.so')
+NGX_UNIX_LINK = '../../external/libd3dshared.dylib'
+SHARED_DYLIB_REL = 'lib/external/libd3dshared.dylib'
+NGX_SHA256 = 'f6bc9d77fd1e898fec8c6339d367bd8e0f338992c9c0c66d59b30c6e9e0743e4'
+SHARED_SHA256 = 'd932330841e77682d47688641e0ac17049a2aff498deafac88921983dc16eedb'
+NGX_POLICY = {'implementation': 'stock-gptk-ngx-to-metalfx', 'windows_module': NGX_MODULE_RELS[0],
+              'unix_bridge': NGX_MODULE_RELS[1], 'bridge_target': NGX_UNIX_LINK,
+              'default_gpu_identity': 'rx9070', 'gpu_identity_environment': 'YAAGL_GPU_IDENTITY',
+              'supported_gpu_identities': ['rx9070', 'rtx5060']}
 
 
 def digest(path: pathlib.Path) -> str:
@@ -98,8 +106,10 @@ def read_stage_manifest(tree: pathlib.Path) -> dict:
     data = json.loads(path.read_text(encoding='utf-8'))
     if data.get('stage_schema') not in SUPPORTED_STAGE_SCHEMAS:
         raise SystemExit(f'unsupported stage schema: {data.get("stage_schema")!r}')
-    if data.get('dlss_translation') is not False or data.get('model_policy') != {'all_gpu': 'system-default'}:
-        raise SystemExit('staged runtime does not carry the FSR-only system-default policy')
+    if (data.get('dlss_translation') is not (data['stage_schema'] == 5) or
+            data.get('model_policy') != {'all_gpu': 'system-default'} or
+            (data['stage_schema'] == 5 and data.get('ngx_policy') != NGX_POLICY)):
+        raise SystemExit('staged runtime does not carry the recorded FSR/NGX system-default policy')
     return data
 
 
@@ -108,15 +118,35 @@ def assert_tree_untouched(tree: pathlib.Path, stage: dict) -> None:
     recorded = stage.get('signed_artifacts')
     if not isinstance(recorded, dict) or not recorded:
         raise SystemExit('stage manifest has no signed_artifacts inventory')
+    if stage['stage_schema'] == 5:
+        link = tree / NGX_MODULE_RELS[1]
+        if not link.is_symlink() or link.readlink().as_posix() != NGX_UNIX_LINK:
+            raise SystemExit('stock NGX Unix bridge symlink changed')
     for relative, expected in recorded.items():
         path = tree / relative
         if not path.is_file():
             raise SystemExit(f'signed artifact is missing from the staged tree: {relative}')
         if digest(path) != expected:
             raise SystemExit(f'signed artifact changed since staging: {relative}')
-    for relative in DLSS_MODULE_RELS:
-        if (tree / relative).exists() or (tree / relative).is_symlink():
-            raise SystemExit(f'DLSS-only module is present in an FSR-only runtime: {relative}')
+    if stage['stage_schema'] != 5:
+        for relative in NGX_MODULE_RELS:
+            if (tree / relative).exists() or (tree / relative).is_symlink():
+                raise SystemExit(f'NGX module is present in legacy FSR-only runtime: {relative}')
+    else:
+        ngx = stage.get('ngx_module')
+        if (not isinstance(ngx, dict) or ngx.get('sha256') != NGX_SHA256 or
+                ngx.get('bridge_sha256') != SHARED_SHA256 or
+                ngx.get('runtime_path') != NGX_MODULE_RELS[0] or
+                ngx.get('unix_bridge') != NGX_MODULE_RELS[1] or
+                ngx.get('bridge_target') != NGX_UNIX_LINK or
+                not (tree / NGX_MODULE_RELS[1]).is_symlink() or
+                (tree / NGX_MODULE_RELS[1]).readlink().as_posix() != NGX_UNIX_LINK or
+                digest(tree / NGX_MODULE_RELS[0]) != NGX_SHA256 or
+                digest(tree / SHARED_DYLIB_REL) != SHARED_SHA256 or
+                recorded.get(NGX_MODULE_RELS[0]) != NGX_SHA256 or
+                recorded.get(NGX_MODULE_RELS[1]) != SHARED_SHA256 or
+                recorded.get(SHARED_DYLIB_REL) != SHARED_SHA256):
+            raise SystemExit('stock NGX provenance, signed bridge, or symlink is invalid')
 
 
 def refreshed_graphics(tree: pathlib.Path, base: pathlib.Path, native_build: dict, stage: dict) -> dict:
@@ -187,7 +217,7 @@ def refreshed_provenance(tree: pathlib.Path, base: pathlib.Path, graphics: dict,
         'stageSchema': stage['stage_schema'],
         'stageManifest': STAGE_MANIFEST,
         'stageManifestSha256': digest(tree / STAGE_MANIFEST),
-        'dlssTranslation': False,
+        'dlssTranslation': stage['dlss_translation'],
         'modelPolicy': dict(stage['model_policy']),
         'fsrTranslatorPolicy': dict(stage['fsr_translator']),
         'd3dmetalInput': dict(stage['d3dmetal_input']),
@@ -195,9 +225,11 @@ def refreshed_provenance(tree: pathlib.Path, base: pathlib.Path, graphics: dict,
         'fsrBuildManifest': stage['fsr_build_manifest'],
         'nativeBuildManifest': native_build,
         'fsrArtifacts': fsr_artifacts,
+        'ngxPolicy': stage.get('ngx_policy') if stage['stage_schema'] == 5 else None,
+        'ngxModule': stage.get('ngx_module') if stage['stage_schema'] == 5 else None,
         'inheritedCoreArtifacts': inherited,
         'changedCoreArtifacts': changed,
-        'removedDlssModules': list(DLSS_MODULE_RELS),
+        'removedDlssModules': list(NGX_MODULE_RELS) if stage['stage_schema'] != 5 else [],
     }
     return payload
 

@@ -109,22 +109,6 @@ const char* currentExecutableLeaf() noexcept {
     return safeLeaf(processName) ? processName : nullptr;
 }
 
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-bool forceFdopendirFailure = false;
-int lastFdopendirFd = -1;
-#endif
-
-DIR* openDirectoryStream(int fd) noexcept {
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-    lastFdopendirFd = fd;
-    if (forceFdopendirFailure) {
-        errno = EMFILE;
-        return nullptr;
-    }
-#endif
-    return fdopendir(fd);
-}
-
 } // namespace
 
 static PersistentCacheWarmupResult warmPersistentCachesAtImpl(
@@ -143,7 +127,7 @@ static PersistentCacheWarmupResult warmPersistentCachesAtImpl(
 
         FileDescriptor enumerationFd(dup(cache.get()));
         if (enumerationFd.get() < 0) return result;
-        DIR* rawDirectory = openDirectoryStream(enumerationFd.get());
+        DIR* rawDirectory = fdopendir(enumerationFd.get());
         if (rawDirectory == nullptr) return result;
         static_cast<void>(enumerationFd.release());
         std::uint64_t budget = kTotalAdviceBudget;
@@ -174,45 +158,16 @@ PersistentCacheWarmupResult warmPersistentCachesFromEnvironment() noexcept {
     if (enabled == nullptr || std::strcmp(enabled, "1") != 0) return {};
     try {
         std::string root;
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-        const char* overrideRoot = std::getenv("YAAGL_D3DMETAL_CACHE_ROOT");
-        if (overrideRoot != nullptr) {
-            if (overrideRoot[0] != '/') return {};
-            root = overrideRoot;
-        } else
-#endif
-        {
-            const std::size_t length = confstr(_CS_DARWIN_USER_CACHE_DIR, nullptr, 0);
-            if (length == 0 || length > PATH_MAX) return {};
-            root.resize(length);
-            if (confstr(_CS_DARWIN_USER_CACHE_DIR, root.data(), root.size()) != length) return {};
-            if (!root.empty() && root.back() == '\0') root.pop_back();
-        }
+        const std::size_t length = confstr(_CS_DARWIN_USER_CACHE_DIR, nullptr, 0);
+        if (length == 0 || length > PATH_MAX) return {};
+        root.resize(length);
+        if (confstr(_CS_DARWIN_USER_CACHE_DIR, root.data(), root.size()) != length) return {};
+        if (!root.empty() && root.back() == '\0') root.pop_back();
         const char* executable = currentExecutableLeaf();
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-        const char* overrideExecutable = std::getenv("YAAGL_D3DMETAL_CACHE_EXECUTABLE");
-        if (overrideExecutable != nullptr) executable = overrideExecutable;
-#endif
         return warmPersistentCachesAtImpl(root.c_str(), executable);
     } catch (...) {
         return {};
     }
 }
-
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-PersistentCacheWarmupResult warmPersistentCachesAt(
-    const char* cacheRoot, const char* executableName) noexcept {
-    return warmPersistentCachesAtImpl(cacheRoot, executableName);
-}
-
-void setFdopendirFailureForTest(bool fail) noexcept {
-    forceFdopendirFailure = fail;
-    lastFdopendirFd = -1;
-}
-
-int lastFdopendirFdForTest() noexcept {
-    return lastFdopendirFd;
-}
-#endif
 
 } // namespace yaagl::pso

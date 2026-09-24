@@ -10,16 +10,25 @@ fi
 
 wine_root=$(CDPATH= cd -- "$wrapper_dir/.." && pwd)
 
-# Fixed public profile: GPTK D3DMetal, Metal 4/DXR/MetalFX, RX 9070 identity.
+# GPTK D3DMetal with explicit GPU identity. Keep the AMD identity as the
+# default; NVIDIA is an opt-in for testing the stock NGX path.
 # Keep WINE_ENABLE_TIMEOUT_FIX aligned with src/wine/d3dmetal.ts launch contract.
 export WINE_ENABLE_TIMEOUT_FIX=1
 export CX_ACTIVE_GRAPHICS_BACKEND=d3dmetal
 export D3DM_MTL4=1
 export D3DM_ENABLE_METALFX=1
 export D3DM_SUPPORT_DXR=1
-export D3DM_VENDOR_ID=0x1002
-export D3DM_DEVICE_ID=0x7550
-export D3DM_DEVICE_DESCRIPTION="AMD Radeon RX 9070"
+case "${YAAGL_GPU_IDENTITY:-rx9070}" in
+  rx9070)
+    export D3DM_VENDOR_ID=0x1002
+    export D3DM_DEVICE_ID=0x7550
+    export D3DM_DEVICE_DESCRIPTION="AMD Radeon RX 9070" ;;
+  rtx5060)
+    export D3DM_VENDOR_ID=0x10de
+    export D3DM_DEVICE_ID=0x2d05
+    export D3DM_DEVICE_DESCRIPTION="NVIDIA GeForce RTX 5060" ;;
+  *) echo "YAAGL_GPU_IDENTITY must be rx9070 or rtx5060" >&2; exit 64 ;;
+esac
 export WINEMSYNC=1
 unset WINEDLLOVERRIDES WINEDLLPATH_PREPEND DXMT_CONFIG DXMT_CONFIG_FILE
 unset DXVK_CONFIG_FILE DXVK_STATE_CACHE_PATH VK_ICD_FILENAMES VK_DRIVER_FILES

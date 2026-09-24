@@ -41,7 +41,7 @@ CLI에서는 글로벌 베타에 `--app-path "/Applications/Yaagl ZZZ OS DX12 Be
 
 ### FSR 업스케일링 → MetalFX
 
-- 실행 wrapper는 공개 그래픽 식별자를 AMD Radeon RX 9070(`0x1002:0x7550`)으로 고정합니다. NVIDIA 어댑터로 위장하지 않습니다. 현재 staging wrapper는 별도 helper 없이 FSR을 선택하고 Yaagl의 `MTL_HUD_ENABLED` 선택(미설정·빈 값 포함)을 보존합니다. 기존 v1.1.x 배포 archive에는 HUD를 강제로 켜는 구 helper가 남아 있으므로 새 런타임으로 교체해야 이 동작이 적용됩니다.
+- 공개 v1.1.0 wrapper는 그래픽 식별자를 AMD Radeon RX 9070(`0x1002:0x7550`)으로 고정하며 NVIDIA 선택은 없습니다. **미배포 현재 소스**의 staging wrapper도 기본값은 같은 AMD 식별자이지만 NVIDIA/NGX 비교를 위해 명시적 `YAAGL_GPU_IDENTITY=rtx5060`(`0x10de:0x2d05`)을 지원합니다. 별도 helper 없이 FSR을 선택하고 Yaagl의 `MTL_HUD_ENABLED` 선택(미설정·빈 값 포함)을 보존합니다. 기존 v1.1.x 배포 archive에는 HUD를 강제로 켜는 구 helper가 남아 있으므로 새 런타임으로 교체해야 이 동작이 적용됩니다.
 - builtin `amd_fidelityfx_upscaler_dx12` 모듈이 공개 FSR API 경계를 구현하고 허용된 temporal-upscaling 작업을 MetalFX로 번역합니다. AMD FSR4 신경망을 실행하지 않습니다.
 - 새로 staging한 런타임에서는 `YAAGL_FSR_UPSCALER=metalfx`(미설정·빈 값도 기본값)가 builtin 업스케일러를, `YAAGL_FSR_UPSCALER=native`가 게임의 원본 canonical 업스케일러 DLL을 선택합니다. native 선택 시 builtin으로 fallback하지 않습니다. 이 명시적 SR 비교 옵션은 실행 wrapper를 통과하며 프레임 생성 provider 정책은 바꾸지 않습니다. 다른 값은 Wine 실행 전에 오류로 종료합니다. 기존 배포 archive에는 다시 빌드하기 전까지 반영되지 않습니다.
 - Native AA와 Quality, Balanced, Performance, Ultra Performance 모드는 게임/provider가 명시적으로 선택합니다. 번역기가 임의로 품질 모드를 선택하지 않습니다. 요청이 MetalFX 최대 temporal 배율을 넘으면 MetalFX 출력을 하나의 균일 배율로 제한해 caller의 출력 텍스처 가운데에 배치하고 주변 texel은 보존합니다.
@@ -76,7 +76,7 @@ CLI에서는 글로벌 베타에 `--app-path "/Applications/Yaagl ZZZ OS DX12 Be
 
 아래 항목은 아직 검증하지 않은 위험입니다. 이 항목들이 닫히기 전까지 이 경로는 FPS나 화질을 보장하지 않습니다.
 
-- 현재 합성 검증은 균일한 depth와 하나의 global motion vector를 사용합니다. disocclusion이나 전경/배경의 혼합 motion은 다루지 않으며, 게임에서 관찰된 2256×1272 render-resolution motion vector가 3840×2160 출력으로 전달되는 조건도 재현하지 않습니다.
+- 과거 합성 검증은 균일한 depth와 하나의 global motion vector를 사용했습니다. disocclusion이나 전경/배경의 혼합 motion은 다루지 않았으며, 게임에서 관찰된 2256×1272 render-resolution motion vector가 3840×2160 출력으로 전달되는 조건도 재현하지 않았습니다.
 - 현재 depth와 motion vector는 보간 전에 nearest sampling으로 확대합니다. 이 방식과 MetalFX에 native 저해상도 입력을 직접 주는 방식 중 어느 쪽이 나은지는 A/B 비교가 필요하며, 알려진 화질 버그로 확정된 것은 아닙니다.
 - descriptor의 nullable `scaler`는 연결하지 않습니다. Apple WWDC25 session 211 샘플은 scaler를 연결하지만, 이는 아키텍처 차이일 뿐 현재 경로의 화질 결함을 입증하지 않습니다.
 - 입력 color가 이미 temporal upscale된 경우 jitter 단위는 아직 확인되지 않았습니다. 근거 없이 jitter를 재배율하거나 0으로 바꾸지 말고, 먼저 producer가 실제로 사용하는 규약을 캡처한 뒤 시간적으로 안정된 장면에서 비교해야 합니다.
@@ -95,13 +95,21 @@ CLI에서는 글로벌 베타에 `--app-path "/Applications/Yaagl ZZZ OS DX12 Be
 - 정상 상태에서 무제한 frame별 로그를 남기지 않습니다.
 - 로그는 API, encode 또는 callback 진행을 나타냅니다. GPU 완료, 화질, FPS 또는 OFF 전환의 증거가 아닙니다.
 
-제거한 DLSS 전용 경로는 숨겨진 호환 옵션으로 남아 있지 않습니다. production bridge와 build inventory에는 NGX 진입 hook, NGX reprojection helper·smoke fixture, DLSS exposure 보정, temporal interception 또는 기존 frame-probe 구현·제어가 포함되지 않습니다. FSR에 필요한 공용 command-replay hook 두 개는 `d3dmetal-replay-hooks.{hpp,mm}`로 분리했습니다. layout v9는 PSO/cache hook 17개와 이 replay hook 두 개를 포함하며 DLSS 번역을 복구하지 않습니다.
+### 미배포 현재 소스의 NGX 복구
 
-**미배포 소스:** layout v10은 GPU 완료 시 회수를 위한 Metal4 queue-commit hook을 추가합니다. dispatch table은 20개 항목(PSO/cache 17개, replay 2개, commit 1개)이며 대응하는 D3DMetal patch와 native sidecar를 함께 다시 빌드해야 합니다. 기존 배포 archive는 변경하지 않았습니다.
+Metal4 replay와 legacy encode의 공용 처리는 별도 외부 wrapper를 유지하지 않고 `ngx-hooks.mm` 안으로 직접 복원했습니다. `bridge.mm`의 슬롯 17·18은 NGX replay·encode 진입점에 직접 연결되며, NGX descriptor를 해석하기 전에 FSR 기록 명령을 식별하고 실행합니다. 분리했던 `d3dmetal-replay-hooks.{hpp,mm}` 계층과 해당 빌드 항목은 제거했습니다.
+
+공개 v1.1.0/v1.1.1 런타임은 여전히 FSR 전용입니다. **미배포 schema 5 후보**는 v1.0.5로 되돌아가지 않고 현재 Wine 소스에 추가하는 방식으로 GPTK 원본 `nvngx.dll`(SHA-256 `f6bc9d77fd1e898fec8c6339d367bd8e0f338992c9c0c66d59b30c6e9e0743e4`)과 `nvngx.so` → `../../external/libd3dshared.dylib`(대상 SHA-256 `d932330841e77682d47688641e0ac17049a2aff498deafac88921983dc16eedb`)을 복구합니다. staging 기록에 출처·symlink 대상·서명 산출물 hash 목록을 보존합니다. 기존 설치 아카이브·게임·prefix는 변경하지 않습니다.
+
+Native layout **v14**는 dispatch 항목 25개(일반 hook 21개와 특수 hook 4개)를 게시합니다. NGX wrapper는 공용 replay·encode 두 개만 남기며, FSR을 우선 처리하고 일반 NGX 명령은 원본 D3DMetal replay·encode에 바로 전달합니다. NGX private 출력 shadow·복사 adapter는 제거했으며 FSR backend의 출력 처리는 변경하지 않았습니다. NGX Evaluate·record 관찰 훅, 진단 옵션, 선택적 exposure·temporal 보정은 제거했고 해당 호출은 stock NGX가 직접 처리합니다. 현재 FSR, 출력 선택, GPU 완료·리소스 수명 관리, Wine MSync 수정과 시스템 기본 MetalFX 모델·RX 9070 기본값은 유지합니다. 기존 frame-probe 캡처 계층도 포함하지 않습니다.
+
+앞선 격리 실행에서는 Metal API Validation을 끈 상태로 Metal4·legacy의 stock NGX 경로를 실행했습니다. 해당 합성 테스트는 제거했으며, 출력을 재사용하던 검사는 매 NGX 평가가 새 픽셀을 생성했다는 근거가 되지 못합니다. Validation ON에서는 shared 출력 NGX fixture에서 `outputTexture must have private storage mode` assertion이 발생했으며 이 제한은 남아 있습니다. production Validation 설정은 변경하지 않았고, Validation 준수·실게임 안정성·FPS·화질 개선을 주장하지 않습니다. 짝이 맞는 format-14 D3DMetal patch와 native sidecar가 필요하며 공개 배포 아카이브는 변경하지 않았습니다.
 
 현재 소스는 완료된 execution lease를 allocator Reset 전에 회수하되, 미제출 작업이나 callback 등록 실패에서는 owner의 안전한 보유를 유지합니다. SR은 더 작은 active input에서 호환되는 scaler capacity를 재사용하며 history reset과 동기화된 edge staging을 수행합니다. [메모리 측정 결과와 한계](docs/screenshot-sr-analysis-2026-09-23.ko.md)는 bounded reuse와 즉시 물리 메모리 반환, 아직 검증하지 않은 게임 전체 메모리 차이를 구분합니다.
 
-### 검증 상태
+### 과거 검증 기록
+
+아래는 과거 릴리스 검사 기록이며 현재 실게임 합격 판정이 아닙니다. 여기서 언급하는 합성 테스트는 이후 제거했습니다.
 
 macOS 27 / Apple M5 Pro에서 다음을 확인했습니다.
 
@@ -217,29 +225,29 @@ v1.1.1은 v1.1.0 런타임을 그대로 다시 게시하며 `ZZZWineDX12Installe
 각 아카이브에는 `.sha256` sidecar가 함께 제공됩니다. `installer/build.sh`는 기본적으로 `build/release-v1.1.1/wine-11.17-zzz-dx12-gptk4b2-macos26.tar.xz`의 full runtime 아카이브를 읽습니다(`RUNTIME_ARCHIVE_SOURCE`로 변경 가능).
 
 ```bash
-# 현재 소스로 staging할 출력 경로와 검증된 빌드 입력을 지정합니다.
-WINE_ROOT=/absolute/path/to/current-stage/wine
-WINE_SOURCE=/absolute/path/to/current-P3-runtime/wine
-PATCHED_D3DMETAL=/absolute/path/to/patched-D3DMetal
+# 검증된 현재 schema 4 소스 런타임과 고정된 외부 입력을 지정합니다.
+# 설치된 런타임이나 게임 prefix 위에 staging하지 않고 새 후보를 만듭니다.
+WINE_ROOT=/absolute/path/to/new-candidate/wine
+WINE_SOURCE=/absolute/path/to/current-schema4-runtime/wine
+D3DMETAL_INPUT=/absolute/path/to/verified-stage-locked-D3DMetal
+NGX_DLL=/absolute/path/to/pinned-gptk/nvngx-on-metalfx.dll
 NATIVE_BUILD=/absolute/path/to/native-build
 OUTPUT_DIR=/absolute/path/to/split-output
 (
   set -e
-  base_tmp=$(mktemp -d)
-  trap 'rm -rf -- "$base_tmp"' EXIT
-  tar -xJf build/release-v1.1.0/v1.0.5-original-runtime.tar.xz -C "$base_tmp"
-
-  # 현재 staging에는 새 Wine display bridge가 필요합니다. 구 아카이브만으로는 부족합니다.
+  # 입력은 현재 고정 D3DMetal layout 검사를 통과해야 합니다.
+  # 이 옵션은 SHA가 일치하는 pristine 입력도 허용합니다.
   python3 scripts/stage-runtime.py --wine-source "$WINE_SOURCE" --wine-dest "$WINE_ROOT" \
-    --patched-d3dmetal "$PATCHED_D3DMETAL" --build-dir "$NATIVE_BUILD" --play --fsr-translator
+    --pristine-d3dmetal "$D3DMETAL_INPUT" --ngx-dll "$NGX_DLL" \
+    --build-dir "$NATIVE_BUILD" --play --fsr-translator
 
-  # 최종 staging byte에 맞게 상속된 P3 metadata를 갱신합니다.
+  # 읽기 전용 현재 소스 런타임을 기준으로 상속된 P3 metadata를 갱신합니다.
   python3 scripts/refresh-staged-runtime-metadata.py \
-    --tree "$WINE_ROOT" --base "$base_tmp/wine" \
+    --tree "$WINE_ROOT" --base "$WINE_SOURCE" \
     --native-manifest "$NATIVE_BUILD/build-manifest.json"
 
-  # split 패키징은 schema 4 staging을 현재 소스와 대조해 검증합니다.
-  # 보존된 구 full v1.1.0 아카이브는 schema 3이므로 패키징 입력이 아닙니다.
+  # split 패키징은 schema 5를 현재 소스와 대조한 뒤 두 archive를
+  # 재조립하고 전용 Wine prefix에서 smoke를 실행합니다.
   sh scripts/package-wine-runtime-split.sh "$WINE_ROOT" "$OUTPUT_DIR"
 )
 ```
@@ -248,7 +256,7 @@ OUTPUT_DIR=/absolute/path/to/split-output
 
 ### 출력 모니터와 현재 주사율 선택
 
-Native patch format 12는 adapter output 0 대신 swapchain HWND가 속한 출력을 선택합니다. 창 모드는 모니터 이동을 따라가며, 명시적 전체화면 대상은 창 모드로 돌아올 때까지 우선합니다. 출력을 바꿀 때 swapchain 등록과 참조 소유권도 함께 이전합니다. Present 간격 계산 전 Wine bridge에서 저장된 registry mode가 아닌 `ENUM_CURRENT_SETTINGS`를 조회합니다. `SyncInterval=0`과 명시적 `D3DM_MAX_FPS` 동작은 유지하며, 특정 주사율이나 프레임 제한을 강제하지 않습니다.
+앞선 native patch format 12는 adapter output 0 대신 swapchain HWND가 속한 출력을 선택하도록 수정했으며, 현재 format 14도 이를 유지합니다. 창 모드는 모니터 이동을 따라가며, 명시적 전체화면 대상은 창 모드로 돌아올 때까지 우선합니다. 출력을 바꿀 때 swapchain 등록과 참조 소유권도 함께 이전합니다. Present 간격 계산 전 Wine bridge에서 저장된 registry mode가 아닌 `ENUM_CURRENT_SETTINGS`를 조회합니다. `SyncInterval=0`과 명시적 `D3DM_MAX_FPS` 동작은 유지하며, 특정 주사율이나 프레임 제한을 강제하지 않습니다.
 
 현재 P3 patch로 Wine을 다시 빌드한 뒤 staging해야 합니다. `stage-runtime.py`는 `winemac.so`의 별도 `macdrv_query_d3dmetal_display` export를 요구하고 해당 바이너리의 identity를 기록·검증합니다. 구 런타임의 native sidecar만 교체해서는 충분하지 않습니다. 기존 192바이트 Wine callback table은 변경하지 않았습니다.
 
@@ -256,31 +264,28 @@ Native patch format 12는 adapter output 0 대신 swapchain HWND가 속한 출�
 
 격리 D3D12 회귀 검사에서 CURRENT=120Hz / 저장값=60Hz를 재현했습니다. 구 swapchain은 60Hz를 보고했지만 수정본은 120Hz를 보고했고, Present 최소 간격은 16.667ms에서 8.333ms로 바뀌었습니다. SyncInterval 0은 최소 간격을 요청하지 않았으며, 명시적 30FPS 제한은 33.333ms를 유지했습니다. GPU 픽셀 readback도 통과했습니다. 짝을 맞춘 format-12 런타임은 실제 Wine에서 보고된 60/120Hz 두 출력 간 이동·명시적 전체화면 전환과 CURRENT=60Hz / 저장값=50Hz 구분을 Metal API/GPU validation을 켠 상태로 통과했습니다. 게임 FPS 개선을 확인했다는 뜻은 아닙니다.
 
-창의 surface 배열은 CFArray release callback 없이 참조를 명시적으로 소유합니다. 항목 제거는 참조 소유권을 이전하며, 개별 참조 해제와 창 파괴 시 배열의 참조 해제는 `win_data_mutex`를 푼 뒤 수행해 `surfaces_lock`의 역순 획득을 피합니다. 전용 회귀 검사는 반대 방향의 잠금 획득과 view 생성 실패·창 파괴 시 참조 균형을 검증합니다. 실제 D3D12 smoke에서는 swapchain 수명 128회와 동시 창 크기 변경 128회, GPU 픽셀, 창을 먼저 파괴한 뒤 남은 view를 해제하는 경로를 확인했습니다. 앞선 잠금 수명 검사는 surface마다 별도 queue를 사용했습니다.
+창의 surface 배열은 CFArray release callback 없이 참조를 명시적으로 소유합니다. 항목 제거는 참조 소유권을 이전하며, 개별 참조 해제와 창 파괴 시 배열의 참조 해제는 `win_data_mutex`를 푼 뒤 수행해 `surfaces_lock`의 역순 획득을 피합니다. 과거 회귀 검사에서는 반대 방향의 잠금 획득과 view 생성 실패·창 파괴 시 참조 균형을 검증했습니다. 실제 D3D12 smoke에서는 swapchain 수명 128회와 동시 창 크기 변경 128회, GPU 픽셀, 창을 먼저 파괴한 뒤 남은 view를 해제하는 경로를 확인했습니다. 앞선 잠금 수명 검사는 surface마다 별도 queue를 사용했습니다.
 
-Patch format 12는 `DoPresent`의 마지막 Metal4 commit·signal·present까지 drawable residency를 등록하고 해당 등록만 제거합니다. 기존 D3DMetal 리소스 소유권과 queue의 기본 등록은 유지합니다. 고정된 바이너리의 실제 Wine 검사에서 단일 queue로 Present 수명 132회와 Present 없는 대조 4회를 수행하고 GPU 픽셀 136회를 확인했습니다. 등록을 제거한 뒤 실행된 실제 presentation callback 132회 모두 원래 layer·residency set과 살아 있는 drawable texture를 참조했습니다. queue 등록 누적을 고친 것이며 게임 FPS·메모리 개선을 측정한 것은 아닙니다. 다시 패치한 D3DMetal과 짝이 맞는 sidecar가 필요합니다. 영구 단일-queue 회귀 검사도 Metal API/GPU validation을 켠 상태로 크기 변경을 포함한 swapchain 수명 128회와 유효한 GPU 픽셀 readback 256회를 통과했습니다.
+앞선 patch format 12는 `DoPresent`의 마지막 Metal4 commit·signal·present까지 drawable residency를 등록하고 해당 등록만 제거합니다. 기존 D3DMetal 리소스 소유권과 queue의 기본 등록은 유지합니다. 고정된 바이너리의 실제 Wine 검사에서 단일 queue로 Present 수명 132회와 Present 없는 대조 4회를 수행하고 GPU 픽셀 136회를 확인했습니다. 등록을 제거한 뒤 실행된 실제 presentation callback 132회 모두 원래 layer·residency set과 살아 있는 drawable texture를 참조했습니다. queue 등록 누적을 고친 것이며 게임 FPS·메모리 개선을 측정한 것은 아닙니다. 다시 패치한 D3DMetal과 짝이 맞는 sidecar가 필요합니다. 과거 단일-queue 회귀 검사도 Metal API/GPU validation을 켠 상태로 크기 변경을 포함한 swapchain 수명 128회와 유효한 GPU 픽셀 readback 256회를 통과했습니다.
 
-### 범위가 제한된 검사
+### 필수 안전 검사와 실게임 검증
+
+현재 소스에는 프로젝트 전용 독립 검사를 두 종류만 남깁니다.
+
+- 바이너리 패치 안전성: 부분 패치·변조·지원하지 않는 입력·중복 패치를 거부하고 무관한 바이트를 보존합니다.
+- 설치 안전성: 사용자 파일을 보존하고 설치·활성화 실패 시 이전 런타임과 선택 상태를 복구합니다.
 
 ```bash
-python3 scripts/test-metalfx-native.py --out <native-evidence>
-python3 scripts/test-metalfx-native.py --suite display-routing --out <display-native-evidence>
-python3 scripts/test-d3dmetal-display-routing.py --runtime <runtime> --out <display-d3d12-evidence>
-python3 scripts/test-d3dmetal-display-routing.py --runtime <runtime> --out <residency-evidence> --case residency
-python3 scripts/test-winemac-surface-locks.py
-python3 scripts/test-msync-waitall.py
-python3 scripts/test-fsr-launch-profile.py
-python3 scripts/test-fsr-translator.py --runtime <runtime> --out <upscaler-evidence>
-python3 scripts/test-fsr-translator.py --frame-generation --command-buffer metal4 \
-  --runtime <runtime> --out <fg-metal4-evidence>
-python3 scripts/test-fsr-translator.py --frame-generation --command-buffer legacy \
-  --runtime <runtime> --out <fg-legacy-evidence>
-node --test scripts/test-dx12-launch-regression.mjs
+node --test scripts/metalir-fp64-codec-patch.test.mjs
+# 런타임 아카이브를 포함한 빌드된 설치기와 명시적인 원본 리소스 fixture가 필요합니다.
+python3 scripts/test-resource-lifecycle.py --stock-resource /path/to/stock/resources.neu
 ```
 
-`scripts/test-metalfx-native.py`는 native suite를 실행하며 `transport` suite를 선택할 때 `--d3dmetal <검증된 D3DMetal 바이너리>`가 필요합니다. `scripts/test-fsr-translator.py`는 `--runtime`으로 지정한 런타임에 대해 DX12 fixture를 컴파일·실행합니다.
+설치 검사는 임시 앱·지원 디렉터리 사본을 사용하며 설치된 게임 prefix를 대상으로 하지 않습니다. 빌드·staging·패키징의 바이너리 식별·layout·서명·ABI/export·소스/출처·아카이브 재조합 검증은 유지합니다. split 패키징의 격리 prefix Wine 초기화 확인도 유지합니다. 이는 패키징 안전 검사이지 그래픽 합격 판정이 아닙니다.
 
-이 명령은 범위가 제한된 검사 방법을 설명할 뿐 최종 릴리스 산출물이 통과했다는 주장이 아닙니다.
+프로젝트 전용 NGX·FSR·MetalFX 렌더링·화질·캐시·커서·동기화·실행 설정 테스트와 테스트 전용 빌드 옵션은 제거했습니다. Wine 원본 테스트·CI와 `docs/evidence/`의 과거 기록은 변경하지 않습니다.
+
+그래픽 변경의 합격 여부는 실게임에서 판단합니다. 격리된 후보로 같은 장면·설정의 프레임 시간 안정성·메모리·화질을 비교하고, FSR 및 FG OFF→ON→OFF, 커서·메뉴에서 카메라로 복귀, 전체화면·모니터 전환을 확인해야 합니다. 합성 테스트 PASS 로그, API 성공, 빌드 성공만으로 실게임 정상 동작이나 성능을 주장하지 않습니다.
 
 ## 라이선스
 

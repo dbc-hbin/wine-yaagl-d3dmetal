@@ -4,20 +4,12 @@
 
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
-#include <fcntl.h>
-#include <limits.h>
-#include <unistd.h>
 
 #include <array>
 #include <atomic>
-#include <cerrno>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <new>
-#include <string>
 
 #include "cache.hpp"
 #include "fsr-translator.hpp"
@@ -25,7 +17,7 @@
 #include "function-cache.hpp"
 #include "function-hooks.hpp"
 #include "key.hpp"
-#include "d3dmetal-replay-hooks.hpp"
+#include "ngx-hooks.hpp"
 #include "d3dmetal-transport.hpp"
 #include "display-routing.hpp"
 #include "layout.hpp"
@@ -93,94 +85,9 @@ struct FunctionContextScope final {
     FunctionContext previous;
 };
 
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-struct ProbeCounters final {
-    std::atomic<std::uint64_t> requests{0};
-    std::atomic<std::uint64_t> creates{0};
-    std::atomic<std::uint64_t> reuses{0};
-};
-#endif
-
 struct Runtime final {
     Cache cache;
     FunctionCache functions;
-
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-    Runtime() {
-        const char* path = std::getenv("YAAGL_NATIVE_PSO_CACHE_PROBE");
-        if (path != nullptr && path[0] == '/' && std::strlen(path) < PATH_MAX - 64) {
-            probePath = path;
-            const char* bypass = std::getenv("YAAGL_NATIVE_PSO_CACHE_PROBE_BYPASS");
-            probeBypass = bypass != nullptr && std::strcmp(bypass, "1") == 0;
-        }
-    }
-
-    ~Runtime() { publishProbe(); }
-
-    void publishProbe() noexcept {
-        if (probePath.empty()) return;
-        try {
-            std::lock_guard lock(probeMutex);
-            if (counters[0].requests.load(std::memory_order_relaxed) == 0 &&
-                counters[1].requests.load(std::memory_order_relaxed) == 0 &&
-                counters[2].requests.load(std::memory_order_relaxed) == 0 &&
-                functionCounters.requests.load(std::memory_order_relaxed) == 0) return;
-            char payload[1024];
-            const int length = std::snprintf(payload, sizeof(payload),
-                "{\"schemaVersion\":2,\"active\":true,\"pid\":%d,"
-                "\"renderRequests\":%llu,\"renderCreates\":%llu,\"renderReuses\":%llu,"
-                "\"computeRequests\":%llu,\"computeCreates\":%llu,\"computeReuses\":%llu,"
-                "\"rtRequests\":%llu,\"rtCreates\":%llu,\"rtReuses\":%llu,"
-                "\"functionRequests\":%llu,\"functionCreates\":%llu,"
-                "\"functionReuses\":%llu,\"functionBypasses\":%llu}\n",
-                getpid(),
-                static_cast<unsigned long long>(counters[0].requests.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(counters[0].creates.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(counters[0].reuses.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(counters[1].requests.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(counters[1].creates.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(counters[1].reuses.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(counters[2].requests.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(counters[2].creates.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(counters[2].reuses.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(functionCounters.requests.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(functionCounters.creates.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(functionCounters.reuses.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(functionBypasses.load(std::memory_order_relaxed)));
-            if (length < 0 || static_cast<std::size_t>(length) >= sizeof(payload)) return;
-            char temporary[PATH_MAX];
-            const int pathLength = std::snprintf(temporary, sizeof(temporary), "%s.tmp.%d.%llu",
-                probePath.c_str(), getpid(), static_cast<unsigned long long>(++probeSequence));
-            if (pathLength < 0 || static_cast<std::size_t>(pathLength) >= sizeof(temporary)) return;
-            const int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
-            if (fd < 0) return;
-            std::size_t written = 0;
-            while (written < static_cast<std::size_t>(length)) {
-                const ssize_t count = write(fd, payload + written, static_cast<std::size_t>(length) - written);
-                if (count < 0 && errno == EINTR) continue;
-                if (count <= 0) break;
-                written += static_cast<std::size_t>(count);
-            }
-            const bool closed = close(fd) == 0;
-            if (written != static_cast<std::size_t>(length) || !closed ||
-                rename(temporary, probePath.c_str()) != 0) {
-                unlink(temporary);
-            }
-        } catch (...) {
-            // Explicit probe output must never change native compilation semantics.
-        }
-    }
-
-    std::string probePath;
-    bool probeBypass = false;
-    std::array<ProbeCounters, 3> counters;
-    ProbeCounters functionCounters;
-    std::atomic<std::uint64_t> functionBypasses{0};
-    std::mutex probeMutex;
-    std::uint64_t probeSequence = 0;
-#else
-    void publishProbe() noexcept {}
-#endif
 };
 
 Runtime& runtime() {
@@ -194,16 +101,8 @@ struct Invocation final {
     id descriptor;
     std::uint64_t options;
     bool reflectionRequested;
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-    ProbeCounters* counters;
-    bool created = false;
-#endif
 
     NativeResult create() {
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-        created = true;
-        if (counters != nullptr) counters->creates.fetch_add(1, std::memory_order_relaxed);
-#endif
         id reflection = nil;
         NSError* error = nil;
         id state = original(device, descriptor, options,
@@ -240,28 +139,11 @@ id createPipeline(Api api, const void* device, id descriptor, std::uint64_t opti
     }
 
     Runtime& state = runtime();
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-    ProbeCounters* counters = nullptr;
-    if (!state.probePath.empty()) {
-        const std::size_t category = api != Api::Compute ? 0 :
-            (currentContext.kind == ContextKind::Compute ? 1 : 2);
-        counters = &state.counters[category];
-        counters->requests.fetch_add(1, std::memory_order_relaxed);
-    }
-    Invocation invocation{original, device, descriptor, options, reflection != nullptr, counters};
-    NativeResult result = state.probeBypass ? invocation.create() :
-        state.cache.getOrCreate(device, key.bytes, key.resources, [&invocation] { return invocation.create(); });
-    if (counters != nullptr && !invocation.created) {
-        counters->reuses.fetch_add(1, std::memory_order_relaxed);
-    }
-#else
     Invocation invocation{original, device, descriptor, options, reflection != nullptr};
     NativeResult result = state.cache.getOrCreate(
         device, key.bytes, key.resources, [&invocation] { return invocation.create(); });
-#endif
     if (reflection != nullptr) *reflection = [result.takeReflection() autorelease];
     if (error != nullptr) *error = [result.takeError() autorelease];
-    state.publishProbe();
     return result.takeState();
 }
 
@@ -286,17 +168,9 @@ struct ExtractionInvocation final {
     const void* reflection;
     std::uintptr_t ignoredNames;
     MTLFunctionConstantValues* constants;
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-    ProbeCounters* counters;
-    bool created = false;
-#endif
 
     static FunctionResult create(void* opaque) {
         auto& call = *static_cast<ExtractionInvocation*>(opaque);
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-        call.created = true;
-        if (call.counters != nullptr) call.counters->creates.fetch_add(1, std::memory_order_relaxed);
-#endif
         NSMutableArray* functions = nil;
         call.original(&functions, call.ignoredDevice, call.library, call.rawFlag,
             call.reflection, call.ignoredNames, call.constants);
@@ -315,23 +189,12 @@ __attribute__((noinline)) void* extractFunctions(
     const auto original = reinterpret_cast<ExtractFunctionsEntry>(
         originalFunctions[static_cast<std::size_t>(layout::Hook::ExtractFunctions)]);
     Runtime& state = runtime();
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-    ProbeCounters* counters = state.probePath.empty() ? nullptr : &state.functionCounters;
-    if (counters != nullptr) counters->requests.fetch_add(1, std::memory_order_relaxed);
-    ExtractionInvocation invocation {original, ignoredDevice, library, rawFlag,
-        reflection, ignoredNames, constants, counters};
-#else
     ExtractionInvocation invocation {original, ignoredDevice, library, rawFlag,
         reflection, ignoredNames, constants};
-#endif
     KeyBytes key;
     const void* device = nullptr;
     bool recognized = false;
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-    if (!state.probeBypass && functionImageBase != 0 && caller >= functionImageBase) {
-#else
     if (functionImageBase != 0 && caller >= functionImageBase) {
-#endif
         try {
             recognized = makeFunctionExtractionKey(library, rawFlag, reflection, constants,
                 caller - functionImageBase, currentFunctionContext, key, device);
@@ -339,22 +202,11 @@ __attribute__((noinline)) void* extractFunctions(
             // A cache-key allocation must not replace the native operation.
         }
     }
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-    if (!recognized && counters != nullptr) {
-        state.functionBypasses.fetch_add(1, std::memory_order_relaxed);
-    }
-#endif
     FunctionResult result = recognized ? state.functions.getOrCreate(
         device, key, library, &ExtractionInvocation::create, &invocation) :
         ExtractionInvocation::create(&invocation);
-#ifdef YAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS
-    if (counters != nullptr && !invocation.created) {
-        counters->reuses.fetch_add(1, std::memory_order_relaxed);
-    }
-#endif
     NSMutableArray* functions = result.takeFunctions();
     std::memcpy(output, &functions, sizeof(functions));
-    state.publishProbe();
     return output;
 }
 
@@ -387,7 +239,6 @@ void destroyWithFunctionCacheRetired(const void* device, const void* vtt) {
 void destroyDevice(const void* device, const void* vtt) {
     Runtime& state = runtime();
     state.functions.withDeviceRetired(device, &destroyWithFunctionCacheRetired, vtt);
-    state.publishProbe();
 }
 
 bool matchesImage(const mach_header* untyped) noexcept {
@@ -472,12 +323,12 @@ __attribute__((constructor)) void initialize() noexcept {
         const StageHookEntryPoints stage = initializeStageHooks(base, stageOriginals);
         if (stage.compileComputeStages == nullptr || stage.compileGraphicsStages == nullptr ||
             stage.createComputeStageKey == nullptr || stage.createGraphicsStageKey == nullptr) return;
-        const std::array<std::uintptr_t, d3dmetal::kReplayHookCount> replayOriginals = {
-            originalFunctions[17],
-            originalFunctions[18],
+        const std::array<std::uintptr_t, ngx::kHookCount> ngxOriginals = {
+            originalFunctions[static_cast<std::size_t>(layout::Hook::ReplayTemporalScaleMPL)],
+            originalFunctions[static_cast<std::size_t>(layout::Hook::EncodeTemporalScaleMTL)],
         };
-        const auto replayHooks = d3dmetal::initializeReplayHooks(replayOriginals);
-        for (const auto hook : replayHooks) {
+        const auto ngxHooks = ngx::initializeHooks(ngxOriginals);
+        for (const auto hook : ngxHooks) {
             if (hook == 0) return;
         }
         functionImageBase = reinterpret_cast<std::uintptr_t>(base);
@@ -502,8 +353,8 @@ __attribute__((constructor)) void initialize() noexcept {
             reinterpret_cast<std::uintptr_t>(stage.createGraphicsStageKey),
             reinterpret_cast<std::uintptr_t>(&extractFunctions),
             reinterpret_cast<std::uintptr_t>(&loadGraphicsFunctions),
-            replayHooks[0],
-            replayHooks[1],
+            ngxHooks[0],
+            ngxHooks[1],
             displayHooks.getContainingOutput,
             displayHooks.setFullscreenState,
             displayHooks.presentFlush,

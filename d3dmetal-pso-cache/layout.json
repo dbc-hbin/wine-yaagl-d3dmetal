@@ -1,5 +1,5 @@
 {
-  "formatVersion": 12,
+  "formatVersion": 14,
   "source": {
     "sha256": "f8640e6b0974277068821d44bd398dcc0f42cbb730d07f3afad97843e72a6ea3",
     "machUuid": "674e662b6b5c3fd99a8af415609d2f6a",
@@ -20,8 +20,8 @@
   },
   "constructorVerification": {
     "markerOffset": 4904624,
-    "markerHex": "594141474c50534f43414348450c0000",
-    "description": "Version 12 scopes DoPresent Metal4 drawable residency registration through its last presentation submission. The constructor verifies Mach UUID, entry patches, gates, trampolines, dispatch slot ownership, and a null dispatch slot."
+    "markerHex": "594141474c50534f43414348450e0000",
+    "description": "Version 14 verifies the 21-entry PSO/FSR/display dispatch table, four special presentation/commit/residency gates, and the null dispatch slot; stock NGX Evaluate and recording paths remain unpatched."
   },
   "textCave": {
     "offset": 4904624,

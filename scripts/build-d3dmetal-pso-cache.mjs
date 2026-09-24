@@ -7,10 +7,9 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const testControls = process.argv[2] === "--test-controls";
-const output = process.argv[testControls ? 3 : 2];
-if (!output || process.argv.length !== (testControls ? 4 : 3)) {
-  throw new Error("usage: node scripts/build-d3dmetal-pso-cache.mjs [--test-controls] <output-dir>");
+const output = process.argv[2];
+if (!output || process.argv.length !== 3 || output === "--test-controls") {
+  throw new Error("usage: node scripts/build-d3dmetal-pso-cache.mjs <output-dir>");
 }
 const outputDirectory = resolve(output);
 const sourceDirectory = resolve(root, "d3dmetal-pso-cache");
@@ -22,7 +21,7 @@ const sourcePaths = [
   "d3dmetal-pso-cache/metalfx-contract.hpp",
   "d3dmetal-pso-cache/metalfx-backend.hpp", "d3dmetal-pso-cache/metalfx-backend.mm",
   "d3dmetal-pso-cache/d3dmetal-transport.hpp", "d3dmetal-pso-cache/d3dmetal-transport.mm",
-  "d3dmetal-pso-cache/d3dmetal-replay-hooks.hpp", "d3dmetal-pso-cache/d3dmetal-replay-hooks.mm",
+  "d3dmetal-pso-cache/ngx-hooks.hpp", "d3dmetal-pso-cache/ngx-hooks.mm",
   "d3dmetal-pso-cache/display-routing.hpp", "d3dmetal-pso-cache/display-routing.mm",
   "include/yaagl_d3dmetal_display.h",
   "d3dmetal-pso-cache/d3dmetal-transport-legacy.hpp", "d3dmetal-pso-cache/d3dmetal-transport-legacy.mm",
@@ -55,7 +54,7 @@ const hookNames = [
   "ReplayTemporalScaleMPL", "EncodeTemporalScaleMTL",
   "GetContainingOutput", "SetFullscreenState",
 ];
-if (layout.formatVersion !== 12 || layout.hooks.length !== hookNames.length ||
+if (layout.formatVersion !== 14 || layout.hooks.length !== hookNames.length ||
     layout.commitHook.id !== "CommitMetal4Batch" ||
     layout.presentHook.id !== "RefreshDisplayAndFlush" ||
     layout.presentHook.dispatchFieldOffset !== hookNames.length * 8 ||
@@ -137,10 +136,9 @@ const compileArgs = [
   "-arch", "x86_64", "-std=c++20", "-fno-objc-arc", "-fobjc-exceptions", "-fblocks",
   "-isysroot", sdkPath,
   "-mmacosx-version-min=14.0", "-O2", "-Wall", "-Wextra", "-Werror",
-  ...(testControls ? ["-DYAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS=1"] : []),
   "-dynamiclib", "-pthread", "-framework", "Foundation", "-framework", "Metal", "-framework", "QuartzCore", "-framework", "MetalFX",
   "-I", sourceDirectory, "-I", outputDirectory,
-  ...["cache.mm", "function-cache.mm", "function-hooks.mm", "key.mm", "metalfx-backend.mm", "d3dmetal-transport.mm", "d3dmetal-transport-legacy.mm", "d3dmetal-replay-hooks.mm", "display-routing.mm", "fsr-contract.cpp", "fsr-translator.mm", "fsr-framegeneration.mm", "persistent-cache.mm", "rt-key.mm", "stage-cache.mm", "bridge.mm"].map((file) => resolve(sourceDirectory, file)),
+  ...["cache.mm", "function-cache.mm", "function-hooks.mm", "key.mm", "metalfx-backend.mm", "d3dmetal-transport.mm", "d3dmetal-transport-legacy.mm", "ngx-hooks.mm", "display-routing.mm", "fsr-contract.cpp", "fsr-translator.mm", "fsr-framegeneration.mm", "persistent-cache.mm", "rt-key.mm", "stage-cache.mm", "bridge.mm"].map((file) => resolve(sourceDirectory, file)),
   "-Wl,-install_name,@rpath/libYaaglNativePsoCache.dylib", "-o", modulePath,
 ];
 const compiled = spawnSync(compiler, compileArgs, { cwd: root, stdio: "inherit" });
@@ -163,29 +161,18 @@ for (const control of diagnosticControls) {
 if (moduleBytes.includes(Buffer.from("YAAGL_METALFX_RENDER_PRESET"))) {
   throw new Error("native cache still contains the removed render-size override");
 }
-const environmentControls = [
+const forbiddenMarkers = [
   "YAAGL_NATIVE_PSO_CACHE_PROBE",
   "YAAGL_NATIVE_PSO_CACHE_PROBE_BYPASS",
   "YAAGL_D3DMETAL_CACHE_ROOT",
   "YAAGL_D3DMETAL_CACHE_EXECUTABLE",
+  "setFdopendirFailureForTest",
+  "lastFdopendirFdForTest",
+  "_NSGetArgv",
 ];
-if (testControls) {
-  for (const control of environmentControls) {
-    if (!moduleBytes.includes(Buffer.from(control))) {
-      throw new Error(`test native cache is missing test control: ${control}`);
-    }
-  }
-} else {
-  const forbiddenMarkers = [
-    ...environmentControls,
-    "setFdopendirFailureForTest",
-    "lastFdopendirFdForTest",
-    "_NSGetArgv",
-  ];
-  for (const marker of forbiddenMarkers) {
-    if (moduleBytes.includes(Buffer.from(marker))) {
-      throw new Error(`production native cache contains test control: ${marker}`);
-    }
+for (const marker of forbiddenMarkers) {
+  if (moduleBytes.includes(Buffer.from(marker))) {
+    throw new Error(`production native cache contains test control: ${marker}`);
   }
 }
 
@@ -197,7 +184,7 @@ const manifest = {
   schemaVersion: 1,
   architecture: "x86_64",
   deploymentTarget: "14.0",
-  testControls,
+  testControls: false,
   sources,
   compiler: { path: compiler, version: compilerVersion.stdout.trim(), sdkPath },
   compileArgs,

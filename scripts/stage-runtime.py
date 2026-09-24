@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage an isolated RX 9070 FSR-to-MetalFX Wine runtime; never modify the source or game."""
+"""Stage an isolated FSR/NGX-to-MetalFX Wine runtime; never modify the source or game."""
 from __future__ import annotations
 import argparse
 import hashlib
@@ -17,7 +17,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REL = Path('lib/external/D3DMetal.framework/Versions/A')
 STAGE_MANIFEST = 'zzz-frame-probe-stage.json'
-STAGE_SCHEMA = 4
+STAGE_SCHEMA = 5
+NGX_DLL_SHA256 = 'f6bc9d77fd1e898fec8c6339d367bd8e0f338992c9c0c66d59b30c6e9e0743e4'
+SHARED_DYLIB_PATH = 'lib/external/libd3dshared.dylib'
+SHARED_DYLIB_SHA256 = 'd932330841e77682d47688641e0ac17049a2aff498deafac88921983dc16eedb'
+NGX_UNIX_LINK = '../../external/libd3dshared.dylib'
 DISPLAY_BRIDGE_PATH = 'lib/wine/x86_64-unix/winemac.so'
 PLAY_PROFILE = 'play'
 PLAY_MODEL_POLICY = {'all_gpu': 'system-default'}
@@ -41,7 +45,11 @@ ARTIFACT_PATHS = ('bin/wine', 'bin/wine.real',
     str(REL / 'D3DMetal'), str(REL / 'Resources/libYaaglNativePsoCache.dylib'),
     str(REL / 'Resources/libmetalirconverter.dylib'),
     'lib/wine/x86_64-windows/d3d12.dll', 'lib/wine/x86_64-unix/d3d12.so')
-DLSS_ARTIFACT_PATHS = ('lib/wine/x86_64-windows/nvngx.dll', 'lib/wine/x86_64-unix/nvngx.so')
+NGX_ARTIFACT_PATHS = ('lib/wine/x86_64-windows/nvngx.dll', 'lib/wine/x86_64-unix/nvngx.so', SHARED_DYLIB_PATH)
+NGX_POLICY = {'implementation': 'stock-gptk-ngx-to-metalfx', 'windows_module': NGX_ARTIFACT_PATHS[0],
+              'unix_bridge': NGX_ARTIFACT_PATHS[1], 'bridge_target': NGX_UNIX_LINK,
+              'default_gpu_identity': 'rx9070', 'gpu_identity_environment': 'YAAGL_GPU_IDENTITY',
+              'supported_gpu_identities': ['rx9070', 'rtx5060']}
 
 
 def run(args: list[str]) -> None:
@@ -99,18 +107,27 @@ def original_fg_provenance(path: Path) -> dict:
             'source_access': 'read-only', 'loader_override': False}
 
 
-def artifact_problems(runtime: Path, recorded) -> list[str]:
-    if not isinstance(recorded, dict) or set(recorded) != set(ARTIFACT_PATHS + FSR_ARTIFACT_PATHS):
+def artifact_problems(runtime: Path, recorded, schema: int) -> list[str]:
+    paths = ARTIFACT_PATHS + FSR_ARTIFACT_PATHS + (NGX_ARTIFACT_PATHS if schema == STAGE_SCHEMA else ())
+    if not isinstance(recorded, dict) or set(recorded) != set(paths):
         return ['signed artifact inventory is missing or incomplete; restage with current tooling']
+    if schema == STAGE_SCHEMA:
+        link = runtime / NGX_ARTIFACT_PATHS[1]
+        if not link.is_symlink() or os.readlink(link) != NGX_UNIX_LINK:
+            return ['NGX Unix bridge symlink target changed']
     try:
-        actual = artifact_hashes(runtime)
+        actual = artifact_hashes(runtime, paths)
     except (OSError, ValueError) as error:
         return [str(error)]
     problems = [f'signed runtime artifact changed: {name}' for name in actual if recorded[name] != actual[name]]
-    for relative in DLSS_ARTIFACT_PATHS:
-        path = runtime / relative
-        if path.exists() or path.is_symlink():
-            problems.append(f'DLSS-only artifact remains in FSR-only runtime: {relative}')
+    if schema == 4:
+        for relative in NGX_ARTIFACT_PATHS[:2]:
+            path = runtime / relative
+            if path.exists() or path.is_symlink():
+                problems.append(f'NGX artifact remains in FSR-only schema 4 runtime: {relative}')
+    else:
+        if actual[NGX_ARTIFACT_PATHS[0]] != NGX_DLL_SHA256 or actual[SHARED_DYLIB_PATH] != SHARED_DYLIB_SHA256:
+            problems.append('stock NGX module or shared bridge does not match pinned source')
     return problems
 
 
@@ -122,17 +139,35 @@ def stage_manifest_report(source: Path) -> list[tuple[str, str]]:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as error:
         return [('FAIL', str(error))]
-    if not isinstance(data, dict) or data.get('stage_schema') != STAGE_SCHEMA:
+    if not isinstance(data, dict) or data.get('stage_schema') not in (4, STAGE_SCHEMA):
         return [('FAIL', 'unsupported stage schema; use an intact base runtime and restage with current tooling')]
-    problems = artifact_problems(source, data.get('signed_artifacts'))
+    schema = data['stage_schema']
+    problems = artifact_problems(source, data.get('signed_artifacts'), schema)
     if (data.get('profile') != PLAY_PROFILE or data.get('fsr_translator') != FSR_POLICY or
             data.get('model_policy') != PLAY_MODEL_POLICY or data.get('render_size_override') is not False or
-            data.get('rendering_changes_by_default') is not True or data.get('dlss_translation') is not False):
-        problems.append('unsupported FSR-only rendering policy')
+            data.get('rendering_changes_by_default') is not True or
+            data.get('dlss_translation') is not (schema == STAGE_SCHEMA)):
+        problems.append('unsupported staged rendering policy')
+    if schema == STAGE_SCHEMA:
+        ngx = data.get('ngx_module')
+        if (data.get('ngx_policy') != NGX_POLICY or not isinstance(ngx, dict) or
+                ngx.get('runtime_path') != NGX_ARTIFACT_PATHS[0] or
+                ngx.get('sha256') != NGX_DLL_SHA256 or ngx.get('architecture') != 'COFF-x86-64' or
+                ngx.get('unix_bridge') != NGX_ARTIFACT_PATHS[1] or
+                ngx.get('bridge_target') != NGX_UNIX_LINK or
+                ngx.get('bridge_sha256') != SHARED_DYLIB_SHA256):
+            problems.append('stock NGX provenance or identity selection policy is missing or invalid')
     launcher = source / 'bin/wine'
-    if (not launcher.is_file() or launcher.read_bytes() != (ROOT / 'scripts/wine-launch-wrapper.sh').read_bytes() or
+    launcher_record = data.get('source_launcher')
+    launcher_hash = launcher_record.get('sha256') if isinstance(launcher_record, dict) else None
+    current_hash = hashlib.sha256((ROOT / 'scripts/wine-launch-wrapper.sh').read_bytes()).hexdigest()
+    if (not launcher.is_file() or not isinstance(launcher_record, dict) or
+            launcher_record.get('path') != 'scripts/wine-launch-wrapper.sh' or
+            not re.fullmatch(r'[0-9a-f]{64}', str(launcher_hash)) or
+            hashlib.sha256(launcher.read_bytes()).hexdigest() != launcher_hash or
+            (schema == STAGE_SCHEMA and launcher_hash != current_hash) or
             data.get('launcher_policy') != {'path': 'bin/wine', 'game_launch_only': False}):
-        problems.append('FSR translator manifest does not match the integrated launcher')
+        problems.append('staged launcher does not match its recorded source hash and policy')
     if (source / 'bin/yaagl-frame-probe-exec').exists():
         problems.append('obsolete FSR launch helper remains in staged runtime')
     fallback = data.get('native_fg_fallback')
@@ -145,12 +180,12 @@ def stage_manifest_report(source: Path) -> list[tuple[str, str]]:
     if not private_fallback.is_file() or private_fallback.stat().st_mode & 0o222:
         problems.append('renamed native frame-generation fallback is missing or writable')
     d3dmetal_input = data.get('d3dmetal_input')
-    if (not isinstance(d3dmetal_input, dict) or d3dmetal_input.get('kind') not in ('pristine', 'patched') or
+    if (not isinstance(d3dmetal_input, dict) or d3dmetal_input.get('kind') not in ('pristine', 'stage-patched', 'stage-patched-signed', 'patched') or
             not re.fullmatch(r'[0-9a-f]{64}', str(d3dmetal_input.get('sha256', '')))):
         problems.append('recorded D3DMetal input kind or SHA is invalid')
     if problems:
         return [('FAIL', message) for message in problems]
-    return [('PASS', 'FSR-only staged runtime policy and signed artifact hashes match')]
+    return [('PASS', 'staged FSR/NGX policy and signed artifact hashes match')]
 
 
 def verify_runtime(runtime: Path, current_sources: bool = False) -> list[tuple[str, str]]:
@@ -200,26 +235,28 @@ def main() -> int:
     p.add_argument('--current-sources', action='store_true')
     p.add_argument('--build-dir', type=Path, default=ROOT / 'build/fsr-stage')
     p.add_argument('--original-fg', type=Path, default=ORIGINAL_FG_SOURCE)
+    p.add_argument('--ngx-dll', type=Path, help='pinned stock GPTK nvngx-on-metalfx.dll input')
     p.add_argument('--play', action='store_true', help='select ordinary play with automatic captures disabled')
     p.add_argument('--fsr-translator', action='store_true', help='select the FSR-only MetalFX runtime')
     p.add_argument('--check', action='store_true')
     a = p.parse_args()
     if a.verify_runtime:
-        if a.wine_source or a.wine_dest or a.pristine_d3dmetal or a.patched_d3dmetal or a.check or a.play or a.fsr_translator:
+        if a.wine_source or a.wine_dest or a.pristine_d3dmetal or a.patched_d3dmetal or a.ngx_dll or a.check or a.play or a.fsr_translator:
             p.error('--verify-runtime cannot be combined with staging arguments')
         report = verify_runtime(a.verify_runtime.expanduser().resolve(), a.current_sources)
         for level, message in report:
             print(f'{level}: {message}')
         return int(any(level == 'FAIL' for level, _ in report))
-    if not a.wine_source or not a.wine_dest or not (a.pristine_d3dmetal or a.patched_d3dmetal):
-        p.error('staging requires --wine-source, --wine-dest and exactly one D3DMetal input')
+    if not a.wine_source or not a.wine_dest or not a.ngx_dll or not (a.pristine_d3dmetal or a.patched_d3dmetal):
+        p.error('staging requires --wine-source, --wine-dest, --ngx-dll and exactly one D3DMetal input')
     if a.current_sources:
         p.error('--current-sources requires --verify-runtime')
     if not a.play or not a.fsr_translator:
-        p.error('the FSR-only runtime requires --play --fsr-translator')
+        p.error('the FSR/NGX runtime requires --play --fsr-translator')
     source = a.wine_source.expanduser().resolve()
     dest = a.wine_dest.expanduser().absolute()
     original_fg = a.original_fg.expanduser().resolve()
+    ngx_dll = a.ngx_dll.expanduser().resolve()
     d3dmetal_input = (a.patched_d3dmetal or a.pristine_d3dmetal).expanduser().resolve()
     input_kind = 'patched' if a.patched_d3dmetal else 'pristine'
     build = a.build_dir.expanduser().absolute()
@@ -243,15 +280,32 @@ def main() -> int:
     if input_kind == 'pristine':
         expected = json.loads((ROOT / 'd3dmetal-pso-cache/layout.json').read_text())['source']['sha256']
         if actual != expected:
-            p.error(f'pristine D3DMetal SHA mismatch: expected {expected}, got {actual}')
+            inspection = json.loads(subprocess.check_output(['node', str(checker), 'inspect', str(d3dmetal_input)], text=True))
+            if inspection.get('mode') not in ('stage-patched', 'stage-patched-signed'):
+                p.error(f'D3DMetal is neither pinned pristine ({expected}) nor verified stage-lock input: {actual}')
+            input_kind = inspection['mode']
     else:
         inspection = json.loads(subprocess.check_output(['node', str(checker), 'inspect', str(d3dmetal_input)], text=True))
         if inspection.get('mode') not in ('patched', 'patched-signed'):
             p.error('patched D3DMetal must pass the current pinned layout and payload inspection')
     fg_provenance = original_fg_provenance(original_fg)
+    ngx_hash = hashlib.sha256(ngx_dll.read_bytes()).hexdigest()
+    if ngx_hash != NGX_DLL_SHA256:
+        p.error(f'stock NGX DLL SHA mismatch: expected {NGX_DLL_SHA256}, got {ngx_hash}')
+    readobj = Path('/opt/llvm-mingw-20260616-ucrt-macos-universal/bin/llvm-readobj')
+    if 'Format: COFF-x86-64' not in subprocess.check_output(
+            [str(readobj), '--coff-exports', str(ngx_dll)], text=True):
+        p.error('stock NGX DLL is not x86_64 PE')
+    shared = source / SHARED_DYLIB_PATH
+    if not under(shared, source) or hashlib.sha256(shared.read_bytes()).hexdigest() != SHARED_DYLIB_SHA256:
+        p.error('source libd3dshared.dylib does not match pinned GPTK bridge')
+    ngx_provenance = {'source': str(ngx_dll), 'runtime_path': NGX_ARTIFACT_PATHS[0],
+                      'sha256': ngx_hash, 'size': ngx_dll.stat().st_size, 'architecture': 'COFF-x86-64',
+                      'unix_bridge': NGX_ARTIFACT_PATHS[1], 'bridge_target': NGX_UNIX_LINK,
+                      'bridge_sha256': SHARED_DYLIB_SHA256, 'source_access': 'read-only'}
     if a.check:
-        print(f'PASS: isolated destination, {input_kind} D3DMetal identity, and pinned native FSR provider verified')
-        print('PASS: source launcher will be replaced with the committed RX 9070 wrapper and integrated FSR policy')
+        print(f'PASS: isolated destination, {input_kind} D3DMetal identity, pinned native FSR and stock NGX providers verified')
+        print('PASS: source launcher will be replaced with the committed FSR/NGX wrapper')
         print('No changes.')
         return 0
     if platform.system() != 'Darwin':
@@ -270,10 +324,19 @@ def main() -> int:
                      *(temporary / relative for relative in FSR_ARTIFACT_PATHS)):
             if not under(path, temporary):
                 raise RuntimeError(f'copied runtime contains an external replacement symlink: {path}')
-        for relative in DLSS_ARTIFACT_PATHS:
+        for relative in NGX_ARTIFACT_PATHS[:2]:
             (temporary / relative).unlink(missing_ok=True)
-        if input_kind == 'pristine':
-            patched = build / 'D3DMetal.fsr-only'
+        staged_ngx = temporary / NGX_ARTIFACT_PATHS[0]
+        staged_ngx.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ngx_dll, staged_ngx)
+        staged_bridge = temporary / SHARED_DYLIB_PATH
+        if not under(staged_bridge, temporary) or hashlib.sha256(staged_bridge.read_bytes()).hexdigest() != SHARED_DYLIB_SHA256:
+            raise RuntimeError('copied GPTK shared bridge changed during staging')
+        staged_link = temporary / NGX_ARTIFACT_PATHS[1]
+        staged_link.parent.mkdir(parents=True, exist_ok=True)
+        staged_link.symlink_to(NGX_UNIX_LINK)
+        if input_kind in ('pristine', 'stage-patched', 'stage-patched-signed'):
+            patched = build / 'D3DMetal.fsr-ngx'
             run(['node', str(checker), 'patch', str(d3dmetal_input), str(patched)])
             shutil.copy2(patched, binary)
         else:
@@ -305,7 +368,8 @@ def main() -> int:
         manifest = {
             'stage_schema': STAGE_SCHEMA, 'profile': PLAY_PROFILE, 'diagnostic_only': False,
             'rendering_changes_by_default': True, 'render_size_override': False,
-            'model_policy': PLAY_MODEL_POLICY.copy(), 'dlss_translation': False,
+            'model_policy': PLAY_MODEL_POLICY.copy(), 'dlss_translation': True,
+            'ngx_policy': NGX_POLICY.copy(), 'ngx_module': ngx_provenance,
             'source_runtime': str(source), 'source_launcher': {
                 'path': 'scripts/wine-launch-wrapper.sh', 'sha256': hashlib.sha256(wrapper.encode()).hexdigest()},
             'launcher_policy': {'path': 'bin/wine', 'game_launch_only': False},
@@ -314,7 +378,7 @@ def main() -> int:
             'fsr_build_manifest': json.loads((fsr_build / 'build-manifest.json').read_text()),
             'fsr_translator': FSR_POLICY.copy(), 'native_fg_fallback': fg_provenance,
             'display_bridge': display_bridge_provenance(temporary),
-            'signed_artifacts': artifact_hashes(temporary)}
+            'signed_artifacts': artifact_hashes(temporary, ARTIFACT_PATHS + FSR_ARTIFACT_PATHS + NGX_ARTIFACT_PATHS)}
         (temporary / STAGE_MANIFEST).write_text(json.dumps(manifest, indent=2) + '\n')
         problems = [message for level, message in verify_runtime(temporary, current_sources=True) if level == 'FAIL']
         if problems:
@@ -324,9 +388,9 @@ def main() -> int:
         if temporary.exists():
             shutil.rmtree(temporary)
         raise
-    print(f'FSR-only runtime staged: {dest}')
-    print('RX 9070 wrapper; FSR upscaling and MetalFX frame interpolation; original FSR swapchain/provider retained.')
-    print('System-default MetalFX model, unchanged game sizing, no DLSS modules or automatic GPU capture.')
+    print(f'FSR/NGX runtime staged: {dest}')
+    print('RX 9070 default; RTX 5060 opt-in via YAAGL_GPU_IDENTITY; FSR and stock NGX modules retained.')
+    print('System-default MetalFX model, unchanged game sizing, no automatic GPU capture.')
     return 0
 
 

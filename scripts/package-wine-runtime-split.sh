@@ -1,5 +1,5 @@
 #!/bin/sh
-# Split the verified v1.1.0 FSR-only Wine runtime into a core archive and a
+# Split the verified staged FSR/NGX Wine runtime into a core archive and a
 # D3DMetal overlay. The input tree is only read; no Wine/GPTK build occurs.
 #
 #   package-wine-runtime-split.sh SOURCE_WINE_ROOT OUTPUT_DIR
@@ -25,6 +25,8 @@ wine/x86_64-windows/d3d11.dll
 wine/x86_64-windows/d3d12.dll
 wine/x86_64-windows/dxgi.dll
 wine/x86_64-windows/nvapi64.dll
+wine/x86_64-windows/nvngx.dll
+wine/x86_64-unix/nvngx.so
 wine/x86_64-unix/d3d10.so
 wine/x86_64-unix/d3d11.so
 wine/x86_64-unix/d3d12.so
@@ -62,9 +64,8 @@ for node in $backend_nodes; do
   require_path "$source_root/lib/$node"
 done
 
-# The stage verifier pins every signed graphics/FSR artifact, rejects DLSS
-# leftovers, and proves the embedded native/FSR build manifests still match
-# the current sources before any payload is copied.
+# The stage verifier pins signed graphics, FSR, and NGX artifacts and proves
+# the embedded native/FSR build manifests match current sources before copying.
 /usr/bin/python3 "$repo_dir/scripts/stage-runtime.py" \
   --verify-runtime "$source_root" --current-sources
 

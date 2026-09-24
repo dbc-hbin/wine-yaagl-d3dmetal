@@ -41,7 +41,7 @@ For a beta CLI install, pass `--app-path "/Applications/Yaagl ZZZ OS DX12 Beta.a
 
 ### FSR upscaling to MetalFX
 
-- The launch wrapper fixes the public graphics identity to AMD Radeon RX 9070 (`0x1002:0x7550`). It does not spoof an NVIDIA adapter. The current staged wrapper applies FSR selection without a second helper and preserves Yaagl's `MTL_HUD_ENABLED` choice (including unset or empty). Published v1.1.x archives still contain the older helper that forces the HUD on; they must be replaced to gain this behavior.
+- The published v1.1.0 wrapper fixes the graphics identity to AMD Radeon RX 9070 (`0x1002:0x7550`); it has no NVIDIA option. The **unreleased current-source** staged wrapper defaults to that same AMD identity and offers explicit `YAAGL_GPU_IDENTITY=rtx5060` (`0x10de:0x2d05`) for NVIDIA/NGX comparison. It applies FSR selection without a second helper and preserves Yaagl's `MTL_HUD_ENABLED` choice (including unset or empty). Published v1.1.x archives still contain the older helper that forces the HUD on; they must be replaced to gain this behavior.
 - The builtin `amd_fidelityfx_upscaler_dx12` module implements the public FSR API boundary and translates accepted temporal-upscaling work to MetalFX. It does not execute AMD's FSR4 neural network.
 - In newly staged runtimes, `YAAGL_FSR_UPSCALER=metalfx` (also the unset/empty default) selects that builtin upscaler; `YAAGL_FSR_UPSCALER=native` selects the game's original canonical upscaler DLL without a builtin fallback. This explicit SR comparison option survives the launch wrapper; it does not change the frame-generation provider policy. Other values stop before Wine launches. Existing release archives do not gain this option until rebuilt.
 - Native AA and the Quality, Balanced, Performance, and Ultra Performance modes remain explicit game/provider choices. The translator does not silently select a quality mode. When a request exceeds MetalFX's maximum temporal scale, the MetalFX output is capped to a single uniform scale, centered in the caller's own output texture, and the surrounding texels are preserved.
@@ -76,7 +76,7 @@ For a beta CLI install, pass `--app-path "/Applications/Yaagl ZZZ OS DX12 Beta.a
 
 These items remain unverified risks; the path carries no FPS or image-quality guarantee until they are closed.
 
-- Current synthetic coverage uses uniform depth and a single global motion vector. It does not exercise disocclusion or mixed foreground/background motion, and it does not reproduce the game's observed 2256×1272 render-resolution motion vectors feeding a 3840×2160 output.
+- Earlier synthetic checks used uniform depth and a single global motion vector. They did not exercise disocclusion or mixed foreground/background motion, and they did not reproduce the game's observed 2256×1272 render-resolution motion vectors feeding a 3840×2160 output.
 - Depth and motion vectors are currently expanded with nearest sampling before interpolation. Whether this is better or worse than giving MetalFX its native low-resolution inputs requires an A/B comparison; it is not a known quality bug.
 - The descriptor's nullable `scaler` is not linked. Apple's WWDC25 session 211 sample links a scaler, but that is an architectural difference, not proof of a quality defect here.
 - Jitter units remain unresolved when the input color is already temporally upscaled. Do not blindly rescale the jitter or replace it with zero; first capture the producer's actual convention and compare temporally stable scenes.
@@ -95,13 +95,21 @@ Next verification should use game captures with disocclusion and mixed motion at
 - There is no unbounded normal per-frame log.
 - Log entries report API, encode, or callback progress. They do not prove GPU completion, image quality, FPS, or an OFF transition.
 
-The removed DLSS-only path is not a hidden compatibility option: the production bridge and build inventory no longer include NGX entry hooks, NGX reprojection helpers or smoke fixtures, DLSS exposure correction, temporal interception, or the old frame-probe implementation and controls. The two shared command-replay hooks required by FSR are isolated in `d3dmetal-replay-hooks.{hpp,mm}`; layout v9 contains 17 PSO/cache hooks plus these two replay hooks, without restoring DLSS translation.
+### Unreleased NGX restoration in current source
 
-**Unreleased source:** layout v10 adds a Metal4 queue-commit hook for GPU-completion retirement, bringing the dispatch table to 20 entries (17 PSO/cache, two replay, one commit). This requires rebuilding the paired D3DMetal patch and native sidecar; the existing release archives are unchanged.
+Shared Metal4 replay and legacy encode handling are restored directly inside `ngx-hooks.mm`, rather than retained as an outer compatibility wrapper. `bridge.mm` publishes the NGX replay/encode entrypoints directly in slots 17/18; they recognize and execute FSR-recorded commands before interpreting any NGX descriptor. The separate `d3dmetal-replay-hooks.{hpp,mm}` layer and its build entries have been removed.
+
+The published v1.1.0/v1.1.1 runtime remains FSR-only. The **unreleased schema-5 candidate**, built additively on the current Wine source rather than rolling back to v1.0.5, restores the pinned stock GPTK `nvngx.dll` (SHA-256 `f6bc9d77fd1e898fec8c6339d367bd8e0f338992c9c0c66d59b30c6e9e0743e4`) and `nvngx.so` → `../../external/libd3dshared.dylib` (pinned target SHA-256 `d932330841e77682d47688641e0ac17049a2aff498deafac88921983dc16eedb`). The stage record includes their provenance, symlink target, and signed artifact inventory. No existing installer archive or game/prefix is changed.
+
+Native layout **v14** publishes 25 dispatch entries (21 normal hooks plus four special hooks). The only NGX wrappers are shared replay/encode, retaining FSR-first routing and forwarding ordinary NGX commands directly to the original D3DMetal replay/encode. The NGX private-output shadow/copy adapter has been removed; FSR backend output handling is unchanged. NGX Evaluate/record observation detours, diagnostic controls, and optional exposure/temporal corrections have been removed; stock NGX handles those calls directly. Current FSR, display routing, GPU-completion/resource-lifetime and Wine MSync fixes remain, as do the system-default MetalFX model and RX 9070 default. The old frame-probe capture layer remains absent.
+
+Earlier isolated runs exercised stock NGX in Metal4 and legacy modes with Metal API Validation disabled. Those synthetic harnesses have been removed; their reused output did not establish fresh pixels for every NGX evaluation. With validation enabled, the shared-output NGX fixture previously asserted `outputTexture must have private storage mode`; that known limitation remains. Production validation settings are unchanged, and neither validation compliance nor game stability, FPS or image-quality improvement is claimed. The matching format-14 D3DMetal patch and native sidecar are required; published release archives remain unchanged.
 
 The current source retires completed execution leases without waiting for allocator Reset, while retaining owner-based fallback for unsubmitted work or failed callback registration. SR also reuses compatible scaler capacity for smaller active inputs, with history resets and synchronized edge staging. [Measured memory results and limits](docs/screenshot-sr-analysis-2026-09-23.ko.md) distinguish bounded allocation reuse from immediate physical release and from the unverified game-wide memory difference.
 
-### Verification status
+### Historical verification status
+
+The following records earlier release checks, not current game acceptance. The synthetic harnesses described here have since been removed.
 
 Verified on macOS 27 / Apple M5 Pro:
 
@@ -217,29 +225,29 @@ v1.1.1 republishes the v1.1.0 runtime unchanged; only `ZZZWineDX12Installer.zip`
 Each archive has a `.sha256` sidecar. By default, `installer/build.sh` reads the full runtime archive at `build/release-v1.1.1/wine-11.17-zzz-dx12-gptk4b2-macos26.tar.xz` (override with `RUNTIME_ARCHIVE_SOURCE`).
 
 ```bash
-# Set these to a current stage destination and validated build inputs.
-WINE_ROOT=/absolute/path/to/current-stage/wine
-WINE_SOURCE=/absolute/path/to/current-P3-runtime/wine
-PATCHED_D3DMETAL=/absolute/path/to/patched-D3DMetal
+# Use a verified current schema-4 source runtime and pinned external inputs.
+# This creates a new candidate; do not stage over an installed runtime or game prefix.
+WINE_ROOT=/absolute/path/to/new-candidate/wine
+WINE_SOURCE=/absolute/path/to/current-schema4-runtime/wine
+D3DMETAL_INPUT=/absolute/path/to/verified-stage-locked-D3DMetal
+NGX_DLL=/absolute/path/to/pinned-gptk/nvngx-on-metalfx.dll
 NATIVE_BUILD=/absolute/path/to/native-build
 OUTPUT_DIR=/absolute/path/to/split-output
 (
   set -e
-  base_tmp=$(mktemp -d)
-  trap 'rm -rf -- "$base_tmp"' EXIT
-  tar -xJf build/release-v1.1.0/v1.0.5-original-runtime.tar.xz -C "$base_tmp"
-
-  # Current staging requires a rebuilt Wine display bridge; archives alone are too old.
+  # The input must pass the current pinned D3DMetal layout inspection.
+  # An exact pristine input is accepted by this option as well.
   python3 scripts/stage-runtime.py --wine-source "$WINE_SOURCE" --wine-dest "$WINE_ROOT" \
-    --patched-d3dmetal "$PATCHED_D3DMETAL" --build-dir "$NATIVE_BUILD" --play --fsr-translator
+    --pristine-d3dmetal "$D3DMETAL_INPUT" --ngx-dll "$NGX_DLL" \
+    --build-dir "$NATIVE_BUILD" --play --fsr-translator
 
-  # Refresh inherited P3 metadata for the final staged bytes.
+  # Refresh inherited P3 metadata from the read-only current source runtime.
   python3 scripts/refresh-staged-runtime-metadata.py \
-    --tree "$WINE_ROOT" --base "$base_tmp/wine" \
+    --tree "$WINE_ROOT" --base "$WINE_SOURCE" \
     --native-manifest "$NATIVE_BUILD/build-manifest.json"
 
-  # Split packaging verifies the staged schema-4 tree against current sources.
-  # The retained full v1.1.0 archive is schema 3 and is not a packaging input.
+  # Split packaging verifies schema 5 against current sources, then reassembles
+  # and smoke-tests the pair in a private Wine prefix.
   sh scripts/package-wine-runtime-split.sh "$WINE_ROOT" "$OUTPUT_DIR"
 )
 ```
@@ -248,39 +256,36 @@ The exact archive hashes belong to the parent release notes and are not asserted
 
 ### Display output and refresh routing
 
-Native patch format 12 selects the output containing the swapchain HWND rather than adapter output 0. Windowed routing follows monitor moves; an explicit fullscreen target takes precedence until returning to windowed mode. Output migration preserves swapchain registration and reference ownership. Before Present pacing, the Wine bridge queries `ENUM_CURRENT_SETTINGS`, not the saved registry mode. `SyncInterval=0` and an explicit `D3DM_MAX_FPS` retain their existing behavior; no refresh rate or frame cap is forced.
+The earlier native patch format 12 introduced output selection by swapchain HWND rather than adapter output 0; current format 14 retains that routing. Windowed routing follows monitor moves; an explicit fullscreen target takes precedence until returning to windowed mode. Output migration preserves swapchain registration and reference ownership. Before Present pacing, the Wine bridge queries `ENUM_CURRENT_SETTINGS`, not the saved registry mode. `SyncInterval=0` and an explicit `D3DM_MAX_FPS` retain their existing behavior; no refresh rate or frame cap is forced.
 
 Rebuild Wine with the current P3 patch before staging. `stage-runtime.py` requires the separate `macdrv_query_d3dmetal_display` export in `winemac.so` and records/verifies that binary's identity. Replacing only the native sidecar in an old runtime is not sufficient. The fixed 192-byte Wine callback table is unchanged.
 
-The fullscreen repair also requires repatching D3DMetal, not just rebuilding the sidecar. Both its direct Windows-ABI vtable thunk and unixcall unpacker now forward the explicit output argument and preserve the native HRESULT. Routing resolves the native output interface instead of calling back through the PE `GetDesc` vtable. The D3D12 regression exercises explicit fullscreen, state/output queries, and windowed return even on a single monitor; baseline and saved/current-refresh split runs passed without changing the physical display mode.
+The fullscreen repair also requires repatching D3DMetal, not just rebuilding the sidecar. Both its direct Windows-ABI vtable thunk and unixcall unpacker now forward the explicit output argument and preserve the native HRESULT. Routing resolves the native output interface instead of calling back through the PE `GetDesc` vtable. An earlier D3D12 regression exercised explicit fullscreen, state/output queries, and windowed return even on a single monitor; baseline and saved/current-refresh split runs passed without changing the physical display mode.
 
 The isolated D3D12 regression reproduced CURRENT=120 Hz / saved=60 Hz: the old swapchain reported 60 Hz; the corrected one reported 120 Hz and requested an 8.333 ms minimum Present duration instead of 16.667 ms. SyncInterval 0 requested no minimum; an explicit 30 FPS cap still requested 33.333 ms. GPU pixel readback passed. The paired format-12 runtime additionally passed real Wine movement and explicit fullscreen between reported 60/120 Hz outputs, plus a CURRENT=60 Hz / saved=50 Hz split with Metal API/GPU validation. This is not a game-FPS improvement claim.
 
-Window surface arrays own their references explicitly, without CFArray release callbacks. Removing an entry transfers its reference; individual release and window-destruction draining happen after unlocking `win_data_mutex`, avoiding the reverse acquisition of `surfaces_lock`. The focused regression covers opposing lock acquisitions and reference balance through view-creation failure and window destruction. A real D3D12 smoke completed 128 swapchain lifetimes with 128 concurrent window resizes, verified GPU pixels, and released a retained view after destroying its window. That earlier lock-lifetime smoke used a separate queue per surface.
+Window surface arrays own their references explicitly, without CFArray release callbacks. Removing an entry transfers its reference; individual release and window-destruction draining happen after unlocking `win_data_mutex`, avoiding the reverse acquisition of `surfaces_lock`. An earlier focused regression covered opposing lock acquisitions and reference balance through view-creation failure and window destruction. A real D3D12 smoke completed 128 swapchain lifetimes with 128 concurrent window resizes, verified GPU pixels, and released a retained view after destroying its window. That earlier lock-lifetime smoke used a separate queue per surface.
 
-Patch format 12 also scopes drawable residency registration to the final Metal4 commit/signal/present operations in `DoPresent`, then removes only that registration; existing D3DMetal resource owners and baseline queue registrations remain unchanged. A pinned real-Wine probe passed 132 Present lifetimes plus four no-Present controls on one queue with 136 valid pixel readbacks. All 132 late presentation callbacks still exposed the original layer/residency set and a live drawable texture after registration removal. This fixes queue-registration accumulation, not a measured game-FPS or memory improvement, and requires a matching repatched D3DMetal/sidecar pair. The permanent same-queue regression also passed 128 swapchain lifetimes with resize coverage and 256 valid pixel readbacks under Metal API/GPU validation.
+The earlier format-12 patch also scoped drawable residency registration to the final Metal4 commit/signal/present operations in `DoPresent`, then removes only that registration; existing D3DMetal resource owners and baseline queue registrations remain unchanged. A pinned real-Wine probe passed 132 Present lifetimes plus four no-Present controls on one queue with 136 valid pixel readbacks. All 132 late presentation callbacks still exposed the original layer/residency set and a live drawable texture after registration removal. This fixes queue-registration accumulation, not a measured game-FPS or memory improvement, and requires a matching repatched D3DMetal/sidecar pair. An earlier same-queue regression also passed 128 swapchain lifetimes with resize coverage and 256 valid pixel readbacks under Metal API/GPU validation.
 
-### Focused checks
+### Essential safeguards and real-game validation
+
+Current source keeps only two standalone project checks:
+
+- Binary patch safety: reject partial, corrupted, unsupported, or already patched inputs and preserve unrelated bytes.
+- Installer safety: preserve user files and restore the prior runtime/selection after failed installation or activation.
 
 ```bash
-python3 scripts/test-metalfx-native.py --out <native-evidence>
-python3 scripts/test-metalfx-native.py --suite display-routing --out <display-native-evidence>
-python3 scripts/test-d3dmetal-display-routing.py --runtime <runtime> --out <display-d3d12-evidence>
-python3 scripts/test-d3dmetal-display-routing.py --runtime <runtime> --out <residency-evidence> --case residency
-python3 scripts/test-winemac-surface-locks.py
-python3 scripts/test-msync-waitall.py
-python3 scripts/test-fsr-launch-profile.py
-python3 scripts/test-fsr-translator.py --runtime <runtime> --out <upscaler-evidence>
-python3 scripts/test-fsr-translator.py --frame-generation --command-buffer metal4 \
-  --runtime <runtime> --out <fg-metal4-evidence>
-python3 scripts/test-fsr-translator.py --frame-generation --command-buffer legacy \
-  --runtime <runtime> --out <fg-legacy-evidence>
-node --test scripts/test-dx12-launch-regression.mjs
+node --test scripts/metalir-fp64-codec-patch.test.mjs
+# Requires a built installer with its runtime archive and an explicit stock resource fixture.
+python3 scripts/test-resource-lifecycle.py --stock-resource /path/to/stock/resources.neu
 ```
 
-`scripts/test-metalfx-native.py` runs its native suites and needs `--d3dmetal <verified D3DMetal binary>` when the `transport` suite is selected. `scripts/test-fsr-translator.py` compiles and runs the DX12 fixtures against a runtime passed with `--runtime`.
+The installer check uses temporary app/support copies, not the installed game prefix. Exact binary identity, layout, signature, ABI/export, source/provenance and archive-reassembly checks remain in the build/staging/packaging tools. Split packaging retains its private-prefix Wine initialization check. These are packaging safety checks, not graphics acceptance.
 
-These commands describe the focused checks; their presence is not a claim that the final release artifacts passed them.
+Project-specific NGX/FSR/MetalFX rendering, image-quality, cache, cursor, synchronization and launch-profile test harnesses and their test-only build controls have been removed. Upstream Wine tests/CI and historical evidence under `docs/evidence/` are unchanged.
+
+Accept graphics changes only in the actual game: compare the same scene and settings for frame-time stability, memory and image quality; exercise FSR and FG OFF→ON→OFF, cursor/menu-to-camera transitions, fullscreen and monitor changes. Use an isolated candidate. Synthetic PASS logs, API success and successful builds do not establish game correctness or performance.
 
 ## License
 
