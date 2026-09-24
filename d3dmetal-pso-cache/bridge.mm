@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
 
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
@@ -26,6 +27,7 @@
 #include "key.hpp"
 #include "d3dmetal-replay-hooks.hpp"
 #include "d3dmetal-transport.hpp"
+#include "display-routing.hpp"
 #include "layout.hpp"
 #include "persistent-cache.hpp"
 #include "rt-key.hpp"
@@ -40,11 +42,39 @@ using CompileCompute = void (*)(const void*, bool);
 using DestroyDevice = void (*)(const void*, const void*);
 constexpr std::size_t kHookCount = static_cast<std::size_t>(layout::Hook::Count);
 std::array<std::uintptr_t, kHookCount> originalFunctions{};
-static_assert(layout::kCommitDispatchIndex == kHookCount);
-std::array<std::uintptr_t, kHookCount + 1> dispatchTable{};
+static_assert(layout::kPresentDispatchIndex == kHookCount);
+static_assert(layout::kCommitDispatchIndex == kHookCount + 1);
+static_assert(layout::kPresentResidencyAddDispatchIndex == kHookCount + 2);
+static_assert(layout::kPresentResidencyFinishDispatchIndex == kHookCount + 3);
+std::array<std::uintptr_t, kHookCount + 4> dispatchTable{};
 thread_local Context currentContext{};
 thread_local FunctionContext currentFunctionContext{};
 std::uintptr_t functionImageBase = 0;
+
+struct PresentResidency final {
+    id queue = nil;
+    id set = nil;
+};
+thread_local PresentResidency presentResidency;
+
+// This is only the DoPresent call site, not the queue's long-lived residency
+// registrations. MTL4CommandQueue attaches its current sets to committed work;
+// removing this set after DoPresent's final present/commit only changes later
+// command buffers, including when already-submitted work is still in flight.
+void addPresentResidency(id queue, SEL selector, id set) {
+    using Message = void (*)(id, SEL, id);
+    reinterpret_cast<Message>(objc_msgSend)(queue, selector, set);
+    if (queue != nil && set != nil) presentResidency = {queue, set};
+}
+
+void finishPresentResidency() {
+    const PresentResidency submitted = presentResidency;
+    presentResidency = {};
+    if (submitted.queue == nil) return;
+    using Message = void (*)(id, SEL, id);
+    reinterpret_cast<Message>(objc_msgSend)(submitted.queue,
+        @selector(removeResidencySet:), submitted.set);
+}
 
 struct ContextScope final {
     explicit ContextScope(const Context& next) noexcept : previous(currentContext) {
@@ -451,6 +481,9 @@ __attribute__((constructor)) void initialize() noexcept {
             if (hook == 0) return;
         }
         functionImageBase = reinterpret_cast<std::uintptr_t>(base);
+        const display::Hooks displayHooks = display::initialize(functionImageBase,
+            originalFunctions[static_cast<std::size_t>(layout::Hook::GetContainingOutput)],
+            originalFunctions[static_cast<std::size_t>(layout::Hook::SetFullscreenState)]);
         dispatchTable = {
             reinterpret_cast<std::uintptr_t>(&createMetal4Render),
             reinterpret_cast<std::uintptr_t>(&createRender),
@@ -471,7 +504,12 @@ __attribute__((constructor)) void initialize() noexcept {
             reinterpret_cast<std::uintptr_t>(&loadGraphicsFunctions),
             replayHooks[0],
             replayHooks[1],
+            displayHooks.getContainingOutput,
+            displayHooks.setFullscreenState,
+            displayHooks.presentFlush,
             reinterpret_cast<std::uintptr_t>(&d3dmetal::commitRecordedBatch),
+            reinterpret_cast<std::uintptr_t>(&addPresentResidency),
+            reinterpret_cast<std::uintptr_t>(&finishPresentResidency),
         };
         auto& slot = *reinterpret_cast<std::uintptr_t*>(const_cast<std::uint8_t*>(base) + layout::kDataSlot);
         std::atomic_ref<std::uintptr_t>(slot).store(

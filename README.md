@@ -47,6 +47,8 @@ For a beta CLI install, pass `--app-path "/Applications/Yaagl ZZZ OS DX12 Beta.a
 - Native AA and the Quality, Balanced, Performance, and Ultra Performance modes remain explicit game/provider choices. The translator does not silently select a quality mode. When a request exceeds MetalFX's maximum temporal scale, the MetalFX output is capped to a single uniform scale, centered in the caller's own output texture, and the surrounding texels are preserved.
 - The game remains the source of truth for an explicit OFF selection. The runtime does not auto-enable upscaling or frame generation.
 - Newly staged runtimes retain at most three inactive temporal scalers per FSR context for repeated output-size changes. Switching back resets temporal history; previously unseen sizes still create a scaler and may increase MetalFX/driver-accounted memory.
+- Unreleased source reuses completed, descriptor-matched SR scratch textures and parameter buffers across dispatches. Each MetalFX feature retains at most 128 MiB of idle textures; caller-bound residency and argument tables are rebuilt per frame. This trades bounded idle memory for fewer allocations, not a demonstrated FPS improvement. Existing release archives do not include it.
+- Unreleased SR also retains at most two descriptor-compatible reactive-mask-presence scaler variants per MetalFX feature. Returning to a cached variant resets history; format/layout/input-capacity changes evict incompatible variants, while in-flight frames and leases retain their resources. ARM64 Metal4 checks passed mask alternation, composition masks, input growth and output readback; this is not a measured game-FPS improvement.
 - All Macs use the system-default MetalFX temporal model. There is no hardware-name heuristic, mandatory BBR policy, or private model-version override.
 - FSR exposure, reactive/composition masks, transfer functions, sharpening, reset, jitter, motion-vector scale, and active input/output extents are translated explicitly. Invalid or unsupported contracts return an error instead of becoming successful no-ops.
 
@@ -154,6 +156,8 @@ If an older installer downgraded Yaagl, update Yaagl to the desired version, qui
 5. **Cursor ownership and RawInput separation** — keeps ownership synchronization independent from pointer coordinates and carries corrected motion deltas separately.
 6. **Media, audio, window, and resource tuning** — retains the repository's GStreamer, Media Foundation, CoreAudio, window, and network patches.
 
+Unreleased MSync fixes abandoned-mutex `WaitAll` nontermination and transactional rollback: pre-owned recursive mutexes remain owned, abandoned state is restored, and waiters are notified when acquired objects are returned. The 128-spin registration budget is unchanged. Deterministic race tests cover rollback and real pthread waiter wakeups; an isolated Wine API run passed abandoned status, finite recursive timeout/ownership and consume-once behavior. Both defects also exist in the directly inspected official CrossOver 26.3.0 FOSS source (Wine 11.0); this is not a claim about tested commercial CrossOver binaries.
+
 ## Repository structure
 
 ```text
@@ -215,6 +219,7 @@ Each archive has a `.sha256` sidecar. By default, `installer/build.sh` reads the
 ```bash
 # Set these to a current stage destination and validated build inputs.
 WINE_ROOT=/absolute/path/to/current-stage/wine
+WINE_SOURCE=/absolute/path/to/current-P3-runtime/wine
 PATCHED_D3DMETAL=/absolute/path/to/patched-D3DMetal
 NATIVE_BUILD=/absolute/path/to/native-build
 OUTPUT_DIR=/absolute/path/to/split-output
@@ -224,8 +229,8 @@ OUTPUT_DIR=/absolute/path/to/split-output
   trap 'rm -rf -- "$base_tmp"' EXIT
   tar -xJf build/release-v1.1.0/v1.0.5-original-runtime.tar.xz -C "$base_tmp"
 
-  # Stage from the extracted v1.0.5 baseline, not the old full v1.1.0 archive.
-  python3 scripts/stage-runtime.py --wine-source "$base_tmp/wine" --wine-dest "$WINE_ROOT" \
+  # Current staging requires a rebuilt Wine display bridge; archives alone are too old.
+  python3 scripts/stage-runtime.py --wine-source "$WINE_SOURCE" --wine-dest "$WINE_ROOT" \
     --patched-d3dmetal "$PATCHED_D3DMETAL" --build-dir "$NATIVE_BUILD" --play --fsr-translator
 
   # Refresh inherited P3 metadata for the final staged bytes.
@@ -241,10 +246,29 @@ OUTPUT_DIR=/absolute/path/to/split-output
 
 The exact archive hashes belong to the parent release notes and are not asserted here.
 
+### Display output and refresh routing
+
+Native patch format 12 selects the output containing the swapchain HWND rather than adapter output 0. Windowed routing follows monitor moves; an explicit fullscreen target takes precedence until returning to windowed mode. Output migration preserves swapchain registration and reference ownership. Before Present pacing, the Wine bridge queries `ENUM_CURRENT_SETTINGS`, not the saved registry mode. `SyncInterval=0` and an explicit `D3DM_MAX_FPS` retain their existing behavior; no refresh rate or frame cap is forced.
+
+Rebuild Wine with the current P3 patch before staging. `stage-runtime.py` requires the separate `macdrv_query_d3dmetal_display` export in `winemac.so` and records/verifies that binary's identity. Replacing only the native sidecar in an old runtime is not sufficient. The fixed 192-byte Wine callback table is unchanged.
+
+The fullscreen repair also requires repatching D3DMetal, not just rebuilding the sidecar. Both its direct Windows-ABI vtable thunk and unixcall unpacker now forward the explicit output argument and preserve the native HRESULT. Routing resolves the native output interface instead of calling back through the PE `GetDesc` vtable. The D3D12 regression exercises explicit fullscreen, state/output queries, and windowed return even on a single monitor; baseline and saved/current-refresh split runs passed without changing the physical display mode.
+
+The isolated D3D12 regression reproduced CURRENT=120 Hz / saved=60 Hz: the old swapchain reported 60 Hz; the corrected one reported 120 Hz and requested an 8.333 ms minimum Present duration instead of 16.667 ms. SyncInterval 0 requested no minimum; an explicit 30 FPS cap still requested 33.333 ms. GPU pixel readback passed. The paired format-12 runtime additionally passed real Wine movement and explicit fullscreen between reported 60/120 Hz outputs, plus a CURRENT=60 Hz / saved=50 Hz split with Metal API/GPU validation. This is not a game-FPS improvement claim.
+
+Window surface arrays own their references explicitly, without CFArray release callbacks. Removing an entry transfers its reference; individual release and window-destruction draining happen after unlocking `win_data_mutex`, avoiding the reverse acquisition of `surfaces_lock`. The focused regression covers opposing lock acquisitions and reference balance through view-creation failure and window destruction. A real D3D12 smoke completed 128 swapchain lifetimes with 128 concurrent window resizes, verified GPU pixels, and released a retained view after destroying its window. That earlier lock-lifetime smoke used a separate queue per surface.
+
+Patch format 12 also scopes drawable residency registration to the final Metal4 commit/signal/present operations in `DoPresent`, then removes only that registration; existing D3DMetal resource owners and baseline queue registrations remain unchanged. A pinned real-Wine probe passed 132 Present lifetimes plus four no-Present controls on one queue with 136 valid pixel readbacks. All 132 late presentation callbacks still exposed the original layer/residency set and a live drawable texture after registration removal. This fixes queue-registration accumulation, not a measured game-FPS or memory improvement, and requires a matching repatched D3DMetal/sidecar pair. The permanent same-queue regression also passed 128 swapchain lifetimes with resize coverage and 256 valid pixel readbacks under Metal API/GPU validation.
+
 ### Focused checks
 
 ```bash
 python3 scripts/test-metalfx-native.py --out <native-evidence>
+python3 scripts/test-metalfx-native.py --suite display-routing --out <display-native-evidence>
+python3 scripts/test-d3dmetal-display-routing.py --runtime <runtime> --out <display-d3d12-evidence>
+python3 scripts/test-d3dmetal-display-routing.py --runtime <runtime> --out <residency-evidence> --case residency
+python3 scripts/test-winemac-surface-locks.py
+python3 scripts/test-msync-waitall.py
 python3 scripts/test-fsr-launch-profile.py
 python3 scripts/test-fsr-translator.py --runtime <runtime> --out <upscaler-evidence>
 python3 scripts/test-fsr-translator.py --frame-generation --command-buffer metal4 \

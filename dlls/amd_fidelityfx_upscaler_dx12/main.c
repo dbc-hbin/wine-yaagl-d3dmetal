@@ -343,17 +343,16 @@ static ffxReturnCode_t query_impl(ffxContext *handle, ffxQueryDescHeader *desc)
     }
 }
 
-static ffxReturnCode_t dispatch_impl(ffxContext *handle, const ffxDispatchDescHeader *desc)
+static ffxReturnCode_t dispatch_impl(struct fsr_context *context, const ffxDispatchDescHeader *desc)
 {
     const struct ffxDispatchDescUpscale *dispatch;
-    struct fsr_context *context;
     struct yaagl_fsr_dispatch_packet packet;
     ffxReturnCode_t result;
     if (!desc) return FFX_API_RETURN_ERROR_PARAMETER;
     if (desc->type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE)
         return (desc->type & FFX_API_EFFECT_MASK) != FFX_API_EFFECT_ID_UPSCALE
             ? FFX_API_RETURN_NO_PROVIDER : FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
-    if (!(context = find_context(handle))) return FFX_API_RETURN_ERROR_PARAMETER;
+    if (!context) return FFX_API_RETURN_ERROR_PARAMETER;
     dispatch = (const struct ffxDispatchDescUpscale *)desc;
     memset(&packet, 0, sizeof(packet));
     packet.header.size = sizeof(packet); packet.header.operation = YAAGL_FSR_DISPATCH; packet.header.context = context->native;
@@ -382,7 +381,6 @@ static ffxReturnCode_t dispatch_impl(ffxContext *handle, const ffxDispatchDescHe
     packet.view_space_to_meters = dispatch->viewSpaceToMetersFactor;
     result = unix_call(&packet);
     if (result != FFX_API_RETURN_OK) report(context, FFX_API_MESSAGE_TYPE_ERROR, L"MetalFX FSR dispatch failed");
-    release_context(context);
     return result;
 }
 
@@ -406,8 +404,8 @@ ffxReturnCode_t WINAPI ffxDispatch(ffxContext *handle, const ffxDispatchDescHead
     BOOL context_known = known_context != NULL;
     ffxReturnCode_t result;
     const char *reason;
+    result = dispatch_impl(known_context, desc);
     if (known_context) release_context(known_context);
-    result = dispatch_impl(handle, desc);
     reason = result == FFX_API_RETURN_OK ? "ok" : "dispatch_rejected";
     if (!desc) reason = "null_descriptor";
     else if (desc->type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE) reason = "unsupported_descriptor";

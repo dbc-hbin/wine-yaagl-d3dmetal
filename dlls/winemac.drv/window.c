@@ -1149,8 +1149,13 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format, B
 {
     struct macdrv_client_surface *surface;
 
-    surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd, pixel_format, raw);
-    surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect));
+    if (!(surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd, pixel_format, raw)))
+        return NULL;
+    if (!(surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect))))
+    {
+        client_surface_release(&surface->client);
+        return NULL;
+    }
     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
 
     if (surface)
@@ -1273,11 +1278,18 @@ void macdrv_DestroyWindow(HWND hwnd)
 
     destroy_cocoa_window(data);
 
-    /* CW HACK 22435 */
-    if (data->d3dmetal_client_surfaces) CFRelease(data->d3dmetal_client_surfaces);
-
     CFDictionaryRemoveValue(win_datas, hwnd);
     release_win_data(data);
+
+    /* The array holds the original client-surface references without CF callbacks.
+     * Release them only after dropping the window lock: detach may reacquire it. */
+    if (data->d3dmetal_client_surfaces)
+    {
+        CFIndex i, count = CFArrayGetCount(data->d3dmetal_client_surfaces);
+        for (i = 0; i < count; i++)
+            client_surface_release((struct client_surface *)CFArrayGetValueAtIndex(data->d3dmetal_client_surfaces, i));
+        CFRelease(data->d3dmetal_client_surfaces);
+    }
     free(data);
 }
 

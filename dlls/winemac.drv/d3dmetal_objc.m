@@ -58,6 +58,7 @@
                 {
                     macdrv_event* event;
                     event = macdrv_create_event(CLIENT_SURFACE_PRESENTED, (WineWindow*)view.window);
+                    macdrv_retain_d3dmetal_client_surface(client_surface);
                     event->client_surface_presented.client_surface = client_surface;
 
                     WineEventQueue *queue = [(WineWindow*)view.window queue];

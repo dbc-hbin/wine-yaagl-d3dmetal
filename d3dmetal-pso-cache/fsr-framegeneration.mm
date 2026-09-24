@@ -280,6 +280,8 @@ struct State {
     bool retired = false;
     // Pending provider selection records its first Prepare before PE replays Configure.
     bool generationEnabled = true;
+    // Protected by executionMutex while encoding; configuration also holds mutex.
+    std::uint64_t generationEpoch = 0;
     bool hasMode = false;
     Mode mode = Mode::Legacy;
     Object metalDevice;
@@ -704,6 +706,7 @@ struct PreparedFrame::Impl {
     Object third;
     yaagl_fsr_fg_dispatch_packet dispatch{};
     bool reset = false;
+    std::uint64_t generationEpoch = 0;
 };
 
 struct ExecutionLease::Impl {
@@ -1064,10 +1067,14 @@ bool PreparedFrame::encode(
                                  (id<MTLBuffer>)colorParameters.get(), colorParams,
                                  execution->objects))
                     return fail("encode_output_scatter");
-                state.history = current;
-                state.historyConfiguration = impl_->snapshot->configuration;
-                state.historyDispatch = impl_->dispatch;
-                state.historyFrame = frame;
+                // A queued command may encode after OFF (or after a subsequent ON).
+                // Its output remains owned by the command, but must not seed new history.
+                if (impl_->generationEpoch == state.generationEpoch && state.generationEnabled) {
+                    state.history = current;
+                    state.historyConfiguration = impl_->snapshot->configuration;
+                    state.historyDispatch = impl_->dispatch;
+                    state.historyFrame = frame;
+                }
                 logFirstEncode(configuration.mode, state.creation.flags,
                                p.render_width, p.render_height,
                                effect.nearPlane, effect.farPlane,
@@ -1157,12 +1164,13 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                 if (state->retired) return finish(Parameter);
                 auto& config = *static_cast<yaagl_fsr_fg_configure_packet*>(arguments);
                 if (config.enabled > 1) return finish(Parameter);
+                std::lock_guard executionLock(state->executionMutex);
                 state->generationEnabled = config.enabled != 0;
                 if (!state->generationEnabled) {
+                    ++state->generationEpoch;
                     state->frames.clear();
+                    state->configurations.clear();
                     state->hasPreparedJitter = false;
-                    // Encode owns history under executionMutex, not the registry lock.
-                    std::lock_guard executionLock(state->executionMutex);
                     state->history = {};
                     state->historyConfiguration.reset();
                 }
@@ -1293,11 +1301,22 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                     return finish(Unsupported);
                 auto depth = (id<MTLTexture>)resources.values[0].texture;
                 auto motion = (id<MTLTexture>)resources.values[1].texture;
+                // The first Prepare selects the provider even before the pending
+                // configuration is replayed. Validate its MetalFX eligibility,
+                // but do not create or record snapshots while generation is off.
+                if (!state->generationEnabled && state->hasMode) return finish(Ok);
                 auto configuration = configure(*state, command, *p, depth,
                     MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid,
                     p->render_width, p->render_height,
                     FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB);
                 if (!configuration) return finish(Unsupported);
+                if (!state->generationEnabled) {
+                    state->configurations.clear();
+                    state->hasMode = true;
+                    state->mode = mode;
+                    state->metalDevice = Object((id)command.value.device);
+                    return finish(Ok);
+                }
                 auto snapshot = std::make_shared<Snapshot>();
                 snapshot->configuration = configuration;
                 snapshot->parameters = *p;
@@ -1333,6 +1352,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                 auto found = state->frames.find(frame);
                 if (found == state->frames.end()) return finish(Parameter);
                 implementation->kind = PreparedFrame::Impl::Kind::Generate;
+                implementation->generationEpoch = state->generationEpoch;
                 implementation->reset = d->reset != 0;
                 implementation->dispatch = *d;
                 addresses = {d->present_color, d->output, d->hudless_color};

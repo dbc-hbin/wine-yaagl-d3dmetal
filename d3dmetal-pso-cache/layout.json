@@ -1,5 +1,5 @@
 {
-  "formatVersion": 10,
+  "formatVersion": 12,
   "source": {
     "sha256": "f8640e6b0974277068821d44bd398dcc0f42cbb730d07f3afad97843e72a6ea3",
     "machUuid": "674e662b6b5c3fd99a8af415609d2f6a",
@@ -20,8 +20,8 @@
   },
   "constructorVerification": {
     "markerOffset": 4904624,
-    "markerHex": "594141474c50534f43414348450a0000",
-    "description": "Version 10 adds the pinned Metal4 queue-commit call gate to the 19-entry PSO/cache and FSR replay dispatch table. The constructor verifies Mach UUID, entry patches, gates, trampolines, dispatch slot ownership, and a null dispatch slot."
+    "markerHex": "594141474c50534f43414348450c0000",
+    "description": "Version 12 scopes DoPresent Metal4 drawable residency registration through its last presentation submission. The constructor verifies Mach UUID, entry patches, gates, trampolines, dispatch slot ownership, and a null dispatch slot."
   },
   "textCave": {
     "offset": 4904624,
@@ -40,9 +40,27 @@
     "commonSectionNewSize": 17376,
     "commonSectionOldEndVMAddr": 5407136,
     "segmentEndVMAddr": 5410816,
-    "description": "The patch claims the first eight zero-fill bytes after __common by extending that section; the constructor atomically publishes one pointer to its immutable 19-entry dispatch table."
+    "description": "The patch claims the first eight zero-fill bytes after __common by extending that section; the constructor atomically publishes one pointer to its immutable 25-entry dispatch table."
   },
   "binaryPatches": [
+    {
+      "id": "ForwardExplicitFullscreenDirectCall",
+      "offset": 1144014,
+      "originalHex": "e82bd2ffff31c0",
+      "patchedHex": "e86d6639009090"
+    },
+    {
+      "id": "ForwardExplicitFullscreenDirectTarget",
+      "offset": 4905792,
+      "originalHex": "0000000000000000",
+      "patchedHex": "4c89c2e9b66bc6ff"
+    },
+    {
+      "id": "ForwardExplicitFullscreenTarget",
+      "offset": 1156316,
+      "originalHex": "534889fb488b3f4883c7f08b7308e80fa2ffffc743180000000031c05bc3",
+      "patchedHex": "534889fb488b3f4883c7f08b7308488b5310e80ba2ffff89431831c05bc3"
+    },
     {
       "id": "CacheFileCloseMunmapCall",
       "offset": 539835,
@@ -68,9 +86,38 @@
     "originalHex": "ff15638f3500",
     "entryPatchHex": "e8ac86350090",
     "gateOffset": 4905584,
-    "gateHex": "48833d28a7070000740e4c8b1d1fa7070041ffa398000000ff259a080000",
+    "gateHex": "48833d28a7070000740e4c8b1d1fa7070041ffa3b0000000ff259a080000",
     "objcMsgSendGotOffset": 4907816,
-    "dispatchFieldOffset": 152
+    "dispatchFieldOffset": 176
+  },
+  "presentHook": {
+    "id": "RefreshDisplayAndFlush",
+    "entryOffset": 1134065,
+    "originalHex": "498b7e28488b07ff5010",
+    "entryPatchHex": "e82a8d39009090909090",
+    "gateOffset": 4905760,
+    "gateHex": "4c8b1d79a607004d85db740a4c89f741ffa3a8000000498b7e28488b07ff6010",
+    "dispatchFieldOffset": 168
+  },
+  "presentResidencyAddHook": {
+    "id": "ScopedMetal4PresentResidencyAdd",
+    "entryOffset": 1399968,
+    "originalHex": "ff1582863500",
+    "entryPatchHex": "e8bb7e350090",
+    "gateOffset": 4905824,
+    "gateHex": "48833d38a6070000740e4c8b1d2fa6070041ffa3b8000000ff25aa070000",
+    "objcMsgSendGotOffset": 4907816,
+    "dispatchFieldOffset": 184
+  },
+  "presentResidencyFinishHook": {
+    "id": "ScopedMetal4PresentResidencyFinish",
+    "entryOffset": 1400903,
+    "originalHex": "498bbe90000000",
+    "entryPatchHex": "e9347b35009090",
+    "gateOffset": 4905856,
+    "gateHex": "4c8b1d19a607004d85db740741ff93c0000000498bbe90000000e9af84caff",
+    "continuationOffset": 1400910,
+    "dispatchFieldOffset": 192
   },
   "verificationSpans": [
     {
@@ -352,6 +399,30 @@
       "gateHex": "48833d68a707000074164c8b1d5fa7070041ffa390000000",
       "trampolineHex": "5541574156e90021c8ff",
       "dispatchFieldOffset": 144
+    },
+    {
+      "id": "GetContainingOutput",
+      "entryOffset": 1133508,
+      "gateOffset": 4905632,
+      "trampolineOffset": 4905664,
+      "continuationOffset": 1133514,
+      "originalHex": "415741564154",
+      "entryPatchHex": "e9d78e390090",
+      "gateHex": "48833df8a607000074164c8b1defa6070041ffa398000000",
+      "trampolineHex": "415741564154e9ff70c6ff",
+      "dispatchFieldOffset": 152
+    },
+    {
+      "id": "SetFullscreenState",
+      "entryOffset": 1132286,
+      "gateOffset": 4905696,
+      "trampolineOffset": 4905728,
+      "continuationOffset": 1132297,
+      "originalHex": "554156534881ec90000000",
+      "entryPatchHex": "e9dd933900909090909090",
+      "gateHex": "48833db8a607000074164c8b1dafa6070041ffa3a0000000",
+      "trampolineHex": "554156534881ec90000000e9f96bc6ff",
+      "dispatchFieldOffset": 160
     }
   ]
 }

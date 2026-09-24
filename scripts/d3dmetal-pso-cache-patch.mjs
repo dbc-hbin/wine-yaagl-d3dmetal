@@ -15,21 +15,19 @@ const layoutText = await readFile(
 );
 const layoutSha256 = createHash("sha256").update(layoutText).digest("hex");
 const expectedLayoutSha256 =
-  "9683fca4551df706f10212a1b6a8e88ff9eeb304ff720a0c20ae5135d5b38f9c";
+  "57530b6583ea2defdc66278bd3ba3fcb3255a6a24707d32648221f0c7086d708";
 if (layoutSha256 !== expectedLayoutSha256) {
   throw new Error(
     `layout corruption: expected SHA-256 ${expectedLayoutSha256}, got ${layoutSha256}`
   );
 }
 const layout = JSON.parse(layoutText);
-if (layout.formatVersion !== 10) {
+if (layout.formatVersion !== 12) {
   throw new Error(`unsupported layout format ${layout.formatVersion}`);
 }
 
-export const D3DMETAL_PSO_CACHE_PATCHED_SHA256 =
-  "b9f5985c8f668023e04b3638fd2cacce60a9ff33b07aeb86f0544ac81e827f58";
 export const D3DMETAL_PSO_CACHE_PATCHED_PAYLOAD_SHA256 =
-  "02b61d8d91b9c6188f89571fd67badcc819b040b87b06c9ad659863037729114";
+  "a8141053ac925657edbf792636139933f4b4726092ae2d74358a3d26c3529528";
 
 const LC_SEGMENT_64 = 0x19;
 const LC_UUID = 0x1b;
@@ -346,6 +344,32 @@ const patchSites = [
       patched: Buffer.from(hook.trampolineHex, "hex"),
     },
   ]),
+  {
+    name: `${layout.presentHook.id}-entry`,
+    offset: layout.presentHook.entryOffset,
+    expectedOriginal: Buffer.from(layout.presentHook.originalHex, "hex"),
+    patched: Buffer.from(layout.presentHook.entryPatchHex, "hex"),
+  },
+  {
+    name: `${layout.presentHook.id}-gate`,
+    offset: layout.presentHook.gateOffset,
+    expectedOriginal: Buffer.alloc(Buffer.from(layout.presentHook.gateHex, "hex").length),
+    patched: Buffer.from(layout.presentHook.gateHex, "hex"),
+  },
+  ...[layout.presentResidencyAddHook, layout.presentResidencyFinishHook].flatMap(hook => [
+    {
+      name: `${hook.id}-entry`,
+      offset: hook.entryOffset,
+      expectedOriginal: Buffer.from(hook.originalHex, "hex"),
+      patched: Buffer.from(hook.entryPatchHex, "hex"),
+    },
+    {
+      name: `${hook.id}-gate`,
+      offset: hook.gateOffset,
+      expectedOriginal: Buffer.alloc(Buffer.from(hook.gateHex, "hex").length),
+      patched: Buffer.from(hook.gateHex, "hex"),
+    },
+  ]),
 ];
 
 for (const site of patchSites) {
@@ -391,15 +415,84 @@ if (originalCall.length !== 6 || originalCall[0] !== 0xff || originalCall[1] !==
     patchedCall.length !== 6 || patchedCall[0] !== 0xe8 || patchedCall[5] !== 0x90 ||
     commit.entryOffset + 5 + patchedCall.readInt32LE(1) !== commit.gateOffset ||
     commitGate.length !== 30 || commitGate[8] !== 0x74 || commitGate[9] !== 14 ||
-    commitGate.subarray(17, 24).toString("hex") !== "41ffa398000000" ||
+    commitGate.subarray(17, 20).toString("hex") !== "41ffa3" ||
+    commitGate.readUInt32LE(20) !== commit.dispatchFieldOffset ||
     commitGate[24] !== 0xff || commitGate[25] !== 0x25 ||
     commit.gateOffset + 8 + commitGate.readInt32LE(3) !== layout.dispatch.dataSlotVMAddr ||
     commit.gateOffset + 17 + commitGate.readInt32LE(13) !== layout.dispatch.dataSlotVMAddr ||
     commit.gateOffset + 30 + commitGate.readInt32LE(26) !== commit.objcMsgSendGotOffset ||
     commit.gateOffset < layout.constructorVerification.markerOffset ||
     commit.gateOffset + commitGate.length > layout.textCave.endOffset ||
-    commit.dispatchFieldOffset !== layout.hooks.length * 8) {
+    commit.dispatchFieldOffset !== (layout.hooks.length + 1) * 8) {
   throw new Error("layout corruption: invalid Metal4 commit call gate");
+}
+
+// This call executes inside Present1's existing lock. The unpublished gate
+// tail-calls the original queue flush, retaining its calling convention.
+const present = layout.presentHook;
+const presentCall = Buffer.from(present.entryPatchHex, "hex");
+const presentGate = Buffer.from(present.gateHex, "hex");
+if (present.originalHex !== "498b7e28488b07ff5010" ||
+    presentCall.length !== 10 || presentCall[0] !== 0xe8 ||
+    presentCall.subarray(5).some(byte => byte !== 0x90) ||
+    present.entryOffset + 5 + presentCall.readInt32LE(1) !== present.gateOffset ||
+    presentGate.length !== 32 ||
+    presentGate.subarray(0, 3).toString("hex") !== "4c8b1d" ||
+    present.gateOffset + 7 + presentGate.readInt32LE(3) !== layout.dispatch.dataSlotVMAddr ||
+    presentGate.subarray(7, 18).toString("hex") !== "4d85db740a4c89f741ffa3" ||
+    presentGate.readUInt32LE(18) !== present.dispatchFieldOffset ||
+    presentGate.subarray(22).toString("hex") !== "498b7e28488b07ff6010" ||
+    present.gateOffset < layout.constructorVerification.markerOffset ||
+    present.gateOffset + presentGate.length > layout.textCave.endOffset ||
+    present.dispatchFieldOffset !== layout.hooks.length * 8) {
+  throw new Error("layout corruption: invalid Present refresh call gate");
+}
+
+// This one call is the drawable layer's registration in Metal4 DoPresent.
+// An unpublished dispatch slot must still tail-call the original objc_msgSend.
+const residencyAdd = layout.presentResidencyAddHook;
+const residencyOriginalCall = Buffer.from(residencyAdd.originalHex, "hex");
+const residencyAddEntry = Buffer.from(residencyAdd.entryPatchHex, "hex");
+const residencyAddGate = Buffer.from(residencyAdd.gateHex, "hex");
+if (residencyOriginalCall.length !== 6 ||
+    residencyOriginalCall.subarray(0, 2).toString("hex") !== "ff15" ||
+    residencyAdd.entryOffset + 6 + residencyOriginalCall.readInt32LE(2) !== residencyAdd.objcMsgSendGotOffset ||
+    residencyAddEntry.length !== 6 || residencyAddEntry[0] !== 0xe8 || residencyAddEntry[5] !== 0x90 ||
+    residencyAdd.entryOffset + 5 + residencyAddEntry.readInt32LE(1) !== residencyAdd.gateOffset ||
+    residencyAddGate.length !== 30 || residencyAddGate[8] !== 0x74 || residencyAddGate[9] !== 14 ||
+    residencyAddGate.subarray(17, 20).toString("hex") !== "41ffa3" ||
+    residencyAddGate.readUInt32LE(20) !== residencyAdd.dispatchFieldOffset ||
+    residencyAddGate.subarray(24, 26).toString("hex") !== "ff25" ||
+    residencyAdd.gateOffset + 8 + residencyAddGate.readInt32LE(3) !== layout.dispatch.dataSlotVMAddr ||
+    residencyAdd.gateOffset + 17 + residencyAddGate.readInt32LE(13) !== layout.dispatch.dataSlotVMAddr ||
+    residencyAdd.gateOffset + 30 + residencyAddGate.readInt32LE(26) !== residencyAdd.objcMsgSendGotOffset ||
+    residencyAdd.gateOffset < layout.constructorVerification.markerOffset ||
+    residencyAdd.gateOffset + residencyAddGate.length > layout.textCave.endOffset ||
+    residencyAdd.dispatchFieldOffset !== (layout.hooks.length + 2) * 8) {
+  throw new Error("layout corruption: invalid Metal4 Present residency registration gate");
+}
+
+// All normal Metal4 DoPresent presentation paths converge here after their
+// final present call (and, where required, the final command-queue commit).
+const residencyFinish = layout.presentResidencyFinishHook;
+const residencyFinishEntry = Buffer.from(residencyFinish.entryPatchHex, "hex");
+const residencyFinishGate = Buffer.from(residencyFinish.gateHex, "hex");
+if (residencyFinish.originalHex !== "498bbe90000000" ||
+    residencyFinishEntry.length !== 7 || residencyFinishEntry[0] !== 0xe9 ||
+    residencyFinishEntry.subarray(5).toString("hex") !== "9090" ||
+    residencyFinish.entryOffset + 5 + residencyFinishEntry.readInt32LE(1) !== residencyFinish.gateOffset ||
+    residencyFinishGate.length !== 31 ||
+    residencyFinishGate.subarray(0, 3).toString("hex") !== "4c8b1d" ||
+    residencyFinish.gateOffset + 7 + residencyFinishGate.readInt32LE(3) !== layout.dispatch.dataSlotVMAddr ||
+    residencyFinishGate.subarray(7, 15).toString("hex") !== "4d85db740741ff93" ||
+    residencyFinishGate.readUInt32LE(15) !== residencyFinish.dispatchFieldOffset ||
+    residencyFinishGate.subarray(19, 27).toString("hex") !== "498bbe90000000e9" ||
+    residencyFinish.continuationOffset !== residencyFinish.entryOffset + 7 ||
+    residencyFinish.gateOffset + 31 + residencyFinishGate.readInt32LE(27) !== residencyFinish.continuationOffset ||
+    residencyFinish.gateOffset < layout.constructorVerification.markerOffset ||
+    residencyFinish.gateOffset + residencyFinishGate.length > layout.textCave.endOffset ||
+    residencyFinish.dispatchFieldOffset !== (layout.hooks.length + 3) * 8) {
+  throw new Error("layout corruption: invalid Metal4 Present residency retirement gate");
 }
 
 export const D3DMETAL_PSO_CACHE_PATCH_SITES = patchSites;
@@ -482,7 +575,7 @@ export function inspectD3DMetalPsoCachePatch(bytes) {
     !layoutError &&
     allPatched &&
     patchedHeader &&
-    hash === D3DMETAL_PSO_CACHE_PATCHED_SHA256 &&
+    payloadHash === D3DMETAL_PSO_CACHE_PATCHED_PAYLOAD_SHA256 &&
     reconstructedStageInspection?.mode === "patched"
   ) {
     mode = "patched";

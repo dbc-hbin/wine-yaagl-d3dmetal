@@ -600,6 +600,8 @@ extern void macdrv_clear_ime_text(void);
 
 /* CW HACK 22435 */
 extern void macdrv_client_surface_presented(const macdrv_event *event);
+extern void macdrv_retain_d3dmetal_client_surface(void *surface);
+extern void macdrv_release_d3dmetal_client_surface(void *surface);
 extern void *macdrv_get_view_d3dmetal_client_surface(macdrv_view v);
 void macdrv_set_view_d3dmetal_client_surface(macdrv_view v, void *client_surface);
 

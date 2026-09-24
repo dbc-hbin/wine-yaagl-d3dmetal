@@ -23,7 +23,7 @@
         "include (msync headers)"
       ],
       "status": "present",
-      "sha256": "794e8f0e2527e774d94da3a7fca70866249869f5eb199cc511e8fe2e6d0ea620"
+      "sha256": "e3ce26decb7b1460e2bdaf5cd0203c304483bd750efc0776e7fc3630ee65c296"
     },
     {
       "file": "0002-d3dmetal-bridge.patch",
@@ -32,12 +32,13 @@
         "dlls/winemac.drv",
         "dlls/win32u (CX_ACTIVE_GRAPHICS_BACKEND / d3dkmt / vulkan / shm 23950)",
         "include/ntuser.h",
+        "include/yaagl_d3dmetal_display.h",
         "include/wine/gdi_driver.h",
         "macdrv_functions_t ABI 192",
         "d3dmetal_macdrv_win_data ABI 120"
       ],
       "status": "present",
-      "sha256": "2c52c4989422b8d133b28a5fa7d18f9a536e58d5467d600a1c7995731114f93a"
+      "sha256": "b2921b5b297a920b929f28ff26f0ea6a88eabcfb6e0a431da3b13e42ee42fa12"
     },
     {
       "file": "0003-zzz-compatibility.patch",

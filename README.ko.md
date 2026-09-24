@@ -47,6 +47,8 @@ CLI에서는 글로벌 베타에 `--app-path "/Applications/Yaagl ZZZ OS DX12 Be
 - Native AA와 Quality, Balanced, Performance, Ultra Performance 모드는 게임/provider가 명시적으로 선택합니다. 번역기가 임의로 품질 모드를 선택하지 않습니다. 요청이 MetalFX 최대 temporal 배율을 넘으면 MetalFX 출력을 하나의 균일 배율로 제한해 caller의 출력 텍스처 가운데에 배치하고 주변 texel은 보존합니다.
 - 명시적인 OFF 선택은 게임 설정을 그대로 따릅니다. 런타임이 업스케일링이나 프레임 생성을 자동으로 켜지 않습니다.
 - 새로 staging한 런타임은 출력 크기가 반복 변경될 때 FSR context당 비활성 temporal scaler를 최대 3개 보유합니다. 이전 크기로 돌아가면 temporal history를 reset합니다. 처음 보는 크기는 여전히 scaler를 생성하므로 MetalFX/driver가 계상하는 메모리가 증가할 수 있습니다.
+- 미배포 소스는 완료된 SR 작업의 descriptor가 일치하는 임시 텍스처와 상수 버퍼를 dispatch 사이에 재사용합니다. MetalFX feature당 비활성 텍스처는 최대 128 MiB를 보유하며 caller별 residency·argument table은 매 프레임 다시 만듭니다. 할당 횟수를 줄이는 대신 제한된 메모리를 보유하는 방식이며 FPS 개선을 입증한 것은 아닙니다. 기존 배포 archive에는 포함되지 않습니다.
+- 미배포 SR은 MetalFX feature당 descriptor가 호환되는 reactive mask 유무별 scaler를 최대 2개 보유합니다. 이전 variant로 돌아갈 때 history를 reset하며 format·layout·입력 수용 크기가 바뀌면 호환되지 않는 variant를 제거하되 진행 중인 frame과 lease가 필요한 리소스를 계속 소유합니다. ARM64 Metal4에서 mask 교대·composition mask·입력 크기 증가·출력 readback 검사를 통과했으며 실제 게임 FPS 개선을 측정한 것은 아닙니다.
 - 모든 Mac에서 시스템 기본 MetalFX temporal 모델을 사용합니다. 하드웨어 이름 추정, BBR 강제 정책 또는 비공개 모델 버전 override는 없습니다.
 - FSR exposure, reactive/composition mask, transfer function, sharpening, reset, jitter, motion-vector scale 및 활성 입출력 범위를 명시적으로 번역합니다. 잘못되거나 지원하지 않는 계약은 성공 no-op으로 처리하지 않고 오류를 반환합니다.
 
@@ -154,6 +156,8 @@ v1.0.3은 설치 프로그램만 변경했고 macOS 26 Wine 아카이브와 tuni
 5. **Cursor ownership과 RawInput 분리** — ownership synchronization과 pointer coordinate를 분리하고 보정한 motion delta를 별도로 전달합니다.
 6. **Media·audio·window·resource tuning** — 저장소의 GStreamer, Media Foundation, CoreAudio, window 및 network patch를 유지합니다.
 
+미배포 MSync는 abandoned mutex의 `WaitAll` 무한 재시도와 획득 실패 시 rollback을 수정합니다. 이미 소유한 재귀 mutex의 소유권과 abandoned 상태를 보존하고, 이번 시도에서 획득했다가 돌려놓은 객체의 waiter를 깨웁니다. 등록 대기의 128회 spin 한도는 변경하지 않았습니다. 결정적 경쟁 검사로 rollback과 실제 pthread waiter의 깨우기를 확인했으며 격리 Wine API 실행에서 abandoned 반환값·유한 재귀 timeout/소유권·한 번만 소비되는 동작을 확인했습니다. 두 결함은 공식 CrossOver 26.3.0 FOSS 원본(Wine 11.0)에도 존재하며, 상용 CrossOver 바이너리를 실행해 확인한 것은 아닙니다.
+
 ## 저장소 구조
 
 ```text
@@ -215,6 +219,7 @@ v1.1.1은 v1.1.0 런타임을 그대로 다시 게시하며 `ZZZWineDX12Installe
 ```bash
 # 현재 소스로 staging할 출력 경로와 검증된 빌드 입력을 지정합니다.
 WINE_ROOT=/absolute/path/to/current-stage/wine
+WINE_SOURCE=/absolute/path/to/current-P3-runtime/wine
 PATCHED_D3DMETAL=/absolute/path/to/patched-D3DMetal
 NATIVE_BUILD=/absolute/path/to/native-build
 OUTPUT_DIR=/absolute/path/to/split-output
@@ -224,8 +229,8 @@ OUTPUT_DIR=/absolute/path/to/split-output
   trap 'rm -rf -- "$base_tmp"' EXIT
   tar -xJf build/release-v1.1.0/v1.0.5-original-runtime.tar.xz -C "$base_tmp"
 
-  # 구 full v1.1.0 아카이브가 아니라 추출한 v1.0.5 baseline에서 staging합니다.
-  python3 scripts/stage-runtime.py --wine-source "$base_tmp/wine" --wine-dest "$WINE_ROOT" \
+  # 현재 staging에는 새 Wine display bridge가 필요합니다. 구 아카이브만으로는 부족합니다.
+  python3 scripts/stage-runtime.py --wine-source "$WINE_SOURCE" --wine-dest "$WINE_ROOT" \
     --patched-d3dmetal "$PATCHED_D3DMETAL" --build-dir "$NATIVE_BUILD" --play --fsr-translator
 
   # 최종 staging byte에 맞게 상속된 P3 metadata를 갱신합니다.
@@ -241,10 +246,29 @@ OUTPUT_DIR=/absolute/path/to/split-output
 
 정확한 아카이브 hash는 상위 릴리스 노트에 기록하며 이 문서에서는 주장하지 않습니다.
 
+### 출력 모니터와 현재 주사율 선택
+
+Native patch format 12는 adapter output 0 대신 swapchain HWND가 속한 출력을 선택합니다. 창 모드는 모니터 이동을 따라가며, 명시적 전체화면 대상은 창 모드로 돌아올 때까지 우선합니다. 출력을 바꿀 때 swapchain 등록과 참조 소유권도 함께 이전합니다. Present 간격 계산 전 Wine bridge에서 저장된 registry mode가 아닌 `ENUM_CURRENT_SETTINGS`를 조회합니다. `SyncInterval=0`과 명시적 `D3DM_MAX_FPS` 동작은 유지하며, 특정 주사율이나 프레임 제한을 강제하지 않습니다.
+
+현재 P3 patch로 Wine을 다시 빌드한 뒤 staging해야 합니다. `stage-runtime.py`는 `winemac.so`의 별도 `macdrv_query_d3dmetal_display` export를 요구하고 해당 바이너리의 identity를 기록·검증합니다. 구 런타임의 native sidecar만 교체해서는 충분하지 않습니다. 기존 192바이트 Wine callback table은 변경하지 않았습니다.
+
+전체화면 수정에는 sidecar 재빌드뿐 아니라 D3DMetal 재패치도 필요합니다. 직접 Windows ABI로 호출되는 vtable thunk와 unixcall unpacker 모두 명시적 출력 인자를 전달하고 native HRESULT를 보존하도록 고쳤습니다. 출력 선택은 PE `GetDesc` vtable을 다시 호출하는 대신 native 출력 인터페이스를 사용합니다. D3D12 회귀 검사는 모니터 한 대에서도 명시적 전체화면 진입, 상태·출력 조회, 창 모드 복귀를 실행합니다. 기본 실행과 저장값·현재 주사율을 다르게 설정한 실행 모두 실제 디스플레이 모드를 바꾸지 않고 통과했습니다.
+
+격리 D3D12 회귀 검사에서 CURRENT=120Hz / 저장값=60Hz를 재현했습니다. 구 swapchain은 60Hz를 보고했지만 수정본은 120Hz를 보고했고, Present 최소 간격은 16.667ms에서 8.333ms로 바뀌었습니다. SyncInterval 0은 최소 간격을 요청하지 않았으며, 명시적 30FPS 제한은 33.333ms를 유지했습니다. GPU 픽셀 readback도 통과했습니다. 짝을 맞춘 format-12 런타임은 실제 Wine에서 보고된 60/120Hz 두 출력 간 이동·명시적 전체화면 전환과 CURRENT=60Hz / 저장값=50Hz 구분을 Metal API/GPU validation을 켠 상태로 통과했습니다. 게임 FPS 개선을 확인했다는 뜻은 아닙니다.
+
+창의 surface 배열은 CFArray release callback 없이 참조를 명시적으로 소유합니다. 항목 제거는 참조 소유권을 이전하며, 개별 참조 해제와 창 파괴 시 배열의 참조 해제는 `win_data_mutex`를 푼 뒤 수행해 `surfaces_lock`의 역순 획득을 피합니다. 전용 회귀 검사는 반대 방향의 잠금 획득과 view 생성 실패·창 파괴 시 참조 균형을 검증합니다. 실제 D3D12 smoke에서는 swapchain 수명 128회와 동시 창 크기 변경 128회, GPU 픽셀, 창을 먼저 파괴한 뒤 남은 view를 해제하는 경로를 확인했습니다. 앞선 잠금 수명 검사는 surface마다 별도 queue를 사용했습니다.
+
+Patch format 12는 `DoPresent`의 마지막 Metal4 commit·signal·present까지 drawable residency를 등록하고 해당 등록만 제거합니다. 기존 D3DMetal 리소스 소유권과 queue의 기본 등록은 유지합니다. 고정된 바이너리의 실제 Wine 검사에서 단일 queue로 Present 수명 132회와 Present 없는 대조 4회를 수행하고 GPU 픽셀 136회를 확인했습니다. 등록을 제거한 뒤 실행된 실제 presentation callback 132회 모두 원래 layer·residency set과 살아 있는 drawable texture를 참조했습니다. queue 등록 누적을 고친 것이며 게임 FPS·메모리 개선을 측정한 것은 아닙니다. 다시 패치한 D3DMetal과 짝이 맞는 sidecar가 필요합니다. 영구 단일-queue 회귀 검사도 Metal API/GPU validation을 켠 상태로 크기 변경을 포함한 swapchain 수명 128회와 유효한 GPU 픽셀 readback 256회를 통과했습니다.
+
 ### 범위가 제한된 검사
 
 ```bash
 python3 scripts/test-metalfx-native.py --out <native-evidence>
+python3 scripts/test-metalfx-native.py --suite display-routing --out <display-native-evidence>
+python3 scripts/test-d3dmetal-display-routing.py --runtime <runtime> --out <display-d3d12-evidence>
+python3 scripts/test-d3dmetal-display-routing.py --runtime <runtime> --out <residency-evidence> --case residency
+python3 scripts/test-winemac-surface-locks.py
+python3 scripts/test-msync-waitall.py
 python3 scripts/test-fsr-launch-profile.py
 python3 scripts/test-fsr-translator.py --runtime <runtime> --out <upscaler-evidence>
 python3 scripts/test-fsr-translator.py --frame-generation --command-buffer metal4 \

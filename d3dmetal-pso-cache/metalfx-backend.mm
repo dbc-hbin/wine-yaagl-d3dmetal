@@ -6,10 +6,12 @@
 #import <MetalFX/MetalFX.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -175,39 +177,26 @@ kernel void yaagl_metalfx_exposure_r_to_r16(
 
 id<MTLComputePipelineState> makePipeline(id<MTLDevice> device, const char* sourceText,
                                                  NSString* functionName) noexcept {
+    id<MTLLibrary> library = nil;
+    id<MTLFunction> function = nil;
     @try {
         NSError* error = nil;
         NSString* source = [NSString stringWithUTF8String:sourceText];
-        id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+        library = [device newLibraryWithSource:source options:nil error:&error];
         if (!library) return nil;
-        id<MTLFunction> function = [library newFunctionWithName:functionName];
-        [library release];
+        function = [library newFunctionWithName:functionName];
         if (!function) return nil;
-        id<MTLComputePipelineState> pipeline =
-            [device newComputePipelineStateWithFunction:function error:&error];
-        [function release];
-        return pipeline;
+        return [device newComputePipelineStateWithFunction:function error:&error];
     } @catch (id) {
         return nil;
+    } @finally {
+        [function release];
+        [library release];
     }
 }
 
 id<MTLComputePipelineState> makeExposurePipeline(id<MTLDevice> device) noexcept {
-    @try {
-        NSError* error = nil;
-        NSString* source = [NSString stringWithUTF8String:kExposureKernel];
-        id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
-        if (!library) return nil;
-        id<MTLFunction> function = [library newFunctionWithName:@"yaagl_metalfx_exposure_r_to_r16"];
-        [library release];
-        if (!function) return nil;
-        id<MTLComputePipelineState> pipeline =
-            [device newComputePipelineStateWithFunction:function error:&error];
-        [function release];
-        return pipeline;
-    } @catch (id) {
-        return nil;
-    }
+    return makePipeline(device, kExposureKernel, @"yaagl_metalfx_exposure_r_to_r16");
 }
 
 bool isSrgbFormat(MTLPixelFormat format) noexcept {
@@ -227,6 +216,7 @@ id<MTLTexture> makeScratchTexture(id<MTLDevice> device, id<MTLTexture> source,
                                    MTLPixelFormat format, MTLTextureUsage usage,
                                    NSString* suffix, NSUInteger width = 0,
                                    NSUInteger height = 0) noexcept {
+    id<MTLTexture> texture = nil;
     @try {
         MTLTextureDescriptor* descriptor =
             [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
@@ -236,22 +226,17 @@ id<MTLTexture> makeScratchTexture(id<MTLDevice> device, id<MTLTexture> source,
         descriptor.storageMode = MTLStorageModePrivate;
         descriptor.hazardTrackingMode = MTLHazardTrackingModeTracked;
         descriptor.usage = usage;
-        id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+        texture = [device newTextureWithDescriptor:descriptor];
         if (texture && source.label) texture.label = [source.label stringByAppendingString:suffix];
         return texture;
     } @catch (id) {
+        [texture release];
         return nil;
     }
 }
 
-id<MTLTexture> makeMaskTexture(id<MTLDevice> device, id<MTLTexture> source,
-                               NSUInteger width, NSUInteger height) noexcept {
-    return makeScratchTexture(device, source, MTLPixelFormatR8Unorm,
-                              MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
-                              @".YAAGL.FSR.CombinedMask", width, height);
-}
-
 id<MTLTexture> makeExposureR16(id<MTLDevice> device) noexcept {
+    id<MTLTexture> texture = nil;
     @try {
         MTLTextureDescriptor* descriptor =
             [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float
@@ -261,54 +246,82 @@ id<MTLTexture> makeExposureR16(id<MTLDevice> device) noexcept {
         descriptor.storageMode = MTLStorageModePrivate;
         descriptor.hazardTrackingMode = MTLHazardTrackingModeTracked;
         descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-        id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+        texture = [device newTextureWithDescriptor:descriptor];
         if (texture) texture.label = @"YAAGL MetalFX exposure R16F";
         return texture;
     } @catch (id) {
+        [texture release];
         return nil;
     }
 }
 
-id makeResidencySet(id<MTLDevice> device, const TextureSet& textures,
-                    id<MTLTexture> outputTexture, id<MTLTexture> convertedExposure,
-                    id<MTLTexture> linearColor, id<MTLTexture> combinedMask,
-                    id<MTLTexture> stagedColor, id<MTLTexture> stagedDepth,
-                    id<MTLTexture> stagedMotion, id<MTLTexture> stagedReactive,
-                    id<MTLBuffer> linearizeParams, id<MTLBuffer> maskParams,
-                    id<MTLBuffer> finishParams) noexcept {
-    if (@available(macOS 15.0, *)) {
-        @try {
-            MTLResidencySetDescriptor* descriptor = [MTLResidencySetDescriptor new];
-            descriptor.initialCapacity = 18;
-            descriptor.label = @"YAAGL MetalFX execution";
-            NSError* error = nil;
-            id<MTLResidencySet> residency =
-                [device newResidencySetWithDescriptor:descriptor error:&error];
-            [descriptor release];
-            if (!residency) return nil;
+using ResidencyBindings = std::array<id, 18>;
 
-            id<MTLAllocation> candidates[] = {
-                asTexture(textures.color), asTexture(textures.depth), asTexture(textures.motion),
-                asTexture(textures.output), asTexture(textures.exposure), asTexture(textures.reactive),
-                asTexture(textures.composition), outputTexture, convertedExposure, linearColor,
-                combinedMask, stagedColor, stagedDepth, stagedMotion, stagedReactive,
-                linearizeParams, maskParams, finishParams,
-            };
+ResidencyBindings residencyBindings(const TextureSet& textures,
+                                    id<MTLTexture> outputTexture, id<MTLTexture> convertedExposure,
+                                    id<MTLTexture> linearColor, id<MTLTexture> combinedMask,
+                                    id<MTLTexture> stagedColor, id<MTLTexture> stagedDepth,
+                                    id<MTLTexture> stagedMotion, id<MTLTexture> stagedReactive,
+                                    id<MTLBuffer> linearizeParams, id<MTLBuffer> maskParams,
+                                    id<MTLBuffer> finishParams) noexcept {
+    return {{
+        asTexture(textures.color), asTexture(textures.depth), asTexture(textures.motion),
+        asTexture(textures.output), asTexture(textures.exposure), asTexture(textures.reactive),
+        asTexture(textures.composition), outputTexture, convertedExposure, linearColor,
+        combinedMask, stagedColor, stagedDepth, stagedMotion, stagedReactive,
+        linearizeParams, maskParams, finishParams,
+    }};
+}
+
+// The caller owns an already-empty reusable set, or receives a newly created one.
+// On any binding failure the set is dropped, never returned with partial bindings.
+id makeResidencySet(id<MTLDevice> device, const ResidencyBindings& candidates,
+                    id residency = nil) noexcept {
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor* descriptor = nil;
+        @try {
+            if (!residency) {
+                descriptor = [MTLResidencySetDescriptor new];
+                descriptor.initialCapacity = 18;
+                descriptor.label = @"YAAGL MetalFX execution";
+                NSError* error = nil;
+                residency = [device newResidencySetWithDescriptor:descriptor error:&error];
+                if (!residency) return nil;
+            }
             for (std::size_t i = 0; i != std::size(candidates); ++i) {
-                id<MTLAllocation> candidate = candidates[i];
+                id candidate = candidates[i];
                 if (!candidate) continue;
                 bool duplicate = false;
                 for (std::size_t j = 0; j != i; ++j)
                     if (candidates[j] == candidate) duplicate = true;
-                if (!duplicate) [residency addAllocation:candidate];
+                if (!duplicate)
+                    [residency addAllocation:reinterpret_cast<id<MTLAllocation>>(candidate)];
             }
             [residency commit];
             return residency;
         } @catch (id) {
+            [residency release];
             return nil;
+        } @finally {
+            [descriptor release];
         }
     }
+    [residency release];
     return nil;
+}
+
+bool emptyResidencySet(id& set) noexcept {
+    if (@available(macOS 15.0, *)) {
+        @try {
+            id<MTLResidencySet> residency = reinterpret_cast<id<MTLResidencySet>>(set);
+            [residency removeAllAllocations];
+            [residency commit];
+            return true;
+        } @catch (id) {
+            releaseObject(set);
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -341,33 +354,24 @@ struct ScalerGeneration {
     }
 };
 
-struct Feature::Impl {
-    CreateInfo create{};
-    CommandMode commandMode = CommandMode::Metal4;
-    id<MTLDevice> device = nil;
-    id compiler = nil;
-    id<MTLComputePipelineState> exposurePipeline = nil;
-    id<MTLComputePipelineState> linearizePipeline = nil;
-    id<MTLComputePipelineState> combineMaskPipeline = nil;
-    id<MTLComputePipelineState> finishPipeline = nil;
-    float minScale = 1.0f;
-    float maxScale = 1.0f;
-    std::shared_ptr<ScalerGeneration> currentGeneration;
-    std::mutex mutex;
-
-    ~Impl() {
-        currentGeneration.reset();
-        releaseObject(finishPipeline);
-        releaseObject(combineMaskPipeline);
-        releaseObject(linearizePipeline);
-        releaseObject(exposurePipeline);
-        releaseObject(compiler);
-        releaseObject(device);
+bool scratchMatches(id<MTLTexture> texture, MTLPixelFormat format,
+                    NSUInteger width, NSUInteger height, MTLTextureUsage usage) noexcept {
+    @try {
+        return texture && texture.pixelFormat == format && texture.width == width &&
+               texture.height == height && texture.usage == usage;
+    } @catch (id) {
+        return false;
     }
-};
+}
 
-struct ExecutionLease::Impl {
-    std::shared_ptr<ScalerGeneration> generation;
+NSUInteger scratchBytes(id<MTLTexture> texture) noexcept {
+    @try { return texture.allocatedSize; }
+    @catch (id) { return 0; }
+}
+
+// A committed set and every allocation it names travel together. Caller textures
+// remain owned by PreparedFrame; only the scratch side is transferred here.
+struct ExecutionResources {
     id<MTLTexture> privateOutput = nil;
     id<MTLTexture> convertedExposure = nil;
     id<MTLTexture> linearColor = nil;
@@ -380,17 +384,8 @@ struct ExecutionLease::Impl {
     id<MTLBuffer> maskParams = nil;
     id<MTLBuffer> finishParams = nil;
     id residency = nil;
-    id argumentTable = nil;
-    id fsrArgumentTable = nil;
-    id<MTLFence> fence = nil;
-    bool effectiveReset = false;
-    bool generationInitialized = false;
-    void* scaler = nullptr;
 
-    ~Impl() {
-        releaseObject(fence);
-        releaseObject(fsrArgumentTable);
-        releaseObject(argumentTable);
+    void release() noexcept {
         releaseObject(residency);
         releaseObject(finishParams);
         releaseObject(maskParams);
@@ -404,10 +399,269 @@ struct ExecutionLease::Impl {
         releaseObject(convertedExposure);
         releaseObject(privateOutput);
     }
+
+    void swap(ExecutionResources& other) noexcept {
+        std::swap(privateOutput, other.privateOutput);
+        std::swap(convertedExposure, other.convertedExposure);
+        std::swap(linearColor, other.linearColor);
+        std::swap(combinedMask, other.combinedMask);
+        std::swap(stagedColor, other.stagedColor);
+        std::swap(stagedDepth, other.stagedDepth);
+        std::swap(stagedMotion, other.stagedMotion);
+        std::swap(stagedReactive, other.stagedReactive);
+        std::swap(linearizeParams, other.linearizeParams);
+        std::swap(maskParams, other.maskParams);
+        std::swap(finishParams, other.finishParams);
+        std::swap(residency, other.residency);
+    }
+};
+
+struct Feature::Impl {
+    CreateInfo create{};
+    CommandMode commandMode = CommandMode::Metal4;
+    id<MTLDevice> device = nil;
+    id compiler = nil;
+    id<MTLComputePipelineState> exposurePipeline = nil;
+    id<MTLComputePipelineState> linearizePipeline = nil;
+    id<MTLComputePipelineState> combineMaskPipeline = nil;
+    id<MTLComputePipelineState> finishPipeline = nil;
+    float minScale = 1.0f;
+    float maxScale = 1.0f;
+    std::shared_ptr<ScalerGeneration> currentGeneration;
+    // Retain only the opposite reactive-presence variant for the same descriptor layout.
+    // Prepared frames and GPU leases independently own any evicted generation.
+    std::shared_ptr<ScalerGeneration> alternateGeneration;
+    std::mutex mutex;
+    // Scratch never includes caller textures. Fixed capacity bounds idle memory
+    // across resolution changes and avoids allocations in completion callbacks.
+    std::mutex scratchMutex;
+    static constexpr NSUInteger kMaxIdleTextureBytes = 128u * 1024u * 1024u;
+    std::array<id<MTLTexture>, 12> idleTextures{};
+    std::array<id<MTLBuffer>, 6> idleBuffers{};
+    NSUInteger idleTextureBytes = 0;
+    std::size_t nextTextureSlot = 0;
+
+    struct CachedBundle {
+        ExecutionResources resources;
+        const PreparedFrame::Impl* owner = nullptr;
+    };
+    // Completed bundles preserve same-PreparedFrame replay. Empty residency sets
+    // are bounded separately and can be rebound for a different prepared frame.
+    std::mutex bundleMutex;
+    std::array<CachedBundle, 2> idleBundles{};
+    std::array<id, 2> idleResidencies{};
+    std::size_t nextBundleSlot = 0;
+
+    id<MTLTexture> takeTexture(MTLPixelFormat format, NSUInteger width, NSUInteger height,
+                               MTLTextureUsage usage) noexcept {
+        std::lock_guard<std::mutex> lock(scratchMutex);
+        for (auto& texture : idleTextures) {
+            if (scratchMatches(texture, format, width, height, usage)) {
+                idleTextureBytes -= scratchBytes(texture);
+                return std::exchange(texture, nil);
+            }
+        }
+        return nil;
+    }
+    void putTexture(id<MTLTexture>& texture) noexcept {
+        if (!texture) return;
+        const NSUInteger bytes = scratchBytes(texture);
+        if (!bytes || bytes > kMaxIdleTextureBytes) {
+            releaseObject(texture);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(scratchMutex);
+            // A hard byte cap prevents old output resolutions accumulating GPU
+            // allocations even when the fixed slot count has spare entries.
+            for (auto& slot : idleTextures) {
+                if (!slot || idleTextureBytes <= kMaxIdleTextureBytes - bytes) continue;
+                idleTextureBytes -= scratchBytes(slot);
+                releaseObject(slot);
+            }
+            for (auto& slot : idleTextures) {
+                if (slot) continue;
+                idleTextureBytes += bytes;
+                slot = std::exchange(texture, nil);
+                return;
+            }
+            // Full at the byte cap: discard the oldest slot for this completion.
+            auto& slot = idleTextures[nextTextureSlot];
+            idleTextureBytes -= scratchBytes(slot);
+            releaseObject(slot);
+            idleTextureBytes += bytes;
+            slot = std::exchange(texture, nil);
+            nextTextureSlot = (nextTextureSlot + 1) % idleTextures.size();
+        }
+    }
+    id<MTLBuffer> takeBuffer(NSUInteger length) noexcept {
+        std::lock_guard<std::mutex> lock(scratchMutex);
+        for (auto& buffer : idleBuffers)
+            if (buffer && buffer.length == length) return std::exchange(buffer, nil);
+        return nil;
+    }
+    void putBuffer(id<MTLBuffer>& buffer) noexcept {
+        if (!buffer) return;
+        {
+            std::lock_guard<std::mutex> lock(scratchMutex);
+            for (auto& slot : idleBuffers) {
+                if (slot) continue;
+                slot = std::exchange(buffer, nil);
+                return;
+            }
+        }
+        releaseObject(buffer);
+    }
+
+    void returnResources(ExecutionResources& resources) noexcept {
+        // The lease is retained until GPU completion. Commit the empty set
+        // before allowing any scratch allocation it named into the general pool.
+        if (resources.residency && commandMode == CommandMode::Metal4 &&
+            emptyResidencySet(resources.residency)) {
+            std::lock_guard<std::mutex> lock(bundleMutex);
+            for (auto& slot : idleResidencies) {
+                if (slot) continue;
+                slot = std::exchange(resources.residency, nil);
+                break;
+            }
+        }
+        releaseObject(resources.residency);
+        putBuffer(resources.finishParams);
+        putBuffer(resources.maskParams);
+        putBuffer(resources.linearizeParams);
+        putTexture(resources.stagedReactive);
+        putTexture(resources.stagedMotion);
+        putTexture(resources.stagedDepth);
+        putTexture(resources.stagedColor);
+        putTexture(resources.combinedMask);
+        putTexture(resources.linearColor);
+        putTexture(resources.convertedExposure);
+        putTexture(resources.privateOutput);
+    }
+
+    // An idle set has no bindings. If all sets are still in completed bundles,
+    // reclaim one before scratch acquisition; active leases are never touched.
+    id takeResidency() noexcept {
+        ExecutionResources displaced;
+        id residency = nil;
+        bool reclaimed = false;
+        {
+            std::lock_guard<std::mutex> lock(bundleMutex);
+            for (auto& slot : idleResidencies) {
+                if (!slot) continue;
+                residency = std::exchange(slot, nil);
+                break;
+            }
+            if (!residency) {
+                for (auto& entry : idleBundles) {
+                    if (!entry.resources.residency) continue;
+                    entry.resources.swap(displaced);
+                    entry.owner = nullptr;
+                    residency = std::exchange(displaced.residency, nil);
+                    reclaimed = true;
+                    break;
+                }
+            }
+        }
+        if (reclaimed && !emptyResidencySet(residency)) residency = nil;
+        // The old set is empty (or released) before its scratch becomes reusable.
+        if (reclaimed) returnResources(displaced);
+        return residency;
+    }
+
+    bool takeBundle(ExecutionResources& resources, const PreparedFrame::Impl* owner) noexcept {
+        std::lock_guard<std::mutex> lock(bundleMutex);
+        for (auto& entry : idleBundles) {
+            if (entry.owner != owner || !entry.resources.residency) continue;
+            resources.swap(entry.resources);
+            entry.owner = nullptr;
+            return true;
+        }
+        return false;
+    }
+
+    void putBundle(ExecutionResources& resources, const PreparedFrame::Impl* owner) noexcept {
+        if (!resources.residency) return;
+        ExecutionResources displaced;
+        {
+            std::lock_guard<std::mutex> lock(bundleMutex);
+            CachedBundle* slot = nullptr;
+            for (auto& entry : idleBundles) {
+                if (entry.resources.residency) continue;
+                slot = &entry;
+                break;
+            }
+            if (!slot) {
+                slot = &idleBundles[nextBundleSlot];
+                nextBundleSlot = (nextBundleSlot + 1) % idleBundles.size();
+                slot->resources.swap(displaced);
+            }
+            resources.swap(slot->resources);
+            slot->owner = owner;
+        }
+        returnResources(displaced);
+    }
+
+    void discardBundles(const PreparedFrame::Impl* owner) noexcept {
+        std::array<ExecutionResources, 2> displaced;
+        {
+            std::lock_guard<std::mutex> lock(bundleMutex);
+            for (std::size_t i = 0; i != idleBundles.size(); ++i) {
+                if (idleBundles[i].owner != owner) continue;
+                idleBundles[i].resources.swap(displaced[i]);
+                idleBundles[i].owner = nullptr;
+            }
+        }
+        for (auto& resources : displaced) returnResources(resources);
+    }
+
+    ~Impl() {
+        for (auto& entry : idleBundles) returnResources(entry.resources);
+        for (auto& set : idleResidencies) releaseObject(set);
+        for (auto& texture : idleTextures) releaseObject(texture);
+        for (auto& buffer : idleBuffers) releaseObject(buffer);
+        alternateGeneration.reset();
+        currentGeneration.reset();
+        releaseObject(finishPipeline);
+        releaseObject(combineMaskPipeline);
+        releaseObject(linearizePipeline);
+        releaseObject(exposurePipeline);
+        releaseObject(compiler);
+        releaseObject(device);
+    }
+};
+
+struct ExecutionLease::Impl : ExecutionResources {
+    std::weak_ptr<Feature::Impl> feature;
+    std::weak_ptr<PreparedFrame::Impl> prepared;
+    std::shared_ptr<ScalerGeneration> generation;
+    id argumentTable = nil;
+    id fsrArgumentTable = nil;
+    id<MTLFence> fence = nil;
+    bool effectiveReset = false;
+    bool generationInitialized = false;
+    bool replayEligible = false;
+    void* scaler = nullptr;
+    ~Impl() {
+        releaseObject(fence);
+        releaseObject(fsrArgumentTable);
+        releaseObject(argumentTable);
+        // The transport retains this lease through GPU completion. Only a live
+        // frame may reuse its committed set and owned scratch allocations.
+        if (auto owner = feature.lock()) {
+            if (auto frame = prepared.lock(); replayEligible && frame &&
+                owner->commandMode == CommandMode::Metal4)
+                owner->putBundle(*this, frame.get());
+            owner->returnResources(*this);
+        } else {
+            release();
+        }
+    }
 };
 
 struct PreparedFrame::Impl {
     std::shared_ptr<Feature::Impl> feature;
+    std::weak_ptr<PreparedFrame::Impl> self;
     std::shared_ptr<ScalerGeneration> generation;
     FrameInfo frame{};
     TextureSet textures{};
@@ -435,6 +689,7 @@ struct PreparedFrame::Impl {
     mutable std::shared_ptr<ExecutionLease::Impl> firstLease;
 
     ~Impl() {
+        feature->discardBundles(this);
         releaseObject(composition);
         releaseObject(reactive);
         releaseObject(exposure);
@@ -446,6 +701,31 @@ struct PreparedFrame::Impl {
 };
 
 namespace {
+
+id<MTLTexture> acquireScratch(Feature::Impl& feature, id<MTLTexture> source,
+                              MTLPixelFormat format, MTLTextureUsage usage,
+                              NSString* suffix, NSUInteger width = 0,
+                              NSUInteger height = 0) noexcept {
+    const NSUInteger actualWidth = width ? width : source.width;
+    const NSUInteger actualHeight = height ? height : source.height;
+    id<MTLTexture> texture = feature.takeTexture(format, actualWidth, actualHeight, usage);
+    if (!texture) return makeScratchTexture(feature.device, source, format, usage, suffix,
+                                            actualWidth, actualHeight);
+    @try {
+        texture.label = source.label ? [source.label stringByAppendingString:suffix] : nil;
+        return texture;
+    } @catch (id) {
+        [texture release];
+        return nil;
+    }
+}
+
+id<MTLTexture> acquireExposure(Feature::Impl& feature) noexcept {
+    id<MTLTexture> texture = feature.takeTexture(
+        MTLPixelFormatR16Float, 1, 1,
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+    return texture ? texture : makeExposureR16(feature.device);
+}
 
 bool validateCreate(const CreateContext& context, const CreateInfo& create,
                     Error* error) noexcept {
@@ -794,6 +1074,14 @@ bool generationMatches(const ScalerGeneration& generation, const FrameInfo& fram
            generation.reactiveFormat == (combined ? MTLPixelFormatR8Unorm : reactive.pixelFormat);
 }
 
+bool sameDescriptorLayout(const ScalerGeneration& a, const ScalerGeneration& b) noexcept {
+    return a.inputCapacityWidth == b.inputCapacityWidth &&
+           a.inputCapacityHeight == b.inputCapacityHeight &&
+           a.colorFormat == b.colorFormat && a.depthFormat == b.depthFormat &&
+           a.motionFormat == b.motionFormat && a.outputFormat == b.outputFormat &&
+           a.outputWidth == b.outputWidth && a.outputHeight == b.outputHeight;
+}
+
 std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
                                                const FrameInfo& frame,
                                                const TextureSet& set,
@@ -810,6 +1098,16 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
         generationMatches(*feature.currentGeneration, frame, color, depth, motion, output, reactive,
                           operations, temporal))
         return feature.currentGeneration;
+    if (feature.alternateGeneration &&
+        generationMatches(*feature.alternateGeneration, frame, color, depth, motion, output, reactive,
+                          operations, temporal)) {
+        std::swap(feature.currentGeneration, feature.alternateGeneration);
+        // This scaler's earlier history belongs to a nonconsecutive sequence.
+        // Synchronize with any encode of a previously prepared frame.
+        std::lock_guard<std::mutex> lock(feature.currentGeneration->encodeMutex);
+        feature.currentGeneration->generationFresh = true;
+        return feature.currentGeneration;
+    }
 
     NSUInteger inputCapacityWidth = frame.inputContent.width;
     NSUInteger inputCapacityHeight = frame.inputContent.height;
@@ -834,8 +1132,9 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
         inputCapacityHeight = frame.inputContent.height;
     }
 
+    std::shared_ptr<ScalerGeneration> generation;
+    MTLFXTemporalScalerDescriptor* descriptor = nil;
     @try {
-        std::shared_ptr<ScalerGeneration> generation;
         try {
             generation = std::make_shared<ScalerGeneration>();
         } catch (...) {
@@ -843,7 +1142,7 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
                      "failed to allocate MetalFX scaler generation state");
             return {};
         }
-        MTLFXTemporalScalerDescriptor* descriptor = [MTLFXTemporalScalerDescriptor new];
+        descriptor = [MTLFXTemporalScalerDescriptor new];
         descriptor.colorTextureFormat = operations.colorTransfer == ColorTransfer::Linear
                                             ? color.pixelFormat : linearFormat(color.pixelFormat);
         descriptor.depthTextureFormat = depth.pixelFormat;
@@ -878,7 +1177,7 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
         }
 
         id scaler = nil;
-        @try {
+        {
             IndependentFactoryScope factoryScope;
             if (feature.commandMode == CommandMode::Metal4) {
                 if (@available(macOS 26.0, *)) {
@@ -888,8 +1187,6 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
             } else {
                 scaler = [descriptor newTemporalScalerWithDevice:feature.device];
             }
-        } @finally {
-            [descriptor release];
         }
         if (!scaler) {
             setError(error, ErrorCode::ScalerCreationFailed,
@@ -921,12 +1218,25 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
                 generation->reactiveUsage = [scaler reactiveMaskTextureUsage];
         }
 
+        // A layout/capacity change evicts obsolete variants. A mask-format
+        // change may keep the mask-absent variant, but never a third scaler.
+        const auto opposite = [&](const std::shared_ptr<ScalerGeneration>& candidate) noexcept {
+            return candidate && candidate->reactiveEnabled != generation->reactiveEnabled &&
+                   sameDescriptorLayout(*candidate, *generation);
+        };
+        if (opposite(feature.currentGeneration))
+            feature.alternateGeneration = std::move(feature.currentGeneration);
+        else if (!opposite(feature.alternateGeneration))
+            feature.alternateGeneration.reset();
         feature.currentGeneration = generation;
         return generation;
     } @catch (id) {
+        generation.reset();
         setError(error, ErrorCode::ScalerCreationFailed,
                  "MetalFX temporal scaler creation raised an exception");
         return {};
+    } @finally {
+        [descriptor release];
     }
 }
 
@@ -934,173 +1244,186 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                                                 Error* error) noexcept {
     try {
         auto lease = std::make_shared<ExecutionLease::Impl>();
+        lease->feature = frame.feature;
+        lease->prepared = frame.self;
         Feature::Impl& feature = *frame.feature;
         ScalerGeneration& generation = *frame.generation;
 
-        const bool transfer = frame.operations.colorTransfer != ColorTransfer::Linear;
-        const bool finish = transfer || frame.operations.sharpening || frame.cappedOutput;
-        id<MTLTexture> scalerOutput = frame.output;
-        if (frame.needsOutputShadow) {
-            const MTLTextureUsage outputUsage = generation.outputUsage |
-                (finish ? MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite
-                        : MTLTextureUsageUnknown);
-            scalerOutput = makeScratchTexture(
-                feature.device, frame.output, generation.outputFormat, outputUsage,
-                @".YAAGL.MetalFX.ActiveOutput", frame.temporalOutputWidth,
-                frame.temporalOutputHeight);
-            if (!scalerOutput) {
+        if (feature.commandMode != CommandMode::Metal4 || !feature.takeBundle(*lease, &frame)) {
+            if (feature.commandMode == CommandMode::Metal4)
+                lease->residency = feature.takeResidency();
+            const bool transfer = frame.operations.colorTransfer != ColorTransfer::Linear;
+            const bool finish = transfer || frame.operations.sharpening || frame.cappedOutput;
+            id<MTLTexture> scalerOutput = frame.output;
+            if (frame.needsOutputShadow) {
+                const MTLTextureUsage outputUsage = generation.outputUsage |
+                    (finish ? MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite
+                            : MTLTextureUsageUnknown);
+                scalerOutput = acquireScratch(
+                    feature, frame.output, generation.outputFormat, outputUsage,
+                    @".YAAGL.MetalFX.ActiveOutput", frame.temporalOutputWidth,
+                    frame.temporalOutputHeight);
+                if (!scalerOutput) {
+                    setError(error, ErrorCode::ResourceCreationFailed,
+                             "failed to allocate exact-size Private MetalFX output texture");
+                    return {};
+                }
+                lease->privateOutput = scalerOutput;
+            }
+            if (transfer) {
+                lease->linearColor = acquireScratch(
+                    feature, frame.color, generation.colorFormat,
+                    generation.colorUsage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
+                    @".YAAGL.FSR.LinearColor", generation.inputCapacityWidth,
+                    generation.inputCapacityHeight);
+                if (!lease->linearColor) {
+                    setError(error, ErrorCode::ResourceCreationFailed,
+                             "failed to allocate exact-size FSR linear input texture");
+                    return {};
+                }
+            } else if (frame.needsColorStaging) {
+                lease->stagedColor = acquireScratch(
+                    feature, frame.color, frame.color.pixelFormat, generation.colorUsage,
+                    @".YAAGL.MetalFX.ActiveColor", generation.inputCapacityWidth,
+                    generation.inputCapacityHeight);
+            }
+            if (frame.needsDepthStaging)
+                lease->stagedDepth = acquireScratch(
+                    feature, frame.depth, frame.depth.pixelFormat, generation.depthUsage,
+                    @".YAAGL.MetalFX.ActiveDepth", generation.inputCapacityWidth,
+                    generation.inputCapacityHeight);
+            if (frame.needsMotionStaging)
+                lease->stagedMotion = acquireScratch(
+                    feature, frame.motion, frame.motion.pixelFormat, generation.motionUsage,
+                    @".YAAGL.MetalFX.ActiveMotion",
+                    feature.create.lowResolutionMotionVectors() ? generation.inputCapacityWidth
+                                                                : frame.scalerMotionRect.width,
+                    feature.create.lowResolutionMotionVectors() ? generation.inputCapacityHeight
+                                                                : frame.scalerMotionRect.height);
+            if (frame.operations.combineCompositionMask) {
+                lease->combinedMask = acquireScratch(
+                    feature, frame.reactive ? frame.reactive : frame.composition,
+                    MTLPixelFormatR8Unorm,
+                    MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
+                    @".YAAGL.FSR.CombinedMask", generation.inputCapacityWidth,
+                    generation.inputCapacityHeight);
+                if (!lease->combinedMask ||
+                    !hasUsage(lease->combinedMask, generation.reactiveUsage)) {
+                    setError(error, ErrorCode::ResourceCreationFailed,
+                             "failed to allocate exact-size MetalFX combined reactive mask");
+                    return {};
+                }
+            } else if (frame.needsReactiveStaging) {
+                lease->stagedReactive = acquireScratch(
+                    feature, frame.reactive, frame.reactive.pixelFormat,
+                    generation.reactiveUsage, @".YAAGL.MetalFX.ActiveReactive",
+                    generation.inputCapacityWidth, generation.inputCapacityHeight);
+            }
+            if ((!transfer && frame.needsColorStaging && !lease->stagedColor) ||
+                (frame.needsDepthStaging && !lease->stagedDepth) ||
+                (frame.needsMotionStaging && !lease->stagedMotion) ||
+                (frame.needsReactiveStaging && !lease->stagedReactive)) {
                 setError(error, ErrorCode::ResourceCreationFailed,
-                         "failed to allocate exact-size Private MetalFX output texture");
+                         "failed to allocate exact-size MetalFX input texture");
                 return {};
             }
-            lease->privateOutput = scalerOutput;
-        }
-        if (transfer) {
-            lease->linearColor = makeScratchTexture(
-                feature.device, frame.color, generation.colorFormat,
-                generation.colorUsage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
-                @".YAAGL.FSR.LinearColor", generation.inputCapacityWidth,
-                generation.inputCapacityHeight);
-            if (!lease->linearColor) {
-                setError(error, ErrorCode::ResourceCreationFailed,
-                         "failed to allocate exact-size FSR linear input texture");
-                return {};
-            }
-        } else if (frame.needsColorStaging) {
-            lease->stagedColor = makeScratchTexture(
-                feature.device, frame.color, frame.color.pixelFormat, generation.colorUsage,
-                @".YAAGL.MetalFX.ActiveColor", generation.inputCapacityWidth,
-                generation.inputCapacityHeight);
-        }
-        if (frame.needsDepthStaging)
-            lease->stagedDepth = makeScratchTexture(
-                feature.device, frame.depth, frame.depth.pixelFormat, generation.depthUsage,
-                @".YAAGL.MetalFX.ActiveDepth", generation.inputCapacityWidth,
-                generation.inputCapacityHeight);
-        if (frame.needsMotionStaging)
-            lease->stagedMotion = makeScratchTexture(
-                feature.device, frame.motion, frame.motion.pixelFormat, generation.motionUsage,
-                @".YAAGL.MetalFX.ActiveMotion",
-                feature.create.lowResolutionMotionVectors() ? generation.inputCapacityWidth
-                                                            : frame.scalerMotionRect.width,
-                feature.create.lowResolutionMotionVectors() ? generation.inputCapacityHeight
-                                                            : frame.scalerMotionRect.height);
-        if (frame.operations.combineCompositionMask) {
-            lease->combinedMask = makeMaskTexture(feature.device,
-                                                  frame.reactive ? frame.reactive : frame.composition,
-                                                  generation.inputCapacityWidth,
-                                                  generation.inputCapacityHeight);
-            if (!lease->combinedMask ||
-                !hasUsage(lease->combinedMask, generation.reactiveUsage)) {
-                setError(error, ErrorCode::ResourceCreationFailed,
-                         "failed to allocate exact-size MetalFX combined reactive mask");
-                return {};
-            }
-        } else if (frame.needsReactiveStaging) {
-            lease->stagedReactive = makeScratchTexture(
-                feature.device, frame.reactive, frame.reactive.pixelFormat,
-                generation.reactiveUsage, @".YAAGL.MetalFX.ActiveReactive",
-                generation.inputCapacityWidth, generation.inputCapacityHeight);
-        }
-        if ((!transfer && frame.needsColorStaging && !lease->stagedColor) ||
-            (frame.needsDepthStaging && !lease->stagedDepth) ||
-            (frame.needsMotionStaging && !lease->stagedMotion) ||
-            (frame.needsReactiveStaging && !lease->stagedReactive)) {
-            setError(error, ErrorCode::ResourceCreationFailed,
-                     "failed to allocate exact-size MetalFX input texture");
-            return {};
-        }
 
-        if (frame.needsExposureConversion) {
-            lease->convertedExposure = makeExposureR16(feature.device);
-            if (!lease->convertedExposure) {
+            if (frame.needsExposureConversion) {
+                lease->convertedExposure = acquireExposure(feature);
+                if (!lease->convertedExposure) {
+                    setError(error, ErrorCode::ResourceCreationFailed,
+                             "failed to allocate R16Float exposure conversion texture");
+                    return {};
+                }
+            }
+
+            struct alignas(8) Params {
+                std::uint32_t sourceOrigin[2];
+                std::uint32_t destinationOrigin[2];
+                std::uint32_t extent[2];
+                std::uint32_t dispatchOrigin[2];
+                std::uint32_t dispatchExtent[2];
+                std::uint32_t transfer;
+                std::uint32_t flags;
+                float sharpness;
+                float exposure;
+            };
+            const std::uint32_t flags = (frame.reactive ? 1u : 0u) |
+                                        (frame.composition ? 2u : 0u) |
+                                        (frame.operations.sharpening ? 4u : 0u) |
+                                        (frame.frame.exposureMode == ExposureMode::Texture ? 8u : 0u) |
+                                        (frame.cappedOutput ? 16u : 0u);
+            const auto makeParams = [&](const Rect& source, const Rect& destination,
+                                        const Rect& dispatch, ColorTransfer transfer) {
+                Params params{{source.x, source.y}, {destination.x, destination.y},
+                              {source.width, source.height}, {dispatch.x, dispatch.y},
+                              {dispatch.width, dispatch.height}, static_cast<std::uint32_t>(transfer),
+                              flags, frame.operations.sharpness, frame.frame.preExposure.value};
+                id<MTLBuffer> buffer = feature.takeBuffer(sizeof(params));
+                if (buffer) {
+                    std::memcpy(buffer.contents, &params, sizeof(params));
+                    return buffer;
+                }
+                return [feature.device newBufferWithBytes:&params length:sizeof(params)
+                                                   options:MTLResourceStorageModeShared];
+            };
+            if (transfer) {
+                const ColorTransfer inputTransfer =
+                    frame.operations.colorTransfer == ColorTransfer::SRGB &&
+                            isSrgbFormat(frame.color.pixelFormat)
+                        ? ColorTransfer::Linear : frame.operations.colorTransfer;
+                const Rect destination{0, 0, frame.frame.inputContent.width,
+                                       frame.frame.inputContent.height};
+                lease->linearizeParams = makeParams(frame.frame.colorRect, destination,
+                                                    destination, inputTransfer);
+            }
+            if (frame.operations.combineCompositionMask)
+                lease->maskParams = makeParams(
+                    frame.frame.reactiveRect,
+                    Rect{0, 0, frame.frame.inputContent.width, frame.frame.inputContent.height},
+                    Rect{0, 0, frame.frame.inputContent.width, frame.frame.inputContent.height},
+                    ColorTransfer::Linear);
+            if (finish) {
+                const ColorTransfer outputTransfer =
+                    frame.operations.colorTransfer == ColorTransfer::SRGB &&
+                            isSrgbFormat(frame.output.pixelFormat)
+                        ? ColorTransfer::Linear : frame.operations.colorTransfer;
+                const Rect source{0, 0,
+                                  static_cast<std::uint32_t>(frame.temporalOutputWidth),
+                                  static_cast<std::uint32_t>(frame.temporalOutputHeight)};
+                const Rect destination{static_cast<std::uint32_t>(frame.frame.outputRect.x + frame.placementX),
+                                       static_cast<std::uint32_t>(frame.frame.outputRect.y + frame.placementY),
+                                       source.width, source.height};
+                lease->finishParams = makeParams(source, destination, frame.frame.outputRect,
+                                                 outputTransfer);
+            }
+            if ((transfer && !lease->linearizeParams) ||
+                (frame.operations.combineCompositionMask && !lease->maskParams) ||
+                (finish && !lease->finishParams)) {
                 setError(error, ErrorCode::ResourceCreationFailed,
-                         "failed to allocate R16Float exposure conversion texture");
+                         "failed to allocate FSR operation constants");
                 return {};
             }
-        }
 
-        struct alignas(8) Params {
-            std::uint32_t sourceOrigin[2];
-            std::uint32_t destinationOrigin[2];
-            std::uint32_t extent[2];
-            std::uint32_t dispatchOrigin[2];
-            std::uint32_t dispatchExtent[2];
-            std::uint32_t transfer;
-            std::uint32_t flags;
-            float sharpness;
-            float exposure;
-        };
-        const std::uint32_t flags = (frame.reactive ? 1u : 0u) |
-                                    (frame.composition ? 2u : 0u) |
-                                    (frame.operations.sharpening ? 4u : 0u) |
-                                    (frame.frame.exposureMode == ExposureMode::Texture ? 8u : 0u) |
-                                    (frame.cappedOutput ? 16u : 0u);
-        const auto makeParams = [&](const Rect& source, const Rect& destination,
-                                    const Rect& dispatch, ColorTransfer transfer) {
-            Params params{{source.x, source.y}, {destination.x, destination.y},
-                          {source.width, source.height}, {dispatch.x, dispatch.y},
-                          {dispatch.width, dispatch.height}, static_cast<std::uint32_t>(transfer),
-                          flags, frame.operations.sharpness, frame.frame.preExposure.value};
-            return [feature.device newBufferWithBytes:&params length:sizeof(params)
-                                               options:MTLResourceStorageModeShared];
-        };
-        if (transfer) {
-            const ColorTransfer inputTransfer =
-                frame.operations.colorTransfer == ColorTransfer::SRGB &&
-                        isSrgbFormat(frame.color.pixelFormat)
-                    ? ColorTransfer::Linear : frame.operations.colorTransfer;
-            const Rect destination{0, 0, frame.frame.inputContent.width,
-                                   frame.frame.inputContent.height};
-            lease->linearizeParams = makeParams(frame.frame.colorRect, destination,
-                                                destination, inputTransfer);
-        }
-        if (frame.operations.combineCompositionMask)
-            lease->maskParams = makeParams(
-                frame.frame.reactiveRect,
-                Rect{0, 0, frame.frame.inputContent.width, frame.frame.inputContent.height},
-                Rect{0, 0, frame.frame.inputContent.width, frame.frame.inputContent.height},
-                ColorTransfer::Linear);
-        if (finish) {
-            const ColorTransfer outputTransfer =
-                frame.operations.colorTransfer == ColorTransfer::SRGB &&
-                        isSrgbFormat(frame.output.pixelFormat)
-                    ? ColorTransfer::Linear : frame.operations.colorTransfer;
-            const Rect source{0, 0,
-                              static_cast<std::uint32_t>(frame.temporalOutputWidth),
-                              static_cast<std::uint32_t>(frame.temporalOutputHeight)};
-            const Rect destination{static_cast<std::uint32_t>(frame.frame.outputRect.x + frame.placementX),
-                                   static_cast<std::uint32_t>(frame.frame.outputRect.y + frame.placementY),
-                                   source.width, source.height};
-            lease->finishParams = makeParams(source, destination, frame.frame.outputRect,
-                                             outputTransfer);
-        }
-        if ((transfer && !lease->linearizeParams) ||
-            (frame.operations.combineCompositionMask && !lease->maskParams) ||
-            (finish && !lease->finishParams)) {
-            setError(error, ErrorCode::ResourceCreationFailed,
-                     "failed to allocate FSR operation constants");
-            return {};
-        }
-
-        lease->residency = makeResidencySet(feature.device, frame.textures,
-                                            scalerOutput, lease->convertedExposure,
-                                            lease->linearColor, lease->combinedMask,
-                                            lease->stagedColor, lease->stagedDepth,
-                                            lease->stagedMotion, lease->stagedReactive,
-                                            lease->linearizeParams, lease->maskParams,
-                                            lease->finishParams);
-        if (feature.commandMode == CommandMode::Metal4 && !lease->residency) {
-            setError(error, ErrorCode::ResourceCreationFailed,
-                     "failed to create Metal4 residency set for MetalFX execution");
-            return {};
+            id reusable = std::exchange(lease->residency, nil);
+            lease->residency = makeResidencySet(feature.device,
+                residencyBindings(frame.textures, scalerOutput, lease->convertedExposure,
+                    lease->linearColor, lease->combinedMask, lease->stagedColor,
+                    lease->stagedDepth, lease->stagedMotion, lease->stagedReactive,
+                    lease->linearizeParams, lease->maskParams, lease->finishParams), reusable);
+            if (feature.commandMode == CommandMode::Metal4 && !lease->residency) {
+                setError(error, ErrorCode::ResourceCreationFailed,
+                         "failed to create Metal4 residency set for MetalFX execution");
+                return {};
+            }
         }
 
         if ((lease->linearizeParams || lease->maskParams || lease->finishParams) &&
             feature.commandMode == CommandMode::Metal4) {
             if (@available(macOS 26.0, *)) {
+                MTL4ArgumentTableDescriptor* descriptor = nil;
                 @try {
-                    MTL4ArgumentTableDescriptor* descriptor = [MTL4ArgumentTableDescriptor new];
+                    descriptor = [MTL4ArgumentTableDescriptor new];
                     descriptor.maxBufferBindCount = 1;
                     descriptor.maxTextureBindCount = 3;
                     descriptor.initializeBindings = YES;
@@ -1108,7 +1431,6 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                     NSError* tableError = nil;
                     lease->fsrArgumentTable =
                         [feature.device newArgumentTableWithDescriptor:descriptor error:&tableError];
-                    [descriptor release];
                     if (!lease->fsrArgumentTable) {
                         setError(error, ErrorCode::ResourceCreationFailed,
                                  "failed to create Metal4 FSR argument table");
@@ -1118,21 +1440,23 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                     setError(error, ErrorCode::ResourceCreationFailed,
                              "Metal4 FSR argument-table setup raised an exception");
                     return {};
+                } @finally {
+                    [descriptor release];
                 }
             }
         }
 
         if (frame.needsExposureConversion && feature.commandMode == CommandMode::Metal4) {
             if (@available(macOS 26.0, *)) {
+                MTL4ArgumentTableDescriptor* descriptor = nil;
                 @try {
-                    MTL4ArgumentTableDescriptor* descriptor = [MTL4ArgumentTableDescriptor new];
+                    descriptor = [MTL4ArgumentTableDescriptor new];
                     descriptor.maxTextureBindCount = 2;
                     descriptor.initializeBindings = YES;
                     descriptor.label = @"YAAGL MetalFX exposure conversion";
                     NSError* tableError = nil;
                     lease->argumentTable =
                         [feature.device newArgumentTableWithDescriptor:descriptor error:&tableError];
-                    [descriptor release];
                     if (!lease->argumentTable) {
                         setError(error, ErrorCode::ResourceCreationFailed,
                                  "failed to create Metal4 exposure argument table");
@@ -1146,6 +1470,8 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                     setError(error, ErrorCode::ResourceCreationFailed,
                              "Metal4 exposure argument-table setup raised an exception");
                     return {};
+                } @finally {
+                    [descriptor release];
                 }
             }
         }
@@ -1659,6 +1985,7 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(
 
         auto frame = std::make_shared<PreparedFrame::Impl>();
         frame->feature = impl_;
+        frame->self = frame;
         frame->generation = generation;
         frame->frame = info;
         frame->textures = textures;
@@ -1933,6 +2260,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
         generation.hasLastInputContent = true;
         generation.generationFresh = false;
         observation.completed();
+        lease->replayEligible = true;
         return true;
     } catch (...) {
         setError(error, ErrorCode::EncodeFailed, "failed to retain MetalFX execution state");

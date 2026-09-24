@@ -317,14 +317,14 @@ static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
                 val = tid;
         }
 
-        if (__atomic_load_n( (int *)obj_shm, __ATOMIC_ACQUIRE ) != val)
-            return STATUS_PENDING;
-
         if (end)
         {
             ns_timeleft = update_timeout( *end ) * 100;
             if (!ns_timeleft) return STATUS_TIMEOUT;
         }
+
+        if (__atomic_load_n( (int *)obj_shm, __ATOMIC_ACQUIRE ) != val)
+            return STATUS_PENDING;
         ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, obj_shm, val, ns_timeleft );
     } while (ret == -EINTR || ret == -EFAULT);
 
@@ -1008,10 +1008,9 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
          *
          * The idea is basically just to wait in sequence on every object in the
          * set. Then when we're done, try to grab them all in a tight loop. If
-         * that fails, release any resources we've grabbed (and yes, we can
-         * reliably do this—it's just mutexes and semaphores that we have to
-         * put back, and in both cases we just put back 1), and if any of that
-         * fails we start over.
+         * that fails, restore only resources acquired in this attempt,
+         * preserving existing mutex ownership and abandoned state. Wake
+         * waiters for anything we restore, then start over.
          *
          * What makes this inherently bad is that we might temporarily grab a
          * resource incorrectly. Hopefully it'll be quick (and hey, it won't
@@ -1025,12 +1024,17 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
          * waiting for an instant while we put things back. */
 
         NTSTATUS status = STATUS_SUCCESS;
+        unsigned char acquired[MAXIMUM_WAIT_OBJECTS];
+        BOOL attempted = FALSE;
 
         while (1)
         {
             BOOL abandoned;
 
 tryagain:
+            if (alert_obj && __atomic_load_n( alert_obj_shm, __ATOMIC_SEQ_CST )) goto userapc;
+            if (attempted && timeout && !update_timeout( end )) return STATUS_TIMEOUT;
+            attempted = TRUE;
             abandoned = FALSE;
 
             /* First step: try to wait on each object in sequence. */
@@ -1040,11 +1044,13 @@ tryagain:
                 if (((struct mutex *)objs_shm[i])->msync_type == MSYNC_MUTEX)
                 {
                     struct mutex *mutex = (struct mutex *)objs_shm[i];
+                    int owner;
 
                     if (mutex->tid == current_tid)
                         continue;
 
-                    while (__atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST ))
+                    while ((owner = __atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST )) &&
+                           owner != ~0 && owner != current_tid)
                     {
                         status = do_single_wait( objs[i], objs_shm[i], alert_obj, alert_obj_shm, timeout ? &end : NULL, current_tid );
                         if (status != STATUS_PENDING)
@@ -1100,11 +1106,15 @@ tryagain:
                     struct mutex *mutex = (struct mutex *)objs_shm[i];
                     int tid = __atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST );
                     if (tid == current_tid)
+                    {
+                        acquired[i] = 0;
                         break;
+                    }
                     if (tid && tid != ~0)
                         goto tooslow;
                     if (__sync_val_compare_and_swap( &mutex->tid, tid, current_tid ) != tid)
                         goto tooslow;
+                    acquired[i] = tid == ~0 ? 2 : 1;
                     if (tid == ~0)
                         abandoned = TRUE;
                     break;
@@ -1122,6 +1132,7 @@ tryagain:
                     }
                     if (!current)
                         goto tooslow;
+                    acquired[i] = 1;
                     break;
                 }
                 case MSYNC_AUTO_EVENT:
@@ -1130,11 +1141,12 @@ tryagain:
                     struct event *event = (struct event *)objs_shm[i];
                     if (!__sync_val_compare_and_swap( &event->signaled, 1, 0 ))
                         goto tooslow;
+                    acquired[i] = 1;
                     break;
                 }
                 default:
-                    /* If a manual-reset event changed between there and
-                     * here, it's shouldn't be a problem. */
+                    /* A manual-reset event isn't consumed by this wait. */
+                    acquired[i] = 0;
                     break;
                 }
             }
@@ -1157,21 +1169,21 @@ tryagain:
 tooslow:
             for (--i; i >= 0; i--)
             {
+                if (!acquired[i]) continue;
                 switch (((struct event *)objs_shm[i])->msync_type)
                 {
                 case MSYNC_MUTEX:
                 {
                     struct mutex *mutex = (struct mutex *)objs_shm[i];
-                    /* HACK: This won't do the right thing with abandoned
-                     * mutexes, but fixing it is probably more trouble than
-                     * it's worth. */
-                    __atomic_store_n( &mutex->tid, 0, __ATOMIC_SEQ_CST );
+                    __atomic_store_n( &mutex->tid, acquired[i] == 2 ? ~0 : 0, __ATOMIC_SEQ_CST );
+                    signal_all( (void *)mutex, objs[i] );
                     break;
                 }
                 case MSYNC_SEMAPHORE:
                 {
                     struct semaphore *semaphore = (struct semaphore *)objs_shm[i];
                     __sync_fetch_and_add( &semaphore->count, 1 );
+                    signal_all( (void *)semaphore, objs[i] );
                     break;
                 }
                 case MSYNC_AUTO_EVENT:
@@ -1179,6 +1191,7 @@ tooslow:
                 {
                     struct event *event = (struct event *)objs_shm[i];
                     __atomic_store_n( &event->signaled, 1, __ATOMIC_SEQ_CST );
+                    signal_all( (void *)event, objs[i] );
                     break;
                 }
                 default:

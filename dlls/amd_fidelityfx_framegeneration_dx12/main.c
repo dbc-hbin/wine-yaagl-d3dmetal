@@ -493,7 +493,9 @@ static void store_native_config(struct fg_context *context,
 {
     struct FfxApiResource hudless;
 
-    retain_resource(&hudless, &desc->HUDLessColor);
+    memset(&hudless, 0, sizeof(hudless));
+    if (desc->frameGenerationEnabled)
+        retain_resource(&hudless, &desc->HUDLessColor);
     release_resource(&context->hudless);
     context->hudless = hudless;
     context->native_config = *desc;
@@ -1235,6 +1237,9 @@ static ffxReturnCode_t configure_frame_generation(
         {
             if (notify && !desc->swapChain)
                 return FFX_API_RETURN_ERROR_PARAMETER;
+            /* Pending selection still observes OFF before its first Prepare. */
+            result = configure_translation(context->translated, desc->frameGenerationEnabled);
+            if (result != FFX_API_RETURN_OK) return result;
             store_native_config(context, desc);
             return FFX_API_RETURN_OK;
         }

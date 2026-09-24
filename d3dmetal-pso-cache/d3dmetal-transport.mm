@@ -342,10 +342,17 @@ struct OwnerState {
                std::size_t count,
                std::uint64_t feature,
                std::uint64_t evaluation)
-        : prepared(std::move(frame)), textureCount(count),
-          featureID(feature), evaluationID(evaluation) {
-        for (std::size_t i = 0; i < count; ++i)
-            textures[i] = [uses[i].texture retain];
+        : prepared(std::move(frame)), featureID(feature), evaluationID(evaluation) {
+        @try {
+            for (std::size_t i = 0; i < count; ++i) {
+                textures[i] = [uses[i].texture retain];
+                ++textureCount;
+            }
+        } @catch (id exception) {
+            for (std::size_t i = 0; i < textureCount; ++i)
+                [textures[i] release];
+            @throw exception;
+        }
     }
 
     ~OwnerState() {
@@ -625,17 +632,21 @@ bool record(NativeCommandList& commandList, const RecordRequest& request) noexce
         const_cast<std::uint8_t*>(image) + kExtendResourceLifetime);
 
     YAAGLMetalFXRecordedOwner* owner = nil;
+    OwnerState* unownedState = nullptr;
     std::size_t begun = 0;
     bool transferred = false;
     bool success = false;
 
     try {
         @try {
-            auto* state = new OwnerState(request.prepared, uses, useCount,
-                                         request.featureID, request.evaluationID);
-            owner = [[YAAGLMetalFXRecordedOwner alloc] initWithState:state];
-            if (!owner) delete state;
-            if (!owner) return false;
+            unownedState = new OwnerState(request.prepared, uses, useCount,
+                                          request.featureID, request.evaluationID);
+            owner = [[YAAGLMetalFXRecordedOwner alloc] initWithState:unownedState];
+            if (!owner) {
+                delete unownedState;
+                return false;
+            }
+            unownedState = nullptr; // initWithState transferred ownership to -dealloc.
 
             // Transfer the +1 from alloc/init to the native command allocator.
             // ExtendResourceLifetime itself does not retain; allocator Reset is
@@ -696,6 +707,7 @@ bool record(NativeCommandList& commandList, const RecordRequest& request) noexce
     } catch (...) {
         success = false;
     }
+    delete unownedState;
 
     if (!success && begun) {
         @try {

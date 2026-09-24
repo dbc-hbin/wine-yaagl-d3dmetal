@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and run the shared MetalFX backend, transport, and quality suites."""
+"""Build and run the native MetalFX, transport, quality, and display suites."""
 from __future__ import annotations
 
 import argparse
@@ -24,6 +24,7 @@ SOURCES = {
     "lifetime": ["metalfx-backend.mm", "d3dmetal-transport-legacy.mm",
                  "fsr-framegeneration.mm", "d3dmetal-transport-lifetime.test.mm"],
     "quality": ["metalfx-backend.mm", "metalfx-quality.native.test.mm"],
+    "display-routing": ["display-routing.native.test.cpp"],
 }
 MARKERS = {
     "backend": "METALFX_BACKEND_NATIVE_PASS",
@@ -31,10 +32,14 @@ MARKERS = {
     "legacy-transport": "PASS legacy pins=1",
     "lifetime": "TRANSPORT_LIFETIME_PASS",
     "quality": "METALFX_QUALITY_NATIVE_PASS",
+    "display-routing": "native output routing: passed",
 }
-# The lifetime fixture includes transport.mm directly to access its private
-# execution-slot registry; hash that included translation unit as build input.
-INCLUDED_SOURCES = {"lifetime": ["d3dmetal-transport.mm"]}
+# Fixtures include implementation files directly to exercise private state;
+# hash those included translation units as build inputs.
+INCLUDED_SOURCES = {
+    "lifetime": ["d3dmetal-transport.mm"],
+    "display-routing": ["display-routing.mm", "display-routing.hpp"],
+}
 TRACKED_HEADERS = [
     "metalfx-contract.hpp",
     "metalfx-backend.hpp",
@@ -64,10 +69,14 @@ def run_suite(suite: str, out: Path, d3dmetal: Path) -> dict[str, object]:
     tracked.update(SRC / name for name in INCLUDED_SOURCES.get(suite, []))
     tracked.update(SRC / name for name in TRACKED_HEADERS)
     tracked.add(SRC / "fsr-kernels.metal")
+    if suite == "display-routing":
+        tracked.add(ROOT / "include/yaagl_d3dmetal_display.h")
     before = {str(path.relative_to(ROOT)): digest(path) for path in sorted(tracked)}
     command = ["xcrun", "clang++", "-arch", "x86_64", "-std=c++20", "-O2",
                "-mmacosx-version-min=14.0", "-Wall", "-Wextra", "-Werror", "-pthread",
                "-fno-objc-arc", "-fobjc-exceptions", "-fblocks", "-I", str(out)]
+    if suite == "display-routing":
+        command.remove("-fobjc-exceptions")
     command.extend(str(path) for path in sources)
     command.extend(["-framework", "Foundation", "-framework", "Metal", "-framework", "MetalFX",
                     "-o", str(executable)])

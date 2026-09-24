@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REL = Path('lib/external/D3DMetal.framework/Versions/A')
 STAGE_MANIFEST = 'zzz-frame-probe-stage.json'
 STAGE_SCHEMA = 4
+DISPLAY_BRIDGE_PATH = 'lib/wine/x86_64-unix/winemac.so'
 PLAY_PROFILE = 'play'
 PLAY_MODEL_POLICY = {'all_gpu': 'system-default'}
 FSR_OVERRIDE = 'amd_fidelityfx_upscaler_dx12,amd_fidelityfx_framegeneration_dx12=b'
@@ -64,6 +65,16 @@ def artifact_hashes(runtime: Path, paths=ARTIFACT_PATHS + FSR_ARTIFACT_PATHS) ->
             raise ValueError(f'external runtime artifact: {relative}')
         result[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     return result
+
+
+def display_bridge_provenance(runtime: Path) -> dict[str, str]:
+    path = runtime / DISPLAY_BRIDGE_PATH
+    if not under(path, runtime) or not path.is_file():
+        raise ValueError('missing runtime Wine display bridge')
+    symbols = subprocess.check_output(['nm', '-arch', 'x86_64', '-gU', str(path)], text=True)
+    if '_macdrv_query_d3dmetal_display' not in symbols.split():
+        raise ValueError('Wine display bridge is too old; rebuild winemac with current display routing')
+    return {'path': DISPLAY_BRIDGE_PATH, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
 def original_fg_provenance(path: Path) -> dict:
@@ -146,9 +157,16 @@ def verify_runtime(runtime: Path, current_sources: bool = False) -> list[tuple[s
     report = stage_manifest_report(runtime)
     if not (runtime / STAGE_MANIFEST).is_file():
         return [('FAIL', 'staged-runtime manifest is missing')]
-    if any(level == 'FAIL' for level, _ in report) or not current_sources:
+    if any(level == 'FAIL' for level, _ in report):
         return report
     data = json.loads((runtime / STAGE_MANIFEST).read_text())
+    try:
+        if data.get('display_bridge') != display_bridge_provenance(runtime):
+            report.append(('FAIL', 'Wine display bridge identity does not match the staged runtime'))
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        report.append(('FAIL', str(error)))
+    if not current_sources:
+        return report
     for label, key in (('native', 'native_build_manifest'), ('FSR translator', 'fsr_build_manifest')):
         build_manifest = data.get(key)
         sources = build_manifest.get('sources') if isinstance(build_manifest, dict) else None
@@ -215,6 +233,7 @@ def main() -> int:
     failed = [message for level, message in source_report if level == 'FAIL']
     if failed:
         p.error('; '.join(failed))
+    display_bridge_provenance(source)
     launcher_path = ROOT / 'scripts/wine-launch-wrapper.sh'
     wrapper = launcher_path.read_text()
     if not wrapper.startswith('#!') or 'zzz-frame-probe-stage.json' not in wrapper:
@@ -294,6 +313,7 @@ def main() -> int:
             'native_build_manifest': json.loads((build / 'build-manifest.json').read_text()),
             'fsr_build_manifest': json.loads((fsr_build / 'build-manifest.json').read_text()),
             'fsr_translator': FSR_POLICY.copy(), 'native_fg_fallback': fg_provenance,
+            'display_bridge': display_bridge_provenance(temporary),
             'signed_artifacts': artifact_hashes(temporary)}
         (temporary / STAGE_MANIFEST).write_text(json.dumps(manifest, indent=2) + '\n')
         problems = [message for level, message in verify_runtime(temporary, current_sources=True) if level == 'FAIL']

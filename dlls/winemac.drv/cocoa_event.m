@@ -709,6 +709,11 @@ void macdrv_release_event(macdrv_event *event)
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         switch (event->type)
         {
+            case CLIENT_SURFACE_PRESENTED:
+#if defined(__x86_64__)
+                macdrv_release_d3dmetal_client_surface(event->client_surface_presented.client_surface);
+#endif
+                break;
             case IM_SET_TEXT:
                 if (event->im_set_text.text)
                     CFRelease(event->im_set_text.text);

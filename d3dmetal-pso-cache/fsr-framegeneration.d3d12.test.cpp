@@ -558,8 +558,9 @@ void runProvider(Gpu& gpu, const FrameGenerationApi& api,
         // Verify writes throughout warm-up and actual interpolation thereafter.
         for (unsigned step = 0; step < (options.longDirectSequence && !pattern ? 70u : 5u);
              ++step, ++frameID) {
-            const bool implicitGap = options.displayJitter &&
-                pattern == 1 && step == 0;
+            const bool implicitGap = (options.displayJitter &&
+                pattern == 1 && step == 0) ||
+                (options.longDirectSequence && pattern == 0 && step == 6);
             const bool reset = step == 0 && !implicitGap;
             const auto scene = options.transfer == TransferCase::SDR
                 ? makePattern(pattern, static_cast<float>(step))
@@ -888,15 +889,23 @@ void runProvider(Gpu& gpu, const FrameGenerationApi& api,
                        D3D12_RESOURCE_STATE_COPY_SOURCE);
             copyToReadback(gpu.list.Get(), output.Get(), readback);
 
+            // Dispatch has recorded Generate but transport has not encoded it.
+            // OFF must invalidate its history even when this list executes later.
+            if (options.longDirectSequence && pattern == 0 && step == 5) {
+                configure.frameGenerationEnabled = false;
+                requireFfx(api.configure(&context, &configure.header),
+                           FFX_API_RETURN_OK, path, "disable before queued Generate");
+            }
             // The supplied helper submits the command list and waits for its
             // exact fence value. No timing assumptions or sleep/poll loops.
             gpu.submit();
             check(gpu.device->GetDeviceRemovedReason(),
                   "framegeneration GPU completion");
-            if (!options.longDirectSequence || step < 5) {
+            if (!options.longDirectSequence || step < 5 || step == 6 || step == 10) {
                 inspectOutput(readback, pattern, step, previous, current, path, hudless,
                               options.transfer, implicitGap);
-                if (step >= 3) ++verifiedIntermediates;
+                if (step >= 3 && (!options.longDirectSequence || step < 5))
+                    ++verifiedIntermediates;
             }
             previous = current;
             // The direct dispatch completed and retired its frame-ID snapshot.
@@ -1381,6 +1390,9 @@ void runSwapchain(Gpu& gpu, const FrameGenerationApi& api) {
             uploadTexture(gpu, queuedHudless.Get(), queuedScene.data(), kWidth * 8);
         }
 
+        const ULONG hudlessReferencesBeforeConfigure =
+            frame < disabledFrames ? hudlessColor->AddRef() - 1 : 0;
+        if (frame < disabledFrames) hudlessColor->Release();
         configure.frameID = frame;
         configure.frameGenerationEnabled = frame >= disabledFrames;
         configure.HUDLessColor = ffxApiGetResourceDX12(
@@ -1435,6 +1447,12 @@ void runSwapchain(Gpu& gpu, const FrameGenerationApi& api) {
 
         requireFfx(api.dispatch(&context, &prepare.header),
                    FFX_API_RETURN_OK, path, "PrepareV2");
+        if (frame < disabledFrames) {
+            const ULONG references = hudlessColor->AddRef() - 1;
+            hudlessColor->Release();
+            require(references == hudlessReferencesBeforeConfigure, path,
+                    "FG OFF retained HUD-less resource after Prepare");
+        }
 
         ffxQueryGetProviderVersion provider{};
         provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;

@@ -23,6 +23,8 @@ const sourcePaths = [
   "d3dmetal-pso-cache/metalfx-backend.hpp", "d3dmetal-pso-cache/metalfx-backend.mm",
   "d3dmetal-pso-cache/d3dmetal-transport.hpp", "d3dmetal-pso-cache/d3dmetal-transport.mm",
   "d3dmetal-pso-cache/d3dmetal-replay-hooks.hpp", "d3dmetal-pso-cache/d3dmetal-replay-hooks.mm",
+  "d3dmetal-pso-cache/display-routing.hpp", "d3dmetal-pso-cache/display-routing.mm",
+  "include/yaagl_d3dmetal_display.h",
   "d3dmetal-pso-cache/d3dmetal-transport-legacy.hpp", "d3dmetal-pso-cache/d3dmetal-transport-legacy.mm",
   "d3dmetal-pso-cache/fsr-contract.hpp", "d3dmetal-pso-cache/fsr-contract.cpp",
   "d3dmetal-pso-cache/fsr-translator.hpp", "d3dmetal-pso-cache/fsr-translator.mm",
@@ -51,10 +53,17 @@ const hookNames = [
   "CreateComputeStageKey", "CreateGraphicsStageKey",
   "ExtractFunctions", "LoadGraphicsFunctions",
   "ReplayTemporalScaleMPL", "EncodeTemporalScaleMTL",
+  "GetContainingOutput", "SetFullscreenState",
 ];
-if (layout.formatVersion !== 10 || layout.hooks.length !== hookNames.length ||
+if (layout.formatVersion !== 12 || layout.hooks.length !== hookNames.length ||
     layout.commitHook.id !== "CommitMetal4Batch" ||
-    layout.commitHook.dispatchFieldOffset !== hookNames.length * 8 ||
+    layout.presentHook.id !== "RefreshDisplayAndFlush" ||
+    layout.presentHook.dispatchFieldOffset !== hookNames.length * 8 ||
+    layout.commitHook.dispatchFieldOffset !== (hookNames.length + 1) * 8 ||
+    layout.presentResidencyAddHook.id !== "ScopedMetal4PresentResidencyAdd" ||
+    layout.presentResidencyAddHook.dispatchFieldOffset !== (hookNames.length + 2) * 8 ||
+    layout.presentResidencyFinishHook.id !== "ScopedMetal4PresentResidencyFinish" ||
+    layout.presentResidencyFinishHook.dispatchFieldOffset !== (hookNames.length + 3) * 8 ||
     layout.hooks.some((hook, index) => hook.id !== hookNames[index] || hook.dispatchFieldOffset !== index * 8)) {
   throw new Error("unsupported native PSO dispatch layout");
 }
@@ -64,6 +73,12 @@ const spans = [
   ...layout.verificationSpans.map((span) => ({ offset: span.offset, hex: span.expectedHex })),
   { offset: layout.commitHook.entryOffset, hex: layout.commitHook.entryPatchHex },
   { offset: layout.commitHook.gateOffset, hex: layout.commitHook.gateHex },
+  { offset: layout.presentHook.entryOffset, hex: layout.presentHook.entryPatchHex },
+  { offset: layout.presentHook.gateOffset, hex: layout.presentHook.gateHex },
+  { offset: layout.presentResidencyAddHook.entryOffset, hex: layout.presentResidencyAddHook.entryPatchHex },
+  { offset: layout.presentResidencyAddHook.gateOffset, hex: layout.presentResidencyAddHook.gateHex },
+  { offset: layout.presentResidencyFinishHook.entryOffset, hex: layout.presentResidencyFinishHook.entryPatchHex },
+  { offset: layout.presentResidencyFinishHook.gateOffset, hex: layout.presentResidencyFinishHook.gateHex },
   ...layout.hooks.flatMap((hook) => [
     { offset: hook.entryOffset, hex: hook.entryPatchHex },
     { offset: hook.gateOffset, hex: hook.gateHex },
@@ -86,6 +101,9 @@ const header = [
   `inline constexpr std::uintptr_t kFirstTextOffset = ${layout.dependency.firstTextOffset};`,
   `inline constexpr std::uintptr_t kDataSlot = ${layout.dispatch.dataSlotVMAddr};`,
   `inline constexpr std::size_t kCommitDispatchIndex = ${layout.commitHook.dispatchFieldOffset / 8};`,
+  `inline constexpr std::size_t kPresentDispatchIndex = ${layout.presentHook.dispatchFieldOffset / 8};`,
+  `inline constexpr std::size_t kPresentResidencyAddDispatchIndex = ${layout.presentResidencyAddHook.dispatchFieldOffset / 8};`,
+  `inline constexpr std::size_t kPresentResidencyFinishDispatchIndex = ${layout.presentResidencyFinishHook.dispatchFieldOffset / 8};`,
   `inline constexpr std::uintptr_t kCommonSectionOffset = ${layout.dispatch.commonSectionCommandOffset};`,
   `inline constexpr std::uint64_t kCommonAddress = ${layout.dispatch.commonSectionOldEndVMAddr - layout.dispatch.commonSectionOldSize};`,
   `inline constexpr std::uint64_t kCommonSize = ${layout.dispatch.commonSectionNewSize};`,
@@ -122,7 +140,7 @@ const compileArgs = [
   ...(testControls ? ["-DYAAGL_NATIVE_PSO_CACHE_TEST_CONTROLS=1"] : []),
   "-dynamiclib", "-pthread", "-framework", "Foundation", "-framework", "Metal", "-framework", "QuartzCore", "-framework", "MetalFX",
   "-I", sourceDirectory, "-I", outputDirectory,
-  ...["cache.mm", "function-cache.mm", "function-hooks.mm", "key.mm", "metalfx-backend.mm", "d3dmetal-transport.mm", "d3dmetal-transport-legacy.mm", "d3dmetal-replay-hooks.mm", "fsr-contract.cpp", "fsr-translator.mm", "fsr-framegeneration.mm", "persistent-cache.mm", "rt-key.mm", "stage-cache.mm", "bridge.mm"].map((file) => resolve(sourceDirectory, file)),
+  ...["cache.mm", "function-cache.mm", "function-hooks.mm", "key.mm", "metalfx-backend.mm", "d3dmetal-transport.mm", "d3dmetal-transport-legacy.mm", "d3dmetal-replay-hooks.mm", "display-routing.mm", "fsr-contract.cpp", "fsr-translator.mm", "fsr-framegeneration.mm", "persistent-cache.mm", "rt-key.mm", "stage-cache.mm", "bridge.mm"].map((file) => resolve(sourceDirectory, file)),
   "-Wl,-install_name,@rpath/libYaaglNativePsoCache.dylib", "-o", modulePath,
 ];
 const compiled = spawnSync(compiler, compileArgs, { cwd: root, stdio: "inherit" });

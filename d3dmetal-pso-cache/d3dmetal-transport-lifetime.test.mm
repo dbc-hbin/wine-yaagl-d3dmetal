@@ -93,6 +93,45 @@ static void requireAt(bool value, int line) {
 }
 @end
 
+@interface ThrowingOwnerTexture : NSObject {
+@public
+    NSUInteger retains;
+    NSUInteger releases;
+    BOOL throwOnRetain;
+}
+@end
+@implementation ThrowingOwnerTexture
+- (id)retain {
+    if (throwOnRetain)
+        @throw [NSException exceptionWithName:@"InjectedRetain" reason:nil userInfo:nil];
+    ++retains;
+    return [super retain];
+}
+- (oneway void)release {
+    ++releases;
+    [super release];
+}
+@end
+
+static void testPartialOwnerConstruction() {
+    auto* first = [ThrowingOwnerTexture new];
+    auto* second = [ThrowingOwnerTexture new];
+    second->throwOnRetain = YES;
+    std::array<UseEntry, kMaxResources> uses{};
+    uses[0].texture = reinterpret_cast<id<MTLTexture>>(first);
+    uses[1].texture = reinterpret_cast<id<MTLTexture>>(second);
+    bool caught = false;
+    @try {
+        OwnerState owner(PreparedWork{}, uses, 2, 1, 1);
+    } @catch (NSException*) {
+        caught = true;
+    }
+    require(caught && first->retains == 1 && first->releases == 1 &&
+            second->retains == 0 && second->releases == 0);
+    [first release];
+    [second release];
+}
+
 static std::unique_ptr<OwnerState> makeOwner() {
     std::array<UseEntry, kMaxResources> uses{};
     return std::make_unique<OwnerState>(PreparedWork{}, uses, 0, 1, 1);
@@ -135,6 +174,7 @@ static void registerLegacyHandler(LeaseLegacyCommandBuffer* buffer,
 }
 
 int main() { @autoreleasepool {
+    testPartialOwnerConstruction();
     LeaseCommitQueue* queue = [LeaseCommitQueue new];
     void* a = reinterpret_cast<void*>(0x1000);
     void* b = reinterpret_cast<void*>(0x2000);

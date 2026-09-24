@@ -130,6 +130,8 @@ struct FactoryCapture {
     bool autoExposure = false;
     bool outputMotion = false;
     bool jitteredMotion = false;
+    bool reactiveEnabled = false;
+    MTLPixelFormat reactiveFormat = MTLPixelFormatInvalid;
 };
 
 std::mutex gCaptureMutex;
@@ -218,6 +220,8 @@ FactoryCapture snapshotDescriptor(MTLFXTemporalScalerDescriptor* descriptor,
     if (@available(macOS 27.0, *)) {
         capture.outputMotion = descriptor.outputResolutionMotionVectorsEnabled;
         capture.jitteredMotion = descriptor.jitteredMotionVectorsEnabled;
+        capture.reactiveEnabled = descriptor.reactiveMaskTextureEnabled;
+        capture.reactiveFormat = descriptor.reactiveMaskTextureFormat;
     }
     return capture;
 }
@@ -1959,6 +1963,117 @@ void testInputCapacityGrowthAndScaleFallback(id<MTLDevice> device, id compiler,
                 large, smaller, smaller, large, cappedInput, cappedInput, cappedOutput, cappedOutput);
 }
 
+void testReactiveVariantReuse(id<MTLDevice> device, id<MTL4Compiler> compiler,
+                              id<MTLCommandQueue> transfer) API_AVAILABLE(macos(27.0)) {
+    Error error;
+    constexpr NSUInteger kBacking = 88;
+    const float minScale = [MTLFXTemporalScalerDescriptor
+        supportedInputContentMinScaleForDevice:device];
+    const float maxScale = [MTLFXTemporalScalerDescriptor
+        supportedInputContentMaxScaleForDevice:device];
+    NSUInteger grownContent = 0;
+    for (NSUInteger candidate = kContent + 1; candidate <= kBacking - kColorX; ++candidate) {
+        const float scale = static_cast<float>(kOutput) / static_cast<float>(candidate);
+        if (scale >= minScale && scale <= maxScale) {
+            grownContent = candidate;
+            break;
+        }
+    }
+    require(grownContent != 0, "device supports legal reactive input-capacity growth");
+    CreateInfo create = makeCreateInfo();
+    create.input = {kBacking, kBacking};
+    auto feature = Feature::create(
+        {reinterpret_cast<void*>(device), reinterpret_cast<void*>(compiler), CommandMode::Metal4},
+        create, &error);
+    require(feature != nullptr, "reactive variant feature");
+    Resources resources = makeResources(device, kBacking, MTLStorageModeShared);
+    id<MTLTexture> reactive = makeTexture(device, MTLPixelFormatR8Unorm, kBacking, kBacking,
+                                          MTLStorageModeShared, MTLTextureUsageShaderRead);
+    id<MTLTexture> composition = makeTexture(device, MTLPixelFormatR8Unorm, kBacking, kBacking,
+                                             MTLStorageModeShared, MTLTextureUsageShaderRead);
+    std::vector<unsigned char> maskBytes(kBacking * kBacking, 192);
+    [reactive replaceRegion:MTLRegionMake2D(0, 0, kBacking, kBacking) mipmapLevel:0
+                 withBytes:maskBytes.data() bytesPerRow:kBacking];
+    [composition replaceRegion:MTLRegionMake2D(0, 0, kBacking, kBacking) mipmapLevel:0
+                    withBytes:maskBytes.data() bytesPerRow:kBacking];
+
+    Metal4Runner runner(device);
+    const std::size_t captureBase = captureCount();
+    // Composition changes preprocessing but not the R8 MetalFX descriptor.
+    // Growing input capacity invalidates both older, smaller variants exactly once.
+    constexpr std::array<unsigned, 10> variants = {1, 0, 1, 0, 2, 2, 1, 0, 1, 0};
+    constexpr std::array<std::size_t, 10> factories = {1, 2, 2, 2, 2, 2, 3, 4, 4, 4};
+    constexpr std::array<bool, 10> resets = {
+        true, true, true, true, true, false, true, true, true, true};
+    id enabledScaler = nil;
+    id disabledScaler = nil;
+    for (std::size_t i = 0; i < variants.size(); ++i) {
+        fillInputs(resources, static_cast<unsigned>(i));
+        writeRGBA8(device, transfer, resources.output, sentinelBytes());
+        FrameInfo frame = makeFrame(resources, static_cast<unsigned>(i), i == 0);
+        if (i >= 6) {
+            frame.inputContent = {static_cast<std::uint32_t>(grownContent),
+                                  static_cast<std::uint32_t>(grownContent)};
+            frame.colorRect.width = frame.depthRect.width = frame.motionRect.width =
+                frame.reactiveRect.width = static_cast<std::uint32_t>(grownContent);
+            frame.colorRect.height = frame.depthRect.height = frame.motionRect.height =
+                frame.reactiveRect.height = static_cast<std::uint32_t>(grownContent);
+            frame.motionVectorScaleX.value = frame.motionVectorScaleY.value =
+                static_cast<float>(grownContent);
+        }
+        TextureSet textures = makeTextureSet(resources);
+        FrameOperations operations{};
+        if (variants[i] == 1) {
+            textures.reactive = reinterpret_cast<void*>(reactive);
+            frame.reactiveMask = {reinterpret_cast<void*>(reactive), true};
+        } else if (variants[i] == 2) {
+            textures.composition = reinterpret_cast<void*>(composition);
+            operations.combineCompositionMask = true;
+        }
+        auto prepared = feature->prepare(frame, textures, &error, operations);
+        require(prepared != nullptr,
+                error.message.empty() ? "reactive variant preparation" : error.message.c_str());
+        require(captureCount() == captureBase + factories[i],
+                "alternating reactive presence reuses the two MetalFX descriptor variants");
+        if (i == 0 || i == 6) {
+            const FactoryCapture capture = captureAt(captureBase + (i == 0 ? 0 : 2));
+            require(capture.reactiveEnabled && capture.reactiveFormat == MTLPixelFormatR8Unorm,
+                    "mask-present factory uses a matching R8 reactive descriptor");
+            enabledScaler = capture.scaler;
+            installScalerObservers(enabledScaler);
+        } else if (i == 1 || i == 7) {
+            const FactoryCapture capture = captureAt(captureBase + (i == 1 ? 1 : 3));
+            require(!capture.reactiveEnabled,
+                    "mask-absent factory uses a distinct disabled reactive descriptor");
+            disabledScaler = capture.scaler;
+            installScalerObservers(disabledScaler);
+        }
+        const auto lease = runner.run(prepared, &error);
+        const id expectedScaler = variants[i] ? enabledScaler : disabledScaler;
+        require(lease != nullptr && lease->scaler() == reinterpret_cast<void*>(expectedScaler),
+                "reactive variant execution uses its original descriptor");
+        require(lease->effectiveReset() == resets[i] &&
+                lease->generationInitialized() == !resets[i],
+                "switching variants resets stale temporal history, not consecutive frames");
+        bool resetValue = false;
+        require(observedBool(expectedScaler, &gObservedResetKey, resetValue) &&
+                resetValue == resets[i], "reactive variant reset reaches MetalFX setter");
+        id<MTLFXTemporalScalerBase> scaler =
+            reinterpret_cast<id<MTLFXTemporalScalerBase>>(expectedScaler);
+        require(static_cast<bool>(scaler.reactiveMaskTexture) == (variants[i] != 0),
+                "reactive descriptor receives a mask exactly when enabled");
+        if (variants[i] == 2)
+            require(scaler.reactiveMaskTexture != composition,
+                    "composition reaches MetalFX through a combined mask scratch");
+        verifyOutputSentinel(readRGBA8(device, transfer, resources.output),
+                             resources.output.width, resources.output.height);
+    }
+    [composition release];
+    [reactive release];
+    std::printf("REACTIVE_VARIANT_REUSE_PASS factories=4 frames=10 grown_input=%zux%zu reactivation_reset=1 composition=1\n",
+                grownContent, grownContent);
+}
+
 void testDisplayResolutionMotionMetal4(id<MTLDevice> device, id<MTL4Compiler> compiler,
                                        id<MTLCommandQueue> transfer) API_AVAILABLE(macos(26.0)) {
     CreateInfo create = makeCreateInfo();
@@ -2071,39 +2186,63 @@ void testMetal4InflightReplay(id<MTLDevice> device, id<MTL4Compiler> compiler,
     auto feature = Feature::create({reinterpret_cast<void*>(device), reinterpret_cast<void*>(compiler),
                                     CommandMode::Metal4}, create, &error);
     require(feature != nullptr, "inflight replay feature");
-    Resources resources = makeResources(device, 80, MTLStorageModeShared);
-    fillInputs(resources, 1);
-    writeRGBA8(device, transfer, resources.output, sentinelBytes());
-    auto prepared = feature->prepare(makeFrame(resources, 1, false), makeTextureSet(resources), &error);
-    require(prepared != nullptr, "inflight replay prepared frame");
+    // A and B overlap; C is first prepared only after their GPU feedback and
+    // leases are released. Distinct caller textures expose stale cached bindings.
+    std::array<Resources, 3> resources = {
+        makeResources(device, 80, MTLStorageModeShared),
+        makeResources(device, 80, MTLStorageModeShared),
+        makeResources(device, 80, MTLStorageModeShared)};
+    const std::array<std::array<unsigned char, 4>, 3> colors = {{{240, 20, 30, 255},
+                                                                 {20, 30, 240, 255},
+                                                                 {20, 240, 30, 255}}};
+    std::array<std::shared_ptr<const PreparedFrame>, 3> prepared;
+    const auto prepareCaller = [&](unsigned i) {
+        fillInputs(resources[i], 0);
+        std::vector<unsigned char> solid(resources[i].capacity * resources[i].capacity * 4);
+        for (std::size_t offset = 0; offset < solid.size(); offset += 4)
+            std::copy(colors[i].begin(), colors[i].end(), solid.begin() + offset);
+        [resources[i].color replaceRegion:MTLRegionMake2D(0, 0, resources[i].capacity,
+                                                           resources[i].capacity)
+                             mipmapLevel:0 withBytes:solid.data()
+                             bytesPerRow:resources[i].capacity * 4];
+        writeRGBA8(device, transfer, resources[i].output, sentinelBytes());
+        prepared[i] = feature->prepare(makeFrame(resources[i], 0, true),
+                                       makeTextureSet(resources[i]), &error);
+        require(prepared[i] != nullptr,
+                error.message.empty() ? "inflight distinct-binding prepare" : error.message.c_str());
+    };
+    prepareCaller(0);
+    prepareCaller(1);
 
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
     require(queue != nil, "inflight replay queue");
-    std::array<id<MTL4CommandAllocator>, 2> allocators = {
-        [device newCommandAllocator], [device newCommandAllocator]};
-    std::array<id<MTL4CommandBuffer>, 2> commands = {
-        [device newCommandBuffer], [device newCommandBuffer]};
-    std::array<id<MTLFence>, 2> fences = {[device newFence], [device newFence]};
-    std::array<std::shared_ptr<const ExecutionLease>, 2> leases{};
-    for (unsigned i = 0; i < 2; ++i) {
+    // Replay the same A preparation twice while both executions are live,
+    // then introduce B before either completion is observed.
+    std::array<id<MTL4CommandAllocator>, 3> allocators = {
+        [device newCommandAllocator], [device newCommandAllocator], [device newCommandAllocator]};
+    std::array<id<MTL4CommandBuffer>, 3> commands = {
+        [device newCommandBuffer], [device newCommandBuffer], [device newCommandBuffer]};
+    std::array<id<MTLFence>, 3> fences = {[device newFence], [device newFence], [device newFence]};
+    std::array<std::shared_ptr<const ExecutionLease>, 3> leases{};
+    for (unsigned i = 0; i < 3; ++i) {
         require(allocators[i] && commands[i] && fences[i], "inflight replay slot");
         [commands[i] beginCommandBufferWithAllocator:allocators[i]];
         id<MTL4ComputeCommandEncoder> producer = [commands[i] computeCommandEncoder];
         [producer updateFence:fences[i] afterEncoderStages:MTLStageDispatch];
         [producer endEncoding];
-        require(prepared->encode(reinterpret_cast<void*>(commands[i]),
-                                 reinterpret_cast<void*>(fences[i]), leases[i], &error),
-                "inflight replay encode");
+        require(prepared[i == 2 ? 1 : 0]->encode(reinterpret_cast<void*>(commands[i]),
+                                                   reinterpret_cast<void*>(fences[i]),
+                                                   leases[i], &error),
+                error.message.empty() ? "inflight distinct-binding encode" : error.message.c_str());
         require(leases[i] != nullptr, "inflight replay lease");
         [commands[i] endCommandBuffer];
     }
-    require(leases[0].get() != leases[1].get(), "each in-flight replay receives a unique ExecutionLease");
-
-    std::array<dispatch_semaphore_t, 2> done = {
-        dispatch_semaphore_create(0), dispatch_semaphore_create(0)};
-    std::array<NSError*, 2> errors = {nil, nil};
-    std::array<MTL4CommitOptions*, 2> options = {[MTL4CommitOptions new], [MTL4CommitOptions new]};
-    for (unsigned i = 0; i < 2; ++i) {
+    std::array<dispatch_semaphore_t, 3> done = {
+        dispatch_semaphore_create(0), dispatch_semaphore_create(0), dispatch_semaphore_create(0)};
+    std::array<NSError*, 3> errors = {nil, nil, nil};
+    std::array<MTL4CommitOptions*, 3> options = {
+        [MTL4CommitOptions new], [MTL4CommitOptions new], [MTL4CommitOptions new]};
+    for (unsigned i = 0; i < 3; ++i) {
         NSError** errorSlot = &errors[i];
         dispatch_semaphore_t doneSlot = done[i];
         [options[i] addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
@@ -2113,16 +2252,33 @@ void testMetal4InflightReplay(id<MTLDevice> device, id<MTL4Compiler> compiler,
         id<MTL4CommandBuffer> batch[] = {commands[i]};
         [queue commit:batch count:1 options:options[i]];
     }
-    for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned i = 0; i < 3; ++i) {
         require(dispatch_semaphore_wait(done[i], dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0,
                 "inflight replay completion timeout");
         if (errors[i]) NSLog(@"inflight replay error: %@", errors[i]);
         require(errors[i] == nil, "inflight replay GPU completion");
     }
-    const auto bytes = readRGBA8(device, transfer, resources.output);
-    verifyOutputSentinel(bytes, resources.output.width, resources.output.height);
+    std::array<std::vector<unsigned char>, 3> outputs;
+    const std::size_t center = ((kOutputY + kOutput / 2) * kOutputBacking +
+                                kOutputX + kOutput / 2) * 4;
+    const std::array<unsigned, 3> dominantChannels = {0, 2, 1};
+    const auto checkCaller = [&](unsigned i, const char* message) {
+        outputs[i] = readRGBA8(device, transfer, resources[i].output);
+        verifyOutputSentinel(outputs[i], resources[i].output.width, resources[i].output.height);
+        const unsigned channel = dominantChannels[i];
+        for (unsigned other = 0; other < 3; ++other) {
+            if (other != channel)
+                require(outputs[i][center + channel] > outputs[i][center + other] + 64, message);
+        }
+    };
+    checkCaller(0, "in-flight A output reflects its own caller color");
+    checkCaller(1, "in-flight B output reflects its own caller color");
+    require(outputs[0] != outputs[1], "distinct in-flight bindings produce distinct readbacks");
 
-    for (unsigned i = 0; i < 2; ++i) {
+    // Complete feedback and release every old lease before preparing a new
+    // caller. Otherwise the cache cannot reclaim an idle residency binding.
+    for (auto& lease : leases) lease.reset();
+    for (unsigned i = 0; i < 3; ++i) {
         [errors[i] release];
         [options[i] release];
         dispatch_release(done[i]);
@@ -2131,6 +2287,34 @@ void testMetal4InflightReplay(id<MTLDevice> device, id<MTL4Compiler> compiler,
         [allocators[i] release];
     }
     [queue release];
+
+    prepareCaller(2);
+    Metal4Runner replay(device);
+    auto replayLease = replay.run(prepared[2], &error);
+    require(replayLease != nullptr, "new C caller after completed A/A/B");
+    checkCaller(2, "new C output reflects its own caller color");
+    require(readRGBA8(device, transfer, resources[0].output) == outputs[0] &&
+            readRGBA8(device, transfer, resources[1].output) == outputs[1],
+            "C does not overwrite completed A or B outputs");
+    replayLease.reset();
+
+    // Alternate old and new prepared frames after the new binding was used.
+    writeRGBA8(device, transfer, resources[0].output, sentinelBytes());
+    replayLease = replay.run(prepared[0], &error);
+    require(replayLease != nullptr, "A replay after C");
+    checkCaller(0, "replayed A restores its caller color after C");
+    require(readRGBA8(device, transfer, resources[1].output) == outputs[1] &&
+            readRGBA8(device, transfer, resources[2].output) == outputs[2],
+            "A replay does not overwrite B or C caller outputs");
+    replayLease.reset();
+
+    writeRGBA8(device, transfer, resources[2].output, sentinelBytes());
+    replayLease = replay.run(prepared[2], &error);
+    require(replayLease != nullptr, "C replay after A");
+    checkCaller(2, "replayed C restores its caller color after A");
+    require(readRGBA8(device, transfer, resources[0].output) == outputs[0] &&
+            readRGBA8(device, transfer, resources[1].output) == outputs[1],
+            "C replay does not overwrite A or B caller outputs");
 }
 
 void testExactScaleCapGpu(id<MTLDevice> device, id<MTLCommandQueue> transfer) {
@@ -2371,6 +2555,51 @@ int main(int argc, char** argv) {
             require(false, "scoped edge-reuse cases require macOS 27 or newer");
             return 1;
         }
+        if (argc == 2 && std::strcmp(argv[1], "--reactive-variants-only") == 0) {
+            if (@available(macOS 27.0, *)) {
+                id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+                require(device != nil && [MTLFXTemporalScalerDescriptor supportsMetal4FX:device],
+                        "Metal4FX temporal device for reactive variants");
+                installFactoryCapture();
+                id<MTLCommandQueue> transfer = [device newCommandQueue];
+                MTL4CompilerDescriptor* descriptor = [MTL4CompilerDescriptor new];
+                NSError* compilerError = nil;
+                id<MTL4Compiler> compiler =
+                    [device newCompilerWithDescriptor:descriptor error:&compilerError];
+                [descriptor release];
+                if (compilerError) NSLog(@"reactive variant compiler error: %@", compilerError);
+                require(transfer != nil && compiler != nil, "reactive variant queues/compiler");
+                testReactiveVariantReuse(device, compiler, transfer);
+                releaseCaptures();
+                [compiler release];
+                [transfer release];
+                [device release];
+                return 0;
+            }
+            require(false, "reactive variant regression requires macOS 27 or newer");
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--binding-replay-only") == 0) {
+            if (@available(macOS 26.0, *)) {
+                id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+                require(device != nil && [MTLFXTemporalScalerDescriptor supportsMetal4FX:device],
+                        "Metal4FX device for binding replay");
+                id<MTLCommandQueue> transfer = [device newCommandQueue];
+                NSError* compilerError = nil;
+                MTL4CompilerDescriptor* descriptor = [MTL4CompilerDescriptor new];
+                id<MTL4Compiler> compiler =
+                    [device newCompilerWithDescriptor:descriptor error:&compilerError];
+                [descriptor release];
+                if (compilerError) NSLog(@"binding replay compiler error: %@", compilerError);
+                require(transfer != nil && compiler != nil, "binding replay queues/compiler");
+                testMetal4InflightReplay(device, compiler, transfer);
+                [compiler release];
+                [transfer release];
+                [device release];
+                std::puts("METAL4_BINDING_REPLAY_PASS");
+                return 0;
+            }
+            require(false, "binding replay requires macOS 26 or newer");
+        }
         require(argc == 1, "unknown MetalFX backend test argument");
         if (@available(macOS 27.0, *)) {
         } else {
@@ -2449,6 +2678,7 @@ int main(int argc, char** argv) {
                 testFsrOperationsMetal4(device, compiler, transfer);
                 testDisplayResolutionMotionMetal4(device, compiler, transfer);
                 if (@available(macOS 27.0, *)) {
+                    testReactiveVariantReuse(device, compiler, transfer);
                     testInputExtentReuse(device, compiler, transfer, CommandMode::Metal4, true);
                     testInputExtentReuse(device, compiler, transfer, CommandMode::Metal4, false);
                     testInputExtentReuse(device, compiler, transfer, CommandMode::Metal4, true, true);
