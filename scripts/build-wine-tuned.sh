@@ -73,7 +73,8 @@ PATCH_INVENTORY='0001-msync-tuned.patch
 0013-window-resources.patch
 0014-core-resources.patch
 0015-msync-owned-exports.patch
-0016-cursor-diagnostics.patch'
+0016-cursor-diagnostics.patch
+0017-cursor-reconciliation-coalescing.patch'
 
 # key|build tree|make target|installed path|architecture|format|changed sources (comma-separated)
 # This is the single authoritative source/artifact inventory. Source exclusions,

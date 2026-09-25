@@ -122,6 +122,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
     - (void) setupObservations;
     - (void) applicationDidBecomeActive:(NSNotification *)notification;
     - (void) cgDisplaysWereReconfigured:(NSArray*)changes;
+    - (void) setCursorWithSelector:(SEL)selector frames:(NSArray*)frames;
 
     static void PerformRequest(void *info);
 
@@ -1018,37 +1019,77 @@ static NSString* WineLocalizedString(unsigned int stringID)
         [self updateCursor:mouseIsOverWineWindow];
     }
 
-    - (void) hideCursor
+    /* Single entry point for a native cursor payload.  Prepares the retained
+       cursor, the animation frames and timer, and the desired visibility, then
+       performs exactly one strict reconciliation.  Runs on the main thread. */
+    - (void) setCursorWithSelector:(SEL)selector frames:(NSArray*)frames
     {
-        if (!clientWantsCursorHidden)
+        if (selector)
         {
-            clientWantsCursorHidden = TRUE;
-            [self reconcileCursorForCurrentMouseLocation];
-        }
-    }
-
-    - (void) unhideCursor
-    {
-        if (clientWantsCursorHidden)
-        {
+            /* A named cursor takes precedence over frames and is always visible. */
+            [self stopCursorAnimation];
+            self.cursor = [NSCursor performSelector:selector];
             clientWantsCursorHidden = FALSE;
-            [self reconcileCursorForCurrentMouseLocation];
         }
+        else if ([frames count])
+        {
+            /* Identical frames keep the retained cursor and the running
+               animation, but still get the final reconciliation below to
+               repair an arrow the system may have installed over them. */
+            clientWantsCursorHidden = FALSE;
+            if (self.cursorFrames != frames && ![self.cursorFrames isEqualToArray:frames])
+            {
+                [cursorTimer invalidate];
+                self.cursorTimer = nil;
+                self.cursorFrames = frames;
+                cursorFrame = 0;
+
+                if ([frames count] > 1)
+                {
+                    NSDictionary* frame = frames[0];
+                    NSTimeInterval duration = [frame[@"duration"] doubleValue];
+                    NSDate* date = [NSDate dateWithTimeIntervalSinceNow:duration];
+                    self.cursorTimer = [[[NSTimer alloc] initWithFireDate:date
+                                                                 interval:1000000
+                                                                   target:self
+                                                                 selector:@selector(nextCursorFrame:)
+                                                                 userInfo:nil
+                                                                  repeats:YES] autorelease];
+                    [[NSRunLoop currentRunLoop] addTimer:cursorTimer forMode:NSRunLoopCommonModes];
+                }
+
+                [self setCursor];
+            }
+        }
+        else
+        {
+            /* Hidden payload: retain the last cursor so it can be restored
+               later, but drop the animation.  Reconcile even if already hidden. */
+            [self stopCursorAnimation];
+            clientWantsCursorHidden = TRUE;
+        }
+
+        [self reconcileCursorForCurrentMouseLocation];
     }
 
     - (void) setCursor:(NSCursor*)newCursor
     {
+        /* State only.  The native cursor is applied by the reconciliation at
+           the end of the payload entry point, never here.  The previously
+           applied native cursor stays valid until that reconcile, which
+           force-clears cursorIsCurrent on the eligible path, so the
+           ownership flag is deliberately left untouched. */
         if (newCursor != cursor)
         {
             [cursor release];
             cursor = [newCursor retain];
-            cursorIsCurrent = FALSE;
         }
-        [self reconcileCursorForCurrentMouseLocation];
     }
 
     - (void) setCursor
     {
+        /* State only: build the retained cursor for the current animation
+           frame.  The caller reconciles. */
         NSDictionary* frame = cursorFrames[cursorFrame];
         CGImageRef cgimage = (CGImageRef)frame[@"image"];
         CGSize size = CGSizeMake(CGImageGetWidth(cgimage), CGImageGetHeight(cgimage));
@@ -1061,7 +1102,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
         hotSpot = cgpoint_mac_from_win(hotSpot);
         self.cursor = [[[NSCursor alloc] initWithImage:image hotSpot:NSPointFromCGPoint(hotSpot)] autorelease];
         [image release];
-        [self unhideCursor];
     }
 
     - (void) nextCursorFrame:(NSTimer*)theTimer
@@ -1074,6 +1114,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
         if (cursorFrame >= [cursorFrames count])
             cursorFrame = 0;
         [self setCursor];
+        clientWantsCursorHidden = FALSE;
+        [self reconcileCursorForCurrentMouseLocation];
 
         frame = cursorFrames[cursorFrame];
         duration = [frame[@"duration"] doubleValue];
@@ -1081,37 +1123,12 @@ static NSString* WineLocalizedString(unsigned int stringID)
         [cursorTimer setFireDate:date];
     }
 
-    - (void) setCursorWithFrames:(NSArray*)frames
+    - (void) stopCursorAnimation
     {
-        if (self.cursorFrames == frames || [self.cursorFrames isEqualToArray:frames])
-        {
-            [self reconcileCursorForCurrentMouseLocation];
-            return;
-        }
-
-        self.cursorFrames = frames;
-        cursorFrame = 0;
         [cursorTimer invalidate];
         self.cursorTimer = nil;
-
-        if ([frames count])
-        {
-            if ([frames count] > 1)
-            {
-                NSDictionary* frame = frames[0];
-                NSTimeInterval duration = [frame[@"duration"] doubleValue];
-                NSDate* date = [NSDate dateWithTimeIntervalSinceNow:duration];
-                self.cursorTimer = [[[NSTimer alloc] initWithFireDate:date
-                                                             interval:1000000
-                                                               target:self
-                                                             selector:@selector(nextCursorFrame:)
-                                                             userInfo:nil
-                                                              repeats:YES] autorelease];
-                [[NSRunLoop currentRunLoop] addTimer:cursorTimer forMode:NSRunLoopCommonModes];
-            }
-
-            [self setCursor];
-        }
+        self.cursorFrames = nil;
+        cursorFrame = 0;
     }
 
     - (void) setApplicationIconFromCGImageArray:(NSArray*)images
@@ -2673,36 +2690,14 @@ int macdrv_set_display_mode(CGDirectDisplayID displayID, CGDisplayModeRef displa
  */
 void macdrv_set_cursor(CFStringRef name, CFArrayRef frames)
 {
-    SEL sel;
+    SEL sel = NSSelectorFromString((NSString*)name);
+    NSArray* nsframes = sel ? nil : (NSArray*)frames;
 
-    sel = NSSelectorFromString((NSString*)name);
-    if (sel)
-    {
-        OnMainThreadAsync(^{
-            WineApplicationController* controller = [WineApplicationController sharedController];
-            [controller setCursorWithFrames:nil];
-            controller.cursor = [NSCursor performSelector:sel];
-            [controller unhideCursor];
-        });
-    }
-    else
-    {
-        NSArray* nsframes = (NSArray*)frames;
-        if ([nsframes count])
-        {
-            OnMainThreadAsync(^{
-                [[WineApplicationController sharedController] setCursorWithFrames:nsframes];
-            });
-        }
-        else
-        {
-            OnMainThreadAsync(^{
-                WineApplicationController* controller = [WineApplicationController sharedController];
-                [controller setCursorWithFrames:nil];
-                [controller hideCursor];
-            });
-        }
-    }
+    /* One asynchronous request per native payload.  The block retains the
+       payload and the controller entry performs exactly one reconciliation. */
+    OnMainThreadAsync(^{
+        [[WineApplicationController sharedController] setCursorWithSelector:sel frames:nsframes];
+    });
 }
 
 /***********************************************************************

@@ -115,6 +115,12 @@ python3 scripts/decode-cursor-trace.py "$trace_dir" --around-ns 123456789000 --b
 - `clock_ns`는 공통 단조 시계이고 원본 이벤트 시간의 단위는 별도 표시합니다. 포인터 식별자는 재사용될 수 있어 시퀀스와 수명을 함께 봐야 하며 프로세스 간 인과관계를 자동으로 확정하지 않습니다. 같은 RawInput 핸들의 반복 읽기를 추가 물리 입력으로 합산하면 안 됩니다. Confinement에서는 EventTap 워프 보정이 실행되지 않습니다.
 - 수집기·분석기의 비활성화, 순환 경계, 동시 기록, fork 격리, 잘못된 파일 검증: `python3 scripts/test-cursor-trace.py`.
 
+### 미배포 커서 재적용 중복 축소
+
+커서 실험 브랜치의 `0017-cursor-reconciliation-coalescing.patch`는 한 커서 요청의 모양·애니메이션·표시 상태를 먼저 준비하고, 마지막에 위치 판정과 네이티브 재적용을 한 번 수행합니다. 동일한 커서 요청도 재적용하므로 macOS가 기본 화살표로 덮어쓴 상태를 복구할 수 있습니다. 같은 애니메이션 프레임 배열은 프레임 위치와 타이머를 유지합니다.
+
+같은 창의 연속된 동기화 요청은 마지막 메인 큐 작업이 아직 대기 중일 때만 합칩니다. 다른 창이 끼어든 `A → B → A`의 순서와, 작업 시작 이후 발생한 새 요청은 보존합니다. 시작·활성화·첫 콘텐츠·표시/숨김·AppKit 커서 전환 트리거와 기존 Wine 이벤트 큐 병합은 유지합니다. 이 변경은 진단 환경변수와 독립적이며, RawInput·좌표·워프 보정이나 서버 프로토콜은 바꾸지 않습니다.
+
 ### 미배포 현재 소스의 NGX 복구
 
 Metal4 replay와 legacy encode의 공용 처리는 별도 외부 wrapper를 유지하지 않고 `ngx-hooks.mm` 안으로 직접 복원했습니다. `bridge.mm`의 슬롯 17·18은 NGX replay·encode 진입점에 직접 연결되며, NGX descriptor를 해석하기 전에 FSR 기록 명령을 식별하고 실행합니다. 분리했던 `d3dmetal-replay-hooks.{hpp,mm}` 계층과 해당 빌드 항목은 제거했습니다.

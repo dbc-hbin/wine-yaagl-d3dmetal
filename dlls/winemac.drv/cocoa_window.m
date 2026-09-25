@@ -929,6 +929,13 @@ static inline BOOL stage_manager_enabled(void)
 
     static WineWindow* causing_becomeKeyWindow;
 
+    /* Scheduling state for the main-queue blocks that publish
+       WINDOW_NATIVE_CURSOR_SYNC.  Only the window whose block is still waiting
+       is coalesced, so requests for distinct windows keep their relative order.
+       Every caller runs on the main thread, so no locking is needed. */
+    static WineWindow* pendingNativeCursorSyncWindow;
+    static uint64_t nativeCursorSyncSerial;
+
     @synthesize disabled, noForeground, preventsAppActivation, floating, fullscreen, fakingClose, closing, latentParentWindow, hwnd, queue;
     @synthesize drawnSinceShown;
     @synthesize shapeChangedSinceLastDraw;
@@ -1200,7 +1207,23 @@ static inline BOOL stage_manager_enabled(void)
 
     - (void) postNativeCursorSyncEvent
     {
+        /* Coalesce only consecutive requests for the same window; that block runs
+           after this request and publishes the same event, while requests for
+           distinct windows are always queued so their order is preserved
+           (A, B, A stays A, B, A).  The newest block clears the pending window as
+           it begins, before publishing, so a reentrant request still schedules
+           another block.  Main thread only; the queued block retains the window. */
+        if (pendingNativeCursorSyncWindow == self)
+            return;
+
+        uint64_t serial = ++nativeCursorSyncSerial;
+
+        pendingNativeCursorSyncWindow = self;
+
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (nativeCursorSyncSerial == serial)
+                pendingNativeCursorSyncWindow = nil;
+
             macdrv_event *event = macdrv_create_event(WINDOW_NATIVE_CURSOR_SYNC, self);
 
             [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_NATIVE_CURSOR_SYNC) forWindow:self];

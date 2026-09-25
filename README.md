@@ -115,6 +115,12 @@ python3 scripts/decode-cursor-trace.py "$trace_dir" --around-ns 123456789000 --b
 - `clock_ns` uses the common monotonic clock; source-event clock units are separately labeled. Pointer identities can be reused, so interpret them with sequence/lifetime context, not as automatic cross-process causal links. Repeated reads of a RawInput handle are not additional physical input. Confinement does not execute EventTap warp correction.
 - Collector/decoder checks for disabled recording, wraparound, concurrent producers, fork isolation, and malformed files: `python3 scripts/test-cursor-trace.py`.
 
+### Unreleased cursor reconciliation coalescing
+
+On the cursor experiment branch, `0017-cursor-reconciliation-coalescing.patch` prepares each cursor request's shape, animation, and visibility before one final hit-test and native reconciliation. Identical cursor payloads still reconcile, repairing a system-installed arrow. Equal animation frames preserve the current frame and timer.
+
+Consecutive same-window synchronization requests coalesce only while the latest main-queue publication is pending. Interleaved `A → B → A` ordering and requests made after a publication begins remain intact. Startup, activation, first-content, visibility, and AppKit cursor-update triggers and existing Wine event-queue coalescing are retained. This change is independent of the diagnostic environment variable and does not change RawInput, position/warp correction, or the server protocol.
+
 ### Unreleased NGX restoration in current source
 
 Shared Metal4 replay and legacy encode handling are restored directly inside `ngx-hooks.mm`, rather than retained as an outer compatibility wrapper. `bridge.mm` publishes the NGX replay/encode entrypoints directly in slots 17/18; they recognize and execute FSR-recorded commands before interpreting any NGX descriptor. The separate `d3dmetal-replay-hooks.{hpp,mm}` layer and its build entries have been removed.
