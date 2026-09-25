@@ -10,25 +10,17 @@ fi
 
 wine_root=$(CDPATH= cd -- "$wrapper_dir/.." && pwd)
 
-# GPTK D3DMetal with explicit GPU identity. Keep the AMD identity as the
-# default; NVIDIA is an opt-in for testing the stock NGX path.
+# GPTK D3DMetal with a fixed per-game adapter identity: Zenless Zone Zero sees
+# AMD Radeon RX 9070, every other launch sees NVIDIA GeForce RTX 5060.
 # Keep WINE_ENABLE_TIMEOUT_FIX aligned with src/wine/d3dmetal.ts launch contract.
 export WINE_ENABLE_TIMEOUT_FIX=1
 export CX_ACTIVE_GRAPHICS_BACKEND=d3dmetal
 export D3DM_MTL4=1
 export D3DM_ENABLE_METALFX=1
 export D3DM_SUPPORT_DXR=1
-case "${YAAGL_GPU_IDENTITY:-rx9070}" in
-  rx9070)
-    export D3DM_VENDOR_ID=0x1002
-    export D3DM_DEVICE_ID=0x7550
-    export D3DM_DEVICE_DESCRIPTION="AMD Radeon RX 9070" ;;
-  rtx5060)
-    export D3DM_VENDOR_ID=0x10de
-    export D3DM_DEVICE_ID=0x2d05
-    export D3DM_DEVICE_DESCRIPTION="NVIDIA GeForce RTX 5060" ;;
-  *) echo "YAAGL_GPU_IDENTITY must be rx9070 or rtx5060" >&2; exit 64 ;;
-esac
+# The identity is derived from the launch below; never let an inherited or
+# stale manual selection reach wine.real or the game.
+unset YAAGL_GPU_IDENTITY
 export WINEMSYNC=1
 unset WINEDLLOVERRIDES WINEDLLPATH_PREPEND DXMT_CONFIG DXMT_CONFIG_FILE
 unset DXVK_CONFIG_FILE DXVK_STATE_CACHE_PATH VK_ICD_FILENAMES VK_DRIVER_FILES
@@ -70,43 +62,57 @@ if [ -f "$wine_root/yaagl-wine-p3-runtime.txt" ]; then
   fi
 fi
 
-has_zzz=0
-has_config_batch=0
-for argument in "$@"; do
-  case "$argument" in
-    *ZenlessZoneZero.exe*) has_zzz=1 ;;
-    *config.bat*) has_config_batch=1 ;;
-  esac
-done
+# Classify this launch. Yaagl passes the game executable directly or through the
+# Steam wrapper, and its normal launch runs `cmd /c "Z:\...\config.bat"`; match
+# only a standalone, case-insensitive file-name token so related files such as
+# NotZenlessZoneZero.exe or ZenlessZoneZero.exe.bak never select the game.
+launch_has_zzz_token() {
+  LC_ALL=C grep -qiE '(^"?|[\\/])zenlesszonezero[.]exe"?[[:space:]]*$'
+}
 
+has_zzz=0
+if printf '%s\n' "$@" | launch_has_zzz_token; then
+  has_zzz=1
+fi
+
+# The generated game batch is consulted only when config.bat itself is in the
+# invocation, so any other program keeps the default identity even while a
+# stale game batch from an earlier run is still on disk.
+if [ "$has_zzz" -eq 0 ] && [ -n "${WINEPREFIX:-}" ] &&
+    printf '%s\n' "$@" | LC_ALL=C grep -qiE '(^"?|[\\/])config[.]bat"?[[:space:]]*$'; then
+  game_batch="$(dirname -- "$WINEPREFIX")/config.bat"
+  # Yaagl quotes the full game executable, with optional arguments after it.
+  if [ -f "$game_batch" ] && {
+    LC_ALL=C grep -qiE '"([^"]*[\\/])?zenlesszonezero[.]exe"([[:space:]]|$)' "$game_batch" ||
+      launch_has_zzz_token <"$game_batch"
+  }; then
+    has_zzz=1
+  fi
+fi
+
+# Fixed automatic identity: the game keeps the AMD adapter, every other program
+# sees the NVIDIA adapter. This does not change renderer capabilities.
+if [ "$has_zzz" -eq 1 ]; then
+  export D3DM_VENDOR_ID=0x1002
+  export D3DM_DEVICE_ID=0x7550
+  export D3DM_DEVICE_DESCRIPTION="AMD Radeon RX 9070"
+else
+  export D3DM_VENDOR_ID=0x10de
+  export D3DM_DEVICE_ID=0x2d05
+  export D3DM_DEVICE_DESCRIPTION="NVIDIA GeForce RTX 5060"
+fi
+
+# Original Yaagl temporarily moves the packaged module to .bak and installs
+# DXMT before launching. Copy the saved D3DMetal module back for this run;
+# keep .bak so Yaagl's normal patchRevertProgram remains valid afterwards.
 restore_d3dmetal_modules() {
   module_dir="$wrapper_dir/../lib/wine/x86_64-windows"
   for module in d3d10core.dll d3d11.dll dxgi.dll; do
-    # Original Yaagl temporarily moves the packaged module to .bak and installs
-    # DXMT before launching. Copy the saved D3DMetal module back for this run;
-    # keep .bak so Yaagl's normal patchRevertProgram remains valid afterwards.
     if [ -f "$module_dir/$module.bak" ]; then
       cp "$module_dir/$module.bak" "$module_dir/$module" || return 1
     fi
   done
 }
 
-# Direct and steam-wrapper launches expose the game executable in argv.
-if [ "$has_zzz" -eq 1 ]; then
-  restore_d3dmetal_modules || exit 124
-  exec "$real_wine" "$@"
-fi
-
-# Original Yaagl launches `cmd /c Z:\...\config.bat`; inspect its standard
-# generated file only to select the D3DMetal modules. Renderer arguments remain
-# entirely owned by the launcher configuration.
-if [ "$has_config_batch" -eq 1 ] && [ -n "${WINEPREFIX:-}" ]; then
-  support_root=$(dirname -- "$WINEPREFIX")
-  source_batch="$support_root/config.bat"
-  if [ -f "$source_batch" ] && grep -q 'ZenlessZoneZero\.exe' "$source_batch"; then
-    restore_d3dmetal_modules || exit 124
-    exec "$real_wine" "$@"
-  fi
-fi
-
+restore_d3dmetal_modules || exit 124
 exec "$real_wine" "$@"

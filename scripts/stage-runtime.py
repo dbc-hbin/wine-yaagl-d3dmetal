@@ -17,7 +17,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REL = Path('lib/external/D3DMetal.framework/Versions/A')
 STAGE_MANIFEST = 'zzz-frame-probe-stage.json'
-STAGE_SCHEMA = 5
+STAGE_SCHEMA = 6
+LEGACY_NGX_SCHEMA = 5  # staged bytes carry the superseded manual YAAGL_GPU_IDENTITY launcher
 NGX_DLL_SHA256 = 'f6bc9d77fd1e898fec8c6339d367bd8e0f338992c9c0c66d59b30c6e9e0743e4'
 SHARED_DYLIB_PATH = 'lib/external/libd3dshared.dylib'
 SHARED_DYLIB_SHA256 = 'd932330841e77682d47688641e0ac17049a2aff498deafac88921983dc16eedb'
@@ -48,8 +49,18 @@ ARTIFACT_PATHS = ('bin/wine', 'bin/wine.real',
 NGX_ARTIFACT_PATHS = ('lib/wine/x86_64-windows/nvngx.dll', 'lib/wine/x86_64-unix/nvngx.so', SHARED_DYLIB_PATH)
 NGX_POLICY = {'implementation': 'stock-gptk-ngx-to-metalfx', 'windows_module': NGX_ARTIFACT_PATHS[0],
               'unix_bridge': NGX_ARTIFACT_PATHS[1], 'bridge_target': NGX_UNIX_LINK,
-              'default_gpu_identity': 'rx9070', 'gpu_identity_environment': 'YAAGL_GPU_IDENTITY',
-              'supported_gpu_identities': ['rx9070', 'rtx5060']}
+              'supported_gpu_identities': ['rx9070', 'rtx5060'],
+              'default_gpu_identity': 'rtx5060', 'gpu_identity_policy': 'per-game',
+              'game_gpu_identities': {'ZenlessZoneZero.exe': 'rx9070'}}
+# Schema 5 runtime bytes shipped the superseded manual YAAGL_GPU_IDENTITY selection; keep
+# describing them with the policy they actually implement instead of the current one.
+LEGACY_NGX_POLICY = {'implementation': 'stock-gptk-ngx-to-metalfx', 'windows_module': NGX_ARTIFACT_PATHS[0],
+                     'unix_bridge': NGX_ARTIFACT_PATHS[1], 'bridge_target': NGX_UNIX_LINK,
+                     'default_gpu_identity': 'rx9070', 'gpu_identity_environment': 'YAAGL_GPU_IDENTITY',
+                     'supported_gpu_identities': ['rx9070', 'rtx5060']}
+NGX_POLICIES = {LEGACY_NGX_SCHEMA: LEGACY_NGX_POLICY, STAGE_SCHEMA: NGX_POLICY}
+NGX_SCHEMAS = (LEGACY_NGX_SCHEMA, STAGE_SCHEMA)
+SUPPORTED_STAGE_SCHEMAS = (4, LEGACY_NGX_SCHEMA, STAGE_SCHEMA)
 
 
 def run(args: list[str]) -> None:
@@ -108,10 +119,10 @@ def original_fg_provenance(path: Path) -> dict:
 
 
 def artifact_problems(runtime: Path, recorded, schema: int) -> list[str]:
-    paths = ARTIFACT_PATHS + FSR_ARTIFACT_PATHS + (NGX_ARTIFACT_PATHS if schema == STAGE_SCHEMA else ())
+    paths = ARTIFACT_PATHS + FSR_ARTIFACT_PATHS + (NGX_ARTIFACT_PATHS if schema in NGX_SCHEMAS else ())
     if not isinstance(recorded, dict) or set(recorded) != set(paths):
         return ['signed artifact inventory is missing or incomplete; restage with current tooling']
-    if schema == STAGE_SCHEMA:
+    if schema in NGX_SCHEMAS:
         link = runtime / NGX_ARTIFACT_PATHS[1]
         if not link.is_symlink() or os.readlink(link) != NGX_UNIX_LINK:
             return ['NGX Unix bridge symlink target changed']
@@ -125,7 +136,7 @@ def artifact_problems(runtime: Path, recorded, schema: int) -> list[str]:
             path = runtime / relative
             if path.exists() or path.is_symlink():
                 problems.append(f'NGX artifact remains in FSR-only schema 4 runtime: {relative}')
-    else:
+    elif schema in NGX_SCHEMAS:
         if actual[NGX_ARTIFACT_PATHS[0]] != NGX_DLL_SHA256 or actual[SHARED_DYLIB_PATH] != SHARED_DYLIB_SHA256:
             problems.append('stock NGX module or shared bridge does not match pinned source')
     return problems
@@ -139,18 +150,18 @@ def stage_manifest_report(source: Path) -> list[tuple[str, str]]:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as error:
         return [('FAIL', str(error))]
-    if not isinstance(data, dict) or data.get('stage_schema') not in (4, STAGE_SCHEMA):
+    if not isinstance(data, dict) or data.get('stage_schema') not in SUPPORTED_STAGE_SCHEMAS:
         return [('FAIL', 'unsupported stage schema; use an intact base runtime and restage with current tooling')]
     schema = data['stage_schema']
     problems = artifact_problems(source, data.get('signed_artifacts'), schema)
     if (data.get('profile') != PLAY_PROFILE or data.get('fsr_translator') != FSR_POLICY or
             data.get('model_policy') != PLAY_MODEL_POLICY or data.get('render_size_override') is not False or
             data.get('rendering_changes_by_default') is not True or
-            data.get('dlss_translation') is not (schema == STAGE_SCHEMA)):
+            data.get('dlss_translation') is not (schema in NGX_SCHEMAS)):
         problems.append('unsupported staged rendering policy')
-    if schema == STAGE_SCHEMA:
+    if schema in NGX_SCHEMAS:
         ngx = data.get('ngx_module')
-        if (data.get('ngx_policy') != NGX_POLICY or not isinstance(ngx, dict) or
+        if (data.get('ngx_policy') != NGX_POLICIES[schema] or not isinstance(ngx, dict) or
                 ngx.get('runtime_path') != NGX_ARTIFACT_PATHS[0] or
                 ngx.get('sha256') != NGX_DLL_SHA256 or ngx.get('architecture') != 'COFF-x86-64' or
                 ngx.get('unix_bridge') != NGX_ARTIFACT_PATHS[1] or
@@ -389,7 +400,8 @@ def main() -> int:
             shutil.rmtree(temporary)
         raise
     print(f'FSR/NGX runtime staged: {dest}')
-    print('RX 9070 default; RTX 5060 opt-in via YAAGL_GPU_IDENTITY; FSR and stock NGX modules retained.')
+    print('ZenlessZoneZero.exe runs as RX 9070; every other program defaults to RTX 5060.')
+    print('FSR and stock NGX modules retained; no manual GPU identity environment.')
     print('System-default MetalFX model, unchanged game sizing, no automatic GPU capture.')
     return 0
 

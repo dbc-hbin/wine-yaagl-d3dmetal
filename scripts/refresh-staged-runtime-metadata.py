@@ -29,7 +29,10 @@ import subprocess
 import sys
 
 STAGE_MANIFEST = 'zzz-frame-probe-stage.json'
-SUPPORTED_STAGE_SCHEMAS = (3, 4, 5)
+STAGE_SCHEMA = 6
+LEGACY_NGX_SCHEMA = 5
+NGX_SCHEMAS = (LEGACY_NGX_SCHEMA, STAGE_SCHEMA)
+SUPPORTED_STAGE_SCHEMAS = (3, 4, LEGACY_NGX_SCHEMA, STAGE_SCHEMA)
 GRAPHICS_MANIFEST = 'yaagl-wine-p3-graphics-artifacts.json'
 PROVENANCE_MANIFEST = 'yaagl-wine-p3-provenance.json'
 RUNTIME_MANIFEST = 'yaagl-wine-runtime-files.json'
@@ -52,8 +55,16 @@ NGX_SHA256 = 'f6bc9d77fd1e898fec8c6339d367bd8e0f338992c9c0c66d59b30c6e9e0743e4'
 SHARED_SHA256 = 'd932330841e77682d47688641e0ac17049a2aff498deafac88921983dc16eedb'
 NGX_POLICY = {'implementation': 'stock-gptk-ngx-to-metalfx', 'windows_module': NGX_MODULE_RELS[0],
               'unix_bridge': NGX_MODULE_RELS[1], 'bridge_target': NGX_UNIX_LINK,
-              'default_gpu_identity': 'rx9070', 'gpu_identity_environment': 'YAAGL_GPU_IDENTITY',
-              'supported_gpu_identities': ['rx9070', 'rtx5060']}
+              'supported_gpu_identities': ['rx9070', 'rtx5060'],
+              'default_gpu_identity': 'rtx5060', 'gpu_identity_policy': 'per-game',
+              'game_gpu_identities': {'ZenlessZoneZero.exe': 'rx9070'}}
+# Schema 5 staged bytes ship the superseded manual YAAGL_GPU_IDENTITY launcher; record the
+# policy they actually implement so old runtimes are never relabelled with the current one.
+LEGACY_NGX_POLICY = {'implementation': 'stock-gptk-ngx-to-metalfx', 'windows_module': NGX_MODULE_RELS[0],
+                     'unix_bridge': NGX_MODULE_RELS[1], 'bridge_target': NGX_UNIX_LINK,
+                     'default_gpu_identity': 'rx9070', 'gpu_identity_environment': 'YAAGL_GPU_IDENTITY',
+                     'supported_gpu_identities': ['rx9070', 'rtx5060']}
+NGX_POLICIES = {LEGACY_NGX_SCHEMA: LEGACY_NGX_POLICY, STAGE_SCHEMA: NGX_POLICY}
 
 
 def digest(path: pathlib.Path) -> str:
@@ -106,9 +117,10 @@ def read_stage_manifest(tree: pathlib.Path) -> dict:
     data = json.loads(path.read_text(encoding='utf-8'))
     if data.get('stage_schema') not in SUPPORTED_STAGE_SCHEMAS:
         raise SystemExit(f'unsupported stage schema: {data.get("stage_schema")!r}')
-    if (data.get('dlss_translation') is not (data['stage_schema'] == 5) or
+    schema = data['stage_schema']
+    if (data.get('dlss_translation') is not (schema in NGX_SCHEMAS) or
             data.get('model_policy') != {'all_gpu': 'system-default'} or
-            (data['stage_schema'] == 5 and data.get('ngx_policy') != NGX_POLICY)):
+            (schema in NGX_SCHEMAS and data.get('ngx_policy') != NGX_POLICIES[schema])):
         raise SystemExit('staged runtime does not carry the recorded FSR/NGX system-default policy')
     return data
 
@@ -118,7 +130,7 @@ def assert_tree_untouched(tree: pathlib.Path, stage: dict) -> None:
     recorded = stage.get('signed_artifacts')
     if not isinstance(recorded, dict) or not recorded:
         raise SystemExit('stage manifest has no signed_artifacts inventory')
-    if stage['stage_schema'] == 5:
+    if stage['stage_schema'] in NGX_SCHEMAS:
         link = tree / NGX_MODULE_RELS[1]
         if not link.is_symlink() or link.readlink().as_posix() != NGX_UNIX_LINK:
             raise SystemExit('stock NGX Unix bridge symlink changed')
@@ -128,7 +140,7 @@ def assert_tree_untouched(tree: pathlib.Path, stage: dict) -> None:
             raise SystemExit(f'signed artifact is missing from the staged tree: {relative}')
         if digest(path) != expected:
             raise SystemExit(f'signed artifact changed since staging: {relative}')
-    if stage['stage_schema'] != 5:
+    if stage['stage_schema'] not in NGX_SCHEMAS:
         for relative in NGX_MODULE_RELS:
             if (tree / relative).exists() or (tree / relative).is_symlink():
                 raise SystemExit(f'NGX module is present in legacy FSR-only runtime: {relative}')
@@ -225,11 +237,11 @@ def refreshed_provenance(tree: pathlib.Path, base: pathlib.Path, graphics: dict,
         'fsrBuildManifest': stage['fsr_build_manifest'],
         'nativeBuildManifest': native_build,
         'fsrArtifacts': fsr_artifacts,
-        'ngxPolicy': stage.get('ngx_policy') if stage['stage_schema'] == 5 else None,
-        'ngxModule': stage.get('ngx_module') if stage['stage_schema'] == 5 else None,
+        'ngxPolicy': stage.get('ngx_policy') if stage['stage_schema'] in NGX_SCHEMAS else None,
+        'ngxModule': stage.get('ngx_module') if stage['stage_schema'] in NGX_SCHEMAS else None,
         'inheritedCoreArtifacts': inherited,
         'changedCoreArtifacts': changed,
-        'removedDlssModules': list(NGX_MODULE_RELS) if stage['stage_schema'] != 5 else [],
+        'removedDlssModules': [] if stage['stage_schema'] in NGX_SCHEMAS else list(NGX_MODULE_RELS),
     }
     return payload
 
