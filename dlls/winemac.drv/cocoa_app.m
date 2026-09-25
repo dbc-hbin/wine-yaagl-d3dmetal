@@ -22,7 +22,6 @@
 #import "cocoa_cursorclipping.h"
 #import "cocoa_event.h"
 #import "cocoa_window.h"
-#include "wine/cursor_trace.h"
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
@@ -43,19 +42,6 @@ static NSString* const WineActivatingAppConfigDirKey = @"ActivatingAppConfigDir"
 
 
 bool macdrv_err_on;
-
-static void trace_cursor_geometry(NSData *frames)
-{
-    if (wine_cursor_trace_active)
-    {
-        const CGRect *rects = [frames bytes];
-        NSUInteger count = [frames length] / sizeof(*rects);
-        for (NSUInteger i = 0; i < count; ++i)
-            CURSOR_TRACE(WCT_GEOMETRY, retina_on ? WCT_RETINA : 0, 0, 0, 0,
-                         i, rects[i].origin.x, rects[i].origin.y, rects[i].size.width,
-                         rects[i].size.height, retina_on ? 2 : 1, count, 0);
-    }
-}
 
 
 #if !defined(MAC_OS_VERSION_14_0) || MAC_OS_X_VERSION_MAX_ALLOWED < MAC_OS_VERSION_14_0
@@ -1224,9 +1210,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
     {
         BOOL ret;
 
-        CURSOR_TRACE(WCT_SET_POS, WCT_BEFORE | (retina_on ? WCT_RETINA : 0), self, clipCursorHandler,
-                     lastSetCursorPositionTime, pos.x, pos.y, self.clippingCursor, 0, 0, 0, 0, 0);
-
         if ([windowsBeingDragged count])
             ret = FALSE;
         else if (self.clippingCursor && [clipCursorHandler respondsToSelector:@selector(setCursorPosition:)])
@@ -1271,9 +1254,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 warpRecord.from_x = nativeLocation.x;
                 warpRecord.from_y = nativeLocation.y;
                 warpRecord.time_before = [[NSProcessInfo processInfo] systemUptime];
-                CURSOR_TRACE(WCT_WARP, WCT_BEFORE | WCT_TIME_NS | (retina_on ? WCT_RETINA : 0),
-                             self, 0, warpRecord.time_before * NSEC_PER_SEC,
-                             warpRecord.from_x, warpRecord.from_y, pos.x, pos.y, 0, 0, 0, 0);
                 CGSetLocalEventsSuppressionInterval(0);
                 warpError = CGWarpMouseCursorPosition(pos);
                 ret = (warpError == kCGErrorSuccess);
@@ -1287,29 +1267,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
                     /* A warp which didn't actually move the cursor (e.g. the
                        recenter performed when clipping starts) has no displacement
                        to correct later. */
-                    if (warp_correction_push(&warpCorrections, &warpRecord))
-                    {
-                        CURSOR_TRACE(WCT_WARP, WCT_AFTER | WCT_SUCCESS | WCT_TIME_NS, self, 0,
-                                     warpRecord.time_after * NSEC_PER_SEC, warpRecord.from_x, warpRecord.from_y,
-                                     warpRecord.to_x, warpRecord.to_y, warpRecord.time_before * NSEC_PER_SEC,
-                                     warpCorrections.count, 0, 0);
-                    }
-                    else
-                    {
-                        CURSOR_TRACE(WCT_WARP, WCT_AFTER | WCT_SUCCESS | WCT_NOOP | WCT_TIME_NS,
-                                     self, 0, warpRecord.time_after * NSEC_PER_SEC, warpRecord.from_x, warpRecord.from_y,
-                                     warpRecord.to_x, warpRecord.to_y, warpRecord.time_before * NSEC_PER_SEC, 0, 0, 0);
-                    }
+                    warp_correction_push(&warpCorrections, &warpRecord);
 
                     lastSetCursorPositionTime = warpRecord.time_after;
 
                     CGAssociateMouseAndMouseCursorPosition(true);
-                }
-                else
-                {
-                    CURSOR_TRACE(WCT_WARP, WCT_AFTER | WCT_ERROR | WCT_TIME_NS, self, 0,
-                                 [[NSProcessInfo processInfo] systemUptime] * NSEC_PER_SEC, warpRecord.from_x, warpRecord.from_y,
-                                 pos.x, pos.y, warpError, 0, 0, 0);
                 }
             }
         }
@@ -1330,8 +1292,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
             [eventQueuesLock unlock];
         }
 
-        CURSOR_TRACE(WCT_SET_POS, WCT_AFTER | (ret ? WCT_SUCCESS : WCT_ERROR), self, clipCursorHandler,
-                     lastSetCursorPositionTime, pos.x, pos.y, self.clippingCursor, 0, 0, 0, 0, 0);
         return ret;
     }
 
@@ -1355,25 +1315,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
         }
 
         if (self.clippingCursor && CGRectEqualToRect(rect, clipCursorHandler.cursorClipRect))
-        {
-            CURSOR_TRACE(WCT_CLIP, WCT_AFTER | WCT_SUCCESS | WCT_NOOP, self, clipCursorHandler,
-                         0, rect.origin.x, rect.origin.y, rect.size.width, rect.size.height, 1, 0, 0, 0);
             return TRUE;
-        }
 
         if (![clipCursorHandler startClippingCursor:rect])
-        {
-            CURSOR_TRACE(WCT_CLIP, WCT_AFTER | WCT_ERROR, self, clipCursorHandler,
-                         0, rect.origin.x, rect.origin.y, rect.size.width, rect.size.height, 1, 0, 0, 0);
             return FALSE;
-        }
-
-        CURSOR_TRACE(WCT_CLIP, WCT_AFTER | WCT_SUCCESS | WCT_TRANSITION |
-                     ([clipCursorHandler isKindOfClass:[WineConfinementClipCursorHandler class]] ?
-                      WCT_CONFINEMENT : WCT_EVENT_TAP) | (retina_on ? WCT_RETINA : 0),
-                     self, clipCursorHandler, lastSetCursorPositionTime,
-                     rect.origin.x, rect.origin.y, rect.size.width, rect.size.height, 1, 0, 0, 0);
-        trace_cursor_geometry(screenFrameCGRects);
 
         [self setCursorPosition:NSPointToCGPoint([self flippedMouseLocation:[NSEvent mouseLocation]])];
         lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
@@ -1388,21 +1333,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
     - (BOOL) stopClippingCursor
     {
         if (!self.clippingCursor)
-        {
-            CURSOR_TRACE(WCT_CLIP, WCT_AFTER | WCT_SUCCESS | WCT_NOOP, self, clipCursorHandler,
-                         0, 0, 0, 0, 0, 0, 0, 0, 0);
             return TRUE;
-        }
 
         if (![clipCursorHandler stopClippingCursor])
-        {
-            CURSOR_TRACE(WCT_CLIP, WCT_AFTER | WCT_ERROR, self, clipCursorHandler,
-                         0, 0, 0, 0, 0, 0, 0, 0, 0);
             return FALSE;
-        }
-
-        CURSOR_TRACE(WCT_CLIP, WCT_AFTER | WCT_SUCCESS | WCT_TRANSITION, self, clipCursorHandler,
-                     lastSetCursorPositionTime, 0, 0, 0, 0, 0, 0, 0, 0);
 
         lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
         mouseMoveDeltaX = 0;
@@ -1511,15 +1445,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
         if (warpsFinished)
         {
             double subtractX, subtractY;
-            unsigned int i;
-
-            if (wine_cursor_trace_active) for (i = 0; i < warpsFinished; i++)
-            {
-                struct warp_correction_record* warpRecord = &warpCorrections.records[i];
-                CURSOR_TRACE(WCT_WARP_MATCH, WCT_TIME_NS, anEvent, warpRecord, [anEvent timestamp] * NSEC_PER_SEC,
-                             warpRecord->from_x, warpRecord->from_y, warpRecord->to_x, warpRecord->to_y,
-                             warpRecord->time_before * NSEC_PER_SEC, warpRecord->time_after * NSEC_PER_SEC, deltaX, deltaY);
-            }
 
             warp_correction_consume(&warpCorrections, warpsFinished, &subtractX, &subtractY);
             deltaX -= subtractX;
@@ -1555,21 +1480,13 @@ static NSString* WineLocalizedString(unsigned int stringID)
             BOOL absolute, noncoalescible;
             double scale = retina_on ? 2 : 1;
 
-            CURSOR_TRACE(WCT_COCOA, retina_on ? WCT_RETINA : 0, anEvent, [anEvent CGEvent],
-                         [anEvent timestamp], [anEvent deltaX], [anEvent deltaY], point.x, point.y,
-                         lastSetCursorPositionTime, forceNextMouseMoveAbsolute, scale, [anEvent type]);
-
             // If we recently warped the cursor (other than in our cursor-clipping
             // event tap), discard mouse move events until we see an event which is
             // later than that time.
             if (lastSetCursorPositionTime)
             {
                 if ([anEvent timestamp] <= lastSetCursorPositionTime)
-                {
-                    CURSOR_TRACE(WCT_FILTER, WCT_OLD, anEvent, targetWindow, [anEvent timestamp],
-                                 [anEvent deltaX], [anEvent deltaY], lastSetCursorPositionTime, 0, 0, 0, 0, 0);
                     return;
-                }
 
                 /* The synthetic notification around our own warp (or the event
                    tap removing the synthetic center-warp displacement) leaves a
@@ -1577,11 +1494,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
                    (and across buttons or wheels, which never enter this path)
                    until the first real post-warp movement. */
                 if (!deltaX && !deltaY)
-                {
-                    CURSOR_TRACE(WCT_FILTER, WCT_ZERO, anEvent, targetWindow, [anEvent timestamp],
-                                 0, 0, lastSetCursorPositionTime, 0, 0, 0, 0, 0);
                     return;
-                }
 
                 lastSetCursorPositionTime = 0;
                 forceNextMouseMoveAbsolute = TRUE;
@@ -1687,10 +1600,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 event->mouse_moved.drag = drag;
                 event->mouse_moved.noncoalescible = noncoalescible;
 
-                CURSOR_TRACE(WCT_QUEUE_NEW, WCT_TIME_MS | (absolute ? WCT_ABSOLUTE : 0), event, anEvent,
-                             event->mouse_moved.time_ms, event->mouse_moved.x, event->mouse_moved.y,
-                             event->mouse_moved.raw_x, event->mouse_moved.raw_y,
-                             rawMouseMoveDeltaX, rawMouseMoveDeltaY, scale, noncoalescible);
                 [targetWindow.queue postEvent:event];
             }
 
@@ -2374,7 +2283,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
     - (void) setRetinaMode:(BOOL)mode
     {
-        CURSOR_TRACE(WCT_DISPLAY, WCT_TRANSITION, self, 0, 0, retina_on, mode, 0, 0, 0, 0, 0, 0);
         retina_on = mode;
 
         [clipCursorHandler setRetinaMode:mode];
@@ -2392,8 +2300,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
      */
     - (void)cgDisplaysWereReconfigured:(NSArray*)changes
     {
-        CURSOR_TRACE(WCT_DISPLAY, WCT_TRANSITION, self, 0, 0, retina_on, retina_on,
-                     [changes count], 0, 0, 0, 0, 0);
         primaryScreenHeightValid = FALSE;
         [self sendDisplaysChanged:FALSE];
         [self adjustWindowLevels];
@@ -2468,8 +2374,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
         NSNumber* displayID;
         NSDictionary* modesToRealize = [latentDisplayModes autorelease];
 
-        CURSOR_TRACE(WCT_FOCUS, WCT_TRANSITION, self, 0, 0, 1, retina_on,
-                     lastSetCursorPositionTime, forceNextMouseMoveAbsolute, 0, 0, 0, 0);
         latentDisplayModes = [[NSMutableDictionary alloc] init];
         for (displayID in modesToRealize)
         {
@@ -2516,8 +2420,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
         macdrv_event* event;
         WineEventQueue* queue;
 
-        CURSOR_TRACE(WCT_FOCUS, WCT_TRANSITION, self, 0, 0, 0, retina_on,
-                     lastSetCursorPositionTime, forceNextMouseMoveAbsolute, 0, 0, 0, 0);
         [self invalidateGotFocusEvents];
 
         /* Mouse movements are consumed by whoever is active from here on; any

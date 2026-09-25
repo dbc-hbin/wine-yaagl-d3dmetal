@@ -1117,7 +1117,6 @@ SOURCES = \
 	wine/atsvc.idl \
 	wine/condrv.h \
 	wine/dcetypes.idl \
-	wine/cursor_trace.h \
 	wine/debug.h \
 	wine/dplaysp.h \
 	wine/epm.idl \

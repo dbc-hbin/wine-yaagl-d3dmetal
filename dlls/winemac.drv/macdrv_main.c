@@ -34,10 +34,6 @@
 #include "shellapi.h"
 #include "wine/server.h"
 
-#define WINE_CURSOR_TRACE_IMPLEMENTATION
-#define WINE_CURSOR_TRACE_MODULE "macdrv"
-#include "wine/cursor_trace.h"
-
 WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
 
 #define IS_OPTION_TRUE(ch) \

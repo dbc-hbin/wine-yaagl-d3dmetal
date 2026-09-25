@@ -26,7 +26,6 @@
 #import "cocoa_event.h"
 #import "cocoa_app.h"
 #import "cocoa_window.h"
-#include "wine/cursor_trace.h"
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
@@ -248,11 +247,6 @@ static const OSType WineHotKeySignature = 'Wine';
 
             if (merged)
             {
-                CURSOR_TRACE(WCT_QUEUE_MERGE, WCT_TIME_MS, lastEvent->event, event->event,
-                             event->event->mouse_moved.time_ms,
-                             lastEvent->event->mouse_moved.raw_x, lastEvent->event->mouse_moved.raw_y,
-                             event->event->mouse_moved.raw_x, event->event->mouse_moved.raw_y,
-                             raw_x, raw_y, lastEvent->event->type, event->event->type);
                 if (event->event->type == MOUSE_MOVED_RELATIVE)
                 {
                     lastEvent->event->mouse_moved.x = x;
@@ -325,11 +319,6 @@ static const OSType WineHotKeySignature = 'Wine';
                     __atomic_sub_fetch(&event->event->deliver, 1, __ATOMIC_RELAXED) >= 0)
                 {
                     ret = event;
-                    if (event->event->type == MOUSE_MOVED_RELATIVE || event->event->type == MOUSE_MOVED_ABSOLUTE)
-                        CURSOR_TRACE(WCT_QUEUE_TAKE, WCT_TIME_MS, event->event, self,
-                                     event->event->mouse_moved.time_ms, event->event->mouse_moved.x,
-                                     event->event->mouse_moved.y, event->event->mouse_moved.raw_x,
-                                     event->event->mouse_moved.raw_y, event->event->type, 0, 0, 0);
                     break;
                 }
             }
@@ -351,13 +340,7 @@ static const OSType WineHotKeySignature = 'Wine';
 
         indexes = [events indexesOfObjectsPassingTest:^BOOL(id obj, NSUInteger idx, BOOL *stop){
             MacDrvEvent* event = obj;
-            BOOL discard = block(event->event);
-            if (discard && (event->event->type == MOUSE_MOVED_RELATIVE || event->event->type == MOUSE_MOVED_ABSOLUTE))
-                CURSOR_TRACE(WCT_QUEUE_DROP, WCT_TIME_MS, event->event, self,
-                             event->event->mouse_moved.time_ms, event->event->mouse_moved.x,
-                             event->event->mouse_moved.y, event->event->mouse_moved.raw_x,
-                             event->event->mouse_moved.raw_y, event->event->type, 0, 0, 0);
-            return discard;
+            return block(event->event);
         }];
 
         [events removeObjectsAtIndexes:indexes];

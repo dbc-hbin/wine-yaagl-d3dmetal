@@ -97,37 +97,23 @@ Next verification should use game captures with disocclusion and mixed motion at
 - There is no unbounded normal per-frame log.
 - Log entries report API, encode, or callback progress. They do not prove GPU completion, image quality, FPS, or an OFF transition.
 
-### Unreleased opt-in cursor diagnostics
+### Cursor diagnostics worktree
 
-Build both `winemac.so` and `win32u.so` from current source; existing releases do not contain this feature. Recording requires `YAAGL_CURSOR_TRACE` in the Wine process environment. Enabling recording itself does not change cursor correction, clipping, or RawInput delivery policy.
+The runtime branch `fix/runtime-lifecycle` has no cursor ring-buffer instrumentation, collector, decoder, or diagnostic patch. The complete diagnostic version is preserved on `experiment/cursor-diagnostics` in the sibling `../zzz-wine-cursor-diagnostics` worktree; recording instructions and tools live there. Cursor reconciliation coalescing and direct-warp input correction remain in both branches. Source separation does not change an already installed runtime.
 
-```sh
-trace_dir="$(mktemp -d /tmp/yaagl-cursor.XXXXXX)"
-YAAGL_CURSOR_TRACE="$trace_dir" /path/to/diagnostic/wine /path/to/application.exe
-python3 scripts/decode-cursor-trace.py "$trace_dir" --summary
-python3 scripts/decode-cursor-trace.py "$trace_dir" --last-seconds 5 > cursor.jsonl
-# Select a window around an event's clock_ns:
-python3 scripts/decode-cursor-trace.py "$trace_dir" --around-ns 123456789000 --before 2 --after 1
-```
-
-- The output directory must already exist and be absolute. Files are created with mode `0600`. Configuration is read at process startup; omit the variable on the next launch to disable recording.
-- Records cover the actual Confinement/EventTap backend, clip/focus/Retina transitions, warps and no-ops, EventTap correction, Cocoa deltas and timestamp filtering, queue merge/discard, Wine delivery, and application RawInput/position reads. Keyboard contents and game camera angles are not captured.
-- Each loaded DLL in each process retains only its latest 65,536 records in **8 MiB + 128 bytes**. Files survive exit. There are no explicit file writes, additional threads, or allocations on the input path; diagnostic work and OS writeback of mapped pages still have a cost.
-- Read from a separate terminal immediately after the symptom; older records roll out. Live reads are not globally atomic snapshots. The decoder reports contention drops, sequences outside the retained window, and unstable slots.
-- `clock_ns` uses the common monotonic clock; source-event clock units are separately labeled. Pointer identities can be reused, so interpret them with sequence/lifetime context, not as automatic cross-process causal links. Repeated reads of a RawInput handle are not additional physical input. Confinement does not execute EventTap warp correction.
-- Collector/decoder checks for disabled recording, wraparound, concurrent producers, fork isolation, and malformed files: `python3 scripts/test-cursor-trace.py`.
+The uninstrumented x86_64 `winemac.so` and `win32u.so` were rebuilt and observed loading in an isolated Wine probe. Sixteen cursor moves, clip/cursor-handle checks, and RawInput delivery passed; setting the trace environment variable produced no trace files. The 18-patch tuned overlay matched all 15 affected cursor/MSync source files and regenerated protocol headers on a reconstructed baseline. This is not visual/game verification or full pinned-P3 preparation. A separate pre-existing packaging gap remains unchanged: the quilt does not carry `dlls/winemac.drv/window.c`'s detach-before-destroy lifetime fix; full runtime-source/quilt equivalence is not claimed.
 
 ### Unreleased cursor reconciliation coalescing
 
-On the cursor experiment branch, `0017-cursor-reconciliation-coalescing.patch` prepares each cursor request's shape, animation, and visibility before one final hit-test and native reconciliation. Identical cursor payloads still reconcile, repairing a system-installed arrow. Equal animation frames preserve the current frame and timer.
+In the runtime source, `0017-cursor-reconciliation-coalescing.patch` prepares each cursor request's shape, animation, and visibility before one final hit-test and native reconciliation. Identical cursor payloads still reconcile, repairing a system-installed arrow. Equal animation frames preserve the current frame and timer.
 
-Consecutive same-window synchronization requests coalesce only while the latest main-queue publication is pending. Interleaved `A → B → A` ordering and requests made after a publication begins remain intact. Startup, activation, first-content, visibility, and AppKit cursor-update triggers and existing Wine event-queue coalescing are retained. This change is independent of the diagnostic environment variable and does not change RawInput, position/warp correction, or the server protocol.
+Consecutive same-window synchronization requests coalesce only while the latest main-queue publication is pending. Interleaved `A → B → A` ordering and requests made after a publication begins remain intact. Startup, activation, first-content, visibility, and AppKit cursor-update triggers and existing Wine event-queue coalescing are retained. This change does not change RawInput, position/warp correction, or the server protocol.
 
 ### Unreleased direct-warp input correction
 
 `0018-confinement-warp-correction.patch` tracks successful direct cursor warps in the Confinement/unclipped path and subtracts their actual native displacement from the matching movement before legacy and RawInput accumulation. Zero-delta warp notifications leave the correction pending; timestamp ordering handles queued events and successive warps. No-op/failed warps add no displacement, focus transitions clear stale corrections, and the EventTap path retains its own correction without double subtraction. The reusable queue is reserved before moving the cursor, so allocation failure rejects the move rather than leaving an untracked warp.
 
-Run `python3 scripts/test-cursor-warp-correction.py` for eight deterministic input-preservation and allocation-failure regressions. A rebuilt x86_64 `winemac.so` also passed captured-event replay through its actual Objective-C movement handler: the delayed `(-675,-136)` sample left `(1,-2)` physical residual, and the next `(4,-3)` sample was unchanged. The replay substitutes native window/queue boundaries; it does not verify physical-device timing or the game camera. This source change requires rebuilding `winemac.so`; it does not install a runtime or disable diagnostic capture.
+Run `python3 scripts/test-cursor-warp-correction.py` for eight deterministic input-preservation and allocation-failure regressions. A rebuilt x86_64 `winemac.so` also passed captured-event replay through its actual Objective-C movement handler: the delayed `(-675,-136)` sample left `(1,-2)` physical residual, and the next `(4,-3)` sample was unchanged. The replay substitutes native window/queue boundaries; it does not verify physical-device timing or the game camera. This source change requires rebuilding `winemac.so`; it does not install a runtime.
 
 ### Unreleased NGX restoration in current source
 
