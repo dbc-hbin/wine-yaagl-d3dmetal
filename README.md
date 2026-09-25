@@ -99,7 +99,7 @@ Next verification should use game captures with disocclusion and mixed motion at
 
 ### Unreleased opt-in cursor diagnostics
 
-Build both `winemac.so` and `win32u.so` from current source; existing releases do not contain this feature. Recording requires `YAAGL_CURSOR_TRACE` in the Wine process environment. Cursor correction, clipping, and RawInput delivery policy remain unchanged.
+Build both `winemac.so` and `win32u.so` from current source; existing releases do not contain this feature. Recording requires `YAAGL_CURSOR_TRACE` in the Wine process environment. Enabling recording itself does not change cursor correction, clipping, or RawInput delivery policy.
 
 ```sh
 trace_dir="$(mktemp -d /tmp/yaagl-cursor.XXXXXX)"
@@ -123,6 +123,12 @@ On the cursor experiment branch, `0017-cursor-reconciliation-coalescing.patch` p
 
 Consecutive same-window synchronization requests coalesce only while the latest main-queue publication is pending. Interleaved `A → B → A` ordering and requests made after a publication begins remain intact. Startup, activation, first-content, visibility, and AppKit cursor-update triggers and existing Wine event-queue coalescing are retained. This change is independent of the diagnostic environment variable and does not change RawInput, position/warp correction, or the server protocol.
 
+### Unreleased direct-warp input correction
+
+`0018-confinement-warp-correction.patch` tracks successful direct cursor warps in the Confinement/unclipped path and subtracts their actual native displacement from the matching movement before legacy and RawInput accumulation. Zero-delta warp notifications leave the correction pending; timestamp ordering handles queued events and successive warps. No-op/failed warps add no displacement, focus transitions clear stale corrections, and the EventTap path retains its own correction without double subtraction. The reusable queue is reserved before moving the cursor, so allocation failure rejects the move rather than leaving an untracked warp.
+
+Run `python3 scripts/test-cursor-warp-correction.py` for eight deterministic input-preservation and allocation-failure regressions. A rebuilt x86_64 `winemac.so` also passed captured-event replay through its actual Objective-C movement handler: the delayed `(-675,-136)` sample left `(1,-2)` physical residual, and the next `(4,-3)` sample was unchanged. The replay substitutes native window/queue boundaries; it does not verify physical-device timing or the game camera. This source change requires rebuilding `winemac.so`; it does not install a runtime or disable diagnostic capture.
+
 ### Unreleased NGX restoration in current source
 
 Shared Metal4 replay and legacy encode handling are restored directly inside `ngx-hooks.mm`, rather than retained as an outer compatibility wrapper. `bridge.mm` publishes the NGX replay/encode entrypoints directly in slots 17/18; they recognize and execute FSR-recorded commands before interpreting any NGX descriptor. The separate `d3dmetal-replay-hooks.{hpp,mm}` layer and its build entries have been removed.
@@ -137,7 +143,12 @@ The current source retires completed execution leases without waiting for alloca
 
 ### Unreleased lifecycle corrections
 
-- MSync leaves the borrowed alert index alone at thread exit. Cache exports have process-owned, one-shot IDs and are reclaimed after native process death. Rebuild `ntdll` and `wineserver` together: server protocol **968**, MSync Mach wire **3**; existing request numbers are preserved.
+MSync message dispatch regression: `python3 scripts/test-msync-message-dispatch.py -v` on macOS. Ten cases exercise the production C bodies, including high-ID registration/unregister, malformed close rejection, and close delivery through a real owned Mach port.
+
+- The in-process synchronization cache now allocates full 64 KiB blocks even when its 24-byte entries do not divide that size. This fixes the `anon_mmap_alloc` assertion introduced by the MSync export-ID change when a higher handle needs another cache block, without padding entries or removing ownership checks. The `ntdll` sync regression keeps 4,096 events live and checks independent signal/reset/wait state. Its extracted test body passed 18,432 assertions on a rebuilt runtime in an isolated prefix; a separate 2,740-event API smoke passed the previously crashing high-handle operation. The test remains in the source test suite; the runtime quilt carries only the production fix. No Beta installation or game validation is implied.
+- MSync leaves the borrowed alert index alone at thread exit. Cache exports have process-owned, one-shot IDs and are reclaimed after native process death. Rebuild `ntdll` and `wineserver` together: server protocol **968** for tuned and **969** for safe-msync, MSync Mach wire **3**; existing request numbers are preserved. Protocol 969 is reserved for the safe-msync request layout and must not be reused by tuned.
+- Server-internal MSync export retirement uses a dedicated message ID and carries the shared index separately, so high thread-ID bits cannot turn a wait registration or unregister into a close. Exact message size, the server cookie, and index range are checked before releasing a reference. Invalid close messages are discarded rather than interpreted as waits; client wait messages and the shared-memory layout are unchanged. An isolated rebuilt Wine run passed repeated 4,096-event cache reuse, 256 multi-object wakeups with observed armed registrations, and child-process exit with outstanding exports.
+- The shared MSync patch no longer assumes the cursor protocol is present. Tuned and safe-msync apply separate final protocol-version patches; safe-msync does not import cursor/window changes. Both ordered overlays passed the actual prepare overlay functions, repeat-application validation, source-inheritance inventory checks, and byte-identical `tools/make_requests` regeneration on a reconstructed pre-tuned baseline. The pinned-upstream preflight was not exercised because the prepared P3 baseline is unavailable. The P3 manifest hash matches the updated graphics-bridge patch.
 - macdrv detaches window state under the window-data lock, then closes the Cocoa window and releases queued surface events outside that lock, for both destruction and top-level-to-child reparenting.
 - Native FG callbacks enter their owning context's callback scope, avoiding configure/dispatch lock inversion. Unchanged callbacks reuse a binding without allocation or presenter waits; obsolete bindings are reclaimed only after successful replacement and the required drain.
 - FG bridge **v4** retires the exact completed frame after failed/skipped generation too. Older pending frames and recorded commands keep their snapshots. Rebuild the FG PE/Unix modules and native sidecar together.

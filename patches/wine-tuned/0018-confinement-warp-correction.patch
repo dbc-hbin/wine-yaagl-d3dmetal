@@ -1,0 +1,376 @@
+diff --git a/dlls/winemac.drv/cocoa_app.h b/dlls/winemac.drv/cocoa_app.h
+index ae5c7a1..5e6ab75 100644
+--- a/dlls/winemac.drv/cocoa_app.h
++++ b/dlls/winemac.drv/cocoa_app.h
+@@ -21,6 +21,7 @@
+ #import <AppKit/AppKit.h>
+ 
+ #include "macdrv_cocoa.h"
++#include "cocoa_warpconsumption.h"
+ 
+ #define ERR(...) do { if (macdrv_err_on) LogError(__func__, __VA_ARGS__); } while (false)
+ 
+@@ -72,6 +73,9 @@ @interface WineApplicationController : NSObject <NSApplicationDelegate>
+     BOOL forceNextMouseMoveAbsolute;
+     double mouseMoveDeltaX, mouseMoveDeltaY;
+     double rawMouseMoveDeltaX, rawMouseMoveDeltaY;
++    /* Pending direct-CGWarp displacements folded into future mouse-move
++       event deltas (main thread only).  See cocoa_warpconsumption.h. */
++    struct warp_correction_state warpCorrections;
+     NSUInteger unmatchedMouseDowns;
+ 
+     NSTimeInterval lastScrollTime;
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+index 42fe16d..1ee3965 100644
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -214,6 +214,7 @@ - (id) init
+ 
+     - (void) dealloc
+     {
++        warp_correction_destroy(&warpCorrections);
+         [windowsBeingDragged release];
+         [cursor release];
+         [screenFrameCGRects release];
+@@ -1232,6 +1233,10 @@ - (BOOL) setCursorPosition:(CGPoint)pos
+             ret = [clipCursorHandler setCursorPosition:pos];
+         else
+         {
++            struct warp_correction_record warpRecord;
++            NSPoint nativeLocation;
++            CGError warpError;
++
+             if (self.clippingCursor)
+                 [clipCursorHandler clipCursorLocation:&pos];
+ 
+@@ -1249,14 +1254,63 @@ - (BOOL) setCursorPosition:(CGPoint)pos
+             // the local events suppression interval to 0 for the warp.  That's
+             // deprecated, but I'm not aware of any other way.  For good
+             // measure, we do both.
+-            CGSetLocalEventsSuppressionInterval(0);
+-            ret = (CGWarpMouseCursorPosition(pos) == kCGErrorSuccess);
+-            CGSetLocalEventsSuppressionInterval(0.25);
+-            if (ret)
++            //
++            // Unlike the cursor-clipping event tap, this direct warp has no
++            // tap to cancel its displacement out of the next event's deltas.
++            // Record the actual pre/post native locations so that
++            // -handleMouseMove: can subtract our own warp displacement when it
++            // is finally delivered (see cocoa_warpconsumption.h).
++            /* Reserve the record before the native warp so that a successful
++               warp can never go untracked; on allocation failure we simply
++               don't move the cursor. */
++            if (!warp_correction_reserve(&warpCorrections))
++                ret = FALSE;
++            else
+             {
+-                lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
++                nativeLocation = [self flippedMouseLocation:[NSEvent mouseLocation]];
++                warpRecord.from_x = nativeLocation.x;
++                warpRecord.from_y = nativeLocation.y;
++                warpRecord.time_before = [[NSProcessInfo processInfo] systemUptime];
++                CURSOR_TRACE(WCT_WARP, WCT_BEFORE | WCT_TIME_NS | (retina_on ? WCT_RETINA : 0),
++                             self, 0, warpRecord.time_before * NSEC_PER_SEC,
++                             warpRecord.from_x, warpRecord.from_y, pos.x, pos.y, 0, 0, 0, 0);
++                CGSetLocalEventsSuppressionInterval(0);
++                warpError = CGWarpMouseCursorPosition(pos);
++                ret = (warpError == kCGErrorSuccess);
++                CGSetLocalEventsSuppressionInterval(0.25);
++                if (ret)
++                {
++                    warpRecord.time_after = [[NSProcessInfo processInfo] systemUptime];
++                    nativeLocation = [self flippedMouseLocation:[NSEvent mouseLocation]];
++                    warpRecord.to_x = nativeLocation.x;
++                    warpRecord.to_y = nativeLocation.y;
++                    /* A warp which didn't actually move the cursor (e.g. the
++                       recenter performed when clipping starts) has no displacement
++                       to correct later. */
++                    if (warp_correction_push(&warpCorrections, &warpRecord))
++                    {
++                        CURSOR_TRACE(WCT_WARP, WCT_AFTER | WCT_SUCCESS | WCT_TIME_NS, self, 0,
++                                     warpRecord.time_after * NSEC_PER_SEC, warpRecord.from_x, warpRecord.from_y,
++                                     warpRecord.to_x, warpRecord.to_y, warpRecord.time_before * NSEC_PER_SEC,
++                                     warpCorrections.count, 0, 0);
++                    }
++                    else
++                    {
++                        CURSOR_TRACE(WCT_WARP, WCT_AFTER | WCT_SUCCESS | WCT_NOOP | WCT_TIME_NS,
++                                     self, 0, warpRecord.time_after * NSEC_PER_SEC, warpRecord.from_x, warpRecord.from_y,
++                                     warpRecord.to_x, warpRecord.to_y, warpRecord.time_before * NSEC_PER_SEC, 0, 0, 0);
++                    }
++
++                    lastSetCursorPositionTime = warpRecord.time_after;
+ 
+-                CGAssociateMouseAndMouseCursorPosition(true);
++                    CGAssociateMouseAndMouseCursorPosition(true);
++                }
++                else
++                {
++                    CURSOR_TRACE(WCT_WARP, WCT_AFTER | WCT_ERROR | WCT_TIME_NS, self, 0,
++                                 [[NSProcessInfo processInfo] systemUptime] * NSEC_PER_SEC, warpRecord.from_x, warpRecord.from_y,
++                                 pos.x, pos.y, warpError, 0, 0, 0);
++                }
+             }
+         }
+ 
+@@ -1441,6 +1495,36 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+     {
+         WineWindow* targetWindow;
+         BOOL drag = [anEvent type] != NSEventTypeMouseMoved;
++        CGPoint eventPoint = CGEventGetLocation([anEvent CGEvent]);
++        double deltaX = [anEvent deltaX], deltaY = [anEvent deltaY];
++        unsigned int warpsFinished;
++
++        /* Direct cursor warps (no event tap) fold their displacement into the
++           delta of a later event.  Subtract our own warp displacement before
++           the deltas contribute anything, even if the event ends up filtered
++           or not posted for a Wine window: movements consumed elsewhere must
++           not leave a stale correction to distort later real movement.  The
++           zero-delta notification around a warp does not consume its pending
++           displacement: the captured nonzero movement follows it later. */
++        warpsFinished = warp_correction_match(&warpCorrections, [anEvent timestamp], deltaX, deltaY,
++                                              eventPoint.x, eventPoint.y);
++        if (warpsFinished)
++        {
++            double subtractX, subtractY;
++            unsigned int i;
++
++            if (wine_cursor_trace_active) for (i = 0; i < warpsFinished; i++)
++            {
++                struct warp_correction_record* warpRecord = &warpCorrections.records[i];
++                CURSOR_TRACE(WCT_WARP_MATCH, WCT_TIME_NS, anEvent, warpRecord, [anEvent timestamp] * NSEC_PER_SEC,
++                             warpRecord->from_x, warpRecord->from_y, warpRecord->to_x, warpRecord->to_y,
++                             warpRecord->time_before * NSEC_PER_SEC, warpRecord->time_after * NSEC_PER_SEC, deltaX, deltaY);
++            }
++
++            warp_correction_consume(&warpCorrections, warpsFinished, &subtractX, &subtractY);
++            deltaX -= subtractX;
++            deltaY -= subtractY;
++        }
+ 
+         if ([windowsBeingDragged count])
+             targetWindow = nil;
+@@ -1454,8 +1538,7 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+                event indicates its window is the main window, even if the cursor is
+                over a different window.  Find the actual WineWindow that is under the
+                cursor and post the event as being for that window. */
+-            CGPoint cgpoint = CGEventGetLocation([anEvent CGEvent]);
+-            NSPoint point = [self flippedMouseLocation:NSPointFromCGPoint(cgpoint)];
++            NSPoint point = [self flippedMouseLocation:NSPointFromCGPoint(eventPoint)];
+             NSInteger windowUnderNumber;
+ 
+             windowUnderNumber = [NSWindow windowNumberAtPoint:point
+@@ -1467,7 +1550,7 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+ 
+         if ([targetWindow isKindOfClass:[WineWindow class]])
+         {
+-            CGPoint point = CGEventGetLocation([anEvent CGEvent]);
++            CGPoint point = eventPoint;
+             macdrv_event* event;
+             BOOL absolute, noncoalescible;
+             double scale = retina_on ? 2 : 1;
+@@ -1488,11 +1571,12 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+                     return;
+                 }
+ 
+-                /* The event tap removes the synthetic center-warp displacement.
+-                   Keep waiting across that zero-motion event (and across buttons or
+-                   wheels, which never enter this path) until the first real post-warp
+-                   movement. */
+-                if (![anEvent deltaX] && ![anEvent deltaY])
++                /* The synthetic notification around our own warp (or the event
++                   tap removing the synthetic center-warp displacement) leaves a
++                   zero-motion event.  Keep waiting across that zero-motion event
++                   (and across buttons or wheels, which never enter this path)
++                   until the first real post-warp movement. */
++                if (!deltaX && !deltaY)
+                 {
+                     CURSOR_TRACE(WCT_FILTER, WCT_ZERO, anEvent, targetWindow, [anEvent timestamp],
+                                  0, 0, lastSetCursorPositionTime, 0, 0, 0, 0, 0);
+@@ -1519,8 +1603,6 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+                 // union of the screen frames), then we figure the cursor would
+                 // have moved outside if it could but it was pinned.
+                 CGPoint computedPoint = point;
+-                CGFloat deltaX = [anEvent deltaX];
+-                CGFloat deltaY = [anEvent deltaY];
+ 
+                 if (deltaX > 0.001)
+                     computedPoint.x++;
+@@ -1573,8 +1655,8 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+             {
+                 /* Add event delta to accumulated delta error */
+                 /* deltaY is already flipped */
+-                mouseMoveDeltaX += [anEvent deltaX];
+-                mouseMoveDeltaY += [anEvent deltaY];
++                mouseMoveDeltaX += deltaX;
++                mouseMoveDeltaY += deltaY;
+ 
+                 event = macdrv_create_event(MOUSE_MOVED_RELATIVE, targetWindow);
+                 event->mouse_moved.x = mouseMoveDeltaX * scale;
+@@ -1586,10 +1668,11 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+             }
+ 
+             /* Preserve every physical Cocoa delta for RawInput independently of
+-               the legacy absolute/relative baseline.  The event tap has already
+-               corrected post-warp deltas, and deltaY is already flipped. */
+-            rawMouseMoveDeltaX += [anEvent deltaX];
+-            rawMouseMoveDeltaY += [anEvent deltaY];
++               the legacy absolute/relative baseline, minus our own direct-warp
++               displacement (the event tap has already corrected post-warp
++               deltas in its path).  deltaY is already flipped. */
++            rawMouseMoveDeltaX += deltaX;
++            rawMouseMoveDeltaY += deltaY;
+             event->mouse_moved.raw_x = rawMouseMoveDeltaX * scale;
+             event->mouse_moved.raw_y = rawMouseMoveDeltaY * scale;
+ 
+@@ -2415,10 +2498,13 @@ - (void)applicationDidBecomeActive:(NSNotification *)notification
+ 
+         // The cursor probably moved while we were inactive.  Accumulated mouse
+         // movement deltas are invalidated.  Make sure the next mouse move event
+-        // starts over from an absolute baseline.
++        // starts over from an absolute baseline.  Pending warp corrections are
++        // invalidated, too: any folds delivered while we were inactive were not
++        // consumed here and must not distort later movement.
+         forceNextMouseMoveAbsolute = TRUE;
+         mouseMoveDeltaX = 0;
+         mouseMoveDeltaY = 0;
++        warp_correction_clear(&warpCorrections);
+ 
+         dispatch_async(dispatch_get_main_queue(), ^{
+             [self reconcileCursorForCurrentMouseLocation];
+@@ -2434,6 +2520,11 @@ - (void)applicationDidResignActive:(NSNotification *)notification
+                      lastSetCursorPositionTime, forceNextMouseMoveAbsolute, 0, 0, 0, 0);
+         [self invalidateGotFocusEvents];
+ 
++        /* Mouse movements are consumed by whoever is active from here on; any
++           warp folds they deliver are not ours to see.  Drop pending
++           corrections so they cannot leak into events we receive later. */
++        warp_correction_clear(&warpCorrections);
++
+         event = macdrv_create_event(APP_DEACTIVATED, nil);
+ 
+         [eventQueuesLock lock];
+diff --git a/dlls/winemac.drv/cocoa_warpconsumption.h b/dlls/winemac.drv/cocoa_warpconsumption.h
+new file mode 100644
+index 0000000..5fecac6
+--- /dev/null
++++ b/dlls/winemac.drv/cocoa_warpconsumption.h
+@@ -0,0 +1,118 @@
++/*
++ * Synthetic-delta correction for direct CGWarpMouseCursorPosition() moves.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_MACDRV_WARPCONSUMPTION_H
++#define __WINE_MACDRV_WARPCONSUMPTION_H
++
++#include <limits.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* Main-thread FIFO. Coordinates are Quartz screen points; times use the
++ * systemUptime/NSEvent clock in seconds. EventTap-owned warps stay in its
++ * separate tracker and must not be recorded here. */
++struct warp_correction_record
++{
++    double from_x, from_y;
++    double to_x, to_y;
++    double time_before, time_after;
++};
++
++struct warp_correction_state
++{
++    struct warp_correction_record *records;
++    unsigned int count, capacity;
++};
++
++static inline void warp_correction_clear(struct warp_correction_state *state)
++{
++    state->count = 0;
++}
++
++static inline void warp_correction_destroy(struct warp_correction_state *state)
++{
++    free(state->records);
++    memset(state, 0, sizeof(*state));
++}
++
++/* Reserve BEFORE moving the native cursor. Failure must leave both the cursor
++ * and pending corrections intact. Storage is reused; consuming never allocates. */
++static inline int warp_correction_reserve(struct warp_correction_state *state)
++{
++    unsigned int capacity;
++    struct warp_correction_record *records;
++
++    if (state->count < state->capacity) return 1;
++    if (state->capacity > UINT_MAX / 2) return 0;
++    capacity = state->capacity ? state->capacity * 2 : 4;
++    if (SIZE_MAX / capacity < sizeof(*records)) return 0;
++    if (!(records = realloc(state->records, (size_t)capacity * sizeof(*records)))) return 0;
++    state->records = records;
++    state->capacity = capacity;
++    return 1;
++}
++
++/* Caller has reserved a slot and completed a successful native warp. Use its
++ * actual before/after locations, not the requested (possibly clamped) target. */
++static inline int warp_correction_push(struct warp_correction_state *state,
++                                      const struct warp_correction_record *record)
++{
++    if (record->from_x == record->to_x && record->from_y == record->to_y) return 0;
++    state->records[state->count++] = *record;
++    return 1;
++}
++
++/* Match the EventTap timestamp/location convention, but retain direct warps
++ * across the zero-delta notification observed before their delayed movement.
++ * Match before filtering/routing so a discarded event still retires its warp. */
++static inline unsigned int warp_correction_match(const struct warp_correction_state *state,
++                                                double time, double dx, double dy, double x, double y)
++{
++    unsigned int i;
++
++    if (!dx && !dy) return 0;
++    for (i = 0; i < state->count; i++)
++    {
++        const struct warp_correction_record *record = &state->records[i];
++        if (!(record->time_after < time ||
++              (record->time_before <= time && x == record->to_x && y == record->to_y))) break;
++    }
++    return i;
++}
++
++/* finished is the result of match() on this unchanged state. Keep the
++ * per-record trace available until consumption, then preserve fractional
++ * physical movement by subtracting only the summed native displacement. */
++static inline void warp_correction_consume(struct warp_correction_state *state, unsigned int finished,
++                                          double *subtract_x, double *subtract_y)
++{
++    unsigned int i;
++
++    *subtract_x = *subtract_y = 0;
++    for (i = 0; i < finished; i++)
++    {
++        *subtract_x += state->records[i].to_x - state->records[i].from_x;
++        *subtract_y += state->records[i].to_y - state->records[i].from_y;
++    }
++    state->count -= finished;
++    if (finished && state->count)
++        memmove(state->records, state->records + finished, state->count * sizeof(*state->records));
++}
++
++#endif /* __WINE_MACDRV_WARPCONSUMPTION_H */

@@ -21,6 +21,7 @@
 #import <AppKit/AppKit.h>
 
 #include "macdrv_cocoa.h"
+#include "cocoa_warpconsumption.h"
 
 #define ERR(...) do { if (macdrv_err_on) LogError(__func__, __VA_ARGS__); } while (false)
 
@@ -72,6 +73,9 @@ enum {
     BOOL forceNextMouseMoveAbsolute;
     double mouseMoveDeltaX, mouseMoveDeltaY;
     double rawMouseMoveDeltaX, rawMouseMoveDeltaY;
+    /* Pending direct-CGWarp displacements folded into future mouse-move
+       event deltas (main thread only).  See cocoa_warpconsumption.h. */
+    struct warp_correction_state warpCorrections;
     NSUInteger unmatchedMouseDowns;
 
     NSTimeInterval lastScrollTime;

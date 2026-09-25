@@ -99,7 +99,7 @@ CLI에서는 글로벌 베타에 `--app-path "/Applications/Yaagl ZZZ OS DX12 Be
 
 ### 미배포 선택적 커서 진단
 
-현재 소스의 `winemac.so`와 `win32u.so`를 함께 빌드해야 합니다. 기존 배포 런타임에는 이 기능이 없습니다. `YAAGL_CURSOR_TRACE`가 Wine 프로세스에 전달된 경우에만 기록하며, 커서 보정·클리핑·RawInput 전달 정책은 바꾸지 않습니다.
+현재 소스의 `winemac.so`와 `win32u.so`를 함께 빌드해야 합니다. 기존 배포 런타임에는 이 기능이 없습니다. `YAAGL_CURSOR_TRACE`가 Wine 프로세스에 전달된 경우에만 기록하며, 기록 활성화 자체는 커서 보정·클리핑·RawInput 전달 정책을 바꾸지 않습니다.
 
 ```sh
 trace_dir="$(mktemp -d /tmp/yaagl-cursor.XXXXXX)"
@@ -123,6 +123,12 @@ python3 scripts/decode-cursor-trace.py "$trace_dir" --around-ns 123456789000 --b
 
 같은 창의 연속된 동기화 요청은 마지막 메인 큐 작업이 아직 대기 중일 때만 합칩니다. 다른 창이 끼어든 `A → B → A`의 순서와, 작업 시작 이후 발생한 새 요청은 보존합니다. 시작·활성화·첫 콘텐츠·표시/숨김·AppKit 커서 전환 트리거와 기존 Wine 이벤트 큐 병합은 유지합니다. 이 변경은 진단 환경변수와 독립적이며, RawInput·좌표·워프 보정이나 서버 프로토콜은 바꾸지 않습니다.
 
+### 미배포 직접 워프 입력 보정
+
+`0018-confinement-warp-correction.patch`는 Confinement/클리핑 해제 상태에서 성공한 직접 커서 워프를 추적하고, 해당 이동 이벤트에서 실제 네이티브 강제 이동량만 뺀 뒤 일반 이동과 RawInput을 누적합니다. 이동량이 0인 워프 알림은 보정을 소비하지 않으며, 타임스탬프 순서로 대기 이벤트와 연속 워프를 구분합니다. no-op·실패한 워프는 이동량을 추가하지 않고, 포커스 전환에서는 오래된 보정을 지웁니다. EventTap 경로는 기존 보정을 유지하며 이중으로 차감하지 않습니다. 큐 공간은 커서를 움직이기 전에 확보하므로 할당 실패 시 추적되지 않은 워프 대신 이동 실패를 반환합니다.
+
+`python3 scripts/test-cursor-warp-correction.py`로 입력 보존·할당 실패 회귀 8개를 검사합니다. 재빌드한 x86_64 `winemac.so`의 실제 Objective-C 이동 처리 메서드에 캡처 이벤트를 재생했을 때, 지연된 `(-675,-136)`에서 실제 잔여 움직임 `(1,-2)`가 남고 다음 `(4,-3)` 입력도 유지됐습니다. 이 재생은 네이티브 창·큐 경계를 대체하므로 물리 마우스 타이밍이나 게임 카메라 검증은 아닙니다. 적용에는 `winemac.so` 재빌드가 필요하며, 소스 변경만으로 런타임을 설치하거나 진단 기록을 끄지 않습니다.
+
 ### 미배포 현재 소스의 NGX 복구
 
 Metal4 replay와 legacy encode의 공용 처리는 별도 외부 wrapper를 유지하지 않고 `ngx-hooks.mm` 안으로 직접 복원했습니다. `bridge.mm`의 슬롯 17·18은 NGX replay·encode 진입점에 직접 연결되며, NGX descriptor를 해석하기 전에 FSR 기록 명령을 식별하고 실행합니다. 분리했던 `d3dmetal-replay-hooks.{hpp,mm}` 계층과 해당 빌드 항목은 제거했습니다.
@@ -137,7 +143,12 @@ Native layout **v14**는 dispatch 항목 25개(일반 hook 21개와 특수 hook 
 
 ### 미배포 수명 관리 수정
 
-- MSync 스레드 종료 시 빌린 alert 인덱스를 Unix descriptor로 닫지 않습니다. 캐시 참조에 프로세스별 일회성 export ID를 부여하고 native 프로세스 종료 후 회수합니다. `ntdll`과 `wineserver`를 함께 빌드해야 합니다. 서버 프로토콜은 **968**, MSync Mach wire는 **3**이며 기존 요청 번호는 유지합니다.
+MSync 메시지 분기 회귀 검사: macOS에서 `python3 scripts/test-msync-message-dispatch.py -v`. 제품 C 함수 본문을 실행하는 10개 사례로 높은 ID의 대기 등록·해제, 잘못된 close 거부, 실제 전용 Mach 포트를 통한 close 처리를 검사합니다.
+
+- 프로세스 내 동기화 캐시는 24바이트 항목이 블록 크기를 나누어떨어지게 하지 않아도 64 KiB 전체를 할당합니다. MSync export ID 추가 후 높은 핸들이 다음 캐시 블록을 요구할 때 발생하던 `anon_mmap_alloc` assertion을 항목 패딩이나 소유권 검사 제거 없이 수정했습니다. `ntdll` sync 회귀 테스트는 이벤트 4,096개를 유지하면서 독립적인 signal/reset/wait 상태를 검사합니다. 테스트 본문을 추출한 실행은 재빌드한 런타임과 격리 prefix에서 18,432개 assertion을 통과했고, 별도 이벤트 2,740개 API 스모크도 기존에 크래시하던 높은 핸들 동작을 통과했습니다. 테스트는 소스 테스트 모음에 유지하고 런타임 quilt에는 제품 코드 수정만 반영합니다. Beta 설치나 실게임 검증을 뜻하지 않습니다.
+- MSync 스레드 종료 시 빌린 alert 인덱스를 Unix descriptor로 닫지 않습니다. 캐시 참조에 프로세스별 일회성 export ID를 부여하고 native 프로세스 종료 후 회수합니다. `ntdll`과 `wineserver`를 함께 빌드해야 합니다. 서버 프로토콜은 tuned **968**, safe-msync **969**, MSync Mach wire는 **3**이며 기존 요청 번호는 유지합니다. 프로토콜 969는 safe-msync 요청 구조 전용으로 예약하며 tuned에서 재사용하면 안 됩니다.
+- 서버 내부 MSync export 해제는 전용 메시지 ID를 사용하고 공유 인덱스는 payload에 따로 전달하므로 높은 스레드 ID가 대기 등록·해제를 close로 바꾸지 않습니다. 정확한 메시지 크기·서버 cookie·인덱스 범위를 확인한 뒤 참조를 해제합니다. 잘못된 close는 대기로 해석하지 않고 버리며 클라이언트 대기 메시지와 공유 메모리 구조는 유지합니다. 격리한 재빌드 Wine에서 이벤트 4,096개 반복 재사용, 실제 등록 로그를 확인한 다중 대기 깨우기 256회, export를 남긴 자식 프로세스 종료를 통과했습니다.
+- 공통 MSync 패치에서 커서 프로토콜 의존성을 분리했습니다. tuned와 safe-msync는 마지막 프로토콜 버전 패치를 각각 적용하고, safe-msync에는 커서·창 변경을 가져오지 않습니다. 복원한 pre-tuned baseline에서 두 프로필의 실제 prepare overlay 함수, 반복 적용 검증, 소스 상속 inventory 검사, `tools/make_requests` 재생성 결과의 바이트 일치를 확인했습니다. 준비된 P3 baseline이 없어 upstream pin을 확인하는 전체 preflight는 실행하지 않았습니다. P3 manifest의 해시는 변경된 graphics-bridge 패치와 일치합니다.
 - macdrv는 창 데이터 잠금 안에서 상태를 분리한 뒤 잠금 밖에서 Cocoa 창과 대기 중인 surface 이벤트를 정리합니다. 창 파괴와 최상위 창의 자식 창 전환에 같은 순서를 적용합니다.
 - Native FG 콜백은 소유 context의 callback scope에 진입해 configure/dispatch 잠금 역전을 피합니다. 콜백이 같으면 할당·present 대기 없이 binding을 재사용하고, 이전 binding은 교체 성공과 필요한 drain 이후에만 회수합니다.
 - FG bridge **v4**는 콜백 실패·생성 생략에도 완료된 frame ID를 정리합니다. 이전 미완료 프레임과 기록된 명령의 snapshot은 보존합니다. FG PE/Unix 모듈과 native sidecar를 함께 다시 빌드해야 합니다.

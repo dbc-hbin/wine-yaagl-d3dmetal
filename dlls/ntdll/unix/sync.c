@@ -593,7 +593,8 @@ struct inproc_sync
     unsigned short closed;    /* fd has been closed but sync is still referenced */
 };
 
-#define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
+#define INPROC_SYNC_CACHE_BLOCK_BYTES 65536
+#define INPROC_SYNC_CACHE_BLOCK_SIZE  (INPROC_SYNC_CACHE_BLOCK_BYTES / sizeof(struct inproc_sync))
 #define INPROC_SYNC_CACHE_ENTRIES     128
 
 static struct inproc_sync *inproc_sync_cache[INPROC_SYNC_CACHE_ENTRIES];
@@ -631,8 +632,8 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync 
         if (!entry) inproc_sync_cache[0] = inproc_sync_cache_initial_block;
         else
         {
-            static const size_t size = INPROC_SYNC_CACHE_BLOCK_SIZE * sizeof(struct inproc_sync);
-            void *ptr = anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
+            /* The entry size need not divide the page-aligned block size. */
+            void *ptr = anon_mmap_alloc( INPROC_SYNC_CACHE_BLOCK_BYTES, PROT_READ | PROT_WRITE );
             if (ptr == MAP_FAILED) return sync;
             inproc_sync_cache[entry] = ptr;
         }
