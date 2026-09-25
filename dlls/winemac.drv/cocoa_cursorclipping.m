@@ -22,6 +22,7 @@
 #import "cocoa_app.h"
 #import "cocoa_cursorclipping.h"
 #import "cocoa_window.h"
+#include "wine/cursor_trace.h"
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
@@ -141,6 +142,9 @@ static void scale_rect_for_retina_mode(BOOL mode, CGRect *cursorClipRect)
         else
             oldLocation = NSPointToCGPoint([[WineApplicationController sharedController] flippedMouseLocation:[NSEvent mouseLocation]]);
 
+        CURSOR_TRACE(WCT_WARP, WCT_BEFORE | WCT_EVENT_TAP |
+                     (CGPointEqualToPoint(oldLocation, *newLocation) ? WCT_NOOP : 0), self, 0,
+                     0, oldLocation.x, oldLocation.y, newLocation->x, newLocation->y, 0, 0, 0, 0);
         if (!CGPointEqualToPoint(oldLocation, *newLocation))
         {
             WarpRecord* warpRecord = [[[WarpRecord alloc] init] autorelease];
@@ -152,10 +156,19 @@ static void scale_rect_for_retina_mode(BOOL mode, CGRect *cursorClipRect)
             /* Actually move the cursor. */
             err = CGWarpMouseCursorPosition(*newLocation);
             if (err != kCGErrorSuccess)
+            {
+                CURSOR_TRACE(WCT_WARP, WCT_AFTER | WCT_ERROR | WCT_TIME_NS, warpRecord, self,
+                             warpRecord.timeBefore, oldLocation.x, oldLocation.y,
+                             newLocation->x, newLocation->y, err, 0, 0, 0);
                 return FALSE;
+            }
 
             warpRecord.timeAfter = [[NSProcessInfo processInfo] systemUptime] * NSEC_PER_SEC;
             *newLocation = NSPointToCGPoint([[WineApplicationController sharedController] flippedMouseLocation:[NSEvent mouseLocation]]);
+            CURSOR_TRACE(WCT_WARP, WCT_AFTER | WCT_SUCCESS | WCT_TIME_NS |
+                         (CGPointEqualToPoint(oldLocation, *newLocation) ? WCT_NOOP : 0), warpRecord, self,
+                         warpRecord.timeAfter, oldLocation.x, oldLocation.y, newLocation->x, newLocation->y,
+                         warpRecord.timeBefore, 0, 0, 0);
 
             if (!CGPointEqualToPoint(oldLocation, *newLocation))
             {
@@ -204,9 +217,13 @@ static void scale_rect_for_retina_mode(BOOL mode, CGRect *cursorClipRect)
         CGPoint eventLocation, cursorLocation;
 
         if (type == kCGEventTapDisabledByUserInput)
+        {
+            CURSOR_TRACE(WCT_TAP, WCT_ERROR, self, 0, 0, type, 0, 0, 0, 0, 0, 0, 0);
             return event;
+        }
         if (type == kCGEventTapDisabledByTimeout)
         {
+            CURSOR_TRACE(WCT_TAP, WCT_ERROR, self, 0, 0, type, 0, 0, 0, 0, 0, 0, 0);
             CGEventTapEnable(cursorClippingEventTap, TRUE);
             return event;
         }
@@ -229,10 +246,15 @@ static void scale_rect_for_retina_mode(BOOL mode, CGRect *cursorClipRect)
 
             deltaX = CGEventGetDoubleValueField(event, kCGMouseEventDeltaX);
             deltaY = CGEventGetDoubleValueField(event, kCGMouseEventDeltaY);
+            CURSOR_TRACE(WCT_TAP, WCT_BEFORE | WCT_TIME_NS, event, self, eventTime,
+                         deltaX, deltaY, eventLocation.x, eventLocation.y, warpsFinished, [warpRecords count], 0, 0);
 
             for (i = 0; i < warpsFinished; i++)
             {
                 WarpRecord* warpRecord = warpRecords[0];
+                CURSOR_TRACE(WCT_WARP_MATCH, WCT_TIME_NS, event, warpRecord, eventTime,
+                             warpRecord.from.x, warpRecord.from.y, warpRecord.to.x, warpRecord.to.y,
+                             warpRecord.timeBefore, warpRecord.timeAfter, deltaX, deltaY);
                 deltaX -= warpRecord.to.x - warpRecord.from.x;
                 deltaY -= warpRecord.to.y - warpRecord.from.y;
                 [warpRecords removeObjectAtIndex:0];
@@ -243,6 +265,8 @@ static void scale_rect_for_retina_mode(BOOL mode, CGRect *cursorClipRect)
                 CGEventSetDoubleValueField(event, kCGMouseEventDeltaX, deltaX);
                 CGEventSetDoubleValueField(event, kCGMouseEventDeltaY, deltaY);
             }
+            CURSOR_TRACE(WCT_TAP, WCT_AFTER | WCT_TIME_NS, event, self, eventTime,
+                         deltaX, deltaY, eventLocation.x, eventLocation.y, warpsFinished, [warpRecords count], 0, 0);
 
             synthesizedLocation.x += deltaX;
             synthesizedLocation.y += deltaY;

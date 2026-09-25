@@ -95,6 +95,26 @@ CLI에서는 글로벌 베타에 `--app-path "/Applications/Yaagl ZZZ OS DX12 Be
 - 정상 상태에서 무제한 frame별 로그를 남기지 않습니다.
 - 로그는 API, encode 또는 callback 진행을 나타냅니다. GPU 완료, 화질, FPS 또는 OFF 전환의 증거가 아닙니다.
 
+### 미배포 선택적 커서 진단
+
+현재 소스의 `winemac.so`와 `win32u.so`를 함께 빌드해야 합니다. 기존 배포 런타임에는 이 기능이 없습니다. `YAAGL_CURSOR_TRACE`가 Wine 프로세스에 전달된 경우에만 기록하며, 커서 보정·클리핑·RawInput 전달 정책은 바꾸지 않습니다.
+
+```sh
+trace_dir="$(mktemp -d /tmp/yaagl-cursor.XXXXXX)"
+YAAGL_CURSOR_TRACE="$trace_dir" /path/to/diagnostic/wine /path/to/application.exe
+python3 scripts/decode-cursor-trace.py "$trace_dir" --summary
+python3 scripts/decode-cursor-trace.py "$trace_dir" --last-seconds 5 > cursor.jsonl
+# 특정 레코드의 clock_ns를 중심으로 전후 구간 선택:
+python3 scripts/decode-cursor-trace.py "$trace_dir" --around-ns 123456789000 --before 2 --after 1
+```
+
+- 출력 디렉터리는 미리 존재하는 절대 경로여야 합니다. 파일은 권한 `0600`으로 생성됩니다. 프로세스 시작 때 설정을 읽으므로, 다음 실행에서 변수를 전달하지 않으면 꺼집니다.
+- 실제 Confinement/EventTap 선택, 클립·포커스·Retina 전환, 강제 이동과 no-op, EventTap 보정, Cocoa 이동량과 시간 필터, 큐 병합·폐기, Wine 전달, 앱의 RawInput·좌표 읽기를 기록합니다. 키보드 내용과 게임 카메라 각도는 기록하지 않습니다.
+- DLL별·프로세스별로 **8 MiB + 128바이트**, 최근 65,536개 레코드만 보존합니다. 파일은 종료 후에도 남습니다. 입력 경로에서 명시적인 파일 쓰기·추가 스레드·동적 할당은 하지 않지만, 진단 비용과 OS의 매핑 페이지 쓰기 비용이 없다는 뜻은 아닙니다.
+- 증상 직후 별도 터미널에서 읽으십시오. 오래 기다리면 해당 구간이 덮어써집니다. 실행 중 읽기는 원자적 전체 스냅샷이 아니며 분석기는 경합으로 빠진 기록, 보존 범위 밖 시퀀스, 불안정한 슬롯을 보고합니다.
+- `clock_ns`는 공통 단조 시계이고 원본 이벤트 시간의 단위는 별도 표시합니다. 포인터 식별자는 재사용될 수 있어 시퀀스와 수명을 함께 봐야 하며 프로세스 간 인과관계를 자동으로 확정하지 않습니다. 같은 RawInput 핸들의 반복 읽기를 추가 물리 입력으로 합산하면 안 됩니다. Confinement에서는 EventTap 워프 보정이 실행되지 않습니다.
+- 수집기·분석기의 비활성화, 순환 경계, 동시 기록, fork 격리, 잘못된 파일 검증: `python3 scripts/test-cursor-trace.py`.
+
 ### 미배포 현재 소스의 NGX 복구
 
 Metal4 replay와 legacy encode의 공용 처리는 별도 외부 wrapper를 유지하지 않고 `ngx-hooks.mm` 안으로 직접 복원했습니다. `bridge.mm`의 슬롯 17·18은 NGX replay·encode 진입점에 직접 연결되며, NGX descriptor를 해석하기 전에 FSR 기록 명령을 식별하고 실행합니다. 분리했던 `d3dmetal-replay-hooks.{hpp,mm}` 계층과 해당 빌드 항목은 제거했습니다.

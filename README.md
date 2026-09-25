@@ -95,6 +95,26 @@ Next verification should use game captures with disocclusion and mixed motion at
 - There is no unbounded normal per-frame log.
 - Log entries report API, encode, or callback progress. They do not prove GPU completion, image quality, FPS, or an OFF transition.
 
+### Unreleased opt-in cursor diagnostics
+
+Build both `winemac.so` and `win32u.so` from current source; existing releases do not contain this feature. Recording requires `YAAGL_CURSOR_TRACE` in the Wine process environment. Cursor correction, clipping, and RawInput delivery policy remain unchanged.
+
+```sh
+trace_dir="$(mktemp -d /tmp/yaagl-cursor.XXXXXX)"
+YAAGL_CURSOR_TRACE="$trace_dir" /path/to/diagnostic/wine /path/to/application.exe
+python3 scripts/decode-cursor-trace.py "$trace_dir" --summary
+python3 scripts/decode-cursor-trace.py "$trace_dir" --last-seconds 5 > cursor.jsonl
+# Select a window around an event's clock_ns:
+python3 scripts/decode-cursor-trace.py "$trace_dir" --around-ns 123456789000 --before 2 --after 1
+```
+
+- The output directory must already exist and be absolute. Files are created with mode `0600`. Configuration is read at process startup; omit the variable on the next launch to disable recording.
+- Records cover the actual Confinement/EventTap backend, clip/focus/Retina transitions, warps and no-ops, EventTap correction, Cocoa deltas and timestamp filtering, queue merge/discard, Wine delivery, and application RawInput/position reads. Keyboard contents and game camera angles are not captured.
+- Each loaded DLL in each process retains only its latest 65,536 records in **8 MiB + 128 bytes**. Files survive exit. There are no explicit file writes, additional threads, or allocations on the input path; diagnostic work and OS writeback of mapped pages still have a cost.
+- Read from a separate terminal immediately after the symptom; older records roll out. Live reads are not globally atomic snapshots. The decoder reports contention drops, sequences outside the retained window, and unstable slots.
+- `clock_ns` uses the common monotonic clock; source-event clock units are separately labeled. Pointer identities can be reused, so interpret them with sequence/lifetime context, not as automatic cross-process causal links. Repeated reads of a RawInput handle are not additional physical input. Confinement does not execute EventTap warp correction.
+- Collector/decoder checks for disabled recording, wraparound, concurrent producers, fork isolation, and malformed files: `python3 scripts/test-cursor-trace.py`.
+
 ### Unreleased NGX restoration in current source
 
 Shared Metal4 replay and legacy encode handling are restored directly inside `ngx-hooks.mm`, rather than retained as an outer compatibility wrapper. `bridge.mm` publishes the NGX replay/encode entrypoints directly in slots 17/18; they recognize and execute FSR-recorded commands before interpreting any NGX descriptor. The separate `d3dmetal-replay-hooks.{hpp,mm}` layer and its build entries have been removed.

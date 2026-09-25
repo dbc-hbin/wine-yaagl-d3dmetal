@@ -1,0 +1,809 @@
+diff --git a/dlls/win32u/input.c b/dlls/win32u/input.c
+index c24bbab..68fd02d 100644
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -37,6 +37,10 @@
+ #include "wine/debug.h"
+ #include "kbd.h"
+ 
++#define WINE_CURSOR_TRACE_IMPLEMENTATION
++#define WINE_CURSOR_TRACE_MODULE "win32u"
++#include "wine/cursor_trace.h"
++
+ WINE_DEFAULT_DEBUG_CHANNEL(win);
+ WINE_DECLARE_DEBUG_CHANNEL(keyboard);
+ 
+@@ -693,7 +697,18 @@ static NTSTATUS send_mouse_motion( UINT flags )
+     if (!input.mi.dwFlags && !input.mi.mouseData && !info->raw_mouse.count) return STATUS_SUCCESS; /* ignore empty inputs */
+ 
+     TRACE( "Sending %s (%u raw frames)\n", debugstr_mouseinput( &input.mi ), info->raw_mouse.count );
++    if (wine_cursor_trace_active)
++    {
++        UINT i;
++        for (i = 0; i < info->raw_mouse.count; ++i)
++            CURSOR_TRACE(WCT_SEND, WCT_BEFORE | WCT_TIME_MS, info->mouse_hwnd, 0, input.mi.time,
++                         input.mi.dx, input.mi.dy, info->raw_mouse.data[i].x, info->raw_mouse.data[i].y,
++                         i, info->raw_mouse.count, input.mi.dwFlags, flags);
++    }
+     status = server_send_hardware_message( info->mouse_hwnd, flags, &input, (LPARAM)&info->raw_mouse );
++    CURSOR_TRACE(WCT_SEND, WCT_AFTER | WCT_TIME_MS | (status ? WCT_ERROR : WCT_SUCCESS),
++                 info->mouse_hwnd, 0, input.mi.time, input.mi.dx, input.mi.dy, 0, 0,
++                 status, info->raw_mouse.count, input.mi.dwFlags, flags);
+     memset( &info->mouse_motion, 0, sizeof(info->mouse_motion) );
+     info->raw_mouse.count = 0;
+     info->mouse_hwnd = NULL;
+@@ -716,6 +731,15 @@ static NTSTATUS accum_mouse_motion( HWND hwnd, UINT flags, INPUT input, const st
+     struct user_thread_info *info = get_user_thread_info();
+     BOOL send;
+ 
++    if (wine_cursor_trace_active)
++    {
++        UINT i;
++        for (i = 0; i < raw->count; ++i)
++            CURSOR_TRACE(WCT_ACCUM, WCT_BEFORE | WCT_TIME_MS, hwnd, 0, input.mi.time,
++                         input.mi.dx, input.mi.dy, raw->data[i].x, raw->data[i].y,
++                         i, raw->count, input.mi.dwFlags, info->raw_mouse.count);
++    }
++
+     /* don't accumulate if there's button / wheel / MOUSEEVENTF_MOVE_NOCOALESCE */
+     send = input.mi.mouseData || (input.mi.dwFlags & ~(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE));
+     if (send || info->mouse_hwnd != hwnd || is_clipped_motion( input.mi )) send_mouse_motion( flags );
+@@ -831,6 +855,10 @@ BOOL WINAPI NtUserSetCursorPos( INT x, INT y )
+     }
+     SERVER_END_REQ;
+     if (ret && (prev_x != new_x || prev_y != new_y)) user_driver->pSetCursorPos( new_x, new_y );
++    CURSOR_TRACE(WCT_SET_POS, WCT_AFTER | (ret ? WCT_SUCCESS : WCT_ERROR) |
++                 (ret && prev_x == new_x && prev_y == new_y ? WCT_NOOP : 0), 0, 0, 0,
++                 x, y, ret ? prev_x : 0, ret ? prev_y : 0, ret ? new_x : 0, ret ? new_y : 0,
++                 rect.left, rect.top);
+     return ret;
+ }
+ 
+@@ -843,6 +871,9 @@ BOOL WINAPI NtUserGetCursorPos( POINT *pt )
+     const desktop_shm_t *desktop_shm;
+     BOOL ret = TRUE;
+     DWORD last_change = 0;
++    DWORD age;
++    POINT raw_pos;
++    struct ratio dpi;
+     NTSTATUS status;
+     RECT rect;
+ 
+@@ -857,12 +888,22 @@ BOOL WINAPI NtUserGetCursorPos( POINT *pt )
+     if (status) return FALSE;
+ 
+     /* query new position from graphics driver if we haven't updated recently */
+-    if (NtGetTickCount() - last_change > 100) ret = user_driver->pGetCursorPos( pt );
+-    if (!ret) return FALSE;
++    age = NtGetTickCount() - last_change;
++    if (age > 100) ret = user_driver->pGetCursorPos( pt );
++    if (!ret)
++    {
++        CURSOR_TRACE(WCT_CURSOR_POS, WCT_ERROR | WCT_HOST_QUERY | WCT_TIME_MS, pt, 0,
++                     last_change, 0, 0, 0, 0, age, 0, 0, 0);
++        return FALSE;
++    }
++    if (wine_cursor_trace_active) raw_pos = *pt;
+ 
+     SetRect( &rect, pt->x, pt->y, pt->x, pt->y );
+-    rect = map_rect_raw_to_virt( rect, get_thread_dpi() );
++    dpi = get_thread_dpi();
++    rect = map_rect_raw_to_virt( rect, dpi );
+     *pt = *(POINT *)&rect.left;
++    CURSOR_TRACE(WCT_CURSOR_POS, WCT_SUCCESS | WCT_TIME_MS | (age > 100 ? WCT_HOST_QUERY : 0),
++                 pt, 0, last_change, pt->x, pt->y, raw_pos.x, raw_pos.y, age, dpi.num, dpi.den, 0);
+     return ret;
+ }
+ 
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index 352ceee..c7a4e3b 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -36,6 +36,7 @@
+ #include "dde.h"
+ #include "immdev.h"
+ #include "wine/debug.h"
++#include "wine/cursor_trace.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(msg);
+ WINE_DECLARE_DEBUG_CHANNEL(key);
+@@ -2917,6 +2918,13 @@ static BOOL process_hardware_message( MSG *msg, UINT hw_id, const struct hardwar
+         ERR( "unknown message type %x\n", msg->message );
+     set_thread_dpi_awareness_context( context );
+     if (!ret) thread_info->client_info->msg_source = prev_source;
++    if (wine_cursor_trace_active &&
++        (msg->message == WM_MOUSEMOVE || msg->message == WM_NCMOUSEMOVE ||
++         (msg->message == WM_INPUT && msg_data->rawinput.type == RIM_TYPEMOUSE)))
++        CURSOR_TRACE(WCT_APP_MESSAGE, WCT_TIME_MS | (ret ? WCT_SUCCESS : 0),
++                     hw_id, msg->hwnd, msg->time, msg->message, msg->pt.x, msg->pt.y,
++                     (short)LOWORD(msg->lParam), (short)HIWORD(msg->lParam), remove,
++                     msg_data->source.origin, 0);
+     return ret;
+ }
+ 
+diff --git a/dlls/win32u/rawinput.c b/dlls/win32u/rawinput.c
+index f33a9b5..2adc8ba 100644
+--- a/dlls/win32u/rawinput.c
++++ b/dlls/win32u/rawinput.c
+@@ -33,6 +33,7 @@
+ #include "wine/hid.h"
+ #include "wine/server.h"
+ #include "wine/debug.h"
++#include "wine/cursor_trace.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(rawinput);
+ 
+@@ -455,6 +456,7 @@ UINT WINAPI NtUserGetRawInputBuffer( RAWINPUT *data, UINT *data_size, UINT heade
+ {
+     struct user_thread_info *thread_info;
+     UINT count;
++    UINT trace_capacity = 0;
+ 
+     TRACE( "data %p, data_size %p, header_size %u\n", data, data_size, header_size );
+ 
+@@ -474,6 +476,7 @@ UINT WINAPI NtUserGetRawInputBuffer( RAWINPUT *data, UINT *data_size, UINT heade
+     if (NtCurrentTeb()->WowTebOffset) header_size = sizeof(RAWINPUTHEADER64);
+ 
+     thread_info = get_user_thread_info();
++    if (wine_cursor_trace_active && data) trace_capacity = *data_size;
+     SERVER_START_REQ( get_rawinput_buffer )
+     {
+         req->header_size = header_size;
+@@ -485,6 +488,28 @@ UINT WINAPI NtUserGetRawInputBuffer( RAWINPUT *data, UINT *data_size, UINT heade
+     }
+     SERVER_END_REQ;
+ 
++    CURSOR_TRACE(WCT_RAW_BUFFER, WCT_AFTER | (!data ? WCT_SIZE_ONLY : 0) |
++                 (count == ~0u ? WCT_ERROR : WCT_SUCCESS), data, 0, 0,
++                 count, *data_size, header_size, trace_capacity, 0, 0, 0, 0);
++    if (wine_cursor_trace_active && data && count != ~0u)
++    {
++        SIZE_T offset = 0, align = NtCurrentTeb()->WowTebOffset ? 3 : sizeof(void *) - 1;
++        UINT i;
++        for (i = 0; i < count && offset + header_size <= trace_capacity; ++i)
++        {
++            RAWINPUTHEADER *header = (RAWINPUTHEADER *)((char *)data + offset);
++            UINT size = header->dwSize;
++            if (size < header_size || size > trace_capacity - offset) break;
++            if (header->dwType == RIM_TYPEMOUSE && size >= header_size + sizeof(RAWMOUSE))
++            {
++                RAWMOUSE *mouse = (RAWMOUSE *)((char *)header + header_size);
++                CURSOR_TRACE(WCT_RAW_BUFFER, WCT_SUCCESS, data, 0, 0,
++                             mouse->lLastX, mouse->lLastY, mouse->usFlags, mouse->usButtonFlags,
++                             i, count, size, mouse->ulExtraInformation);
++            }
++            offset += (size + align) & ~align;
++        }
++    }
+     return count;
+ }
+ 
+@@ -503,6 +528,7 @@ UINT WINAPI NtUserGetRawInputData( HRAWINPUT handle, UINT command, void *data, U
+ 
+     if (!(msg_data = thread_info->rawinput) || msg_data->hw_id != (UINT_PTR)handle)
+     {
++        CURSOR_TRACE(WCT_RAW_READ, WCT_ERROR, handle, 0, 0, 0, 0, command, 0, 0, 0, 0, 0);
+         RtlSetLastWin32Error( ERROR_INVALID_HANDLE );
+         return -1;
+     }
+@@ -519,6 +545,9 @@ UINT WINAPI NtUserGetRawInputData( HRAWINPUT handle, UINT command, void *data, U
+     if (!data)
+     {
+         *data_size = sizeof(RAWINPUTHEADER) + size;
++        if (msg_data->rawinput.type == RIM_TYPEMOUSE)
++            CURSOR_TRACE(WCT_RAW_READ, WCT_SIZE_ONLY | WCT_SUCCESS, handle, 0, 0,
++                         0, 0, command, *data_size, 0, 0, 0, 0);
+         return 0;
+     }
+ 
+@@ -532,12 +561,23 @@ UINT WINAPI NtUserGetRawInputData( HRAWINPUT handle, UINT command, void *data, U
+     rawinput->header.dwSize  = sizeof(RAWINPUTHEADER) + msg_data->size - sizeof(*msg_data);
+     rawinput->header.hDevice = UlongToHandle( msg_data->rawinput.device );
+     rawinput->header.wParam  = msg_data->rawinput.wparam;
+-    if (command == RID_HEADER) return sizeof(RAWINPUTHEADER);
++    if (command == RID_HEADER)
++    {
++        if (msg_data->rawinput.type == RIM_TYPEMOUSE)
++            CURSOR_TRACE(WCT_RAW_READ, WCT_HEADER_ONLY | WCT_SUCCESS, handle, rawinput->header.hDevice,
++                         0, 0, 0, command, sizeof(RAWINPUTHEADER), 0, 0, 0, 0);
++        return sizeof(RAWINPUTHEADER);
++    }
+ 
+     if (msg_data->rawinput.type == RIM_TYPEMOUSE)
+     {
+         if (size != sizeof(RAWMOUSE)) goto failed;
+         rawinput->data.mouse = *(RAWMOUSE *)(msg_data + 1);
++        CURSOR_TRACE(WCT_RAW_READ, WCT_SUCCESS, handle, rawinput->header.hDevice, 0,
++                     rawinput->data.mouse.lLastX, rawinput->data.mouse.lLastY,
++                     rawinput->data.mouse.usFlags, rawinput->data.mouse.usButtonFlags,
++                     rawinput->data.mouse.ulExtraInformation, rawinput->header.wParam,
++                     rawinput->header.dwSize, 0);
+     }
+     else if (msg_data->rawinput.type == RIM_TYPEKEYBOARD)
+     {
+@@ -664,7 +704,7 @@ BOOL WINAPI NtUserRegisterRawInputDevices( const RAWINPUTDEVICE *devices, UINT d
+     RAWINPUTDEVICE *new_registered_devices;
+     SIZE_T size;
+     BOOL ret;
+-    UINT i;
++    UINT i, requested_count = device_count;
+ 
+     TRACE( "devices %p, device_count %u, device_size %u.\n", devices, device_count, device_size );
+ 
+@@ -742,6 +782,12 @@ BOOL WINAPI NtUserRegisterRawInputDevices( const RAWINPUTDEVICE *devices, UINT d
+ 
+     pthread_mutex_unlock( &rawinput_mutex );
+ 
++    if (wine_cursor_trace_active)
++        for (i = 0; i < requested_count; ++i)
++            if (devices[i].usUsagePage == 1 && devices[i].usUsage == 2)
++                CURSOR_TRACE(WCT_REGISTER, WCT_AFTER | (ret ? WCT_SUCCESS : WCT_ERROR),
++                             devices[i].hwndTarget, 0, 0, devices[i].dwFlags,
++                             devices[i].usUsagePage, devices[i].usUsage, 0, 0, 0, 0, 0);
+     return ret;
+ }
+ 
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+index 1047009..e352684 100644
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -22,6 +22,7 @@
+ #import "cocoa_cursorclipping.h"
+ #import "cocoa_event.h"
+ #import "cocoa_window.h"
++#include "wine/cursor_trace.h"
+ 
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+ 
+@@ -43,6 +44,19 @@
+ 
+ bool macdrv_err_on;
+ 
++static void trace_cursor_geometry(NSData *frames)
++{
++    if (wine_cursor_trace_active)
++    {
++        const CGRect *rects = [frames bytes];
++        NSUInteger count = [frames length] / sizeof(*rects);
++        for (NSUInteger i = 0; i < count; ++i)
++            CURSOR_TRACE(WCT_GEOMETRY, retina_on ? WCT_RETINA : 0, 0, 0, 0,
++                         i, rects[i].origin.x, rects[i].origin.y, rects[i].size.width,
++                         rects[i].size.height, retina_on ? 2 : 1, count, 0);
++    }
++}
++
+ 
+ #if !defined(MAC_OS_VERSION_14_0) || MAC_OS_X_VERSION_MAX_ALLOWED < MAC_OS_VERSION_14_0
+ @interface NSApplication (CooperativeActivationSelectorsForOldSDKs)
+@@ -1192,6 +1206,9 @@ - (BOOL) setCursorPosition:(CGPoint)pos
+     {
+         BOOL ret;
+ 
++        CURSOR_TRACE(WCT_SET_POS, WCT_BEFORE | (retina_on ? WCT_RETINA : 0), self, clipCursorHandler,
++                     lastSetCursorPositionTime, pos.x, pos.y, self.clippingCursor, 0, 0, 0, 0, 0);
++
+         if ([windowsBeingDragged count])
+             ret = FALSE;
+         else if (self.clippingCursor && [clipCursorHandler respondsToSelector:@selector(setCursorPosition:)])
+@@ -1242,6 +1259,8 @@ - (BOOL) setCursorPosition:(CGPoint)pos
+             [eventQueuesLock unlock];
+         }
+ 
++        CURSOR_TRACE(WCT_SET_POS, WCT_AFTER | (ret ? WCT_SUCCESS : WCT_ERROR), self, clipCursorHandler,
++                     lastSetCursorPositionTime, pos.x, pos.y, self.clippingCursor, 0, 0, 0, 0, 0);
+         return ret;
+     }
+ 
+@@ -1265,10 +1284,25 @@ - (BOOL) startClippingCursor:(CGRect)rect
+         }
+ 
+         if (self.clippingCursor && CGRectEqualToRect(rect, clipCursorHandler.cursorClipRect))
++        {
++            CURSOR_TRACE(WCT_CLIP, WCT_AFTER | WCT_SUCCESS | WCT_NOOP, self, clipCursorHandler,
++                         0, rect.origin.x, rect.origin.y, rect.size.width, rect.size.height, 1, 0, 0, 0);
+             return TRUE;
++        }
+ 
+         if (![clipCursorHandler startClippingCursor:rect])
++        {
++            CURSOR_TRACE(WCT_CLIP, WCT_AFTER | WCT_ERROR, self, clipCursorHandler,
++                         0, rect.origin.x, rect.origin.y, rect.size.width, rect.size.height, 1, 0, 0, 0);
+             return FALSE;
++        }
++
++        CURSOR_TRACE(WCT_CLIP, WCT_AFTER | WCT_SUCCESS | WCT_TRANSITION |
++                     ([clipCursorHandler isKindOfClass:[WineConfinementClipCursorHandler class]] ?
++                      WCT_CONFINEMENT : WCT_EVENT_TAP) | (retina_on ? WCT_RETINA : 0),
++                     self, clipCursorHandler, lastSetCursorPositionTime,
++                     rect.origin.x, rect.origin.y, rect.size.width, rect.size.height, 1, 0, 0, 0);
++        trace_cursor_geometry(screenFrameCGRects);
+ 
+         [self setCursorPosition:NSPointToCGPoint([self flippedMouseLocation:[NSEvent mouseLocation]])];
+         lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
+@@ -1283,10 +1317,21 @@ - (BOOL) startClippingCursor:(CGRect)rect
+     - (BOOL) stopClippingCursor
+     {
+         if (!self.clippingCursor)
++        {
++            CURSOR_TRACE(WCT_CLIP, WCT_AFTER | WCT_SUCCESS | WCT_NOOP, self, clipCursorHandler,
++                         0, 0, 0, 0, 0, 0, 0, 0, 0);
+             return TRUE;
++        }
+ 
+         if (![clipCursorHandler stopClippingCursor])
++        {
++            CURSOR_TRACE(WCT_CLIP, WCT_AFTER | WCT_ERROR, self, clipCursorHandler,
++                         0, 0, 0, 0, 0, 0, 0, 0, 0);
+             return FALSE;
++        }
++
++        CURSOR_TRACE(WCT_CLIP, WCT_AFTER | WCT_SUCCESS | WCT_TRANSITION, self, clipCursorHandler,
++                     lastSetCursorPositionTime, 0, 0, 0, 0, 0, 0, 0, 0);
+ 
+         lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
+         mouseMoveDeltaX = 0;
+@@ -1410,20 +1455,32 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+             BOOL absolute, noncoalescible;
+             double scale = retina_on ? 2 : 1;
+ 
++            CURSOR_TRACE(WCT_COCOA, retina_on ? WCT_RETINA : 0, anEvent, [anEvent CGEvent],
++                         [anEvent timestamp], [anEvent deltaX], [anEvent deltaY], point.x, point.y,
++                         lastSetCursorPositionTime, forceNextMouseMoveAbsolute, scale, [anEvent type]);
++
+             // If we recently warped the cursor (other than in our cursor-clipping
+             // event tap), discard mouse move events until we see an event which is
+             // later than that time.
+             if (lastSetCursorPositionTime)
+             {
+                 if ([anEvent timestamp] <= lastSetCursorPositionTime)
++                {
++                    CURSOR_TRACE(WCT_FILTER, WCT_OLD, anEvent, targetWindow, [anEvent timestamp],
++                                 [anEvent deltaX], [anEvent deltaY], lastSetCursorPositionTime, 0, 0, 0, 0, 0);
+                     return;
++                }
+ 
+                 /* The event tap removes the synthetic center-warp displacement.
+                    Keep waiting across that zero-motion event (and across buttons or
+                    wheels, which never enter this path) until the first real post-warp
+                    movement. */
+                 if (![anEvent deltaX] && ![anEvent deltaY])
++                {
++                    CURSOR_TRACE(WCT_FILTER, WCT_ZERO, anEvent, targetWindow, [anEvent timestamp],
++                                 0, 0, lastSetCursorPositionTime, 0, 0, 0, 0, 0);
+                     return;
++                }
+ 
+                 lastSetCursorPositionTime = 0;
+                 forceNextMouseMoveAbsolute = TRUE;
+@@ -1530,6 +1587,10 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+                 event->mouse_moved.drag = drag;
+                 event->mouse_moved.noncoalescible = noncoalescible;
+ 
++                CURSOR_TRACE(WCT_QUEUE_NEW, WCT_TIME_MS | (absolute ? WCT_ABSOLUTE : 0), event, anEvent,
++                             event->mouse_moved.time_ms, event->mouse_moved.x, event->mouse_moved.y,
++                             event->mouse_moved.raw_x, event->mouse_moved.raw_y,
++                             rawMouseMoveDeltaX, rawMouseMoveDeltaY, scale, noncoalescible);
+                 [targetWindow.queue postEvent:event];
+             }
+ 
+@@ -2213,6 +2274,7 @@ - (void) unminimizeWindowIfNoneVisible
+ 
+     - (void) setRetinaMode:(BOOL)mode
+     {
++        CURSOR_TRACE(WCT_DISPLAY, WCT_TRANSITION, self, 0, 0, retina_on, mode, 0, 0, 0, 0, 0, 0);
+         retina_on = mode;
+ 
+         [clipCursorHandler setRetinaMode:mode];
+@@ -2230,6 +2292,8 @@ - (void) setRetinaMode:(BOOL)mode
+      */
+     - (void)cgDisplaysWereReconfigured:(NSArray*)changes
+     {
++        CURSOR_TRACE(WCT_DISPLAY, WCT_TRANSITION, self, 0, 0, retina_on, retina_on,
++                     [changes count], 0, 0, 0, 0, 0);
+         primaryScreenHeightValid = FALSE;
+         [self sendDisplaysChanged:FALSE];
+         [self adjustWindowLevels];
+@@ -2304,6 +2368,8 @@ - (void)applicationDidBecomeActive:(NSNotification *)notification
+         NSNumber* displayID;
+         NSDictionary* modesToRealize = [latentDisplayModes autorelease];
+ 
++        CURSOR_TRACE(WCT_FOCUS, WCT_TRANSITION, self, 0, 0, 1, retina_on,
++                     lastSetCursorPositionTime, forceNextMouseMoveAbsolute, 0, 0, 0, 0);
+         latentDisplayModes = [[NSMutableDictionary alloc] init];
+         for (displayID in modesToRealize)
+         {
+@@ -2347,6 +2413,8 @@ - (void)applicationDidResignActive:(NSNotification *)notification
+         macdrv_event* event;
+         WineEventQueue* queue;
+ 
++        CURSOR_TRACE(WCT_FOCUS, WCT_TRANSITION, self, 0, 0, 0, retina_on,
++                     lastSetCursorPositionTime, forceNextMouseMoveAbsolute, 0, 0, 0, 0);
+         [self invalidateGotFocusEvents];
+ 
+         event = macdrv_create_event(APP_DEACTIVATED, nil);
+diff --git a/dlls/winemac.drv/cocoa_cursorclipping.m b/dlls/winemac.drv/cocoa_cursorclipping.m
+index b6151a2..31a6303 100644
+--- a/dlls/winemac.drv/cocoa_cursorclipping.m
++++ b/dlls/winemac.drv/cocoa_cursorclipping.m
+@@ -22,6 +22,7 @@
+ #import "cocoa_app.h"
+ #import "cocoa_cursorclipping.h"
+ #import "cocoa_window.h"
++#include "wine/cursor_trace.h"
+ 
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+ 
+@@ -141,6 +142,9 @@ - (BOOL) warpCursorTo:(CGPoint*)newLocation from:(const CGPoint*)currentLocation
+         else
+             oldLocation = NSPointToCGPoint([[WineApplicationController sharedController] flippedMouseLocation:[NSEvent mouseLocation]]);
+ 
++        CURSOR_TRACE(WCT_WARP, WCT_BEFORE | WCT_EVENT_TAP |
++                     (CGPointEqualToPoint(oldLocation, *newLocation) ? WCT_NOOP : 0), self, 0,
++                     0, oldLocation.x, oldLocation.y, newLocation->x, newLocation->y, 0, 0, 0, 0);
+         if (!CGPointEqualToPoint(oldLocation, *newLocation))
+         {
+             WarpRecord* warpRecord = [[[WarpRecord alloc] init] autorelease];
+@@ -152,10 +156,19 @@ - (BOOL) warpCursorTo:(CGPoint*)newLocation from:(const CGPoint*)currentLocation
+             /* Actually move the cursor. */
+             err = CGWarpMouseCursorPosition(*newLocation);
+             if (err != kCGErrorSuccess)
++            {
++                CURSOR_TRACE(WCT_WARP, WCT_AFTER | WCT_ERROR | WCT_TIME_NS, warpRecord, self,
++                             warpRecord.timeBefore, oldLocation.x, oldLocation.y,
++                             newLocation->x, newLocation->y, err, 0, 0, 0);
+                 return FALSE;
++            }
+ 
+             warpRecord.timeAfter = [[NSProcessInfo processInfo] systemUptime] * NSEC_PER_SEC;
+             *newLocation = NSPointToCGPoint([[WineApplicationController sharedController] flippedMouseLocation:[NSEvent mouseLocation]]);
++            CURSOR_TRACE(WCT_WARP, WCT_AFTER | WCT_SUCCESS | WCT_TIME_NS |
++                         (CGPointEqualToPoint(oldLocation, *newLocation) ? WCT_NOOP : 0), warpRecord, self,
++                         warpRecord.timeAfter, oldLocation.x, oldLocation.y, newLocation->x, newLocation->y,
++                         warpRecord.timeBefore, 0, 0, 0);
+ 
+             if (!CGPointEqualToPoint(oldLocation, *newLocation))
+             {
+@@ -204,9 +217,13 @@ - (CGEventRef) eventTapWithProxy:(CGEventTapProxy)proxy
+         CGPoint eventLocation, cursorLocation;
+ 
+         if (type == kCGEventTapDisabledByUserInput)
++        {
++            CURSOR_TRACE(WCT_TAP, WCT_ERROR, self, 0, 0, type, 0, 0, 0, 0, 0, 0, 0);
+             return event;
++        }
+         if (type == kCGEventTapDisabledByTimeout)
+         {
++            CURSOR_TRACE(WCT_TAP, WCT_ERROR, self, 0, 0, type, 0, 0, 0, 0, 0, 0, 0);
+             CGEventTapEnable(cursorClippingEventTap, TRUE);
+             return event;
+         }
+@@ -229,10 +246,15 @@ - (CGEventRef) eventTapWithProxy:(CGEventTapProxy)proxy
+ 
+             deltaX = CGEventGetDoubleValueField(event, kCGMouseEventDeltaX);
+             deltaY = CGEventGetDoubleValueField(event, kCGMouseEventDeltaY);
++            CURSOR_TRACE(WCT_TAP, WCT_BEFORE | WCT_TIME_NS, event, self, eventTime,
++                         deltaX, deltaY, eventLocation.x, eventLocation.y, warpsFinished, [warpRecords count], 0, 0);
+ 
+             for (i = 0; i < warpsFinished; i++)
+             {
+                 WarpRecord* warpRecord = warpRecords[0];
++                CURSOR_TRACE(WCT_WARP_MATCH, WCT_TIME_NS, event, warpRecord, eventTime,
++                             warpRecord.from.x, warpRecord.from.y, warpRecord.to.x, warpRecord.to.y,
++                             warpRecord.timeBefore, warpRecord.timeAfter, deltaX, deltaY);
+                 deltaX -= warpRecord.to.x - warpRecord.from.x;
+                 deltaY -= warpRecord.to.y - warpRecord.from.y;
+                 [warpRecords removeObjectAtIndex:0];
+@@ -243,6 +265,8 @@ - (CGEventRef) eventTapWithProxy:(CGEventTapProxy)proxy
+                 CGEventSetDoubleValueField(event, kCGMouseEventDeltaX, deltaX);
+                 CGEventSetDoubleValueField(event, kCGMouseEventDeltaY, deltaY);
+             }
++            CURSOR_TRACE(WCT_TAP, WCT_AFTER | WCT_TIME_NS, event, self, eventTime,
++                         deltaX, deltaY, eventLocation.x, eventLocation.y, warpsFinished, [warpRecords count], 0, 0);
+ 
+             synthesizedLocation.x += deltaX;
+             synthesizedLocation.y += deltaY;
+diff --git a/dlls/winemac.drv/cocoa_event.m b/dlls/winemac.drv/cocoa_event.m
+index 003df32..fca7335 100644
+--- a/dlls/winemac.drv/cocoa_event.m
++++ b/dlls/winemac.drv/cocoa_event.m
+@@ -26,6 +26,7 @@
+ #import "cocoa_event.h"
+ #import "cocoa_app.h"
+ #import "cocoa_window.h"
++#include "wine/cursor_trace.h"
+ 
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+ 
+@@ -247,6 +248,11 @@ - (void) postEventObject:(MacDrvEvent*)event
+ 
+             if (merged)
+             {
++                CURSOR_TRACE(WCT_QUEUE_MERGE, WCT_TIME_MS, lastEvent->event, event->event,
++                             event->event->mouse_moved.time_ms,
++                             lastEvent->event->mouse_moved.raw_x, lastEvent->event->mouse_moved.raw_y,
++                             event->event->mouse_moved.raw_x, event->event->mouse_moved.raw_y,
++                             raw_x, raw_y, lastEvent->event->type, event->event->type);
+                 if (event->event->type == MOUSE_MOVED_RELATIVE)
+                 {
+                     lastEvent->event->mouse_moved.x = x;
+@@ -319,6 +325,11 @@ - (MacDrvEvent*) getEventMatchingMask:(macdrv_event_mask)mask
+                     __atomic_sub_fetch(&event->event->deliver, 1, __ATOMIC_RELAXED) >= 0)
+                 {
+                     ret = event;
++                    if (event->event->type == MOUSE_MOVED_RELATIVE || event->event->type == MOUSE_MOVED_ABSOLUTE)
++                        CURSOR_TRACE(WCT_QUEUE_TAKE, WCT_TIME_MS, event->event, self,
++                                     event->event->mouse_moved.time_ms, event->event->mouse_moved.x,
++                                     event->event->mouse_moved.y, event->event->mouse_moved.raw_x,
++                                     event->event->mouse_moved.raw_y, event->event->type, 0, 0, 0);
+                     break;
+                 }
+             }
+@@ -340,7 +351,13 @@ - (void) discardEventsPassingTest:(BOOL (^)(macdrv_event* event))block
+ 
+         indexes = [events indexesOfObjectsPassingTest:^BOOL(id obj, NSUInteger idx, BOOL *stop){
+             MacDrvEvent* event = obj;
+-            return block(event->event);
++            BOOL discard = block(event->event);
++            if (discard && (event->event->type == MOUSE_MOVED_RELATIVE || event->event->type == MOUSE_MOVED_ABSOLUTE))
++                CURSOR_TRACE(WCT_QUEUE_DROP, WCT_TIME_MS, event->event, self,
++                             event->event->mouse_moved.time_ms, event->event->mouse_moved.x,
++                             event->event->mouse_moved.y, event->event->mouse_moved.raw_x,
++                             event->event->mouse_moved.raw_y, event->event->type, 0, 0, 0);
++            return discard;
+         }];
+ 
+         [events removeObjectsAtIndexes:indexes];
+diff --git a/dlls/winemac.drv/macdrv_main.c b/dlls/winemac.drv/macdrv_main.c
+index 6489af1..e14ead5 100644
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -34,6 +34,10 @@
+ #include "shellapi.h"
+ #include "wine/server.h"
+ 
++#define WINE_CURSOR_TRACE_IMPLEMENTATION
++#define WINE_CURSOR_TRACE_MODULE "macdrv"
++#include "wine/cursor_trace.h"
++
+ WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
+ 
+ #define IS_OPTION_TRUE(ch) \
+diff --git a/dlls/winemac.drv/mouse.c b/dlls/winemac.drv/mouse.c
+index dae0a29..67aed2a 100644
+--- a/dlls/winemac.drv/mouse.c
++++ b/dlls/winemac.drv/mouse.c
+@@ -29,6 +29,7 @@
+ #define OEMRESOURCE
+ #include "macdrv.h"
+ #include "wine/server.h"
++#include "wine/cursor_trace.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(cursor);
+ 
+@@ -652,6 +653,9 @@ BOOL macdrv_ClipCursor(const RECT *clip, BOOL reset)
+ {
+     CGRect rect;
+ 
++    CURSOR_TRACE(WCT_CLIP, WCT_BEFORE, clip, 0, 0, clip ? clip->left : 0,
++                 clip ? clip->top : 0, clip ? clip->right - clip->left : 0,
++                 clip ? clip->bottom - clip->top : 0, !!clip, reset, 0, 0);
+     TRACE("%s %u\n", wine_dbgstr_rect(clip), reset);
+ 
+     if (!reset && clip)
+@@ -899,6 +903,9 @@ void macdrv_mouse_moved(HWND hwnd, const macdrv_event *event)
+     if (event->type == MOUSE_MOVED_ABSOLUTE)
+         flags |= MOUSEEVENTF_ABSOLUTE;
+ 
++    CURSOR_TRACE(WCT_DRIVER, WCT_TIME_MS, event, hwnd, event->mouse_moved.time_ms,
++                 event->mouse_moved.x, event->mouse_moved.y, event->mouse_moved.raw_x,
++                 event->mouse_moved.raw_y, flags, event->mouse_moved.drag, 0, 0);
+     send_mouse_input(hwnd, flags, event->mouse_moved.x, event->mouse_moved.y,
+                      0, 1, event->mouse_moved.raw_x, event->mouse_moved.raw_y,
+                      event->mouse_moved.time_ms);
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 021f1e9..ca7199b 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1117,6 +1117,7 @@ SOURCES = \
+ 	wine/atsvc.idl \
+ 	wine/condrv.h \
+ 	wine/dcetypes.idl \
++	wine/cursor_trace.h \
+ 	wine/debug.h \
+ 	wine/dplaysp.h \
+ 	wine/epm.idl \
+diff --git a/include/wine/cursor_trace.h b/include/wine/cursor_trace.h
+new file mode 100644
+index 0000000..251aa2e
+--- /dev/null
++++ b/include/wine/cursor_trace.h
+@@ -0,0 +1,189 @@
++/* Opt-in cursor diagnostics. No changes to input delivery or server protocol.
++ *
++ * Define WINE_CURSOR_TRACE_IMPLEMENTATION and WINE_CURSOR_TRACE_MODULE in one
++ * Unix translation unit per DLL. Hidden symbols keep each DLL's ring separate.
++ * The mapping lives until process exit, including while other threads unwind.
++ */
++#ifndef __WINE_CURSOR_TRACE_H
++#define __WINE_CURSOR_TRACE_H
++
++#include <stdint.h>
++
++enum wine_cursor_trace_kind
++{
++    WCT_CLIP = 1, WCT_SET_POS, WCT_WARP, WCT_WARP_MATCH, WCT_TAP,
++    WCT_COCOA, WCT_FILTER, WCT_QUEUE_NEW, WCT_QUEUE_MERGE, WCT_QUEUE_DROP,
++    WCT_QUEUE_TAKE, WCT_DRIVER, WCT_ACCUM, WCT_SEND, WCT_REGISTER,
++    WCT_RAW_READ, WCT_RAW_BUFFER, WCT_CURSOR_POS, WCT_FOCUS, WCT_DISPLAY,
++    WCT_GEOMETRY, WCT_APP_MESSAGE
++};
++
++enum wine_cursor_trace_flags
++{
++    WCT_BEFORE = 1, WCT_AFTER = 2, WCT_SUCCESS = 4, WCT_NOOP = 8,
++    WCT_RETINA = 16, WCT_CONFINEMENT = 32, WCT_EVENT_TAP = 64,
++    WCT_OLD = 128, WCT_ZERO = 256, WCT_ABSOLUTE = 512,
++    WCT_SIZE_ONLY = 1024, WCT_HEADER_ONLY = 2048, WCT_ERROR = 4096,
++    WCT_HOST_QUERY = 8192, WCT_TIME_NS = 16384, WCT_TIME_MS = 32768,
++    WCT_TRANSITION = 0x80000000u
++};
++
++/* All integers are native little-endian on the supported macOS hosts.
++ * sequence is published last with release semantics; UINT64_MAX means busy.
++ * source_time preserves the input timestamp; clock_ns is CLOCK_MONOTONIC.
++ * object/related are diagnostic identities, never injected into input payloads.
++ */
++struct wine_cursor_trace_record
++{
++    uint64_t sequence, clock_ns, thread_id, object, related;
++    double source_time;
++    uint64_t epoch;
++    uint32_t kind, flags;
++    double value[8];
++};
++
++struct wine_cursor_trace_header
++{
++    char magic[8];
++    uint32_t version, record_size, capacity, header_size;
++    uint64_t pid, start_ns, next_sequence, dropped, epoch;
++    char module[16];
++    char reserved[48];
++};
++
++extern int wine_cursor_trace_active __attribute__((visibility("hidden")));
++extern uint64_t wine_cursor_trace_emit(uint32_t kind, uint32_t flags, uint64_t object,
++                                      uint64_t related, double source_time, const double value[8])
++    __attribute__((visibility("hidden")));
++
++/* Arguments, including floating-point conversion, are not evaluated when off. */
++#define CURSOR_TRACE(kind, flags, object, related, time, a, b, c, d, e, f, g, h) \
++    do { if (wine_cursor_trace_active) { \
++        const double wct_values[8] = {a, b, c, d, e, f, g, h}; \
++        wine_cursor_trace_emit(kind, flags, (uint64_t)(uintptr_t)(object), \
++                               (uint64_t)(uintptr_t)(related), time, wct_values); \
++    } } while (0)
++
++#ifdef WINE_CURSOR_TRACE_IMPLEMENTATION
++
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++#ifndef WINE_CURSOR_TRACE_CAPACITY
++#define WINE_CURSOR_TRACE_CAPACITY 65536u
++#endif
++
++typedef char wct_record_size_check[sizeof(struct wine_cursor_trace_record) == 128 ? 1 : -1];
++typedef char wct_header_size_check[sizeof(struct wine_cursor_trace_header) == 128 ? 1 : -1];
++
++int wine_cursor_trace_active;
++static struct wine_cursor_trace_header *wct_header;
++static struct wine_cursor_trace_record *wct_records;
++
++static void wine_cursor_trace_after_fork(void)
++{
++    /* A fork child must not publish into the parent process's shared mapping. */
++    wine_cursor_trace_active = 0;
++}
++
++static void __attribute__((constructor)) wine_cursor_trace_init(void)
++{
++    const char *directory = getenv("YAAGL_CURSOR_TRACE");
++    struct timespec now;
++    struct wine_cursor_trace_header *header;
++    uint64_t ns;
++    size_t size = sizeof(*header) + WINE_CURSOR_TRACE_CAPACITY * sizeof(*wct_records);
++    char name[128];
++    int dir_fd = -1, fd = -1, saved_errno = errno;
++
++    if (!directory || !*directory) return;
++    if (*directory != '/') { errno = EINVAL; goto failed; }
++    if (clock_gettime(CLOCK_MONOTONIC, &now)) goto failed;
++    ns = (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec;
++    snprintf(name, sizeof(name), "cursor-%u-%s-%llu.bin", (unsigned)getpid(),
++             WINE_CURSOR_TRACE_MODULE, (unsigned long long)ns);
++    if ((dir_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0) goto failed;
++    if ((fd = openat(dir_fd, name, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600)) < 0)
++        goto failed;
++    if (ftruncate(fd, size)) goto failed;
++    header = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    if (header == MAP_FAILED) goto failed;
++
++    /* Fault in the bounded mapping at module load, not on the input path. */
++    memset(header, 0, size);
++    header->version = 1;
++    header->record_size = sizeof(*wct_records);
++    header->capacity = WINE_CURSOR_TRACE_CAPACITY;
++    header->header_size = sizeof(*header);
++    header->pid = getpid();
++    header->start_ns = ns;
++    memcpy(header->module, WINE_CURSOR_TRACE_MODULE, sizeof(WINE_CURSOR_TRACE_MODULE));
++    memcpy(header->magic, "YACUR01", 8);
++    wct_header = header;
++    wct_records = (struct wine_cursor_trace_record *)(header + 1);
++    pthread_atfork(NULL, NULL, wine_cursor_trace_after_fork);
++    wine_cursor_trace_active = 1;
++    close(fd);
++    close(dir_fd);
++    errno = saved_errno;
++    return;
++
++failed:
++    fprintf(stderr, "cursor trace (%s): cannot initialize %s: %s\n",
++            WINE_CURSOR_TRACE_MODULE, directory, strerror(errno));
++    if (fd >= 0) { close(fd); unlinkat(dir_fd, name, 0); }
++    if (dir_fd >= 0) close(dir_fd);
++    errno = saved_errno;
++}
++
++uint64_t wine_cursor_trace_emit(uint32_t kind, uint32_t flags, uint64_t object,
++                               uint64_t related, double source_time, const double value[8])
++{
++    struct wine_cursor_trace_record *record;
++    struct timespec now;
++    uint64_t sequence, previous, thread_id;
++    int saved_errno = errno;
++
++    if (!wine_cursor_trace_active) return 0;
++    sequence = __atomic_add_fetch(&wct_header->next_sequence, 1, __ATOMIC_RELAXED);
++    record = &wct_records[(sequence - 1) % WINE_CURSOR_TRACE_CAPACITY];
++    previous = __atomic_load_n(&record->sequence, __ATOMIC_ACQUIRE);
++    /* A producer never waits for a preempted producer, nor overwrites newer data. */
++    if (previous == UINT64_MAX || previous >= sequence ||
++        !__atomic_compare_exchange_n(&record->sequence, &previous, UINT64_MAX, 0,
++                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
++    {
++        __atomic_fetch_add(&wct_header->dropped, 1, __ATOMIC_RELAXED);
++        return 0;
++    }
++    clock_gettime(CLOCK_MONOTONIC, &now);
++#ifdef __APPLE__
++    pthread_threadid_np(NULL, &thread_id);
++#else
++    thread_id = (uintptr_t)pthread_self();
++#endif
++    if (flags & WCT_TRANSITION) __atomic_fetch_add(&wct_header->epoch, 1, __ATOMIC_RELAXED);
++    record->clock_ns = (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec;
++    record->thread_id = thread_id;
++    record->object = object;
++    record->related = related;
++    record->source_time = source_time;
++    record->epoch = __atomic_load_n(&wct_header->epoch, __ATOMIC_RELAXED);
++    record->kind = kind;
++    record->flags = flags;
++    memcpy(record->value, value, sizeof(record->value));
++    __atomic_store_n(&record->sequence, sequence, __ATOMIC_RELEASE);
++    errno = saved_errno;
++    return sequence;
++}
++#endif /* WINE_CURSOR_TRACE_IMPLEMENTATION */
++#endif /* __WINE_CURSOR_TRACE_H */

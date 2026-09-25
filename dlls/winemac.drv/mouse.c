@@ -29,6 +29,7 @@
 #define OEMRESOURCE
 #include "macdrv.h"
 #include "wine/server.h"
+#include "wine/cursor_trace.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(cursor);
 
@@ -652,6 +653,9 @@ BOOL macdrv_ClipCursor(const RECT *clip, BOOL reset)
 {
     CGRect rect;
 
+    CURSOR_TRACE(WCT_CLIP, WCT_BEFORE, clip, 0, 0, clip ? clip->left : 0,
+                 clip ? clip->top : 0, clip ? clip->right - clip->left : 0,
+                 clip ? clip->bottom - clip->top : 0, !!clip, reset, 0, 0);
     TRACE("%s %u\n", wine_dbgstr_rect(clip), reset);
 
     if (!reset && clip)
@@ -899,6 +903,9 @@ void macdrv_mouse_moved(HWND hwnd, const macdrv_event *event)
     if (event->type == MOUSE_MOVED_ABSOLUTE)
         flags |= MOUSEEVENTF_ABSOLUTE;
 
+    CURSOR_TRACE(WCT_DRIVER, WCT_TIME_MS, event, hwnd, event->mouse_moved.time_ms,
+                 event->mouse_moved.x, event->mouse_moved.y, event->mouse_moved.raw_x,
+                 event->mouse_moved.raw_y, flags, event->mouse_moved.drag, 0, 0);
     send_mouse_input(hwnd, flags, event->mouse_moved.x, event->mouse_moved.y,
                      0, 1, event->mouse_moved.raw_x, event->mouse_moved.raw_y,
                      event->mouse_moved.time_ms);

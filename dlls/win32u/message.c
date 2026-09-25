@@ -36,6 +36,7 @@
 #include "dde.h"
 #include "immdev.h"
 #include "wine/debug.h"
+#include "wine/cursor_trace.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(msg);
 WINE_DECLARE_DEBUG_CHANNEL(key);
@@ -2917,6 +2918,13 @@ static BOOL process_hardware_message( MSG *msg, UINT hw_id, const struct hardwar
         ERR( "unknown message type %x\n", msg->message );
     set_thread_dpi_awareness_context( context );
     if (!ret) thread_info->client_info->msg_source = prev_source;
+    if (wine_cursor_trace_active &&
+        (msg->message == WM_MOUSEMOVE || msg->message == WM_NCMOUSEMOVE ||
+         (msg->message == WM_INPUT && msg_data->rawinput.type == RIM_TYPEMOUSE)))
+        CURSOR_TRACE(WCT_APP_MESSAGE, WCT_TIME_MS | (ret ? WCT_SUCCESS : 0),
+                     hw_id, msg->hwnd, msg->time, msg->message, msg->pt.x, msg->pt.y,
+                     (short)LOWORD(msg->lParam), (short)HIWORD(msg->lParam), remove,
+                     msg_data->source.origin, 0);
     return ret;
 }
 

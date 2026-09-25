@@ -33,6 +33,7 @@
 #include "wine/hid.h"
 #include "wine/server.h"
 #include "wine/debug.h"
+#include "wine/cursor_trace.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(rawinput);
 
@@ -455,6 +456,7 @@ UINT WINAPI NtUserGetRawInputBuffer( RAWINPUT *data, UINT *data_size, UINT heade
 {
     struct user_thread_info *thread_info;
     UINT count;
+    UINT trace_capacity = 0;
 
     TRACE( "data %p, data_size %p, header_size %u\n", data, data_size, header_size );
 
@@ -474,6 +476,7 @@ UINT WINAPI NtUserGetRawInputBuffer( RAWINPUT *data, UINT *data_size, UINT heade
     if (NtCurrentTeb()->WowTebOffset) header_size = sizeof(RAWINPUTHEADER64);
 
     thread_info = get_user_thread_info();
+    if (wine_cursor_trace_active && data) trace_capacity = *data_size;
     SERVER_START_REQ( get_rawinput_buffer )
     {
         req->header_size = header_size;
@@ -485,6 +488,28 @@ UINT WINAPI NtUserGetRawInputBuffer( RAWINPUT *data, UINT *data_size, UINT heade
     }
     SERVER_END_REQ;
 
+    CURSOR_TRACE(WCT_RAW_BUFFER, WCT_AFTER | (!data ? WCT_SIZE_ONLY : 0) |
+                 (count == ~0u ? WCT_ERROR : WCT_SUCCESS), data, 0, 0,
+                 count, *data_size, header_size, trace_capacity, 0, 0, 0, 0);
+    if (wine_cursor_trace_active && data && count != ~0u)
+    {
+        SIZE_T offset = 0, align = NtCurrentTeb()->WowTebOffset ? 3 : sizeof(void *) - 1;
+        UINT i;
+        for (i = 0; i < count && offset + header_size <= trace_capacity; ++i)
+        {
+            RAWINPUTHEADER *header = (RAWINPUTHEADER *)((char *)data + offset);
+            UINT size = header->dwSize;
+            if (size < header_size || size > trace_capacity - offset) break;
+            if (header->dwType == RIM_TYPEMOUSE && size >= header_size + sizeof(RAWMOUSE))
+            {
+                RAWMOUSE *mouse = (RAWMOUSE *)((char *)header + header_size);
+                CURSOR_TRACE(WCT_RAW_BUFFER, WCT_SUCCESS, data, 0, 0,
+                             mouse->lLastX, mouse->lLastY, mouse->usFlags, mouse->usButtonFlags,
+                             i, count, size, mouse->ulExtraInformation);
+            }
+            offset += (size + align) & ~align;
+        }
+    }
     return count;
 }
 
@@ -503,6 +528,7 @@ UINT WINAPI NtUserGetRawInputData( HRAWINPUT handle, UINT command, void *data, U
 
     if (!(msg_data = thread_info->rawinput) || msg_data->hw_id != (UINT_PTR)handle)
     {
+        CURSOR_TRACE(WCT_RAW_READ, WCT_ERROR, handle, 0, 0, 0, 0, command, 0, 0, 0, 0, 0);
         RtlSetLastWin32Error( ERROR_INVALID_HANDLE );
         return -1;
     }
@@ -519,6 +545,9 @@ UINT WINAPI NtUserGetRawInputData( HRAWINPUT handle, UINT command, void *data, U
     if (!data)
     {
         *data_size = sizeof(RAWINPUTHEADER) + size;
+        if (msg_data->rawinput.type == RIM_TYPEMOUSE)
+            CURSOR_TRACE(WCT_RAW_READ, WCT_SIZE_ONLY | WCT_SUCCESS, handle, 0, 0,
+                         0, 0, command, *data_size, 0, 0, 0, 0);
         return 0;
     }
 
@@ -532,12 +561,23 @@ UINT WINAPI NtUserGetRawInputData( HRAWINPUT handle, UINT command, void *data, U
     rawinput->header.dwSize  = sizeof(RAWINPUTHEADER) + msg_data->size - sizeof(*msg_data);
     rawinput->header.hDevice = UlongToHandle( msg_data->rawinput.device );
     rawinput->header.wParam  = msg_data->rawinput.wparam;
-    if (command == RID_HEADER) return sizeof(RAWINPUTHEADER);
+    if (command == RID_HEADER)
+    {
+        if (msg_data->rawinput.type == RIM_TYPEMOUSE)
+            CURSOR_TRACE(WCT_RAW_READ, WCT_HEADER_ONLY | WCT_SUCCESS, handle, rawinput->header.hDevice,
+                         0, 0, 0, command, sizeof(RAWINPUTHEADER), 0, 0, 0, 0);
+        return sizeof(RAWINPUTHEADER);
+    }
 
     if (msg_data->rawinput.type == RIM_TYPEMOUSE)
     {
         if (size != sizeof(RAWMOUSE)) goto failed;
         rawinput->data.mouse = *(RAWMOUSE *)(msg_data + 1);
+        CURSOR_TRACE(WCT_RAW_READ, WCT_SUCCESS, handle, rawinput->header.hDevice, 0,
+                     rawinput->data.mouse.lLastX, rawinput->data.mouse.lLastY,
+                     rawinput->data.mouse.usFlags, rawinput->data.mouse.usButtonFlags,
+                     rawinput->data.mouse.ulExtraInformation, rawinput->header.wParam,
+                     rawinput->header.dwSize, 0);
     }
     else if (msg_data->rawinput.type == RIM_TYPEKEYBOARD)
     {
@@ -664,7 +704,7 @@ BOOL WINAPI NtUserRegisterRawInputDevices( const RAWINPUTDEVICE *devices, UINT d
     RAWINPUTDEVICE *new_registered_devices;
     SIZE_T size;
     BOOL ret;
-    UINT i;
+    UINT i, requested_count = device_count;
 
     TRACE( "devices %p, device_count %u, device_size %u.\n", devices, device_count, device_size );
 
@@ -742,6 +782,12 @@ BOOL WINAPI NtUserRegisterRawInputDevices( const RAWINPUTDEVICE *devices, UINT d
 
     pthread_mutex_unlock( &rawinput_mutex );
 
+    if (wine_cursor_trace_active)
+        for (i = 0; i < requested_count; ++i)
+            if (devices[i].usUsagePage == 1 && devices[i].usUsage == 2)
+                CURSOR_TRACE(WCT_REGISTER, WCT_AFTER | (ret ? WCT_SUCCESS : WCT_ERROR),
+                             devices[i].hwndTarget, 0, 0, devices[i].dwFlags,
+                             devices[i].usUsagePage, devices[i].usUsage, 0, 0, 0, 0, 0);
     return ret;
 }
 

@@ -37,6 +37,10 @@
 #include "wine/debug.h"
 #include "kbd.h"
 
+#define WINE_CURSOR_TRACE_IMPLEMENTATION
+#define WINE_CURSOR_TRACE_MODULE "win32u"
+#include "wine/cursor_trace.h"
+
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 WINE_DECLARE_DEBUG_CHANNEL(keyboard);
 
@@ -693,7 +697,18 @@ static NTSTATUS send_mouse_motion( UINT flags )
     if (!input.mi.dwFlags && !input.mi.mouseData && !info->raw_mouse.count) return STATUS_SUCCESS; /* ignore empty inputs */
 
     TRACE( "Sending %s (%u raw frames)\n", debugstr_mouseinput( &input.mi ), info->raw_mouse.count );
+    if (wine_cursor_trace_active)
+    {
+        UINT i;
+        for (i = 0; i < info->raw_mouse.count; ++i)
+            CURSOR_TRACE(WCT_SEND, WCT_BEFORE | WCT_TIME_MS, info->mouse_hwnd, 0, input.mi.time,
+                         input.mi.dx, input.mi.dy, info->raw_mouse.data[i].x, info->raw_mouse.data[i].y,
+                         i, info->raw_mouse.count, input.mi.dwFlags, flags);
+    }
     status = server_send_hardware_message( info->mouse_hwnd, flags, &input, (LPARAM)&info->raw_mouse );
+    CURSOR_TRACE(WCT_SEND, WCT_AFTER | WCT_TIME_MS | (status ? WCT_ERROR : WCT_SUCCESS),
+                 info->mouse_hwnd, 0, input.mi.time, input.mi.dx, input.mi.dy, 0, 0,
+                 status, info->raw_mouse.count, input.mi.dwFlags, flags);
     memset( &info->mouse_motion, 0, sizeof(info->mouse_motion) );
     info->raw_mouse.count = 0;
     info->mouse_hwnd = NULL;
@@ -715,6 +730,15 @@ static NTSTATUS accum_mouse_motion( HWND hwnd, UINT flags, INPUT input, const st
 {
     struct user_thread_info *info = get_user_thread_info();
     BOOL send;
+
+    if (wine_cursor_trace_active)
+    {
+        UINT i;
+        for (i = 0; i < raw->count; ++i)
+            CURSOR_TRACE(WCT_ACCUM, WCT_BEFORE | WCT_TIME_MS, hwnd, 0, input.mi.time,
+                         input.mi.dx, input.mi.dy, raw->data[i].x, raw->data[i].y,
+                         i, raw->count, input.mi.dwFlags, info->raw_mouse.count);
+    }
 
     /* don't accumulate if there's button / wheel / MOUSEEVENTF_MOVE_NOCOALESCE */
     send = input.mi.mouseData || (input.mi.dwFlags & ~(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE));
@@ -831,6 +855,10 @@ BOOL WINAPI NtUserSetCursorPos( INT x, INT y )
     }
     SERVER_END_REQ;
     if (ret && (prev_x != new_x || prev_y != new_y)) user_driver->pSetCursorPos( new_x, new_y );
+    CURSOR_TRACE(WCT_SET_POS, WCT_AFTER | (ret ? WCT_SUCCESS : WCT_ERROR) |
+                 (ret && prev_x == new_x && prev_y == new_y ? WCT_NOOP : 0), 0, 0, 0,
+                 x, y, ret ? prev_x : 0, ret ? prev_y : 0, ret ? new_x : 0, ret ? new_y : 0,
+                 rect.left, rect.top);
     return ret;
 }
 
@@ -843,6 +871,9 @@ BOOL WINAPI NtUserGetCursorPos( POINT *pt )
     const desktop_shm_t *desktop_shm;
     BOOL ret = TRUE;
     DWORD last_change = 0;
+    DWORD age;
+    POINT raw_pos;
+    struct ratio dpi;
     NTSTATUS status;
     RECT rect;
 
@@ -857,12 +888,22 @@ BOOL WINAPI NtUserGetCursorPos( POINT *pt )
     if (status) return FALSE;
 
     /* query new position from graphics driver if we haven't updated recently */
-    if (NtGetTickCount() - last_change > 100) ret = user_driver->pGetCursorPos( pt );
-    if (!ret) return FALSE;
+    age = NtGetTickCount() - last_change;
+    if (age > 100) ret = user_driver->pGetCursorPos( pt );
+    if (!ret)
+    {
+        CURSOR_TRACE(WCT_CURSOR_POS, WCT_ERROR | WCT_HOST_QUERY | WCT_TIME_MS, pt, 0,
+                     last_change, 0, 0, 0, 0, age, 0, 0, 0);
+        return FALSE;
+    }
+    if (wine_cursor_trace_active) raw_pos = *pt;
 
     SetRect( &rect, pt->x, pt->y, pt->x, pt->y );
-    rect = map_rect_raw_to_virt( rect, get_thread_dpi() );
+    dpi = get_thread_dpi();
+    rect = map_rect_raw_to_virt( rect, dpi );
     *pt = *(POINT *)&rect.left;
+    CURSOR_TRACE(WCT_CURSOR_POS, WCT_SUCCESS | WCT_TIME_MS | (age > 100 ? WCT_HOST_QUERY : 0),
+                 pt, 0, last_change, pt->x, pt->y, raw_pos.x, raw_pos.y, age, dpi.num, dpi.den, 0);
     return ret;
 }
 
