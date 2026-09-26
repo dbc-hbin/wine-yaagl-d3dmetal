@@ -270,6 +270,7 @@ extern struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned
 extern void abandon_inproc_mutexes( thread_id_t owner );
 extern void signal_inproc_sync( struct inproc_sync *sync );
 extern void reset_inproc_sync( struct inproc_sync *sync );
+extern void release_process_msync_exports( struct process *process );
 
 /* serial functions */
 

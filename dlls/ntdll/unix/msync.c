@@ -617,25 +617,6 @@ static inline void *get_shm( const unsigned int idx )
     return (void *)((unsigned long)addr + offset);
 }
 
-void msync_close( int obj )
-{
-    static __thread mach_msg_header_t send_header;
-    mach_msg_return_t mr;
-
-    TRACE( "obj=%d.\n", obj );
-
-    send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
-    send_header.msgh_id = (obj & MSYNC_SHM_INDEX_MASK) | MSYNC_SHM_CLOSE_FLAG;
-    send_header.msgh_size = sizeof(send_header);
-    send_header.msgh_remote_port = server_port;
-
-    mr = mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
-                    0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0);
-
-    if (mr != MACH_MSG_SUCCESS)
-        ERR( "Failed to send message to server to close msync object %d: %#x\n", obj, mr );
-}
-
 void msync_init(void)
 {
     struct stat st;
@@ -1227,8 +1208,5 @@ void msync_init(void)
 {
 }
 
-void msync_close( int obj )
-{
-}
 
 #endif /* __APPLE__ */

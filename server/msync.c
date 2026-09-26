@@ -1141,6 +1141,11 @@ void msync_abandon_mutexes( thread_id_t tid )
     }
 }
 
+int msync_release_export( unsigned int shm_idx )
+{
+    return destroy_all( shm_idx ) == MACH_MSG_SUCCESS;
+}
+
 int msync_grab_object( struct msync *msync )
 {
     struct msync_shm *obj = get_shm( msync->shm_idx );

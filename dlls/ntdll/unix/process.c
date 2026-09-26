@@ -469,11 +469,16 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
 NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
 {
     pid_t pid, wret;
-    int fd[2], status, err;
+    int fd[2], status, err, pipe_ret = -1;
 
 #ifdef HAVE_PIPE2
-    if (pipe2( fd, O_CLOEXEC ) == -1)
+#ifdef __APPLE__
+    if (__builtin_available(macOS 27.0, *)) pipe_ret = pipe2( fd, O_CLOEXEC );
+#else
+    pipe_ret = pipe2( fd, O_CLOEXEC );
 #endif
+#endif
+    if (pipe_ret == -1)
     {
         if (pipe(fd) == -1) return STATUS_TOO_MANY_OPENED_FILES;
         fcntl( fd[0], F_SETFD, FD_CLOEXEC );
@@ -563,13 +568,18 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
                                const RTL_USER_PROCESS_PARAMETERS *params )
 {
     pid_t pid;
-    int fd[2], stdin_fd = -1, stdout_fd = -1;
+    int fd[2], stdin_fd = -1, stdout_fd = -1, pipe_ret = -1;
     char **argv;
     NTSTATUS status = STATUS_SUCCESS;
 
 #ifdef HAVE_PIPE2
-    if (pipe2( fd, O_CLOEXEC ) == -1)
+#ifdef __APPLE__
+    if (__builtin_available(macOS 27.0, *)) pipe_ret = pipe2( fd, O_CLOEXEC );
+#else
+    pipe_ret = pipe2( fd, O_CLOEXEC );
 #endif
+#endif
+    if (pipe_ret == -1)
     {
         if (pipe(fd) == -1) return STATUS_TOO_MANY_OPENED_FILES;
         fcntl( fd[0], F_SETFD, FD_CLOEXEC );

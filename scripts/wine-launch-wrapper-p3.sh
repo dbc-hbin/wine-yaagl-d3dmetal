@@ -26,9 +26,10 @@ unset WINEDLLOVERRIDES WINEDLLPATH_PREPEND DXMT_CONFIG DXMT_CONFIG_FILE
 unset DXVK_CONFIG_FILE DXVK_STATE_CACHE_PATH VK_ICD_FILENAMES VK_DRIVER_FILES
 unset DYLD_INSERT_LIBRARIES
 
-# The final runtime manifest enables loader policy before every wine.real route.
+# The baseline FSR bridge is installed only by stage-runtime.py; the P3 marker
+# alone must not enable loader overrides before those modules exist.
 # The launcher owns MTL_HUD_ENABLED; never override its selection.
-if [ -f "$wine_root/yaagl-d3dmetal-runtime.json" ]; then
+if [ -f "$wine_root/zzz-frame-probe-stage.json" ]; then
   case "${YAAGL_FSR_UPSCALER:-metalfx}" in
     metalfx) export WINEDLLOVERRIDES=amd_fidelityfx_upscaler_dx12,amd_fidelityfx_framegeneration_dx12=b ;;
     native) export WINEDLLOVERRIDES="amd_fidelityfx_upscaler_dx12=n;amd_fidelityfx_framegeneration_dx12=b" ;;
@@ -38,8 +39,8 @@ if [ -f "$wine_root/yaagl-d3dmetal-runtime.json" ]; then
   export YAAGL_FSR_FG_NATIVE_DLL="Z:$wine_root/lib/wine/x86_64-windows/amd_fidelityfx_framegeneration_dx12_native.dll"
 fi
 
-# Load bundled MacDeps/GStreamer from the final runtime.
-if [ -f "$wine_root/yaagl-d3dmetal-runtime.json" ]; then
+# The P3 baseline carries bundled MacDeps/GStreamer before FSR staging.
+if [ -f "$wine_root/yaagl-wine-p3-runtime.txt" ]; then
   wine_lib="$wine_root/lib"
   export CX_APPLEGPTK_LIBD3DSHARED_PATH="$wine_lib/external/libd3dshared.dylib"
   gst_root="$wine_lib/GStreamer.framework/Versions/1.0"

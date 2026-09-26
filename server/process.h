@@ -40,6 +40,7 @@ struct process
     struct list          entry;           /* entry in system-wide process list */
     process_id_t         parent_id;       /* parent process id (at the time of creation) */
     struct list          thread_list;     /* thread list */
+    struct list          msync_exports;   /* process-owned shared MSync references */
     struct debug_obj    *debug_obj;       /* debug object debugging this process */
     struct debug_event  *debug_event;     /* debug event being sent to debugger */
     struct handle_table *handles;         /* handle entries */
@@ -65,6 +66,10 @@ struct process
     unsigned int         is_system:1;     /* is it a system process? */
     unsigned int         debug_children:1;/* also debug all child processes */
     unsigned int         is_terminating:1;/* is process terminating? */
+    unsigned int         msync_sigkill_sent:1; /* SIGKILL sent; wait for OS death before export reclaim */
+    unsigned int         msync_pid_start_valid:1; /* Unix identity captured on first export */
+    unsigned __int64     msync_pid_start_sec;
+    unsigned __int64     msync_pid_start_usec;
     data_size_t          imagelen;        /* length of image path in bytes */
     WCHAR               *image;           /* main exe image full path */
     struct job          *job;             /* job object associated with this process */

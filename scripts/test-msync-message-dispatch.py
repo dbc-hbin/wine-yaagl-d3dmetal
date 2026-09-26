@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
-"""Compile the production MSync Mach message pump together with the production
-client close sender and exercise the public header-only close and the
-size-qualified dispatch that serves it.
+"""Compile the production MSync Mach message pump and exercise internal
+reference retirement and size-qualified dispatch.
 
 The generated C harness links the VERBATIM production bodies from
 server/msync.c (message pump, internal reference-retirement sender,
-registration, unregister, signal and reference bookkeeping) and the client
-close sender from dlls/ntdll/unix/msync.c against native Mach headers.  Only
-the kernel send/receive boundary and the shared-memory/tid-map supplies are
+registration, unregister, signal and reference bookkeeping) against native
+Mach headers. Only the kernel send/receive boundary and shared-memory/tid-map supplies are
 scripted, so every assertion below observes real consumer effects: reference
 counts, free-list state, wait-list linkage, wait-state publication and wakeups.
 
-Close and signal share one public header-only message: the low 28 bits of
+Internal close and signal share one header-only message: the low 28 bits of
 msgh_id are the shared index and bit 28 (MSYNC_SHM_CLOSE_FLAG) selects close
 over signal, so only a message whose msgh_size is exactly
 sizeof(mach_msg_header_t) may be dispatched that way.  A larger message
 carrying the same bits is a wait message, which is what keeps a high thread id
-(id >= 1 << 20 sets bit 28) from being read as a close.  There is no cookie, no
-dedicated close message id and no owned export.
+(id >= 1 << 20 sets bit 28) from being read as a close.  Exported references are retired through process-owned server requests.
 
 No Wine install, no wineserver, no game, no sleeps.
 """
@@ -31,7 +28,9 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SERVER_SOURCE = (ROOT / "server" / "msync.c").read_text()
-CLIENT_SOURCE = (ROOT / "dlls" / "ntdll" / "unix" / "msync.c").read_text()
+INPROC_SOURCE = (ROOT / "server" / "inproc_sync.c").read_text()
+PROCESS_SOURCE = (ROOT / "server" / "process.c").read_text()
+CLIENT_SYNC_SOURCE = (ROOT / "dlls" / "ntdll" / "unix" / "sync.c").read_text()
 
 
 def section(text, start, end):
@@ -44,18 +43,10 @@ def section(text, start, end):
 # message pump.
 CORE = section(SERVER_SOURCE, "#define UL_COMPARE_AND_WAIT_SHARED", "\nint do_msync(void)")
 
-# Verbatim production client sender of the public header-only close.  Wine
-# logging collapses to nothing and the harness supplies the server port name.
-CLIENT_BRIDGE = r'''
-#define TRACE(...) do { } while (0)
-#define ERR(...) do { } while (0)
-static mach_port_name_t server_port;
-'''
-
-CLIENT_CLOSE = section(CLIENT_SOURCE, "void msync_close( int obj )", "void msync_init(void)")
 
 PROLOGUE = r'''
 #include <assert.h>
+#include <errno.h>
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
@@ -79,6 +70,7 @@ PROLOGUE = r'''
 #include <servers/bootstrap.h>
 
 #include "wine/msync.h"
+#include "wine/list.h"
 
 #define MAXIMUM_WAIT_OBJECTS 64
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
@@ -205,7 +197,6 @@ static void setup_tid_map(void)
     shm_tid_map = calloc( 1u << 24, sizeof(int) );
     assert(shm_tid_map);
     receive_port = make_receive_port();
-    server_port = receive_port;
     /* Sparse virtual tables covering every 28-bit index, so even the huge
      * fallthrough index of a rejected close resolves to a wait list without
      * touching more than a page of memory. */
@@ -254,18 +245,6 @@ static struct wire_op capture_destroy( unsigned int shm_idx )
     int before = sent_len;
 
     assert(destroy_all( shm_idx ) == MACH_MSG_SUCCESS);
-    assert(sent_len == before + 1);
-    op = sent[sent_len - 1];
-    return op;
-}
-
-/* The public close sender from dlls/ntdll/unix/msync.c. */
-static struct wire_op capture_client_close( int obj )
-{
-    struct wire_op op;
-    int before = sent_len;
-
-    msync_close( obj );
     assert(sent_len == before + 1);
     op = sent[sent_len - 1];
     return op;
@@ -527,45 +506,6 @@ static void case_signal_header_only(void)
     puts("ok signal_header_only");
 }
 
-static void case_client_close_header_only(void)
-{
-    const unsigned int close_idx = MSYNC_SHM_INDEX_MASK & ~0xfu; /* 0x0ffffff0 */
-    const unsigned int neighbour = close_idx + 1;
-    unsigned int token = make_token( 0x60 );
-    struct wait_registration *waiter;
-    struct wire_op close;
-
-    setup_tid_map();
-    prime_slot( close_idx, 2 );
-    prime_slot( neighbour, 2 );
-    /* A planted waiter on the closed index: retiring a reference must never
-     * complete or wake a wait. */
-    waiter = plant_waiter( close_idx, 50, token );
-
-    close = capture_client_close( close_idx );
-    assert(close.len == sizeof(mach_msg_header_t)); /* public header-only close */
-
-    queue_wire( close.bytes, close.len );
-    run_pump();
-    assert(fake_shm[close_idx].refcount == 1); /* exactly one reference released */
-    assert(fake_shm[neighbour].refcount == 2); /* and only for the named index */
-    assert(free_shm_idx == UINT32_MAX);        /* still referenced, not recycled */
-    assert(shm_access_len == 1 && shm_access[0] == close_idx);
-    assert(wake_len == 0);                     /* a close never mutates wait state */
-    expect_waiter_untouched( waiter, close_idx, 50, token );
-    assert(!find_registration( message_id_of( &close ) >> 8 )); /* not a wait message */
-
-    close = capture_client_close( close_idx );
-    queue_wire( close.bytes, close.len );
-    run_pump();
-    assert(fake_shm[close_idx].refcount == 0 && fake_shm[neighbour].refcount == 2);
-    assert(fake_shm[close_idx].msync_type == 0);
-    assert(free_shm_idx == close_idx && fake_shm[close_idx].low == -1); /* recycled once */
-    assert(shm_access_len == 2 && shm_access[1] == close_idx);
-    assert(wake_len == 0);
-    puts("ok client_close_header_only");
-}
-
 static void case_server_retire_close(void)
 {
     unsigned int token = make_token( 0x61 );
@@ -578,7 +518,7 @@ static void case_server_retire_close(void)
     waiter = plant_waiter( 4, 51, token );
 
     close = capture_destroy( 3 );
-    assert(close.len == sizeof(mach_msg_header_t)); /* same public header-only close */
+    assert(close.len == sizeof(mach_msg_header_t)); /* internal header-only close */
 
     queue_wire( close.bytes, close.len );
     run_pump();
@@ -642,7 +582,6 @@ int main(int argc, char **argv)
     else if (!strcmp( argv[1], "register_count65" )) case_register_count65();
     else if (!strcmp( argv[1], "unregister_same_id" )) case_unregister_same_id();
     else if (!strcmp( argv[1], "signal_header_only" )) case_signal_header_only();
-    else if (!strcmp( argv[1], "client_close_header_only" )) case_client_close_header_only();
     else if (!strcmp( argv[1], "server_retire_close" )) case_server_retire_close();
     else if (!strcmp( argv[1], "close_size_qualified" )) case_close_size_qualified();
     else return 2;
@@ -650,8 +589,399 @@ int main(int argc, char **argv)
 }
 '''
 
-HARNESS = PROLOGUE + CORE + CLIENT_BRIDGE + CLIENT_CLOSE + EPILOGUE
+HARNESS = PROLOGUE + CORE + EPILOGUE
 
+# Compile the actual export grant, close handler and process-death sweep along
+# with the same production MSync shared-index retention and Mach message pump.
+EXPORT_CORE = section(SERVER_SOURCE, "int msync_release_export(", "#else /* __APPLE__ */")
+EXPORT_CORE += section(INPROC_SOURCE, "struct msync_export\n", "#else /* NTSYNC_IOC_EVENT_READ */")
+EXPORT_CORE += INPROC_SOURCE[INPROC_SOURCE.index("DECL_HANDLER(close_inproc_sync_export)"):]
+CLIENT_RELEASE = section(CLIENT_SYNC_SOURCE, "static void release_inproc_sync(",
+                         "static struct inproc_sync *get_cached_inproc_sync(")
+EXIT_CORE = section(PROCESS_SOURCE, "#ifdef __APPLE__\n/* A Wine server thread",
+                    "/* start the sigkill timer for a process upon exit */")
+
+
+EXPORT_SETUP = r'''
+#define __int64 long long
+#define STATUS_NO_MEMORY 1
+#define STATUS_UNSUCCESSFUL 2
+#define STATUS_INVALID_HANDLE 3
+#define INPROC_SYNC_EVENT 2
+#define fatal_error(...) abort()
+struct msync { unsigned int shm_idx; };
+struct object { const void *ops; };
+struct inproc_sync { struct object obj; int type; struct msync *msync; };
+struct timeout_user { int active; };
+struct process {
+    struct list msync_exports;
+    int unix_pid;
+    int msync_pid_start_valid;
+    unsigned long long msync_pid_start_sec, msync_pid_start_usec;
+    int msync_sigkill_sent;
+    long long sigkill_delay;
+    struct timeout_user *sigkill_timeout;
+};
+#define PROC_PIDTBSDINFO 3
+#define SZOMB 5
+#define TICKS_PER_SEC 10000000LL
+struct proc_bsdinfo {
+    unsigned int pbi_pid, pbi_status;
+    unsigned long long pbi_start_tvsec, pbi_start_tvusec;
+};
+enum probe_state { PROBE_LIVE, PROBE_ZOMBIE, PROBE_MISSING, PROBE_CHANGED, PROBE_ERROR };
+static enum probe_state probe = PROBE_LIVE;
+static int sigkill_count, died_count, signal_errno;
+static struct timeout_user timer;
+static int harness_proc_pidinfo(int pid, int flavor, unsigned long long arg, void *buffer, int size)
+{
+    struct proc_bsdinfo *info = buffer;
+    (void)flavor; (void)arg;
+    assert(size == sizeof(*info));
+    if (probe == PROBE_MISSING) { errno = ESRCH; return 0; }
+    if (probe == PROBE_ERROR) { errno = EIO; return -1; }
+    info->pbi_pid = pid;
+    info->pbi_start_tvsec = probe == PROBE_CHANGED ? 42 : 11;
+    info->pbi_start_tvusec = 22;
+    info->pbi_status = probe == PROBE_ZOMBIE ? SZOMB : 2;
+    return size;
+}
+#define proc_pidinfo harness_proc_pidinfo
+static int harness_kill(int pid, int signal)
+{
+    (void)pid;
+    if (probe == PROBE_MISSING) { errno = ESRCH; return -1; }
+    if (!signal) return 0;
+    assert(signal == SIGKILL);
+    sigkill_count++;
+    if (signal_errno) { errno = signal_errno; return -1; }
+    return 0;
+}
+#define kill harness_kill
+static struct timeout_user *add_timeout_user(long long timeout, void (*cb)(void *), void *arg)
+{
+    assert(timeout < 0 && cb && arg);
+    timer.active = 1;
+    return &timer;
+}
+static void process_died(struct process *process);
+
+static const int inproc_sync_ops;
+static struct { struct process *process; } request_context, *current = &request_context;
+static int request_error;
+static int do_msync(void) { return 1; }
+static void set_error(int error) { request_error = error; }
+static void *mem_alloc(size_t size) { return malloc(size); }
+static struct object *get_obj_sync(struct object *obj) { return obj; }
+static void release_object(struct object *obj) { (void)obj; }
+struct close_inproc_sync_export_request { unsigned int shm_idx; unsigned long long export_id; };
+#define DECL_HANDLER(name) static void req_##name(const struct close_inproc_sync_export_request *req)
+'''
+
+EXIT_STUB = r'''
+static void process_died(struct process *process)
+{
+    died_count++;
+    release_process_msync_exports( process );
+}
+'''
+
+CLIENT_SETUP = r'''
+typedef int LONG;
+struct client_inproc_sync { LONG refcount; int fd; unsigned long long export_id; };
+static int deliver_close = 1;
+static LONG InterlockedDecrement(LONG *value) { return --*value; }
+static int wine_server_call(struct close_inproc_sync_export_request *req)
+{
+    if (!deliver_close) return STATUS_UNSUCCESSFUL; /* client lost before delivery */
+    request_error = 0;
+    req_close_inproc_sync_export( req );
+    return request_error;
+}
+#define SERVER_START_REQ(name) { struct close_inproc_sync_export_request request = {0}; \
+    struct close_inproc_sync_export_request *req = &request;
+#define SERVER_END_REQ }
+#define ERR(...) do { } while (0)
+#define close(fd) abort()
+#define inproc_sync client_inproc_sync
+'''
+
+EXPORT_CASES = r'''
+static unsigned long long export_index(struct process *process, unsigned int idx)
+{
+    struct msync object = {idx};
+    struct inproc_sync sync = {{&inproc_sync_ops}, INPROC_SYNC_EVENT, &object};
+    unsigned long long id = 0;
+    int type = 0;
+
+    current->process = process;
+    assert(get_obj_inproc_sync( &sync.obj, &type, &id ) == (int)idx);
+    assert(type == INPROC_SYNC_EVENT && id);
+    return id;
+}
+
+static void close_export(struct process *process, unsigned int idx, unsigned long long id, int expected)
+{
+    struct close_inproc_sync_export_request req = {idx, id};
+    current->process = process;
+    request_error = 0;
+    req_close_inproc_sync_export( &req );
+    assert(request_error == expected);
+}
+
+static void flush_retirements(int *cursor)
+{
+    int i;
+    assert(*cursor < sent_len);
+    for (i = *cursor; i < sent_len; i++) queue_wire( sent[i].bytes, sent[i].len );
+    *cursor = sent_len;
+    run_pump();
+}
+
+static void case_export_close_and_reuse(void)
+{
+    struct process first = {0}, other = {0};
+    unsigned long long a, b, c, d, reused;
+    int cursor = 0, before;
+
+    setup_tid_map();
+    list_init( &first.msync_exports );
+    list_init( &other.msync_exports );
+    first.unix_pid = 101; other.unix_pid = 102;
+    prime_slot( 8, 1 );
+    prime_slot( 9, 1 );
+    a = export_index( &first, 8 ); /* two local handles for one object */
+    b = export_index( &first, 8 );
+    c = export_index( &other, 8 ); /* inherited/duplicated into another process */
+    d = export_index( &first, 9 ); /* a distinct object in the same process */
+    assert(fake_shm[8].refcount == 4 && fake_shm[9].refcount == 2);
+    assert(a != b && b != c && c != d);
+
+    close_export( &first, 8, a, 0 );
+    before = sent_len;
+    close_export( &first, 8, a, STATUS_INVALID_HANDLE );
+    close_export( &other, 8, b, STATUS_INVALID_HANDLE );
+    close_export( &first, 9, b, STATUS_INVALID_HANDLE );
+    assert(sent_len == before); /* duplicates/foreign/mismatched index never retire */
+    assert(destroy_all( 9 ) == MACH_MSG_SUCCESS); /* distinct object handle teardown */
+    release_process_msync_exports( &first ); /* process_killed before second NtClose */
+    assert(list_empty( &first.msync_exports ));
+    before = sent_len;
+    release_process_msync_exports( &first ); /* process_destroy fallback */
+    assert(sent_len == before);
+    flush_retirements( &cursor );
+    assert(fake_shm[8].refcount == 2 && fake_shm[9].refcount == 0);
+    assert(free_shm_idx == 9);
+    close_export( &other, 8, c, 0 );
+    assert(destroy_all( 8 ) == MACH_MSG_SUCCESS); /* final server object owner */
+    flush_retirements( &cursor );
+    assert(fake_shm[8].refcount == 0 && free_shm_idx == 8);
+
+    /* A reused index belongs to a new export id. Old closes cannot touch it. */
+    free_shm_idx = UINT32_MAX; /* pop from fake allocator's free list */
+    prime_slot( 8, 1 );
+    reused = export_index( &first, 8 );
+    assert(reused != a && reused != b && reused != c);
+    before = sent_len;
+    close_export( &first, 8, a, STATUS_INVALID_HANDLE );
+    close_export( &other, 8, c, STATUS_INVALID_HANDLE );
+    assert(sent_len == before && fake_shm[8].refcount == 2);
+    close_export( &first, 8, reused, 0 );
+    assert(destroy_all( 8 ) == MACH_MSG_SUCCESS);
+    flush_retirements( &cursor );
+    assert(fake_shm[8].refcount == 0 && free_shm_idx == 8);
+    puts("ok export_close_and_reuse");
+}
+
+static void case_export_death_during_wait(void)
+{
+    struct process dead = {0};
+    unsigned int idx = 12, tid = 43, token = make_token( 0x56 );
+    unsigned int indices[] = {12};
+    unsigned long long id;
+    int cursor = 0;
+
+    setup_tid_map();
+    list_init( &dead.msync_exports );
+    dead.unix_pid = 103;
+    prime_slot( idx, 1 );
+    id = export_index( &dead, idx );
+    shm_tid_map[tid] = token;
+    queue_register( tid, 1, token, indices );
+    run_pump();
+    assert(fake_shm[idx].refcount == 3); /* base + export + concurrent wait */
+    assert(destroy_all( idx ) == MACH_MSG_SUCCESS); /* handle table teardown */
+    release_process_msync_exports( &dead );
+    flush_retirements( &cursor );
+    assert(fake_shm[idx].refcount == 1 && free_shm_idx == UINT32_MAX);
+    close_export( &dead, idx, id, STATUS_INVALID_HANDLE );
+    queue_signal( idx ); /* complete the outstanding wait before unregister */
+    run_pump();
+    queue_unregister( tid, 1, token );
+    run_pump();
+    assert(fake_shm[idx].refcount == 0 && free_shm_idx == idx);
+    puts("ok export_death_during_wait");
+}
+
+static void case_client_last_ref_crash(void)
+{
+    struct process alive = {0};
+    struct client_inproc_sync normal, crashed;
+    unsigned long long first, second;
+    int cursor = 0;
+
+    setup_tid_map();
+    list_init( &alive.msync_exports );
+    alive.unix_pid = 104;
+    prime_slot( 16, 1 );
+    first = export_index( &alive, 16 );
+    normal.refcount = 2; normal.fd = 16; normal.export_id = first;
+    current->process = &alive;
+    release_inproc_sync( &normal ); /* a concurrent local waiter remains */
+    assert(normal.refcount == 1 && sent_len == 0);
+    release_inproc_sync( &normal );
+    assert(normal.refcount == 0 && sent_len == 1);
+
+    second = export_index( &alive, 16 );
+    crashed.refcount = 1; crashed.fd = 16; crashed.export_id = second;
+    deliver_close = 0;
+    release_inproc_sync( &crashed ); /* local ref dies before RPC reaches server */
+    assert(crashed.refcount == 0 && sent_len == 1);
+    release_process_msync_exports( &alive );
+    assert(destroy_all( 16 ) == MACH_MSG_SUCCESS);
+    flush_retirements( &cursor );
+    assert(fake_shm[16].refcount == 0 && free_shm_idx == 16);
+    puts("ok client_last_ref_crash");
+}
+
+static void case_live_then_zombie(void)
+{
+    struct process exiting = {0};
+    int cursor = 0;
+
+    setup_tid_map();
+    list_init( &exiting.msync_exports );
+    exiting.unix_pid = 105;
+    exiting.sigkill_delay = TICKS_PER_SEC / 2;
+    prime_slot( 20, 1 );
+    export_index( &exiting, 20 );
+    assert(exiting.msync_pid_start_valid);
+    process_sigkill( &exiting ); /* SIGKILL delivered, Unix process still live */
+    assert(sigkill_count == 1 && died_count == 0 && fake_shm[20].refcount == 2);
+    process_sigkill( &exiting ); /* not a second SIGKILL */
+    assert(sigkill_count == 1 && died_count == 0);
+    probe = PROBE_ERROR;
+    process_sigkill( &exiting ); /* probe failure cannot imply death */
+    assert(sigkill_count == 1 && died_count == 0 && fake_shm[20].refcount == 2);
+    probe = PROBE_ZOMBIE;
+    process_sigkill( &exiting );
+    assert(died_count == 1 && list_empty( &exiting.msync_exports ));
+    flush_retirements( &cursor );
+    assert(fake_shm[20].refcount == 1);
+    assert(destroy_all( 20 ) == MACH_MSG_SUCCESS);
+    flush_retirements( &cursor );
+    assert(fake_shm[20].refcount == 0 && free_shm_idx == 20);
+    puts("ok live_then_zombie");
+}
+
+static void case_missing_or_reused_pid(int changed)
+{
+    struct process exiting = {0};
+    int cursor = 0;
+    unsigned int idx = changed ? 22 : 21;
+
+    setup_tid_map();
+    list_init( &exiting.msync_exports );
+    exiting.unix_pid = changed ? 107 : 106;
+    exiting.sigkill_delay = TICKS_PER_SEC / 2;
+    prime_slot( idx, 1 );
+    export_index( &exiting, idx );
+    probe = changed ? PROBE_CHANGED : PROBE_MISSING;
+    process_sigkill( &exiting );
+    assert(sigkill_count == 0 && died_count == 1);
+    flush_retirements( &cursor );
+    assert(fake_shm[idx].refcount == 1);
+    assert(destroy_all( idx ) == MACH_MSG_SUCCESS);
+    flush_retirements( &cursor );
+    assert(fake_shm[idx].refcount == 0 && free_shm_idx == idx);
+    puts(changed ? "ok changed_pid" : "ok missing_pid");
+}
+
+static void case_identity_probe_error(void)
+{
+    struct process exiting = {0};
+    struct msync object = {23};
+    struct inproc_sync sync = {{&inproc_sync_ops}, INPROC_SYNC_EVENT, &object};
+    unsigned long long id = 0;
+    int type = 0, cursor = 0;
+
+    setup_tid_map();
+    list_init( &exiting.msync_exports );
+    exiting.unix_pid = 108;
+    exiting.sigkill_delay = TICKS_PER_SEC / 2;
+    prime_slot( 23, 1 );
+    current->process = &exiting;
+    probe = PROBE_ERROR;
+    assert(get_obj_inproc_sync( &sync.obj, &type, &id ) == -1);
+    assert(request_error == STATUS_UNSUCCESSFUL && list_empty( &exiting.msync_exports ));
+    assert(fake_shm[23].refcount == 1);
+    probe = PROBE_LIVE;
+    export_index( &exiting, 23 );
+    exiting.msync_pid_start_valid = 0; /* deliberately unknown identity */
+    probe = PROBE_ERROR;
+    process_sigkill( &exiting );
+    assert(died_count == 0 && sigkill_count == 0 && fake_shm[23].refcount == 2);
+    exiting.msync_pid_start_valid = 1;
+    probe = PROBE_MISSING;
+    process_sigkill( &exiting );
+    assert(died_count == 1);
+    flush_retirements( &cursor );
+    assert(fake_shm[23].refcount == 1);
+    puts("ok identity_probe_error");
+}
+
+static void case_signal_error_one_shot(void)
+{
+    struct process exiting = {0};
+    int cursor = 0;
+
+    setup_tid_map();
+    list_init( &exiting.msync_exports );
+    exiting.unix_pid = 109;
+    exiting.sigkill_delay = TICKS_PER_SEC / 2;
+    prime_slot( 24, 1 );
+    export_index( &exiting, 24 );
+    signal_errno = EPERM;
+    process_sigkill( &exiting );
+    assert(sigkill_count == 1 && exiting.msync_sigkill_sent && died_count == 0);
+    signal_errno = 0;
+    process_sigkill( &exiting );
+    assert(sigkill_count == 1 && fake_shm[24].refcount == 2);
+    probe = PROBE_MISSING;
+    process_sigkill( &exiting );
+    assert(died_count == 1);
+    flush_retirements( &cursor );
+    assert(fake_shm[24].refcount == 1);
+    puts("ok signal_error_one_shot");
+}
+
+'''
+
+EXPORT_HARNESS = HARNESS.replace("int main(int argc, char **argv)",
+                                EXPORT_SETUP + EXPORT_CORE + EXIT_CORE + EXIT_STUB + CLIENT_SETUP + CLIENT_RELEASE +
+                                "\n#undef inproc_sync\n" + EXPORT_CASES +
+                                "int main(int argc, char **argv)")
+EXPORT_HARNESS = EXPORT_HARNESS.replace(
+    'if (!strcmp( argv[1], "register_count1" ))',
+    'if (!strcmp( argv[1], "signal_error_one_shot" )) case_signal_error_one_shot();\n'
+    '    else if (!strcmp( argv[1], "live_then_zombie" )) case_live_then_zombie();\n'
+    '    else if (!strcmp( argv[1], "missing_pid" )) case_missing_or_reused_pid(0);\n'
+    '    else if (!strcmp( argv[1], "changed_pid" )) case_missing_or_reused_pid(1);\n'
+    '    else if (!strcmp( argv[1], "identity_probe_error" )) case_identity_probe_error();\n'
+    '    else if (!strcmp( argv[1], "client_last_ref_crash" )) case_client_last_ref_crash();\n'
+    '    else if (!strcmp( argv[1], "export_close_and_reuse" )) case_export_close_and_reuse();\n'
+    '    else if (!strcmp( argv[1], "export_death_during_wait" )) case_export_death_during_wait();\n'
+    '    else if (!strcmp( argv[1], "register_count1" ))')
 
 class MSyncMessageDispatchTests(unittest.TestCase):
     @classmethod
@@ -693,14 +1023,59 @@ class MSyncMessageDispatchTests(unittest.TestCase):
     def test_signal_header_only_stays_signal(self):
         self.run_case("signal_header_only")
 
-    def test_client_header_only_close_releases_named_index_once(self):
-        self.run_case("client_close_header_only")
-
     def test_internal_retire_close_releases_named_index_once(self):
         self.run_case("server_retire_close")
 
     def test_close_flag_requires_header_only_size(self):
         self.run_case("close_size_qualified")
+
+
+class MSyncExportLifetimeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(prefix="msync-export-lifetime-")
+        root = pathlib.Path(cls.temporary.name)
+        source = root / "msync-export-lifetime.c"
+        cls.binary = root / "msync-export-lifetime"
+        source.write_text(EXPORT_HARNESS)
+        subprocess.run([shutil.which("cc") or "/usr/bin/clang", "-std=gnu11", "-O1", "-g",
+                        "-Wall", "-Werror", "-Wno-unused-function", "-Wno-unused-parameter",
+                        "-Wno-pointer-sign", "-pthread", "-I", str(ROOT / "include"),
+                        str(source), "-o", str(cls.binary)], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temporary.cleanup()
+
+    def run_case(self, name):
+        result = subprocess.run([str(self.binary), name], capture_output=True, text=True,
+                                timeout=30, env={**os.environ, "WINE_MSYNC_TEST_TRACE": ""})
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("ok " + name, result.stdout)
+
+    def test_normal_close_duplicate_process_and_slot_reuse(self):
+        self.run_case("export_close_and_reuse")
+
+    def test_abrupt_death_preserves_concurrent_wait(self):
+        self.run_case("export_death_during_wait")
+
+    def test_client_last_ref_crash_is_reclaimed_by_server(self):
+        self.run_case("client_last_ref_crash")
+
+    def test_live_after_sigkill_then_zombie(self):
+        self.run_case("live_then_zombie")
+
+    def test_missing_process_pid(self):
+        self.run_case("missing_pid")
+
+    def test_reused_process_pid(self):
+        self.run_case("changed_pid")
+
+    def test_identity_probe_error_does_not_release(self):
+        self.run_case("identity_probe_error")
+
+    def test_failed_signal_never_retries_reused_pid(self):
+        self.run_case("signal_error_one_shot")
 
 
 if __name__ == "__main__":

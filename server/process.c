@@ -34,6 +34,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <poll.h>
+#ifdef __APPLE__
+# include <libproc.h>
+# include <sys/proc.h>
+# include <sys/proc_info.h>
+#endif
 #ifdef HAVE_SYS_PARAM_H
 # include <sys/param.h>
 #endif
@@ -548,6 +553,7 @@ void shutdown_master_socket(void)
 /* final cleanup once we are sure a process is really dead */
 static void process_died( struct process *process )
 {
+    release_process_msync_exports( process );
     if (debug_level) fprintf( stderr, "%04x: *process killed*\n", process->id );
     if (!process->is_system)
     {
@@ -558,24 +564,69 @@ static void process_died( struct process *process )
     if (!--running_processes && shutdown_stage) close_master_socket( 0 );
 }
 
+#ifdef __APPLE__
+/* A Wine server thread can disappear before its Unix process stops using MSync
+ * pages.  A zombie cannot touch them; until then the export ledger keeps its
+ * references even after the server handle table has been closed. */
+static int msync_process_exited( struct process *process )
+{
+    struct proc_bsdinfo info;
+    int pid = process->unix_pid;
+    int ret;
+
+    if (!process->msync_pid_start_valid) return -1; /* never reclaim on an unknown identity */
+    errno = 0;
+    ret = proc_pidinfo( pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info) );
+    if (ret == (int)sizeof(info))
+    {
+        if (info.pbi_pid != (unsigned int)pid || info.pbi_start_tvsec != process->msync_pid_start_sec ||
+            info.pbi_start_tvusec != process->msync_pid_start_usec)
+            return 1; /* PID was reused; the exporting process is gone */
+        return info.pbi_status == SZOMB;
+    }
+    if (!ret && errno == ESRCH) return 1;
+    if (kill( pid, 0 ) == -1 && errno == ESRCH) return 1;
+    return -1; /* an unknown probe result is not evidence of death */
+}
+#endif
+
 /* callback for process sigkill timeout */
 static void process_sigkill( void *private )
 {
     struct process *process = private;
     int signal = 0;
 
+#ifdef __APPLE__
+    if (!list_empty( &process->msync_exports ))
+    {
+        int state = msync_process_exited( process );
+
+        if (state > 0) goto died;
+        if (process->sigkill_delay < TICKS_PER_SEC / 2) process->sigkill_delay *= 2;
+        if (state == 0 && process->sigkill_delay >= TICKS_PER_SEC / 2 && !process->msync_sigkill_sent)
+        {
+            process->msync_sigkill_sent = 1; /* never signal this PID a second time */
+            if (kill( process->unix_pid, SIGKILL ) == -1 && errno == ESRCH) goto died;
+        }
+        process->sigkill_timeout = add_timeout_user( -process->sigkill_delay, process_sigkill, process );
+        return;
+    }
+#endif
     process->sigkill_delay *= 2;
     if (process->sigkill_delay >= TICKS_PER_SEC / 2)
         signal = SIGKILL;
 
     if (!kill( process->unix_pid, signal ) && !signal)
-        process->sigkill_timeout = add_timeout_user( -process->sigkill_delay, process_sigkill, process );
-    else
     {
-        process->sigkill_delay = TICKS_PER_SEC / 64;
-        process->sigkill_timeout = NULL;
-        process_died( process );
+        process->sigkill_timeout = add_timeout_user( -process->sigkill_delay, process_sigkill, process );
+        return;
     }
+#ifdef __APPLE__
+died:
+#endif
+    process->sigkill_delay = TICKS_PER_SEC / 64;
+    process->sigkill_timeout = NULL;
+    process_died( process );
 }
 
 /* start the sigkill timer for a process upon exit */
@@ -610,6 +661,8 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->msg_fd          = NULL;
     process->sigkill_timeout = NULL;
     process->sigkill_delay   = TICKS_PER_SEC / 64;
+    process->msync_sigkill_sent = 0;
+    process->msync_pid_start_valid = 0;
     process->machine         = native_machine;
     process->page_size       = get_page_size();
     process->unix_pid        = -1;
@@ -644,6 +697,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     list_init( &process->rawinput_entry );
     list_init( &process->kernel_object );
     list_init( &process->thread_list );
+    list_init( &process->msync_exports );
     list_init( &process->locks );
     list_init( &process->asyncs );
     list_init( &process->classes );
@@ -725,6 +779,7 @@ static void process_destroy( struct object *obj )
     assert( !process->sigkill_timeout );  /* timeout should hold a reference to the process */
 
     close_process_handles( process );
+    release_process_msync_exports( process );
     set_process_startup_state( process, STARTUP_ABORTED );
 
     if (process->job)

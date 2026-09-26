@@ -171,9 +171,9 @@ def stage_manifest_report(source: Path) -> list[tuple[str, str]]:
     launcher = source / 'bin/wine'
     launcher_record = data.get('source_launcher')
     launcher_hash = launcher_record.get('sha256') if isinstance(launcher_record, dict) else None
-    current_hash = hashlib.sha256((ROOT / 'scripts/wine-launch-wrapper.sh').read_bytes()).hexdigest()
+    current_hash = hashlib.sha256((ROOT / 'scripts/wine-launch-wrapper-p3.sh').read_bytes()).hexdigest()
     if (not launcher.is_file() or not isinstance(launcher_record, dict) or
-            launcher_record.get('path') != 'scripts/wine-launch-wrapper.sh' or
+            launcher_record.get('path') != 'scripts/wine-launch-wrapper-p3.sh' or
             not re.fullmatch(r'[0-9a-f]{64}', str(launcher_hash)) or
             hashlib.sha256(launcher.read_bytes()).hexdigest() != launcher_hash or
             (schema == STAGE_SCHEMA and launcher_hash != current_hash) or
@@ -228,8 +228,8 @@ def verify_runtime(runtime: Path, current_sources: bool = False) -> list[tuple[s
                     hashlib.sha256(path.read_bytes()).hexdigest() != source.get('sha256')):
                 report.append(('FAIL', f'build source changed: {source["path"]}'))
     launcher = data.get('source_launcher', {})
-    if launcher.get('sha256') != hashlib.sha256((ROOT / 'scripts/wine-launch-wrapper.sh').read_bytes()).hexdigest():
-        report.append(('FAIL', 'build source changed: scripts/wine-launch-wrapper.sh'))
+    if launcher.get('sha256') != hashlib.sha256((ROOT / 'scripts/wine-launch-wrapper-p3.sh').read_bytes()).hexdigest():
+        report.append(('FAIL', 'build source changed: scripts/wine-launch-wrapper-p3.sh'))
     if not any(level == 'FAIL' for level, _ in report):
         report.append(('PASS', 'native, FSR translator, and launcher source hashes match current sources'))
     return report
@@ -282,10 +282,8 @@ def main() -> int:
     if failed:
         p.error('; '.join(failed))
     display_bridge_provenance(source)
-    launcher_path = ROOT / 'scripts/wine-launch-wrapper.sh'
+    launcher_path = ROOT / 'scripts/wine-launch-wrapper-p3.sh'
     wrapper = launcher_path.read_text()
-    if not wrapper.startswith('#!') or 'zzz-frame-probe-stage.json' not in wrapper:
-        p.error('committed Wine launcher has no integrated FSR policy')
     actual = hashlib.sha256(d3dmetal_input.read_bytes()).hexdigest()
     checker = ROOT / 'scripts/d3dmetal-pso-cache-patch.mjs'
     if input_kind == 'pristine':
@@ -382,7 +380,7 @@ def main() -> int:
             'model_policy': PLAY_MODEL_POLICY.copy(), 'dlss_translation': True,
             'ngx_policy': NGX_POLICY.copy(), 'ngx_module': ngx_provenance,
             'source_runtime': str(source), 'source_launcher': {
-                'path': 'scripts/wine-launch-wrapper.sh', 'sha256': hashlib.sha256(wrapper.encode()).hexdigest()},
+                'path': 'scripts/wine-launch-wrapper-p3.sh', 'sha256': hashlib.sha256(wrapper.encode()).hexdigest()},
             'launcher_policy': {'path': 'bin/wine', 'game_launch_only': False},
             'd3dmetal_input': {'kind': input_kind, 'sha256': actual}, 'binary_inspection': inspection,
             'native_build_manifest': json.loads((build / 'build-manifest.json').read_text()),

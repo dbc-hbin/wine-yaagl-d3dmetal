@@ -1,18 +1,40 @@
 #!/usr/bin/env python3
 """Exercise the real launch wrapper in temporary runtimes, without starting Wine."""
 
+import json
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 
 WRAPPER = Path(__file__).resolve().with_name("wine-launch-wrapper.sh")
+BASELINE_WRAPPER = WRAPPER.with_name("wine-launch-wrapper-p3.sh")
 MODULES = ("d3d10core.dll", "d3d11.dll", "dxgi.dll")
 AMD = ["0x1002", "0x7550", "AMD Radeon RX 9070", "unset"]
 NVIDIA = ["0x10de", "0x2d05", "NVIDIA GeForce RTX 5060", "unset"]
 RECORDER = '''#!/bin/sh
-printf '%s\\n' "$D3DM_VENDOR_ID" "$D3DM_DEVICE_ID" "$D3DM_DEVICE_DESCRIPTION" "${YAAGL_GPU_IDENTITY-unset}"
+printf '%s\n' "$D3DM_VENDOR_ID" "$D3DM_DEVICE_ID" "$D3DM_DEVICE_DESCRIPTION" "${YAAGL_GPU_IDENTITY-unset}"
 '''
+POLICY_KEYS = ('WINEDLLOVERRIDES', 'MTL_CAPTURE_ENABLED', 'YAAGL_FSR_FG_NATIVE_DLL',
+               'CX_APPLEGPTK_LIBD3DSHARED_PATH', 'DYLD_FALLBACK_LIBRARY_PATH',
+               'GST_PLUGIN_SYSTEM_PATH_1_0', 'GST_PLUGIN_SCANNER', 'MTL_HUD_ENABLED',
+               'WINE_ENABLE_TIMEOUT_FIX', 'D3DM_VENDOR_ID', 'D3DM_DEVICE_ID')
+# A native recorder sees DYLD_* after Wine's shell wrapper executes it; protected
+# shell/Python interpreters discard DYLD_* before their script bodies can inspect it.
+POLICY_RECORDER = r'''
+#include <stdio.h>
+#include <stdlib.h>
+int main(int argc, char **argv) {
+    const char *keys[] = {POLICY_KEYS_PLACEHOLDER};
+    printf("%d%c", argc - 1, 0);
+    for (int i = 1; i < argc; ++i) printf("%s%c", argv[i], 0);
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+        const char *value = getenv(keys[i]);
+        printf("%s%c", value ? value : "__unset__", 0);
+    }
+    return 0;
+}
+'''.replace('POLICY_KEYS_PLACEHOLDER', ', '.join(f'"{key}"' for key in POLICY_KEYS))
 
 
 class WineLaunchWrapperTests(unittest.TestCase):
@@ -43,10 +65,109 @@ class WineLaunchWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), expected)
 
+    def record_policy(self, args, **environment):
+        real = self.bin / "wine.real"
+        subprocess.run(["clang", "-x", "c", "-o", str(real), "-"], input=POLICY_RECORDER,
+                       text=True, capture_output=True, check=True)
+        result = self.launch(args, **environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fields = result.stdout.split("\0")
+        count = int(fields[0])
+        args = fields[1:1 + count]
+        values = fields[1 + count:-1]
+        self.assertEqual(len(values), len(POLICY_KEYS))
+        return {"args": args, "env": {key: None if value == "__unset__" else value
+                                     for key, value in zip(POLICY_KEYS, values)}}
+
     def install_backups(self):
         for module in MODULES:
             (self.modules / module).write_bytes(b"launcher replacement")
             (self.modules / f"{module}.bak").write_bytes(b"packaged module")
+
+    def test_final_manifest_controls_runtime_policy_and_preserves_launch_contract(self):
+        gst = self.root / "lib/GStreamer.framework/Versions/1.0"
+        (gst / "lib/gstreamer-1.0").mkdir(parents=True)
+        scanner = gst / "libexec/gstreamer-1.0/gst-plugin-scanner"
+        scanner.parent.mkdir(parents=True)
+        scanner.write_text("#!/bin/sh\n")
+        scanner.chmod(0o755)
+        args = [r"Z:\Games\ZenlessZoneZero.exe", "--quality", "high detail"]
+        inherited = {"WINEDLLOVERRIDES": "old=n", "DYLD_FALLBACK_LIBRARY_PATH": "/inherited/lib",
+                     "MTL_HUD_ENABLED": "0"}
+        absent = self.record_policy(args, YAAGL_FSR_UPSCALER="native", **inherited)
+        self.assertEqual(absent["args"], args)
+        self.assertEqual(absent["env"]["D3DM_VENDOR_ID"], "0x1002")
+        self.assertIsNone(absent["env"]["WINEDLLOVERRIDES"])
+        self.assertIsNone(absent["env"]["YAAGL_FSR_FG_NATIVE_DLL"])
+        self.assertIsNone(absent["env"]["CX_APPLEGPTK_LIBD3DSHARED_PATH"])
+        self.assertIsNone(absent["env"]["DYLD_FALLBACK_LIBRARY_PATH"])
+        self.assertEqual(absent["env"]["MTL_HUD_ENABLED"], "0")
+        self.assertEqual(absent["env"]["WINE_ENABLE_TIMEOUT_FIX"], "1")
+
+        # Even the old stage and P3 markers together cannot activate the final wrapper.
+        (self.root / "zzz-frame-probe-stage.json").write_text("{}")
+        (self.root / "yaagl-wine-p3-runtime.txt").write_text("baseline")
+        old_stage = self.record_policy(args, YAAGL_FSR_UPSCALER="native")
+        self.assertIsNone(old_stage["env"]["WINEDLLOVERRIDES"])
+        self.assertIsNone(old_stage["env"]["CX_APPLEGPTK_LIBD3DSHARED_PATH"])
+        (self.root / "zzz-frame-probe-stage.json").unlink()
+        (self.root / "yaagl-wine-p3-runtime.txt").unlink()
+
+        (self.root / "yaagl-d3dmetal-runtime.json").write_text(
+            json.dumps({"schemaVersion": 1, "runtimeId": "wine-11.17-d3dmetal-gptk4.0b2-2"}))
+        native = self.record_policy(args, YAAGL_FSR_UPSCALER="native", MTL_HUD_ENABLED="1",
+                                    WINE_ENABLE_TIMEOUT_FIX="0", **{
+                                        "DYLD_FALLBACK_LIBRARY_PATH": "/inherited/lib"})
+        env = native["env"]
+        self.assertEqual(native["args"], args)
+        self.assertEqual(env["WINEDLLOVERRIDES"],
+                         "amd_fidelityfx_upscaler_dx12=n;amd_fidelityfx_framegeneration_dx12=b")
+        self.assertEqual(env["YAAGL_FSR_FG_NATIVE_DLL"],
+                         f"Z:{self.root}/lib/wine/x86_64-windows/amd_fidelityfx_framegeneration_dx12_native.dll")
+        self.assertEqual(env["MTL_CAPTURE_ENABLED"], "0")
+        self.assertEqual(env["CX_APPLEGPTK_LIBD3DSHARED_PATH"],
+                         str(self.root / "lib/external/libd3dshared.dylib"))
+        self.assertEqual(env["DYLD_FALLBACK_LIBRARY_PATH"],
+                         f"{gst}/lib:{self.root}/lib")
+        self.assertEqual(env["GST_PLUGIN_SYSTEM_PATH_1_0"], str(gst / "lib/gstreamer-1.0"))
+        self.assertEqual(env["GST_PLUGIN_SCANNER"], str(scanner))
+        self.assertEqual(env["MTL_HUD_ENABLED"], "1")
+        self.assertEqual(env["WINE_ENABLE_TIMEOUT_FIX"], "0")
+        default = self.record_policy(["winecfg"])
+        self.assertEqual(default["env"]["WINEDLLOVERRIDES"],
+                         "amd_fidelityfx_upscaler_dx12,amd_fidelityfx_framegeneration_dx12=b")
+        self.assertEqual(default["env"]["D3DM_VENDOR_ID"], "0x10de")
+        self.assertEqual(default["env"]["DYLD_FALLBACK_LIBRARY_PATH"],
+                         f"{gst}/lib:{self.root}/lib")
+        self.assertEqual(default["env"]["WINE_ENABLE_TIMEOUT_FIX"], "1")
+        self.assertIsNone(default["env"]["MTL_HUD_ENABLED"])
+        metalfx = self.record_policy(args, YAAGL_FSR_UPSCALER="metalfx",
+                                     MTL_HUD_ENABLED="0", WINE_ENABLE_TIMEOUT_FIX="1")
+        self.assertEqual(metalfx["env"]["WINEDLLOVERRIDES"],
+                         default["env"]["WINEDLLOVERRIDES"])
+        self.assertEqual(metalfx["env"]["MTL_HUD_ENABLED"], "0")
+        self.assertEqual(metalfx["env"]["WINE_ENABLE_TIMEOUT_FIX"], "1")
+        invalid = self.launch(args, YAAGL_FSR_UPSCALER="invalid")
+        self.assertEqual(invalid.returncode, 64)
+        self.assertEqual(invalid.stdout, "")
+        self.assertIn("YAAGL_FSR_UPSCALER must be metalfx or native", invalid.stderr)
+
+    def test_baseline_staging_manifest_requires_p3_identity(self):
+        self.wrapper.write_bytes(BASELINE_WRAPPER.read_bytes())
+        (self.root / "yaagl-wine-p3-runtime.txt").write_text("baseline")
+        before_staging = self.record_policy(["winecfg"], YAAGL_FSR_UPSCALER="native")
+        self.assertIsNone(before_staging["env"]["WINEDLLOVERRIDES"])
+        self.assertEqual(before_staging["env"]["CX_APPLEGPTK_LIBD3DSHARED_PATH"],
+                         str(self.root / "lib/external/libd3dshared.dylib"))
+        (self.root / "zzz-frame-probe-stage.json").write_text("{}")
+        baseline = self.record_policy(["winecfg"], YAAGL_FSR_UPSCALER="native")
+        self.assertEqual(baseline["env"]["WINEDLLOVERRIDES"],
+                         "amd_fidelityfx_upscaler_dx12=n;amd_fidelityfx_framegeneration_dx12=b")
+        self.assertEqual(baseline["env"]["CX_APPLEGPTK_LIBD3DSHARED_PATH"],
+                         str(self.root / "lib/external/libd3dshared.dylib"))
+        game = self.record_policy([r"Z:\Games\ZenlessZoneZero.exe"])
+        self.assertEqual(game["env"]["D3DM_VENDOR_ID"], "0x1002")
+        self.assertEqual(baseline["env"]["D3DM_VENDOR_ID"], "0x10de")
 
     def test_direct_and_steam_launches_override_inherited_gpu(self):
         cases = (

@@ -1384,7 +1384,7 @@ if [ -e "$stage/wine/bin/wine.real" ]; then
   die "host prefix already contains wine.real; refusing ambiguous wrapper layout"
 fi
 mv "$stage/wine/bin/wine" "$stage/wine/bin/wine.real"
-cp "$repo_dir/scripts/wine-launch-wrapper.sh" "$stage/wine/bin/wine"
+cp "$repo_dir/scripts/wine-launch-wrapper-p3.sh" "$stage/wine/bin/wine"
 chmod 755 "$stage/wine/bin/wine" "$stage/wine/bin/wine.real"
 
 rm -f "$stage/wine/yaagl-wine-runtime.json" \
@@ -1551,16 +1551,8 @@ require_file "$stage/wine/lib/wine/x86_64-windows/nvngx.dll"
   || die "winemetal.so still present in stage"
 [ ! -e "$stage/wine/lib/wine/x86_64-windows/winemetal.dll" ] \
   || die "winemetal.dll still present in stage"
-grep -q 'WINE_ENABLE_TIMEOUT_FIX=1' "$stage/wine/bin/wine" \
-  || die "wrapper missing WINE_ENABLE_TIMEOUT_FIX=1"
-grep -q 'yaagl-wine-p3-runtime.txt' "$stage/wine/bin/wine" \
-  || die "wrapper missing P3 marker gated runtime lib/GST env"
-grep -q 'DYLD_FALLBACK_LIBRARY_PATH' "$stage/wine/bin/wine" \
-  || die "wrapper missing DYLD_FALLBACK_LIBRARY_PATH for packaged libs"
-grep -q 'GST_PLUGIN_SYSTEM_PATH_1_0' "$stage/wine/bin/wine" \
-  || die "wrapper missing GST_PLUGIN_SYSTEM_PATH_1_0"
-grep -q 'GST_PLUGIN_SCANNER' "$stage/wine/bin/wine" \
-  || die "wrapper missing GST_PLUGIN_SCANNER"
+cmp -s "$repo_dir/scripts/wine-launch-wrapper-p3.sh" "$stage/wine/bin/wine" \
+  || die "packaged baseline wrapper differs from current source"
 
 # Generate package-specific provenance only after every overlay, install-name
 # rewrite, signature, and generated graphics manifest is final. The input

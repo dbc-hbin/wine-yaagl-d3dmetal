@@ -110,6 +110,8 @@ def main():
     if wine.exists() or archive.exists():
         raise ValueError('refusing existing staged runtime or archive')
     shutil.copytree(base, wine, symlinks=True)
+    # The verified baseline wrapper predates this release; ship the current policy.
+    shutil.copy2(ROOT / 'scripts/wine-launch-wrapper.sh', wine / 'bin/wine')
     for relative, source in CHANGES.items():
         target = wine / relative
         built = overlay / source
@@ -143,12 +145,17 @@ def main():
                      'lib/wine/x86_64-unix/amd_fidelityfx_upscaler_dx12.so'):
         if not (wine / relative).exists():
             raise ValueError(f'missing GPTK companion module: {relative}')
-    source_paths = ['dlls/ntdll/unix/msync.c', 'dlls/ntdll/unix/sync.c',
-                    'server/msync.c', 'server/inproc_sync.c', 'server/protocol.def',
+    source_paths = ['dlls/ntdll/unix/msync.c', 'dlls/ntdll/unix/msync.h',
+                    'dlls/ntdll/unix/sync.c', 'dlls/ntdll/unix/process.c',
+                    'dlls/ntdll/unix/server.c', 'server/msync.c', 'server/msync.h',
+                    'server/inproc_sync.c', 'server/process.c', 'server/process.h',
+                    'server/object.h', 'server/protocol.def', 'include/wine/server_protocol.h',
+                    'server/request_handlers.h', 'server/request_trace.h',
                     'dlls/winemac.drv/cocoa_app.m', 'dlls/win32u/input.c',
-                    'dlls/amd_fidelityfx_framegeneration_dx12/main.c']
+                    'dlls/amd_fidelityfx_framegeneration_dx12/main.c',
+                    'scripts/wine-launch-wrapper.sh']
     manifest = {
-        'schemaVersion': 1, 'runtimeId': 'wine-11.17-d3dmetal-gptk4.0b2-1',
+        'schemaVersion': 1, 'runtimeId': 'wine-11.17-d3dmetal-gptk4.0b2-2',
         'archive': NAME, 'archiveRoot': 'wine', 'wineVersion': 'wine-11.17',
         'framework': {'destination': 'lib/external/D3DMetal.framework',
                       'installation': 'native autopatch before loading Wine',
