@@ -1,4 +1,4 @@
-# Yaagl Wine DX12 runtime
+# Wine 11.17 D3DMetal (GPTK 4.0b2, experimental)
 
 [한국어](README.ko.md)
 
@@ -20,6 +20,17 @@ node scripts/build-d3dmetal-autopatch.mjs build/d3dmetal-autopatch
 ```
 
 Output: `build/d3dmetal-autopatch/` and `build/d3dmetal-autopatch.tar.gz`.
+
+## Package the Wine runtime
+
+On the macOS 26 build host with the Wine/P3 compiler dependencies and verified `f163d14` staged Wine tree:
+
+```sh
+scripts/build-yaagl-overlay.sh BASE_WINE_ROOT build/yaagl-overlay
+python3 scripts/package-yaagl-runtime.py BASE_WINE_ROOT build/yaagl-overlay build/d3dmetal-autopatch build/yaagl-release
+```
+
+The `wine/` archive includes the native autopatcher and GPTK companion modules, but excludes only Apple’s `D3DMetal.framework`; the installer must prepare it in `wine/lib/external/` before loading Wine. `wine/yaagl-d3dmetal-runtime.json` inventories all packaged files and symlinks.
 
 ## Licenses
 
