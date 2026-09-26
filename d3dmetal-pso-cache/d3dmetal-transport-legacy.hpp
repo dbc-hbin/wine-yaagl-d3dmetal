@@ -36,10 +36,8 @@ bool queryResourceMetadata(void* d3d12Resource, ResourceMetadata& out) noexcept;
 // D3DMCommandAllocator resource lifetime list.
 bool record(NativeCommandList& commandList, const RecordRequest& request) noexcept;
 
-// Prime's legacy EncodeTemporallyScaleMTLFX hook must branch on this before the
-// original command parser. Once true, replay() owns the command; never fall
-// through to the native temporal parser even if replay() reports failure.
-bool isRecordedCommand(const void* command) noexcept;
-bool replay(void* d3dmCommandEncoder, const void* command) noexcept;
+// Prime's legacy EncodeTemporallyScaleMTLFX hook calls this before the native
+// parser. Only NotRecorded may fall through; recognized failures remain ours.
+ReplayResult replay(void* d3dmCommandEncoder, const void* command) noexcept;
 
 } // namespace yaagl::pso::d3dmetal::legacy

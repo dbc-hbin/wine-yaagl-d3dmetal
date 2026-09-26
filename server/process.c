@@ -554,9 +554,6 @@ static void process_died( struct process *process )
         if (!--user_processes && !shutdown_stage && master_socket_timeout != TIMEOUT_INFINITE)
             shutdown_timeout = add_timeout_user( master_socket_timeout, server_shutdown_timeout, NULL );
     }
-    /* The Unix process is now dead: no new wait registrations can race the
-     * Mach-port-ordered release of its exported shared indices. */
-    release_process_msync_exports( process );
     release_object( process );
     if (!--running_processes && shutdown_stage) close_master_socket( 0 );
 }
@@ -647,7 +644,6 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     list_init( &process->rawinput_entry );
     list_init( &process->kernel_object );
     list_init( &process->thread_list );
-    list_init( &process->msync_exports );
     list_init( &process->locks );
     list_init( &process->asyncs );
     list_init( &process->classes );
@@ -729,7 +725,6 @@ static void process_destroy( struct object *obj )
     assert( !process->sigkill_timeout );  /* timeout should hold a reference to the process */
 
     close_process_handles( process );
-    release_process_msync_exports( process );
     set_process_startup_state( process, STARTUP_ABORTED );
 
     if (process->job)

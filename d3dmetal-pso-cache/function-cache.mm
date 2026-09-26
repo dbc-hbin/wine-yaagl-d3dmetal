@@ -313,19 +313,6 @@ public:
         }
     }
 
-    void forgetDevice(const void* const device) {
-        std::shared_ptr<DeviceScope> forgotten;
-        {
-            std::lock_guard lock(scopesMutex_);
-            const auto found = scopes_.find(device);
-            if (found != scopes_.end()) {
-                forgotten = std::move(found->second);
-                scopes_.erase(found);
-            }
-        }
-        forgotten.reset();
-    }
-
     void withDeviceRetired(
         const void* const device,
         void (*action)(const void*, const void*),
@@ -448,10 +435,6 @@ FunctionResult FunctionCache::getOrCreate(
     const FunctionCreate create,
     void* const context) {
     return impl_->getOrCreate(device, key, library, create, context);
-}
-
-void FunctionCache::forgetDevice(const void* const device) {
-    impl_->forgetDevice(device);
 }
 
 void FunctionCache::withDeviceRetired(

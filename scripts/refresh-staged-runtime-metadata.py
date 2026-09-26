@@ -44,7 +44,7 @@ PACKAGER = PROJECT_ROOT / 'scripts' / 'package-wine-p3-runtime.sh'
 FRAMEWORK_REL = 'lib/external/D3DMetal.framework/Versions/A/D3DMetal'
 MODULE_REL = 'lib/external/D3DMetal.framework/Versions/A/Resources/libYaaglNativePsoCache.dylib'
 CONVERTER_REL = 'lib/external/D3DMetal.framework/Versions/A/Resources/libmetalirconverter.dylib'
-GPTK_SOURCE_SHA256 = 'f8640e6b0974277068821d44bd398dcc0f42cbb730d07f3afad97843e72a6ea3'
+GPTK_SOURCE_SHA256 = '32f8adb414806e63dcb46c4260f399a36b85454ad255e40c3dc5d8e0dfad95eb'
 CONVERTER_SHA256 = '5c5619ef17a7d62e84db0a7f5181d746623b47364379271fd5827e6bd961ba34'
 DEVICE_LIFETIME = {'scope': 'per-native-device', 'retention': 'device-lifetime'}
 FRAMEWORK_DEPENDENCY = '@loader_path/Resources/libYaaglNativePsoCache.dylib'
@@ -134,11 +134,15 @@ def assert_tree_untouched(tree: pathlib.Path, stage: dict) -> None:
         link = tree / NGX_MODULE_RELS[1]
         if not link.is_symlink() or link.readlink().as_posix() != NGX_UNIX_LINK:
             raise SystemExit('stock NGX Unix bridge symlink changed')
+    actual_digests: dict[pathlib.Path, str] = {}
     for relative, expected in recorded.items():
         path = tree / relative
         if not path.is_file():
             raise SystemExit(f'signed artifact is missing from the staged tree: {relative}')
-        if digest(path) != expected:
+        target = path.resolve()
+        if target not in actual_digests:
+            actual_digests[target] = digest(target)
+        if actual_digests[target] != expected:
             raise SystemExit(f'signed artifact changed since staging: {relative}')
     if stage['stage_schema'] not in NGX_SCHEMAS:
         for relative in NGX_MODULE_RELS:
@@ -151,10 +155,6 @@ def assert_tree_untouched(tree: pathlib.Path, stage: dict) -> None:
                 ngx.get('runtime_path') != NGX_MODULE_RELS[0] or
                 ngx.get('unix_bridge') != NGX_MODULE_RELS[1] or
                 ngx.get('bridge_target') != NGX_UNIX_LINK or
-                not (tree / NGX_MODULE_RELS[1]).is_symlink() or
-                (tree / NGX_MODULE_RELS[1]).readlink().as_posix() != NGX_UNIX_LINK or
-                digest(tree / NGX_MODULE_RELS[0]) != NGX_SHA256 or
-                digest(tree / SHARED_DYLIB_REL) != SHARED_SHA256 or
                 recorded.get(NGX_MODULE_RELS[0]) != NGX_SHA256 or
                 recorded.get(NGX_MODULE_RELS[1]) != SHARED_SHA256 or
                 recorded.get(SHARED_DYLIB_REL) != SHARED_SHA256):

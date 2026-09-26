@@ -321,28 +321,44 @@ std::shared_ptr<Configuration> configure(
     id<MTLTexture> depth, MTLPixelFormat sourceColor, MTLPixelFormat sourceUi,
     NSUInteger outputWidth, NSUInteger outputHeight, std::uint32_t transfer) {
     if (@available(macOS 26.0, *)) {
-        auto result = std::make_shared<Configuration>();
-        result->mode = command.value.kind == transport::CommandListKind::mpl
-                     ? Mode::Metal4 : Mode::Legacy;
+        const Mode mode = command.value.kind == transport::CommandListKind::mpl
+                        ? Mode::Metal4 : Mode::Legacy;
         auto device = (id<MTLDevice>)command.value.device;
-        if (!supported(device, result->mode, command.value.compiler)) return {};
+        if (!supported(device, mode, command.value.compiler)) return {};
+        const MTLPixelFormat color = MTLPixelFormatRGBA16Float;
+        const MTLPixelFormat ui = sourceUi == MTLPixelFormatInvalid
+                                ? MTLPixelFormatInvalid : MTLPixelFormatRGBA16Float;
+        const MTLPixelFormat depthFormat = depth.pixelFormat;
+        const MTLPixelFormat motion = MTLPixelFormatRG16Float;
+        const bool cameraPresent = packet.camera_info_present != 0;
+        // MetalFX consumes color, depth, and motion in one origin-zero active domain.
+        for (const auto& cached : state.configurations) {
+            if (cached->device.get() == device && cached->mode == mode &&
+                cached->color == color && cached->ui == ui &&
+                cached->sourceColor == sourceColor && cached->sourceUi == sourceUi &&
+                cached->transfer == transfer && cached->cameraPresent == cameraPresent &&
+                cached->depth == depthFormat && cached->motion == motion &&
+                cached->width == outputWidth && cached->height == outputHeight &&
+                cached->outputWidth == outputWidth && cached->outputHeight == outputHeight)
+                return cached;
+        }
+
+        auto result = std::make_shared<Configuration>();
+        result->mode = mode;
         result->device = Object(device);
         result->compiler = Object((id)command.value.compiler);
-        result->color = MTLPixelFormatRGBA16Float;
-        result->ui = sourceUi == MTLPixelFormatInvalid ? MTLPixelFormatInvalid : MTLPixelFormatRGBA16Float;
+        result->color = color;
+        result->ui = ui;
         result->sourceColor = sourceColor;
         result->sourceUi = sourceUi;
         result->transfer = transfer;
-        result->cameraPresent = packet.camera_info_present != 0;
-        result->depth = depth.pixelFormat;
-        result->motion = MTLPixelFormatRG16Float;
-        // MetalFX consumes color, depth, and motion in one origin-zero active domain.
+        result->cameraPresent = cameraPresent;
+        result->depth = depthFormat;
+        result->motion = motion;
         result->width = outputWidth;
         result->height = outputHeight;
         result->outputWidth = outputWidth;
         result->outputHeight = outputHeight;
-        for (const auto& cached : state.configurations)
-            if (sameConfiguration(*result, *cached)) return cached;
 
         MTLFXFrameInterpolatorDescriptor* descriptor =
             [[MTLFXFrameInterpolatorDescriptor alloc] init];

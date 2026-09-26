@@ -303,19 +303,6 @@ public:
         return *entry->result;
     }
 
-    void forgetDevice(const void* device) {
-        std::shared_ptr<DeviceScope> forgotten;
-        {
-            std::lock_guard lock(scopesMutex_);
-            const auto found = scopes_.find(device);
-            if (found != scopes_.end()) {
-                forgotten = std::move(found->second);
-                scopes_.erase(found);
-            }
-        }
-        forgotten.reset();
-    }
-
     void withDeviceRetired(
         const void* device,
         void (*action)(const void*, const void*),
@@ -409,10 +396,6 @@ NativeResult Cache::getOrCreate(
     NSArray* keyResources,
     const CreateFunction& create) {
     return impl_->getOrCreate(device, key, keyResources, create);
-}
-
-void Cache::forgetDevice(const void* device) {
-    impl_->forgetDevice(device);
 }
 
 void Cache::withDeviceRetired(

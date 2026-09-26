@@ -28,8 +28,6 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <stdarg.h>
 #include <sys/mman.h>
 #ifdef HAVE_SYS_STAT_H
@@ -161,8 +159,6 @@ enum wait_state
 #define WAIT_GENERATION_STEP 8u
 #define MSYNC_MAP_MESSAGE_WIRE_SIZE 32u
 #define MSYNC_CLEANUP_MESSAGE_ID ((mach_msg_id_t)0x7ffffffe)
-/* Wait messages use a low-byte count in [1, MAXIMUM_WAIT_OBJECTS + 1]. */
-#define MSYNC_CLOSE_MESSAGE_ID ((mach_msg_id_t)0x7ffffffd)
 
 static inline unsigned int wait_token_state( unsigned int token )
 {
@@ -365,13 +361,6 @@ typedef struct
     unsigned int shm_idx[MAXIMUM_WAIT_OBJECTS + 2];
     mach_msg_trailer_t trailer;
 } mach_register_message_t;
-
-typedef struct
-{
-    mach_msg_header_t header;
-    uint64_t cookie;
-    unsigned int shm_idx;
-} mach_close_message_t;
 
 typedef struct
 {
@@ -605,28 +594,23 @@ static void retire_message_refs( mach_register_message_t *message, unsigned int 
     }
 }
 
-/* Only the server may retire references. The public Mach send right is also held
- * by clients, so a bare shared index is not authority to close a reused slot. */
-static uint64_t close_cookie;
-
-static inline mach_msg_return_t destroy_all( unsigned int shm_idx )
+static inline void destroy_all_internal( unsigned int shm_idx )
 {
-    mach_close_message_t message = {0};
-
-    message.header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
-    message.header.msgh_id = MSYNC_CLOSE_MESSAGE_ID;
-    message.header.msgh_size = sizeof(message);
-    message.header.msgh_remote_port = receive_port;
-    message.cookie = close_cookie;
-    message.shm_idx = shm_idx;
-
-    return mach_msg2( &message.header, MACH_SEND_MSG, message.header.msgh_size,
-                      0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+    release_shm_ref( shm_idx );
 }
 
-int msync_release_export( unsigned int shm_idx )
+/* Client registration and unregister messages are ordered on the Mach port. Shared
+ * state publication still uses release/acquire ordering for weakly ordered CPUs. */
+static inline mach_msg_return_t destroy_all( unsigned int shm_idx )
 {
-    return destroy_all( shm_idx ) == MACH_MSG_SUCCESS;
+    static mach_msg_header_t send_header;
+    send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
+    send_header.msgh_id = (shm_idx & MSYNC_SHM_INDEX_MASK) | MSYNC_SHM_CLOSE_FLAG;
+    send_header.msgh_size = sizeof(send_header);
+    send_header.msgh_remote_port = receive_port;
+
+    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
+                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0);
 }
 
 static inline mach_msg_return_t signal_all( unsigned int shm_idx, int *shm )
@@ -780,12 +764,7 @@ static void *mach_message_pump( void *args )
 {
     unsigned int tid, count, body_count;
     mach_msg_return_t mr;
-    union
-    {
-        mach_register_message_t wait;
-        mach_close_message_t close;
-    } message = {0};
-    mach_register_message_t *receive_message = &message.wait;
+    mach_register_message_t receive_message = { 0 };
     sigset_t set;
 
     sigfillset( &set );
@@ -793,7 +772,7 @@ static void *mach_message_pump( void *args )
 
     for (;;)
     {
-        mr = receive_mach_msg( receive_message );
+        mr = receive_mach_msg( &receive_message );
         if (mr != MACH_MSG_SUCCESS)
         {
             fprintf( stderr, "msync: failed to receive message\n");
@@ -804,38 +783,36 @@ static void *mach_message_pump( void *args )
          * A complex mach message, where the client expects a reply,
          * is a send back a mach memory entry request.
          */
-        if (receive_message->header.msgh_remote_port != MACH_PORT_NULL)
+        if (receive_message.header.msgh_remote_port != MACH_PORT_NULL)
         {
-            if (receive_message->header.msgh_id == MSYNC_CLEANUP_MESSAGE_ID)
-                cleanup_thread_registration( (mach_cleanup_message_t *)receive_message );
+            if (receive_message.header.msgh_id == MSYNC_CLEANUP_MESSAGE_ID)
+                cleanup_thread_registration( (mach_cleanup_message_t *)&receive_message );
             else
-                send_shm_to_client( (mach_map_message_t *)receive_message );
+                send_shm_to_client( (mach_map_message_t *)&receive_message );
             continue;
         }
 
-        if (receive_message->header.msgh_id == MSYNC_CLOSE_MESSAGE_ID)
+        /* Header-only messages carry a 28-bit shared index and a signal or close flag. */
+        if (receive_message.header.msgh_size == sizeof(mach_msg_header_t))
         {
-            if (receive_message->header.msgh_size == sizeof(message.close) &&
-                message.close.cookie && message.close.cookie == close_cookie &&
-                message.close.shm_idx <= MSYNC_SHM_INDEX_MASK)
-                release_shm_ref( message.close.shm_idx );
-            continue;
-        }
+            unsigned int message_id = receive_message.header.msgh_id;
+            unsigned int shm_idx = message_id & MSYNC_SHM_INDEX_MASK;
 
-        if (receive_message->header.msgh_size == sizeof(mach_msg_header_t))
-        {
-            signal_all_internal( receive_message->header.msgh_id & MSYNC_SHM_INDEX_MASK );
+            if (message_id & MSYNC_SHM_CLOSE_FLAG)
+                destroy_all_internal( shm_idx );
+            else
+                signal_all_internal( shm_idx );
             continue;
         }
 
         /* Finally, registration and ordered unregister messages. */
-        decode_msgh_id( receive_message->header.msgh_id, &tid, &count );
-        body_count = (receive_message->header.msgh_size - sizeof(mach_msg_header_t)) /
-                     sizeof(receive_message->shm_idx[0]);
+        decode_msgh_id( receive_message.header.msgh_id, &tid, &count );
+        body_count = (receive_message.header.msgh_size - sizeof(mach_msg_header_t)) /
+                     sizeof(receive_message.shm_idx[0]);
 
         if (body_count == 1)
         {
-            acknowledge_unregister( tid, receive_message->shm_idx[0] );
+            acknowledge_unregister( tid, receive_message.shm_idx[0] );
             continue;
         }
 
@@ -844,12 +821,12 @@ static void *mach_message_pump( void *args )
             fprintf( stderr, "msync: error: invalid wait registration size %u/%u for tid %u\n",
                      count, body_count, tid );
             if (body_count)
-                publish_wait_state( tid, receive_message->shm_idx[0],
-                                    wait_token_with_state( receive_message->shm_idx[0], MSYNC_WAIT_FAILED ) );
+                publish_wait_state( tid, receive_message.shm_idx[0],
+                                    wait_token_with_state( receive_message.shm_idx[0], MSYNC_WAIT_FAILED ) );
             continue;
         }
 
-        register_wait( receive_message, tid, count );
+        register_wait( &receive_message, tid, count );
     }
 
     return NULL;
@@ -967,9 +944,6 @@ void msync_init(void)
 
     if (!do_msync()) return;
 
-    arc4random_buf( &close_cookie, sizeof(close_cookie) );
-    if (!close_cookie) close_cookie = 1;
-
     if (fstat( config_dir_fd, &st ) == -1)
         fatal_error( "cannot stat config dir\n" );
 
@@ -1022,8 +996,7 @@ void msync_destroy( struct msync *msync )
         list_remove( &msync->mutex_entry );
     if (!msync->shm_idx) return;
 
-    if (!msync_release_export( msync->shm_idx ))
-        fatal_error( "could not release msync object %u\n", msync->shm_idx );
+    destroy_all( msync->shm_idx );
     free( msync );
 }
 

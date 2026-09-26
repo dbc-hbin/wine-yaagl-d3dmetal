@@ -53,10 +53,6 @@ public:
         NSArray* keyResources,
         const CreateFunction& create);
 
-    // Detaches the current scope for this address. Existing calls and waiters
-    // remain valid, while a later call at the same address gets a fresh scope.
-    void forgetDevice(const void* device);
-
     // Prevents cache admission for this address while releasing its current
     // scope and running action. The address can form a fresh scope afterward.
     void withDeviceRetired(

@@ -15,7 +15,7 @@ const layoutText = await readFile(
 );
 const layoutSha256 = createHash("sha256").update(layoutText).digest("hex");
 const expectedLayoutSha256 =
-  "c9b41ce56e03f85ffba75f6e5ceb83f6792e8eff45cdfd14a3cdafbeefdc0919";
+  "a08343959223d336c0710995001ff8361a4046d5bb165abb2922e92675050ba0";
 if (layoutSha256 !== expectedLayoutSha256) {
   throw new Error(
     `layout corruption: expected SHA-256 ${expectedLayoutSha256}, got ${layoutSha256}`
@@ -27,7 +27,7 @@ if (layout.formatVersion !== 14) {
 }
 
 export const D3DMETAL_PSO_CACHE_PATCHED_PAYLOAD_SHA256 =
-  "d6e6c7c0bbf67f40e5e70d376b85387034001f1176c360838bc93bfec2c6430f";
+  "2a7b3f2cc60c75038ccb575c06a32811e3ba03de5968bc4961baeaebdc2e6f8b";
 
 const LC_SEGMENT_64 = 0x19;
 const LC_UUID = 0x1b;

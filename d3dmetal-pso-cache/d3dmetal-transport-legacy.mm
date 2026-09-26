@@ -405,21 +405,17 @@ bool record(NativeCommandList& commandList, const RecordRequest& request) noexce
     }
 }
 
-bool isRecordedCommand(const void* command) noexcept {
-    if (!command || loadAt<std::uint64_t>(command) != kNativeHeader) return false;
+ReplayResult replay(void* d3dmCommandEncoder, const void* command) noexcept {
+    if (!command || loadAt<std::uint64_t>(command) != kNativeHeader)
+        return ReplayResult::NotRecorded;
     const RecordedCommand value = loadAt<RecordedCommand>(command);
     if (value.magic != kMagic || !value.owner)
-        return false;
+        return ReplayResult::NotRecorded;
     const auto ownerBits = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(value.owner));
-    if (value.cookie != (kCookie ^ ownerBits)) return false;
+    if (value.cookie != (kCookie ^ ownerBits)) return ReplayResult::NotRecorded;
     for (std::uint8_t byte : value.reserved)
-        if (byte != 0) return false;
-    return true;
-}
-
-bool replay(void* d3dmCommandEncoder, const void* command) noexcept {
-    if (!d3dmCommandEncoder || !isRecordedCommand(command) || !ensureInitialized()) return false;
-    const RecordedCommand value = loadAt<RecordedCommand>(command);
+        if (byte != 0) return ReplayResult::NotRecorded;
+    if (!d3dmCommandEncoder || !ensureInitialized()) return ReplayResult::Failed;
     auto* owner = static_cast<LegacyOwner*>(value.owner);
     const std::uint8_t* image = gRuntime.image;
 
@@ -439,7 +435,7 @@ bool replay(void* d3dmCommandEncoder, const void* command) noexcept {
         const_cast<std::uint8_t*>(image) + kGetBlitEncoder);
     void* waitSelector = loadAt<void*>(image + kWaitForFenceSelector);
     void* updateSelector = loadAt<void*>(image + kUpdateFenceSelector);
-    if (!waitSelector || !updateSelector) return false;
+    if (!waitSelector || !updateSelector) return ReplayResult::Failed;
 
     bool encoded = false;
     @try {
@@ -449,18 +445,18 @@ bool replay(void* d3dmCommandEncoder, const void* command) noexcept {
         insertSync(d3dmCommandEncoder);
         flushEncoders(d3dmCommandEncoder, 0xfu);
         void* fence = getFence(d3dmCommandEncoder);
-        if (!fence) return false;
+        if (!fence) return ReplayResult::Failed;
 
         // Native legacy TemporalScale publishes all prior D3D work through a
         // blit encoder to the scaler fence before its direct MetalFX encode.
         void* preScaleBlit = getBlit(d3dmCommandEncoder, nullptr, 0);
-        if (!preScaleBlit) return false;
+        if (!preScaleBlit) return ReplayResult::Failed;
         using FenceMessage = void (*)(void*, void*, void*);
         reinterpret_cast<FenceMessage>(objc_msgSend)(preScaleBlit, updateSelector, fence);
         flushEncoders(d3dmCommandEncoder, 4u);
 
         void* commandBuffer = getExternalCommandBuffer(d3dmCommandEncoder);
-        if (!commandBuffer) return false;
+        if (!commandBuffer) return ReplayResult::Failed;
 
         encoded = owner->state.encode(const_cast<void*>(command), commandBuffer, fence);
 
@@ -468,12 +464,12 @@ bool replay(void* d3dmCommandEncoder, const void* command) noexcept {
         // then wait on the same fence the scaler was given. This is the exact
         // post-MetalFX handoff used by native EncodeTemporallyScaleMTLFX.
         void* postScaleBlit = getBlit(d3dmCommandEncoder, nullptr, 0);
-        if (!postScaleBlit) return false;
+        if (!postScaleBlit) return ReplayResult::Failed;
         reinterpret_cast<FenceMessage>(objc_msgSend)(postScaleBlit, waitSelector, fence);
         insertSync(d3dmCommandEncoder);
-        return encoded;
+        return encoded ? ReplayResult::Succeeded : ReplayResult::Failed;
     } @catch (id) {
-        return false;
+        return ReplayResult::Failed;
     }
 }
 

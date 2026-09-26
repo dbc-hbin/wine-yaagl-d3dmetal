@@ -3415,7 +3415,6 @@ static void dump_get_inproc_sync_fd_reply( const struct get_inproc_sync_fd_reply
     fprintf( stderr, " type=%d", req->type );
     fprintf( stderr, ", access=%08x", req->access );
     fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
-    dump_uint64( ", export_id=", &req->export_id );
 }
 
 static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_request *req )
@@ -3539,12 +3538,6 @@ static void dump_alpc_create_port_request( const struct alpc_create_port_request
 static void dump_alpc_create_port_reply( const struct alpc_create_port_reply *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
-}
-
-static void dump_close_inproc_sync_export_request( const struct close_inproc_sync_export_request *req )
-{
-    fprintf( stderr, " shm_idx=%08x", req->shm_idx );
-    dump_uint64( ", export_id=", &req->export_id );
 }
 
 typedef void (*dump_func)( const void *req );
@@ -3859,7 +3852,6 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_request,
     (dump_func)dump_d3dkmt_mutex_release_request,
     (dump_func)dump_alpc_create_port_request,
-    (dump_func)dump_close_inproc_sync_export_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4172,7 +4164,6 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_reply,
     NULL,
     (dump_func)dump_alpc_create_port_reply,
-    NULL,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4485,7 +4476,6 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "d3dkmt_mutex_acquire",
     "d3dkmt_mutex_release",
     "alpc_create_port",
-    "close_inproc_sync_export",
 };
 
 static const struct

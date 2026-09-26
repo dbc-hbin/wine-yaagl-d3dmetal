@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
-"""Compile the production MSync Mach message pump and close sender and exercise
-the server-only close discriminator and registration/signal dispatch paths.
+"""Compile the production MSync Mach message pump together with the production
+client close sender and exercise the public header-only close and the
+size-qualified dispatch that serves it.
 
 The generated C harness links the VERBATIM production bodies from
-server/msync.c (message pump, close sender, registration/unregister, signal,
-reference bookkeeping) against native Mach headers.  Only the kernel
-send/receive boundary and the shared-memory/tid-map supplies are scripted,
-so every assertion below observes real consumer effects: reference counts,
-free-list state, wait-list linkage, wait-state publication and wakeups.
+server/msync.c (message pump, internal reference-retirement sender,
+registration, unregister, signal and reference bookkeeping) and the client
+close sender from dlls/ntdll/unix/msync.c against native Mach headers.  Only
+the kernel send/receive boundary and the shared-memory/tid-map supplies are
+scripted, so every assertion below observes real consumer effects: reference
+counts, free-list state, wait-list linkage, wait-state publication and wakeups.
+
+Close and signal share one public header-only message: the low 28 bits of
+msgh_id are the shared index and bit 28 (MSYNC_SHM_CLOSE_FLAG) selects close
+over signal, so only a message whose msgh_size is exactly
+sizeof(mach_msg_header_t) may be dispatched that way.  A larger message
+carrying the same bits is a wait message, which is what keeps a high thread id
+(id >= 1 << 20 sets bit 28) from being read as a close.  There is no cookie, no
+dedicated close message id and no owned export.
 
 No Wine install, no wineserver, no game, no sleeps.
 """
@@ -21,16 +31,28 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SERVER_SOURCE = (ROOT / "server" / "msync.c").read_text()
+CLIENT_SOURCE = (ROOT / "dlls" / "ntdll" / "unix" / "msync.c").read_text()
 
 
-def section(start, end):
-    begin = SERVER_SOURCE.index(start)
-    return SERVER_SOURCE[begin:SERVER_SOURCE.index(end, begin)]
+def section(text, start, end):
+    begin = text.index(start)
+    return text[begin:text.index(end, begin)]
 
 
 # Verbatim production bodies: wire constants/ids, message structs, wait-state
-# bookkeeping, signal/close internals, close sender and the message pump.
-CORE = section("#define UL_COMPARE_AND_WAIT_SHARED", "\nint do_msync(void)")
+# bookkeeping, signal/close internals, the internal retirement sender and the
+# message pump.
+CORE = section(SERVER_SOURCE, "#define UL_COMPARE_AND_WAIT_SHARED", "\nint do_msync(void)")
+
+# Verbatim production client sender of the public header-only close.  Wine
+# logging collapses to nothing and the harness supplies the server port name.
+CLIENT_BRIDGE = r'''
+#define TRACE(...) do { } while (0)
+#define ERR(...) do { } while (0)
+static mach_port_name_t server_port;
+'''
+
+CLIENT_CLOSE = section(CLIENT_SOURCE, "void msync_close( int obj )", "void msync_init(void)")
 
 PROLOGUE = r'''
 #include <assert.h>
@@ -62,12 +84,9 @@ PROLOGUE = r'''
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define max(a, b) ((a) > (b) ? (a) : (b))
 
-/* Kernel boundary capture.  real_mach_msg is bound before the rename so the
- * harness can forward to the real Mach kernel when a case asks for it. */
-static mach_msg_return_t (*real_mach_msg)(mach_msg_header_t *, mach_msg_option_t, mach_msg_size_t,
-                                          mach_msg_size_t, mach_port_name_t, mach_msg_timeout_t,
-                                          mach_port_name_t) = mach_msg;
-
+/* Kernel boundary capture: mach_msg is renamed so every send performed by the
+ * production bodies lands in the harness recorder and every receive is
+ * answered from the queued wire script. */
 static mach_msg_return_t harness_mach_msg( mach_msg_header_t *msg, mach_msg_option_t option,
     mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_name_t rcv_name,
     mach_msg_timeout_t timeout, mach_port_name_t notify );
@@ -80,39 +99,49 @@ static mach_msg_return_t harness_mach_msg( mach_msg_header_t *msg, mach_msg_opti
 #define MAX_SCRIPT 16
 struct wire_op
 {
-    int real_rcv;
     mach_msg_size_t len;
     unsigned char bytes[MAX_WIRE];
 };
-static struct wire_op script[MAX_SCRIPT], sent[32], captured;
+static struct wire_op script[MAX_SCRIPT], sent[32];
 static int script_len, script_pos, sent_len;
-static int forward_sends;
 '''
 
 EPILOGUE = r'''
-#define FAKE_SHM_SLOTS 256
-static struct msync_shm fake_shm[FAKE_SHM_SLOTS];
+/* The recorded shared-object supply spans the whole 28-bit index space, so a
+ * close of a high index resolves without touching more than a page. */
+#define FAKE_SHM_BYTES ((size_t)MSYNC_SHM_INDEX_COUNT * sizeof(struct msync_shm))
+static struct msync_shm *fake_shm;
 static unsigned int shm_access[512];
 static int shm_access_len;
-static int *wake_addr[512];
+static int *wake_addr[128];
 static int wake_len;
 
 static void *get_shm( unsigned int idx )
 {
-    /* The only index supplier the production paths touch: bounds-checked, and
-     * every resolution is recorded so "nothing was released" is observable. */
+    /* The only index supplier the production paths touch.  Every resolution is
+     * recorded, so "nothing was released" and "only the named index was
+     * touched" are observable. */
     (void)next_unused_shm_idx;
-    assert(idx < FAKE_SHM_SLOTS);
+    assert(idx < MSYNC_SHM_INDEX_COUNT);
     assert(shm_access_len < (int)ARRAY_SIZE(shm_access));
     shm_access[shm_access_len++] = idx;
     return &fake_shm[idx];
+}
+
+static int resolved_index( unsigned int idx )
+{
+    int i;
+
+    for (i = 0; i < shm_access_len; i++)
+        if (shm_access[i] == idx) return 1;
+    return 0;
 }
 
 int harness_ulock_wake( uint32_t operation, void *addr, uint64_t wake_value )
 {
     (void)operation;
     (void)wake_value;
-    /* A wakeup must target the shared wait-state slot of some tid. */
+    /* Wait-state publication wakes the shared slot of the tid it published. */
     assert(shm_tid_map);
     assert((int *)addr >= shm_tid_map && (int *)addr < shm_tid_map + (1u << 24));
     assert(wake_len < (int)ARRAY_SIZE(wake_addr));
@@ -130,14 +159,12 @@ static mach_msg_return_t harness_mach_msg( mach_msg_header_t *msg, mach_msg_opti
 
         if (script_pos == script_len) pthread_exit( NULL ); /* script drained */
         op = &script[script_pos++];
-        if (op->real_rcv)
-            return real_mach_msg( msg, option, send_size, rcv_size, rcv_name, timeout, notify );
         assert(rcv_name == receive_port);
         if (op->len > rcv_size) return MACH_RCV_TOO_LARGE;
         /* Emulate the kernel receive boundary: copy the wire bytes, relocate
-         * the ports (reply port lands remote, receiving port lands local) and
-         * append the trailer.  Stale bytes beyond the wire size survive, as
-         * with the real kernel. */
+         * the ports (a client's reply port lands remote, the receiving port
+         * lands local) and append the trailer.  Stale bytes beyond the wire
+         * size survive, as with the real kernel. */
         memcpy( msg, op->bytes, op->len );
         msg->msgh_remote_port = ((mach_msg_header_t *)op->bytes)->msgh_local_port;
         msg->msgh_local_port = rcv_name;
@@ -150,13 +177,12 @@ static mach_msg_return_t harness_mach_msg( mach_msg_header_t *msg, mach_msg_opti
     }
 
     assert(option & MACH_SEND_MSG);
+    assert(msg->msgh_remote_port == receive_port); /* clients send to the public port */
     assert(send_size <= MAX_WIRE);
     assert(sent_len < (int)ARRAY_SIZE(sent));
     sent[sent_len].len = send_size;
     memcpy( sent[sent_len].bytes, msg, send_size );
     sent_len++;
-    if (forward_sends)
-        return real_mach_msg( msg, option, send_size, rcv_size, rcv_name, timeout, notify );
     return MACH_MSG_SUCCESS;
 }
 
@@ -174,24 +200,27 @@ static mach_port_t make_receive_port(void)
 
 static void setup_tid_map(void)
 {
-    size_t table_size = (size_t)MSYNC_SHM_INDEX_COUNT * sizeof(*wait_lists);
+    size_t wait_table_size = (size_t)MSYNC_SHM_INDEX_COUNT * sizeof(*wait_lists);
 
     shm_tid_map = calloc( 1u << 24, sizeof(int) );
     assert(shm_tid_map);
-    close_cookie = 0x8899aabbccddeeffull;
     receive_port = make_receive_port();
-    /* Sparse virtual table covering every 28-bit index, so even the huge
-     * fallthrough index of the reserved close id resolves to a wait list
-     * without touching more than a page of memory. */
-    wait_lists = mmap( NULL, table_size, PROT_READ | PROT_WRITE,
+    server_port = receive_port;
+    /* Sparse virtual tables covering every 28-bit index, so even the huge
+     * fallthrough index of a rejected close resolves to a wait list without
+     * touching more than a page of memory. */
+    wait_lists = mmap( NULL, wait_table_size, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0 );
     assert(wait_lists != MAP_FAILED);
     wait_lists_size = MSYNC_SHM_INDEX_COUNT;
+    fake_shm = mmap( NULL, FAKE_SHM_BYTES, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0 );
+    assert(fake_shm != MAP_FAILED);
 }
 
 static void prime_slot( unsigned int idx, unsigned int refs )
 {
-    assert(idx < FAKE_SHM_SLOTS);
+    assert(idx < MSYNC_SHM_INDEX_COUNT);
     fake_shm[idx].refcount = refs;
     fake_shm[idx].msync_type = 3;
     fake_shm[idx].low = 0;
@@ -201,17 +230,8 @@ static void prime_slot( unsigned int idx, unsigned int refs )
 static void queue_wire( const void *bytes, mach_msg_size_t len )
 {
     assert(script_len < MAX_SCRIPT && len <= MAX_WIRE);
-    script[script_len].real_rcv = 0;
     script[script_len].len = len;
     memcpy( script[script_len].bytes, bytes, len );
-    script_len++;
-}
-
-static void queue_real_rcv(void)
-{
-    assert(script_len < MAX_SCRIPT);
-    script[script_len].real_rcv = 1;
-    script[script_len].len = 0;
     script_len++;
 }
 
@@ -226,28 +246,38 @@ static void run_pump(void)
     script_len = 0;
 }
 
-static void capture_destroy( unsigned int shm_idx )
+/* The internal retirement sender: the server retires its own reference when an
+ * msync object is destroyed. */
+static struct wire_op capture_destroy( unsigned int shm_idx )
 {
+    struct wire_op op;
     int before = sent_len;
 
     assert(destroy_all( shm_idx ) == MACH_MSG_SUCCESS);
     assert(sent_len == before + 1);
-    captured = sent[sent_len - 1];
+    op = sent[sent_len - 1];
+    return op;
 }
 
-static void kernel_send( const struct wire_op *op )
+/* The public close sender from dlls/ntdll/unix/msync.c. */
+static struct wire_op capture_client_close( int obj )
 {
-    unsigned char buf[MAX_WIRE];
+    struct wire_op op;
+    int before = sent_len;
 
-    memcpy( buf, op->bytes, op->len );
-    assert(real_mach_msg( (mach_msg_header_t *)buf, MACH_SEND_MSG, op->len, 0,
-                          MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL ) == MACH_MSG_SUCCESS);
+    msync_close( obj );
+    assert(sent_len == before + 1);
+    op = sent[sent_len - 1];
+    return op;
 }
 
-static void poke_field( struct wire_op *op, size_t offset, const void *value, size_t size )
+static unsigned int message_id_of( const struct wire_op *op )
 {
-    assert(offset + size <= op->len);
-    memcpy( op->bytes + offset, value, size );
+    unsigned int id;
+
+    assert(op->len >= offsetof(mach_msg_header_t, msgh_id) + sizeof(id));
+    memcpy( &id, op->bytes + offsetof(mach_msg_header_t, msgh_id), sizeof(id) );
+    return id;
 }
 
 /* Wire fixtures for registration/unregister/signal mirror the client format of
@@ -285,27 +315,10 @@ static void queue_signal( unsigned int shm_idx )
     mach_msg_header_t header = {0};
 
     header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
-    header.msgh_id = shm_idx;
+    header.msgh_id = shm_idx; /* header-only without the close flag */
     header.msgh_size = sizeof(header);
     header.msgh_remote_port = 1;
     queue_wire( &header, header.msgh_size );
-}
-
-static struct wire_op queue_close_variant( const struct wire_op *base, mach_msg_size_t len,
-                                           const void *cookie, const void *shm_idx )
-{
-    struct wire_op op = *base;
-    mach_msg_size_t wire_size = len;
-
-    op.len = len;
-    if (len > base->len) memset( op.bytes + base->len, 0xa5, len - base->len );
-    /* The kernel reports the true wire size in msgh_size; a crafted short or
-     * long close must present its malformed size for the pump to reject. */
-    poke_field( &op, offsetof(mach_msg_header_t, msgh_size ), &wire_size, sizeof(wire_size) );
-    if (cookie) poke_field( &op, offsetof(mach_close_message_t, cookie), cookie, sizeof(uint64_t) );
-    if (shm_idx) poke_field( &op, offsetof(mach_close_message_t, shm_idx), shm_idx, sizeof(unsigned int) );
-    queue_wire( op.bytes, op.len );
-    return op;
 }
 
 static int last_wake_is( unsigned int tid )
@@ -322,9 +335,8 @@ static int wakes_include( unsigned int tid )
     return 0;
 }
 
-/* A planted wait node makes "did anything dispatch?" observable without
- * touching the shared memory supply: a spurious signal completes it (state
- * flips to WOKEN plus a wake), a spurious release never does. */
+/* A planted wait node makes "did this message touch wait state?" observable
+ * without a requester: only a signal or a wait dispatch completes it. */
 static struct wait_registration *plant_waiter( unsigned int shm_idx, unsigned int tid,
                                                unsigned int token )
 {
@@ -351,35 +363,6 @@ static void expect_waiter_untouched( struct wait_registration *registration,
     assert(registration->node_count == 1 && registration->nodes[0].shm_idx == shm_idx);
     assert((unsigned int)shm_tid_map[tid] == wait_token_with_state( token, MSYNC_WAIT_ARMED ));
     assert(!wakes_include( tid ));
-}
-
-/* Bytes 24..27 of a close message overlay register shm_idx[0]; a close that
- * falls through into the registration dispatch publishes state for tid
- * 0x7fffff (MSYNC_CLOSE_MESSAGE_ID >> 8) starting from that word. */
-static unsigned int close_token_word( const struct wire_op *op )
-{
-    unsigned int word;
-
-    assert(op->len >= offsetof(mach_close_message_t, cookie) + sizeof(word));
-    memcpy( &word, op->bytes + offsetof(mach_close_message_t, cookie), sizeof(word) );
-    return word;
-}
-
-#define FALLTHROUGH_TID ((unsigned int)MSYNC_CLOSE_MESSAGE_ID >> 8)
-#define FALLTHROUGH_IDX ((unsigned int)MSYNC_CLOSE_MESSAGE_ID & MSYNC_SHM_INDEX_MASK)
-
-/* Publish the state a fallthrough close would CAS from (register/unregister
- * decode of the close id uses the cookie word as the token) so any stray
- * dispatch is observable as a state change. */
-static void preset_fallthrough_state( const struct wire_op *close )
-{
-    shm_tid_map[FALLTHROUGH_TID] = (int)close_token_word( close );
-}
-
-static void expect_fallthrough_untouched( const struct wire_op *close )
-{
-    assert((unsigned int)shm_tid_map[FALLTHROUGH_TID] == close_token_word( close ));
-    assert(!find_registration( FALLTHROUGH_TID ));
 }
 
 static void expect_registered( unsigned int tid, unsigned int count, unsigned int token,
@@ -425,7 +408,7 @@ static void case_register_count1(void)
 {
     setup_tid_map();
     run_single_register_case( 42, 2 );        /* low tid */
-    run_single_register_case( 1u << 20, 3 );  /* bit-20 tid */
+    run_single_register_case( 1u << 20, 3 );  /* bit-20 tid sets bit 28 of the id */
     puts("ok register_count1");
 }
 
@@ -439,7 +422,10 @@ static void case_high_tid_32byte(void)
     shm_tid_map[0xffffffu] = token;
     queue_register( 0xffffffu, 1, token, idxs );
     assert(script[0].len == 32); /* exactly header + token + index */
+    assert(message_id_of( &script[0] ) & MSYNC_SHM_CLOSE_FLAG); /* close flag bit is set */
     run_pump();
+    /* Size decides the branch: the close flag bit alone must not retire an
+     * index, so this stays a registration. */
     expect_registered( 0xffffffu, 1, token, 4 );
     assert(fake_shm[4].refcount == 2); /* a register must never release */
     assert(free_shm_idx == UINT32_MAX);
@@ -541,24 +527,68 @@ static void case_signal_header_only(void)
     puts("ok signal_header_only");
 }
 
-static void case_close_authorized(void)
+static void case_client_close_header_only(void)
 {
+    const unsigned int close_idx = MSYNC_SHM_INDEX_MASK & ~0xfu; /* 0x0ffffff0 */
+    const unsigned int neighbour = close_idx + 1;
+    unsigned int token = make_token( 0x60 );
+    struct wait_registration *waiter;
+    struct wire_op close;
+
+    setup_tid_map();
+    prime_slot( close_idx, 2 );
+    prime_slot( neighbour, 2 );
+    /* A planted waiter on the closed index: retiring a reference must never
+     * complete or wake a wait. */
+    waiter = plant_waiter( close_idx, 50, token );
+
+    close = capture_client_close( close_idx );
+    assert(close.len == sizeof(mach_msg_header_t)); /* public header-only close */
+
+    queue_wire( close.bytes, close.len );
+    run_pump();
+    assert(fake_shm[close_idx].refcount == 1); /* exactly one reference released */
+    assert(fake_shm[neighbour].refcount == 2); /* and only for the named index */
+    assert(free_shm_idx == UINT32_MAX);        /* still referenced, not recycled */
+    assert(shm_access_len == 1 && shm_access[0] == close_idx);
+    assert(wake_len == 0);                     /* a close never mutates wait state */
+    expect_waiter_untouched( waiter, close_idx, 50, token );
+    assert(!find_registration( message_id_of( &close ) >> 8 )); /* not a wait message */
+
+    close = capture_client_close( close_idx );
+    queue_wire( close.bytes, close.len );
+    run_pump();
+    assert(fake_shm[close_idx].refcount == 0 && fake_shm[neighbour].refcount == 2);
+    assert(fake_shm[close_idx].msync_type == 0);
+    assert(free_shm_idx == close_idx && fake_shm[close_idx].low == -1); /* recycled once */
+    assert(shm_access_len == 2 && shm_access[1] == close_idx);
+    assert(wake_len == 0);
+    puts("ok client_close_header_only");
+}
+
+static void case_server_retire_close(void)
+{
+    unsigned int token = make_token( 0x61 );
+    struct wait_registration *waiter;
     struct wire_op close;
 
     setup_tid_map();
     prime_slot( 3, 2 );
     prime_slot( 4, 2 );
-    capture_destroy( 3 );
-    close = captured;
+    waiter = plant_waiter( 4, 51, token );
+
+    close = capture_destroy( 3 );
+    assert(close.len == sizeof(mach_msg_header_t)); /* same public header-only close */
 
     queue_wire( close.bytes, close.len );
     run_pump();
     assert(fake_shm[3].refcount == 1); /* exactly one reference released */
     assert(fake_shm[4].refcount == 2); /* and only for the named index */
-    assert(fake_shm[3].multiple_waiters == 0);
-    assert(free_shm_idx == UINT32_MAX); /* still referenced, not recycled */
+    assert(free_shm_idx == UINT32_MAX);
     assert(shm_access_len == 1 && shm_access[0] == 3);
-    assert(wake_len == 0); /* a close never mutates wait state */
+    assert(wake_len == 0);
+    expect_waiter_untouched( waiter, 4, 51, token );
+    assert(!find_registration( message_id_of( &close ) >> 8 ));
 
     queue_wire( close.bytes, close.len );
     run_pump();
@@ -567,126 +597,41 @@ static void case_close_authorized(void)
     assert(free_shm_idx == 3 && fake_shm[3].low == -1); /* recycled exactly once */
     assert(shm_access_len == 2 && shm_access[1] == 3);
     assert(wake_len == 0);
-    puts("ok close_authorized");
+    puts("ok server_retire_close");
 }
 
-static void case_close_real_port(void)
+static void case_close_size_qualified(void)
 {
-    struct wire_op forged;
+    /* Bit 28 of msgh_id selects close over signal, but only for a message whose
+     * size is exactly a header.  A 32-byte message carrying the same bits is a
+     * one-object wait registration for the thread encoded above the flag. */
+    const unsigned int close_idx = (MSYNC_SHM_INDEX_MASK & ~0xffu) | 1u; /* low byte 1 */
+    const unsigned int waited_idx = 5;
+    unsigned int id = (close_idx & MSYNC_SHM_INDEX_MASK) | MSYNC_SHM_CLOSE_FLAG;
+    unsigned int tid = id >> 8;
+    unsigned int token = make_token( 0x77 );
+    mach_register_message_t message = {{0}};
 
     setup_tid_map();
-    prime_slot( 5, 2 );
-    prime_slot( 6, 2 );
-    capture_destroy( 5 ); /* production sender wire bytes */
-    forged = captured;
-    {
-        uint64_t bad_cookie = close_cookie ^ 1;
-        unsigned int bad_idx = 6;
+    prime_slot( close_idx, 2 );
+    prime_slot( waited_idx, 1 );
+    shm_tid_map[tid] = token;
 
-        poke_field( &forged, offsetof(mach_close_message_t, cookie), &bad_cookie, sizeof(bad_cookie) );
-        poke_field( &forged, offsetof(mach_close_message_t, shm_idx), &bad_idx, sizeof(bad_idx) );
-    }
-    kernel_send( &forged ); /* forged close over the real Mach port */
-    forward_sends = 1;
-    assert(destroy_all( 5 ) == MACH_MSG_SUCCESS); /* production sender, real send */
-    queue_real_rcv();
-    queue_real_rcv();
+    message.header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
+    message.header.msgh_id = id;
+    message.header.msgh_size = sizeof(mach_msg_header_t) + 2 * sizeof(unsigned int);
+    message.header.msgh_remote_port = 1;
+    message.shm_idx[0] = token;
+    message.shm_idx[1] = waited_idx;
+    queue_wire( &message, message.header.msgh_size );
     run_pump();
-    assert(fake_shm[5].refcount == 1); /* authorized close released once */
-    assert(fake_shm[6].refcount == 2); /* forged close discarded */
-    assert(wake_len == 0);
-    puts("ok close_real_port");
-}
 
-static void case_close_bad_cookie(void)
-{
-    uint64_t zero = 0, wrong = 0x00000000ull << 32 | 0xdeadbeefu;
-    unsigned int idx8 = 8;
-    struct wait_registration *waiter, *fallthrough_waiter;
-    struct wire_op variant;
-
-    setup_tid_map();
-    prime_slot( 7, 2 );
-    prime_slot( 8, 2 );
-    capture_destroy( 7 );
-    waiter = plant_waiter( 8, 50, make_token( 0x60 ) );
-    fallthrough_waiter = plant_waiter( FALLTHROUGH_IDX, 60, make_token( 0x62 ) );
-
-    variant = queue_close_variant( &captured, captured.len, &zero, &idx8 ); /* zero cookie */
-    preset_fallthrough_state( &variant );
-    run_pump();
-    assert(fake_shm[7].refcount == 2 && fake_shm[8].refcount == 2);
-    assert(shm_access_len == 0); /* no slot was even resolved */
-    expect_waiter_untouched( waiter, 8, 50, make_token( 0x60 ) );
-    expect_waiter_untouched( fallthrough_waiter, FALLTHROUGH_IDX, 60, make_token( 0x62 ) );
-    expect_fallthrough_untouched( &variant );
-
-    variant = queue_close_variant( &captured, captured.len, &wrong, &idx8 ); /* unknown cookie */
-    preset_fallthrough_state( &variant );
-    run_pump();
-    assert(fake_shm[7].refcount == 2 && fake_shm[8].refcount == 2);
-    assert(fake_shm[8].multiple_waiters == 0); /* planted waiter needs no shm ref */
+    assert(fake_shm[close_idx].refcount == 2); /* no reference released */
+    assert(fake_shm[close_idx].multiple_waiters == 0);
     assert(free_shm_idx == UINT32_MAX);
-    assert(shm_access_len == 0); /* no slot was even resolved */
-    expect_waiter_untouched( waiter, 8, 50, make_token( 0x60 ) );
-    expect_waiter_untouched( fallthrough_waiter, FALLTHROUGH_IDX, 60, make_token( 0x62 ) );
-    expect_fallthrough_untouched( &variant );
-    assert(wake_len == 0);
-    puts("ok close_bad_cookie");
-}
-
-static void case_close_bad_size(void)
-{
-    struct wire_op wire;
-    struct wait_registration *waiter, *fallthrough_waiter;
-
-    setup_tid_map();
-    prime_slot( 9, 2 );
-    prime_slot( 10, 2 );
-    capture_destroy( 10 );
-    wire = captured;
-    assert(wire.len == sizeof(mach_close_message_t));
-    waiter = plant_waiter( 9, 50, make_token( 0x61 ) );
-    fallthrough_waiter = plant_waiter( FALLTHROUGH_IDX, 60, make_token( 0x63 ) );
-    preset_fallthrough_state( &wire );
-
-    queue_wire( wire.bytes, wire.len );           /* valid: releases 10 once */
-    queue_close_variant( &wire, wire.len - sizeof(uint32_t), NULL, NULL ); /* truncated */
-    queue_close_variant( &wire, wire.len + sizeof(uint32_t), NULL, NULL ); /* oversized */
-    queue_close_variant( &wire, sizeof(mach_msg_header_t), NULL, NULL ); /* header-only close id */
-    run_pump();
-    assert(fake_shm[10].refcount == 1); /* only the well-formed close landed */
-    assert(fake_shm[9].refcount == 2 && fake_shm[9].multiple_waiters == 0);
-    assert(free_shm_idx == UINT32_MAX);
-    assert(shm_access_len == 1 && shm_access[0] == 10);
-    expect_waiter_untouched( waiter, 9, 50, make_token( 0x61 ) );
-    expect_waiter_untouched( fallthrough_waiter, FALLTHROUGH_IDX, 60, make_token( 0x63 ) );
-    expect_fallthrough_untouched( &wire );
-    assert(wake_len == 0); /* the 24-byte variant must not signal either */
-    puts("ok close_bad_size");
-}
-
-static void case_close_bad_index(void)
-{
-    unsigned int past_mask = MSYNC_SHM_INDEX_MASK + 1;
-    unsigned int all_ones = ~0u;
-    struct wait_registration *fallthrough_waiter;
-
-    setup_tid_map();
-    prime_slot( 11, 2 );
-    capture_destroy( 11 );
-    fallthrough_waiter = plant_waiter( FALLTHROUGH_IDX, 60, make_token( 0x64 ) );
-    preset_fallthrough_state( &captured );
-    queue_close_variant( &captured, captured.len, NULL, &past_mask );
-    queue_close_variant( &captured, captured.len, NULL, &all_ones );
-    run_pump();
-    assert(fake_shm[11].refcount == 2);
-    assert(free_shm_idx == UINT32_MAX);
-    assert(shm_access_len == 0); /* out-of-range index must not resolve a slot */
-    expect_waiter_untouched( fallthrough_waiter, FALLTHROUGH_IDX, 60, make_token( 0x64 ) );
-    expect_fallthrough_untouched( &captured );
-    assert(wake_len == 0);
-    puts("ok close_bad_index");
+    assert(!resolved_index( close_idx ));     /* the index was never even resolved */
+    expect_registered( tid, 1, token, waited_idx );
+    puts("ok close_size_qualified");
 }
 
 int main(int argc, char **argv)
@@ -697,17 +642,15 @@ int main(int argc, char **argv)
     else if (!strcmp( argv[1], "register_count65" )) case_register_count65();
     else if (!strcmp( argv[1], "unregister_same_id" )) case_unregister_same_id();
     else if (!strcmp( argv[1], "signal_header_only" )) case_signal_header_only();
-    else if (!strcmp( argv[1], "close_authorized" )) case_close_authorized();
-    else if (!strcmp( argv[1], "close_real_port" )) case_close_real_port();
-    else if (!strcmp( argv[1], "close_bad_cookie" )) case_close_bad_cookie();
-    else if (!strcmp( argv[1], "close_bad_size" )) case_close_bad_size();
-    else if (!strcmp( argv[1], "close_bad_index" )) case_close_bad_index();
+    else if (!strcmp( argv[1], "client_close_header_only" )) case_client_close_header_only();
+    else if (!strcmp( argv[1], "server_retire_close" )) case_server_retire_close();
+    else if (!strcmp( argv[1], "close_size_qualified" )) case_close_size_qualified();
     else return 2;
     return 0;
 }
 '''
 
-HARNESS = PROLOGUE + CORE + EPILOGUE
+HARNESS = PROLOGUE + CORE + CLIENT_BRIDGE + CLIENT_CLOSE + EPILOGUE
 
 
 class MSyncMessageDispatchTests(unittest.TestCase):
@@ -750,20 +693,14 @@ class MSyncMessageDispatchTests(unittest.TestCase):
     def test_signal_header_only_stays_signal(self):
         self.run_case("signal_header_only")
 
-    def test_authorized_close_releases_correct_index_once(self):
-        self.run_case("close_authorized")
+    def test_client_header_only_close_releases_named_index_once(self):
+        self.run_case("client_close_header_only")
 
-    def test_close_over_real_mach_port(self):
-        self.run_case("close_real_port")
+    def test_internal_retire_close_releases_named_index_once(self):
+        self.run_case("server_retire_close")
 
-    def test_bad_cookie_close_is_discarded(self):
-        self.run_case("close_bad_cookie")
-
-    def test_bad_size_close_is_discarded(self):
-        self.run_case("close_bad_size")
-
-    def test_bad_index_close_is_discarded(self):
-        self.run_case("close_bad_index")
+    def test_close_flag_requires_header_only_size(self):
+        self.run_case("close_size_qualified")
 
 
 if __name__ == "__main__":

@@ -2,40 +2,25 @@
 
 [English](README.md) | **한국어**
 
-Apple Silicon의 **Yaagl ZZZ OS**에서 **젠레스 존 제로(Zenless Zone Zero, ZZZ)**를 **Direct3D 12(Apple GPTK 4.0b2)**로 실행하기 위한 Wine 11.17 런타임 소스와 원클릭 GUI 설치 프로그램입니다.
+Apple Silicon에서 Yaagl ZZZ용 **Direct3D 12** 런타임을 만들기 위한 Wine 11.17 소스이며 Apple GPTK 4.0b2 D3DMetal을 기준으로 합니다.
 
-v1.1.0 공개 런타임은 그래픽 어댑터를 **AMD Radeon RX 9070**(`0x1002:0x7550`)으로 표시하고 게임의 FSR 업스케일링 API를 MetalFX로 번역합니다. DLSS 또는 NVIDIA NGX 번역 경로는 포함하지 않습니다. 설치 프로그램은 Yaagl Wine 메뉴에 **`Wine 11.17 ZZZ DX12 (GPTK4.0b2)`**를 등록합니다.
+이 브랜치는 의도적으로 **런타임/소스 전용**입니다. 기존 SwiftUI/CLI 독립 설치기와 Yaagl 리소스 등록 코드는 제거했고, Apple의 `D3DMetal.framework`도 더 이상 Git 트리에 넣지 않습니다.
 
 **요구 환경은 Apple Silicon의 macOS 26.0 이상과 Rosetta 2입니다.** 모든 Mac에서 temporal upscaling은 시스템 기본 MetalFX 모델을 사용하며 BBR 또는 비공개 모델 버전을 강제하지 않습니다.
 
-## 빠른 시작
+## D3DMetal 준비
 
-1. [ZZZWineDX12Installer.zip](https://github.com/dbc-hbin/zzz-wine-d3dmetal-dx12/releases/latest/download/ZZZWineDX12Installer.zip)을 다운로드합니다.
-2. 압축을 풀고 **`ZZZ Wine DX12 Installer.app`**을 실행합니다.
-3. Yaagl과 Wine 프로세스를 종료합니다. **`Yaagl Target`**에서 사용할 런처를 고른 뒤 **`Install Wine 11.17 ZZZ DX12`**를 선택합니다. 같은 런타임이 이미 선택돼 있으면 버튼이 **`Reinstall / Update Wine`**으로 표시됩니다.
-4. 선택한 Yaagl 런처를 실행하고 Wine 메뉴에서 **`Wine 11.17 ZZZ DX12 (GPTK4.0b2)`**를 선택합니다.
-
-설치 프로그램은 Yaagl 앱과 지원 디렉터리를 감지하고, 동봉 아카이브를 설치하고, 런타임을 등록하며, Yaagl 리소스·Wine 선택·이전 런타임 디렉터리를 백업합니다. 아카이브는 Yaagl의 로컬 런타임 저장소에 남아 오프라인에서도 선택할 수 있습니다. Node.js는 필요하지 않습니다.
-
-같은 이름의 런타임도 재설치할 수 있습니다. 이름이 같다는 이유로 현재 파일이라고 간주하지 않고 동봉 아카이브로 캐시와 런타임 디렉터리를 모두 교체합니다. 마지막 Wine 선택 활성화에 실패하면 최초 복원 백업을 소비하지 않고 이번 시도 직전의 런타임과 선택 상태로 되돌립니다. 여기서 “업데이트”는 실행한 설치 프로그램에 포함된 빌드로 교체한다는 뜻이며 온라인 업데이트 확인 기능이 아닙니다.
-
-현재 설치기 소스에는 아직 기존 배포 ZIP에 포함되지 않은 DX12 마이그레이션이 있습니다. 구버전의 강제 DX12 실행 규칙이 확인되고, 같은 대상 D3DMetal 런타임이 선택돼 DX12를 지원하며, 저장된 DX12 설정이 없을 때만 ON을 저장해 v1.0.5의 실효 기본값을 보존합니다. 저장된 OFF는 덮어쓰지 않습니다. 새 런처와 이미 설정 기반인 런처는 기존 설정을 따르며, v1.1.x의 불명확한 설정 이력을 값만 보고 추측하지 않습니다.
-
-### 터미널 설치
-
-대상 선택 메뉴는 **Yaagl ZZZ OS**, **Yaagl ZZZ OS DX12 Beta**(글로벌), **Yaagl ZZZ DX12 Beta**(중국)를 지원하며 [DX12 베타 릴리즈](https://github.com/dbc-hbin/yaagl-ZZZ-DX12/releases)에도 설치할 수 있습니다. 각 대상은 별도의 `~/Library/Application Support/<런처 이름>` 폴더를 사용하므로 베타에 설치해도 일반판의 Wine은 교체하지 않습니다. Yaagl을 처음 설치했다면 한 번 실행해 지원 폴더를 만든 뒤 종료하고 설치 프로그램을 사용하세요. 일반판이 설치돼 있으면 기본 선택하며, 없으면 설치된 베타를 감지합니다.
-
-CLI에서는 글로벌 베타에 `--app-path "/Applications/Yaagl ZZZ OS DX12 Beta.app"`, 중국 베타에 `--app-path "/Applications/Yaagl ZZZ DX12 Beta.app"`를 지정합니다. 알려진 앱 이름이면 대응하는 지원 폴더를 자동 선택하며, 사용자 지정 설치에서는 명시한 `--support-path`가 우선합니다.
+고정 입력은 [`dbc-hbin/d3dmetal-redistributable`](https://github.com/dbc-hbin/d3dmetal-redistributable)의 `gptk-4.0b2` 릴리스입니다. 릴리스의 `License.rtf`를 먼저 확인한 뒤 로컬 빌드 입력을 준비합니다.
 
 ```bash
-./installer/zzz-wine-installer --install \
-  --app-path "/Applications/Yaagl ZZZ OS.app" \
-  --support-path "$HOME/Library/Application Support/Yaagl ZZZ OS"
-
-./installer/zzz-wine-installer --restore \
-  --app-path "/Applications/Yaagl ZZZ OS.app" \
-  --support-path "$HOME/Library/Application Support/Yaagl ZZZ OS"
+node scripts/prepare-d3dmetal-runtime.mjs \
+  --accept-apple-license \
+  --output build/d3dmetal-gptk4.0b2
 ```
+
+준비 도구는 릴리스 ZIP, `SHA256SUMS`, `License.rtf`, `Acknowledgements.rtf`를 고정·검증한 뒤 Apple 원본 framework에서 PR용 그래픽 패치 계보를 한 번에 재현합니다. 순서는 FP64 codec 수정, FP64-only framework 재봉인, shader-stage lock 수정, 현재 native PSO/DXIL composite hook 적용입니다. 이후 `libYaaglNativePsoCache.dylib`을 넣고 두 nested dylib을 명시적으로 서명한 뒤 framework를 최종 재봉인하며 모든 중간·최종 식별자를 검증합니다. `--pso-module PATH`를 생략하면 현재 소스에서 sidecar를 빌드해 고정 raw hash와 일치해야 하며, Yaagl/패키징 빌드에서는 미리 빌드한 고정 sidecar를 넘길 수 있습니다. 결과 framework는 Git에서 무시되는 `build/` 아래에만 남으며 저장소에는 커밋하지 않습니다.
+
+Apple Game Porting Toolkit 라이선스는 Framework 전체의 비상업적 배포를 허용하지만, Section 2D는 Apple Software의 modification도 제한합니다. 따라서 FP64 patch는 명시적인 로컬 준비 단계로만 두며, 수정된 framework를 재배포하려면 Wine 코드 리뷰와 별도로 라이선스 판단이 필요합니다.
 
 ## v1.1.0 공개 런타임
 
@@ -72,6 +57,7 @@ CLI에서는 글로벌 베타에 `--app-path "/Applications/Yaagl ZZZ OS DX12 Be
 - sRGB, PQ, scRGB transfer는 정의된 luminance 변환을 보존하고 유한하지 않거나 잘못된 범위는 거부합니다. sharpening이 꺼져 있으면 `[0,1]` 범위의 유한한 sharpness가 남아 있어도 RCAS 없이 처리합니다. jitter phase query는 고정 SDK처럼 소수부를 버리고(1600→2000은 12), null dispatch descriptor는 `FFX_API_RETURN_ERROR_PARAMETER`를 반환합니다.
 - distortion field, AMD debug shader view와 tear/reset overlay, custom DX12 backend allocation callback, frame당 2개 이상의 generated output은 지원하지 않으며 오류를 반환합니다.
 - Metal4 compute parameter buffer는 encode 전에 residency에 포함합니다. configuration cache는 최대 8개이며 luminance·rectangle 원점 변경은 factory 재생성 없이 history를 reset하고, cache에서 제거된 configuration도 진행 중 작업이 완료될 때까지 보존합니다.
+- 임시 configuration 할당과 device/compiler 참조 획득 전에 캐시 적중을 판별합니다. 기존 key 비교와 최대 8개 제한은 유지하며, 실제 Metal4·legacy 검사에서 캐시 적중 시 C++ 할당은 0회였습니다.
 - swapchain에 알리는 Configure 호출은 앱 callback과 user context가 같으면 불변 binding을 재사용해 불필요한 present drain을 피합니다. 실제 callback 변경 시에는 native swapchain을 통해 이전 binding을 회수하며 일반 Configure 호출 중 처리 대기 중인 frame별 HUD-less snapshot을 보존합니다. 이는 pacing·수명 관리 수정이지 측정된 FPS나 화질 개선을 뜻하지 않습니다.
 
 ### 프레임 생성 검증 경계
@@ -101,7 +87,7 @@ CLI에서는 글로벌 베타에 `--app-path "/Applications/Yaagl ZZZ OS DX12 Be
 
 런타임 브랜치 `fix/runtime-lifecycle`에는 커서 링버퍼 계측·수집기·분석기·진단 패치가 없습니다. 계측 버전 전체는 `experiment/cursor-diagnostics` 브랜치와 옆 디렉터리 `../zzz-wine-cursor-diagnostics` 워크트리에 보존하며, 기록 방법과 도구도 그곳에 있습니다. 커서 재적용 중복 축소와 직접 워프 입력 보정은 양쪽 브랜치에 유지합니다. 소스 분리는 이미 설치된 런타임을 변경하지 않습니다.
 
-계측 없는 x86_64 `winemac.so`·`win32u.so`를 재빌드하고 격리 Wine 검사 프로그램에서 실제 로드를 확인했습니다. 커서 이동 16회, 클립·커서 핸들 검사, RawInput 전달을 통과했으며 계측 환경변수를 설정해도 기록 파일은 생성되지 않았습니다. 복원한 baseline에서 tuned 패치 18개의 적용 결과가 영향받는 커서·MSync 소스 15개 및 재생성한 프로토콜 헤더와 일치했습니다. 화면·실게임 검증이나 전체 pinned-P3 준비 검증은 아닙니다. 별도의 기존 배포 누락은 이번 분리에서 변경하지 않았습니다. `dlls/winemac.drv/window.c`의 잠금 해제 후 창을 파괴하는 수명 수정이 quilt에는 빠져 있으므로, 런타임 소스 전체와 quilt 전체의 동등성을 보장하지 않습니다.
+계측 없는 x86_64 `winemac.so`·`win32u.so`를 재빌드하고 격리 Wine 검사 프로그램에서 실제 로드를 확인했습니다. 커서 이동 16회, 클립·커서 핸들 검사, RawInput 전달을 통과했으며 계측 환경변수를 설정해도 기록 파일은 생성되지 않았습니다. 이전에 복원한 baseline에서 당시의 tuned 패치 18개와 커서·MSync 소스 및 재생성한 프로토콜 헤더의 일치를 확인했습니다. 이 검사는 MSync 전환 이전에 수행했으므로 현재 16개 패치의 검증이 아닙니다. 화면·실게임 검증이나 전체 pinned-P3 준비 검증도 아닙니다. 별도의 기존 배포 누락은 이번 분리에서 변경하지 않았습니다. `dlls/winemac.drv/window.c`의 잠금 해제 후 창을 파괴하는 수명 수정이 quilt에는 빠져 있으므로, 런타임 소스 전체와 quilt 전체의 동등성을 보장하지 않습니다.
 
 ### 미배포 커서 재적용 중복 축소
 
@@ -119,6 +105,8 @@ CLI에서는 글로벌 베타에 `--app-path "/Applications/Yaagl ZZZ OS DX12 Be
 
 Metal4 replay와 legacy encode의 공용 처리는 별도 외부 wrapper를 유지하지 않고 `ngx-hooks.mm` 안으로 직접 복원했습니다. `bridge.mm`의 슬롯 17·18은 NGX replay·encode 진입점에 직접 연결되며, NGX descriptor를 해석하기 전에 FSR 기록 명령을 식별하고 실행합니다. 분리했던 `d3dmetal-replay-hooks.{hpp,mm}` 계층과 해당 빌드 항목은 제거했습니다.
 
+각 transport가 명령을 한 번만 판별하고 `NotRecorded`·`Succeeded`·`Failed`를 반환합니다. `NotRecorded`만 원본 NGX로 전달하며, 식별된 명령의 실행 실패는 기존 예외로 처리합니다. 식별 조건·명령 packet 배치·25개 dispatch 슬롯 ABI는 유지합니다.
+
 공개 v1.1.0/v1.1.1 런타임은 여전히 FSR 전용입니다. **미배포 schema 6 후보**는 v1.0.5로 되돌아가지 않고 현재 Wine 소스에 추가하는 방식으로 GPTK 원본 `nvngx.dll`(SHA-256 `f6bc9d77fd1e898fec8c6339d367bd8e0f338992c9c0c66d59b30c6e9e0743e4`)과 `nvngx.so` → `../../external/libd3dshared.dylib`(대상 SHA-256 `d932330841e77682d47688641e0ac17049a2aff498deafac88921983dc16eedb`)을 복구합니다. staging 기록에 출처·symlink 대상·서명 산출물 hash 목록과 게임별 자동 GPU 정책을 보존합니다. 과거 schema 5 기록은 당시의 수동 선택 정책을 유지하며, metadata 갱신으로 기존 런타임의 동작을 새 정책으로 잘못 표시하지 않습니다. 기존 설치 아카이브·게임·prefix는 변경하지 않습니다.
 
 Native layout **v14**는 dispatch 항목 25개(일반 hook 21개와 특수 hook 4개)를 게시합니다. NGX wrapper는 공용 replay·encode 두 개만 남기며, FSR을 우선 처리하고 일반 NGX 명령은 원본 D3DMetal replay·encode에 바로 전달합니다. NGX private 출력 shadow·복사 adapter는 제거했으며 FSR backend의 출력 처리는 변경하지 않았습니다. NGX Evaluate·record 관찰 훅, 진단 옵션, 선택적 exposure·temporal 보정은 제거했고 해당 호출은 stock NGX가 직접 처리합니다. 현재 FSR, 출력 선택, GPU 완료·리소스 수명 관리, Wine MSync 수정과 시스템 기본 MetalFX 모델은 유지합니다. GPU 식별자는 위의 게임별 실행 정책을 따릅니다. 기존 frame-probe 캡처 계층도 포함하지 않습니다.
@@ -129,17 +117,19 @@ Native layout **v14**는 dispatch 항목 25개(일반 hook 21개와 특수 hook 
 
 ### 미배포 수명 관리 수정
 
-MSync 메시지 분기 회귀 검사: macOS에서 `python3 scripts/test-msync-message-dispatch.py -v`. 제품 C 함수 본문을 실행하는 10개 사례로 높은 ID의 대기 등록·해제, 잘못된 close 거부, 실제 전용 Mach 포트를 통한 close 처리를 검사합니다.
+MSync 메시지 분기 회귀 검사: macOS에서 `python3 scripts/test-msync-message-dispatch.py -v`를 실행하면 제품 메시지 펌프와 클라이언트 close 전송을 사용하여 높은 ID의 대기와 메시지 크기로 구분하는 헤더 전용 close 전달을 검사합니다.
 
-- 프로세스 내 동기화 캐시는 24바이트 항목이 블록 크기를 나누어떨어지게 하지 않아도 64 KiB 전체를 할당합니다. MSync export ID 추가 후 높은 핸들이 다음 캐시 블록을 요구할 때 발생하던 `anon_mmap_alloc` assertion을 항목 패딩이나 소유권 검사 제거 없이 수정했습니다. `ntdll` sync 회귀 테스트는 이벤트 4,096개를 유지하면서 독립적인 signal/reset/wait 상태를 검사합니다. 테스트 본문을 추출한 실행은 재빌드한 런타임과 격리 prefix에서 18,432개 assertion을 통과했고, 별도 이벤트 2,740개 API 스모크도 기존에 크래시하던 높은 핸들 동작을 통과했습니다. 테스트는 소스 테스트 모음에 유지하고 런타임 quilt에는 제품 코드 수정만 반영합니다. Beta 설치나 실게임 검증을 뜻하지 않습니다.
-- MSync 스레드 종료 시 빌린 alert 인덱스를 Unix descriptor로 닫지 않습니다. 캐시 참조에 프로세스별 일회성 export ID를 부여하고 native 프로세스 종료 후 회수합니다. `ntdll`과 `wineserver`를 함께 빌드해야 합니다. 서버 프로토콜은 tuned **968**, safe-msync **969**, MSync Mach wire는 **3**이며 기존 요청 번호는 유지합니다. 프로토콜 969는 safe-msync 요청 구조 전용으로 예약하며 tuned에서 재사용하면 안 됩니다.
-- 서버 내부 MSync export 해제는 전용 메시지 ID를 사용하고 공유 인덱스는 payload에 따로 전달하므로 높은 스레드 ID가 대기 등록·해제를 close로 바꾸지 않습니다. 정확한 메시지 크기·서버 cookie·인덱스 범위를 확인한 뒤 참조를 해제합니다. 잘못된 close는 대기로 해석하지 않고 버리며 클라이언트 대기 메시지와 공유 메모리 구조는 유지합니다. 격리한 재빌드 Wine에서 이벤트 4,096개 반복 재사용, 실제 등록 로그를 확인한 다중 대기 깨우기 256회, export를 남긴 자식 프로세스 종료를 통과했습니다.
-- 공통 MSync 패치에서 커서 프로토콜 의존성을 분리했습니다. tuned와 safe-msync는 마지막 프로토콜 버전 패치를 각각 적용하고, safe-msync에는 커서·창 변경을 가져오지 않습니다. 복원한 pre-tuned baseline에서 두 프로필의 실제 prepare overlay 함수, 반복 적용 검증, 소스 상속 inventory 검사, `tools/make_requests` 재생성 결과의 바이트 일치를 확인했습니다. 준비된 P3 baseline이 없어 upstream pin을 확인하는 전체 preflight는 실행하지 않았습니다. P3 manifest의 해시는 변경된 graphics-bridge 패치와 일치합니다.
+- 프로세스 내 동기화 캐시는 원래의 16바이트 항목과 공유 인덱스 직접 close 경로를 사용합니다. 프로세스 소유 export ID·export 해제 요청·확장된 캐시 항목은 필요하지 않습니다. 빌린 alert 인덱스는 스레드 종료 시 소유한 Unix descriptor처럼 닫지 않습니다.
+- MSync wire 형식은 **2**를 유지합니다. `MSYNC_SHM_CLOSE_FLAG`가 붙은 헤더 전용 메시지로 공유 인덱스의 close를 전달합니다. 서버는 ID를 해석하기 전에 정확한 헤더 크기로 close·signal과 대기를 구분합니다. 따라서 높은 스레드 ID가 포함된 더 큰 대기 등록·해제 메시지를 close로 잘못 처리하지 않습니다. close cookie나 전용 close 메시지 ID는 없습니다.
+- MSync 변경에는 `ntdll`과 `wineserver`를 함께 다시 빌드해야 합니다. tuned overlay는 커서 패치의 서버 프로토콜 **966**을 유지하고 safe-msync는 P3 프로토콜 **963**을 상속하며 커서·창 변경을 가져오지 않습니다. 패치 순서는 tuned 16개, safe-msync 5개이며 구형 0015 export·프로토콜 패치는 제외합니다. 이 소스 변경만으로 Beta 설치나 실게임 검증을 뜻하지 않습니다.
 - macdrv는 창 데이터 잠금 안에서 상태를 분리한 뒤 잠금 밖에서 Cocoa 창과 대기 중인 surface 이벤트를 정리합니다. 창 파괴와 최상위 창의 자식 창 전환에 같은 순서를 적용합니다.
 - Native FG 콜백은 소유 context의 callback scope에 진입해 configure/dispatch 잠금 역전을 피합니다. 콜백이 같으면 할당·present 대기 없이 binding을 재사용하고, 이전 binding은 교체 성공과 필요한 drain 이후에만 회수합니다.
+- Native PSO·function cache의 미사용 `forgetDevice` 메서드를 제거했습니다. 장치 파괴에는 기존 `withDeviceRetired`를 유지하여 회수 중 캐시 등록을 막고, 같은 주소를 나중에 재사용하면 새 scope를 만듭니다.
+- FG generation/Prepare 검증은 검증 전용 configuration 잠금 없이 원자적 provider mode를 한 번 읽습니다. 실제 dispatch·콜백 동기화는 유지하며 다른 dispatch 종류에는 mode 읽기를 추가하지 않습니다.
 - FG bridge **v4**는 콜백 실패·생성 생략에도 완료된 frame ID를 정리합니다. 이전 미완료 프레임과 기록된 명령의 snapshot은 보존합니다. FG PE/Unix 모듈과 native sidecar를 함께 다시 빌드해야 합니다.
 - SR 준비 프레임마다 scaler 활성화 번호를 보관해 지연 실행이나 전환 직후 프레임 폐기로 reactive variant 복귀에 필요한 reset이 사라지지 않게 합니다.
 - MF 비동기 명령에 초기 소유 참조를 부여하고 소스 오류 시 대기 중인 읽기·seek를 실패 완료합니다. WM parser 재초기화 실패는 disconnect 후 읽기 스레드를 join합니다. IOHID 시작은 런루프 잠금 대기 없이 상태를 원자적으로 게시합니다.
+- staging 무결성 검사는 한 번의 검사에서 같은 실제 경로의 파일을 한 번만 해시하고, 각 파일 목록 항목의 기대 hash는 개별 비교합니다. 필수 NGX 항목·고정 hash·기존 symlink 대상 검사를 유지하며 검사 호출 사이에 hash를 재사용하지 않습니다.
 
 현재 소스의 수정이며 설치된 Beta나 기존 archive를 바꾸지 않습니다. 실제 게임 FPS 개선을 입증한 것은 아닙니다.
 
@@ -208,9 +198,7 @@ v1.0.3은 설치 프로그램만 변경했고 macOS 26 Wine 아카이브와 tuni
 zzz-wine-d3dmetal-dx12/
 ├── dlls/                   # FSR upscaler/FG builtin을 포함한 Wine source
 ├── d3dmetal-pso-cache/     # Native PSO cache와 FSR → MetalFX backend
-├── external/               # 로컬 GPTK framework 입력
 ├── include/                # Wine/FSR bridge 공용 header
-├── installer/              # SwiftUI installer와 CLI source
 ├── patches/                # Wine tuned/P3 patch series
 ├── scripts/                # Build, verification, staging, packaging tool
 └── server/                 # Native wineserver와 MSync 구현
@@ -224,9 +212,9 @@ zzz-wine-d3dmetal-dx12/
 - Xcode Command Line Tools
 - LLVM MinGW toolchain
 - Bison, pkg-config 및 GStreamer dependency
-- 준비된 P3 source/host/dependency/provenance 입력, 로컬 GPTK overlay 및 Steam helper payload. 이 저장소는 해당 외부 입력을 다운로드하지 않습니다.
+- 준비된 P3 source/host/dependency/provenance 입력과 Steam helper payload가 필요합니다. 레거시 P3 packager는 D3D12/DXGI/NGX/libd3dshared 구성요소가 들어 있는 완전한 GPTK overlay를 계속 요구합니다. prepare-d3dmetal-runtime.mjs는 별도로 고정한 D3DMetal framework만 준비하므로 그 전체 overlay 대용으로 사용하면 안 됩니다.
 
-### 런타임과 설치 프로그램
+### 레거시 P3 런타임 패키징
 
 ```bash
 export WINE_P3_ROOT="/absolute/path/to/prepared/wine-p3"
@@ -240,7 +228,6 @@ export WINE_RUNTIME_ID=11.17-zzz-dx12-tuned-stage-parallel-cache-warmup-cursor-r
 ./scripts/build-wine-tuned.sh all
 ./scripts/package-wine-p3-runtime.sh build/wine-tuned/host "$GPTK_SOURCE" \
   build/wine-tuned/provenance.json build/wine-tuned/package
-./installer/build.sh
 ```
 
 ### 업스트림 Yaagl 연동
@@ -258,7 +245,6 @@ v1.1.1은 v1.1.0 런타임을 그대로 다시 게시하며 `ZZZWineDX12Installe
 |`wine-11.17-zzz-core-macos26.tar.xz`|split core 아카이브(`wine/` 루트)|
 |`d3dmetal-gptk4b2-zzz-v1.1.0.tar.xz`|split backend 오버레이(상대 경로 `lib/`)|
 
-각 아카이브에는 `.sha256` sidecar가 함께 제공됩니다. `installer/build.sh`는 기본적으로 `build/release-v1.1.1/wine-11.17-zzz-dx12-gptk4b2-macos26.tar.xz`의 full runtime 아카이브를 읽습니다(`RUNTIME_ARCHIVE_SOURCE`로 변경 가능).
 
 ```bash
 # 검증된 현재 schema 4 소스 런타임과 고정된 외부 입력을 지정합니다.

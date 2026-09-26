@@ -1,9 +1,0 @@
-diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
---- a/include/wine/server_protocol.h
-+++ b/include/wine/server_protocol.h
-@@ -7208,4 +7208,4 @@
- 
--#define SERVER_PROTOCOL_VERSION 963
-+#define SERVER_PROTOCOL_VERSION 969
- 
- #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

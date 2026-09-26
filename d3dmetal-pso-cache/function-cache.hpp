@@ -47,8 +47,6 @@ public:
         FunctionCreate create,
         void* context);
 
-    void forgetDevice(const void* device);
-
     // Cache admission for device is blocked until detached entries have been
     // released and action returns. The same address starts fresh afterward.
     void withDeviceRetired(

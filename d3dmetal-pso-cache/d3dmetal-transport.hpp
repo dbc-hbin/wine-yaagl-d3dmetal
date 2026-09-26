@@ -22,6 +22,12 @@ class ExecutionLease;
 
 namespace yaagl::pso::d3dmetal {
 
+enum class ReplayResult : std::uint8_t {
+    NotRecorded,
+    Succeeded,
+    Failed,
+};
+
 enum class CommandListKind : std::uint8_t {
     unsupported = 0,
     mpl = 1,
@@ -164,10 +170,9 @@ void releaseResource(MetalResource& resource) noexcept;
 // when the D3D12 command allocator can legally reset.
 bool record(NativeCommandList& commandList, const RecordRequest& request) noexcept;
 
-// Called first from the existing ReplayTemporalScaleMPL hook.  A true result
-// from isRecordedCommand() means the native TemporalScale parser must not run.
-bool isRecordedCommand(const void* command) noexcept;
-bool replay(void* mplReplayer, const void* command) noexcept;
+// Called first from the existing ReplayTemporalScaleMPL hook. Only NotRecorded
+// may enter the native TemporalScale parser; recognized failures remain ours.
+ReplayResult replay(void* mplReplayer, const void* command) noexcept;
 
 // Called only by the pinned native Metal4 queue-commit callsite. Preserves the
 // original Objective-C commit while retiring submitted execution slots at feedback.

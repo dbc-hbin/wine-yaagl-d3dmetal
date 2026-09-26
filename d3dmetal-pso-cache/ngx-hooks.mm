@@ -15,8 +15,9 @@ std::atomic<Replay> gReplay;
 std::atomic<Encode> gEncode;
 
 void replay(void* replayer, const void* command) {
-    if (d3dmetal::isRecordedCommand(command)) {
-        if (!d3dmetal::replay(replayer, command))
+    const auto result = d3dmetal::replay(replayer, command);
+    if (result != d3dmetal::ReplayResult::NotRecorded) {
+        if (result == d3dmetal::ReplayResult::Failed)
             [NSException raise:@"YaaglFSRReplayFailure"
                         format:@"FSR MetalFX command failed during Metal4 replay"];
         return;
@@ -25,8 +26,9 @@ void replay(void* replayer, const void* command) {
 }
 
 void encode(void* encoder, const void* command) {
-    if (d3dmetal::legacy::isRecordedCommand(command)) {
-        if (!d3dmetal::legacy::replay(encoder, command))
+    const auto result = d3dmetal::legacy::replay(encoder, command);
+    if (result != d3dmetal::ReplayResult::NotRecorded) {
+        if (result == d3dmetal::ReplayResult::Failed)
             [NSException raise:@"YaaglFSRLegacyEncodeFailure"
                         format:@"FSR MetalFX command failed during legacy Metal encoding"];
         return;

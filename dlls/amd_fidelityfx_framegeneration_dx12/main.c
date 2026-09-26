@@ -970,11 +970,12 @@ static ffxReturnCode_t validate_public_dispatch(
     if (header->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION)
     {
         const ffxDispatchDescFrameGeneration *desc = (const void *)header;
+        const enum context_mode mode = context_mode(context);
         int64_t right, bottom;
 
         unsigned int i;
 
-        if (context_mode(context) == CONTEXT_METALFX && header->pNext)
+        if (mode == CONTEXT_METALFX && header->pNext)
             return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
         if (!desc->commandList || !desc->presentColor.resource ||
             !desc->numGeneratedFrames || desc->numGeneratedFrames > 4 ||
@@ -989,7 +990,7 @@ static ffxReturnCode_t validate_public_dispatch(
             return FFX_API_RETURN_ERROR_PARAMETER;
         for (i = 0; i < desc->numGeneratedFrames; ++i)
             if (!desc->outputs[i].resource) return FFX_API_RETURN_ERROR_PARAMETER;
-        if (context_mode(context) == CONTEXT_METALFX &&
+        if (mode == CONTEXT_METALFX &&
             (desc->numGeneratedFrames != 1 ||
              desc->outputs[0].resource == desc->presentColor.resource))
             return FFX_API_RETURN_ERROR_PARAMETER;
@@ -1010,6 +1011,7 @@ static ffxReturnCode_t validate_public_dispatch(
     {
         struct yaagl_fsr_fg_prepare_packet packet;
         const ffxApiHeader *entry;
+        const enum context_mode mode = context_mode(context);
         BOOL have_camera = FALSE;
         unsigned int i;
 
@@ -1027,7 +1029,7 @@ static ffxReturnCode_t validate_public_dispatch(
         if (header->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2)
         {
             const struct ffxDispatchDescFrameGenerationPrepareV2 *desc = (const void *)header;
-            if (context_mode(context) == CONTEXT_METALFX && header->pNext)
+            if (mode == CONTEXT_METALFX && header->pNext)
                 return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
             COPY_PREPARE_FIELDS(packet, desc);
             COPY_CAMERA_FIELDS(packet, desc);
@@ -1042,7 +1044,7 @@ static ffxReturnCode_t validate_public_dispatch(
                 const struct ffxDispatchDescFrameGenerationPrepareCameraInfo *camera;
                 if (entry->type != FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO)
                 {
-                    if (context_mode(context) == CONTEXT_METALFX)
+                    if (mode == CONTEXT_METALFX)
                         return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
                     break;
                 }
@@ -2119,13 +2121,7 @@ ffxReturnCode_t WINAPI ffxDispatch(ffxContext *handle,
     context = acquire_context(handle);
     if (!context) return FFX_API_RETURN_ERROR_PARAMETER;
 
-    /*
-     * Waiting from a presenter callback would wait for itself.  Normal
-     * Prepare/Dispatch callback reentry is required and remains permitted.
-     */
-    if (!in_context_callback(context)) AcquireSRWLockShared(&context->configure_lock);
     result = validate_public_dispatch(context, desc);
-    if (!in_context_callback(context)) ReleaseSRWLockShared(&context->configure_lock);
     if (result == FFX_API_RETURN_OK)
     {
         if (in_callback() &&

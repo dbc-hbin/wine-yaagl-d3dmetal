@@ -315,7 +315,6 @@ DECL_HANDLER(d3dkmt_object_open_name);
 DECL_HANDLER(d3dkmt_mutex_acquire);
 DECL_HANDLER(d3dkmt_mutex_release);
 DECL_HANDLER(alpc_create_port);
-DECL_HANDLER(close_inproc_sync_export);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -628,7 +627,6 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_d3dkmt_mutex_acquire,
     (req_handler)req_d3dkmt_mutex_release,
     (req_handler)req_alpc_create_port,
-    (req_handler)req_close_inproc_sync_export,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2336,8 +2334,7 @@ C_ASSERT( sizeof(struct get_inproc_sync_fd_request) == 16 );
 C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, type) == 8 );
 C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, access) == 12 );
 C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, shm_idx) == 16 );
-C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, export_id) == 24 );
-C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 32 );
+C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 24 );
 C_ASSERT( sizeof(struct get_inproc_alert_fd_request) == 16 );
 C_ASSERT( offsetof(struct get_inproc_alert_fd_reply, handle) == 8 );
 C_ASSERT( sizeof(struct get_inproc_alert_fd_reply) == 16 );
@@ -2399,6 +2396,3 @@ C_ASSERT( offsetof(struct alpc_create_port_request, max_msg_len) == 16 );
 C_ASSERT( sizeof(struct alpc_create_port_request) == 24 );
 C_ASSERT( offsetof(struct alpc_create_port_reply, handle) == 8 );
 C_ASSERT( sizeof(struct alpc_create_port_reply) == 16 );
-C_ASSERT( offsetof(struct close_inproc_sync_export_request, shm_idx) == 12 );
-C_ASSERT( offsetof(struct close_inproc_sync_export_request, export_id) == 16 );
-C_ASSERT( sizeof(struct close_inproc_sync_export_request) == 24 );

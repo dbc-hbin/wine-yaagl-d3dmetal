@@ -2,40 +2,25 @@
 
 **English** | [한국어 (Korean)](README.ko.md)
 
-Wine 11.17 runtime source and a one-click GUI installer for playing **Zenless Zone Zero (ZZZ)** through **Direct3D 12 (Apple GPTK 4.0b2)** on Apple Silicon with **Yaagl ZZZ OS**.
+Wine 11.17 runtime source for a Yaagl ZZZ **Direct3D 12** runtime on Apple Silicon, based on Apple GPTK 4.0b2 D3DMetal.
 
-The v1.1.0 public runtime identifies its graphics adapter as **AMD Radeon RX 9070** (`0x1002:0x7550`) and translates the game's FSR upscaling API to MetalFX. It does not ship a DLSS or NVIDIA NGX translation path. The installer registers **`Wine 11.17 ZZZ DX12 (GPTK4.0b2)`** in Yaagl's Wine menu.
+This branch is intentionally **runtime/source only**. The standalone SwiftUI/CLI installer and Yaagl resource-registration code have been removed, and Apple's `D3DMetal.framework` is no longer stored in this Git tree.
 
 **Requirements: macOS 26.0 or later on Apple Silicon and Rosetta 2.** Temporal upscaling uses the system-default MetalFX model on every Mac; the runtime does not force BBR or a private model version.
 
-## Quick start
+## Prepare D3DMetal
 
-1. Download [ZZZWineDX12Installer.zip](https://github.com/dbc-hbin/zzz-wine-d3dmetal-dx12/releases/latest/download/ZZZWineDX12Installer.zip).
-2. Extract it and open **`ZZZ Wine DX12 Installer.app`**.
-3. Quit Yaagl and its Wine processes. Choose your launcher under **`Yaagl Target`**, then select **`Install Wine 11.17 ZZZ DX12`**. If the same runtime is already selected, the button reads **`Reinstall / Update Wine`**.
-4. Start the selected Yaagl launcher and select **`Wine 11.17 ZZZ DX12 (GPTK4.0b2)`** from its Wine menu.
-
-The installer detects the Yaagl application and support directories, installs its bundled archive, registers the runtime, and backs up Yaagl resources, the selected Wine, and the previous runtime directory. The archive remains in Yaagl's local runtime storage for offline selection, and the installer does not require Node.js.
-
-A same-name runtime can be reinstalled. The bundled archive replaces both the cached archive and runtime directory instead of treating the matching name as proof that the files are current. If final Wine-selection activation fails, the installer restores the runtime and selection from immediately before that attempt without consuming the original restore backup. “Update” means replacing the runtime with the build bundled in the installer being run; it is not an online update check.
-
-The current installer source (not yet included in existing release ZIPs) preserves a provable v1.0.5 forced-DX12 default on upgrade: it saves DX12 ON only when the old forced-launch rule is present, the same target D3DMetal runtime is selected and supports DX12, and no DX12 preference was stored. A saved OFF is never overwritten. Fresh and already settings-driven launchers retain their settings-based behavior; an ambiguous v1.1.x preference is not guessed from its value.
-
-### Terminal installer
-
-The target picker supports **Yaagl ZZZ OS**, **Yaagl ZZZ OS DX12 Beta** (global), and **Yaagl ZZZ DX12 Beta** (CN), including the [DX12 beta release](https://github.com/dbc-hbin/yaagl-ZZZ-DX12/releases). Each target uses its own matching `~/Library/Application Support/<launcher name>` directory; installing into a beta does not replace the stable launcher's Wine. Launch a newly installed Yaagl once to create its support directory, then quit it before using the installer. Stable is selected by default when installed; otherwise an installed beta is detected.
-
-For a beta CLI install, pass `--app-path "/Applications/Yaagl ZZZ OS DX12 Beta.app"` (global) or `--app-path "/Applications/Yaagl ZZZ DX12 Beta.app"` (CN). Recognized app names infer the matching support directory; an explicit `--support-path` takes precedence for custom installations.
+The pinned input is the `gptk-4.0b2` release from [`dbc-hbin/d3dmetal-redistributable`](https://github.com/dbc-hbin/d3dmetal-redistributable). Review its `License.rtf` first, then prepare a local build input:
 
 ```bash
-./installer/zzz-wine-installer --install \
-  --app-path "/Applications/Yaagl ZZZ OS.app" \
-  --support-path "$HOME/Library/Application Support/Yaagl ZZZ OS"
-
-./installer/zzz-wine-installer --restore \
-  --app-path "/Applications/Yaagl ZZZ OS.app" \
-  --support-path "$HOME/Library/Application Support/Yaagl ZZZ OS"
+node scripts/prepare-d3dmetal-runtime.mjs \
+  --accept-apple-license \
+  --output build/d3dmetal-gptk4.0b2
 ```
+
+The tool pins and verifies the release ZIP, `SHA256SUMS`, `License.rtf`, and `Acknowledgements.rtf`, then reproduces the current PR graphics patch chain from the Apple-original framework: the FP64 codec fix, an FP64-only framework reseal, the shader-stage lock fix, and the current native PSO/DXIL composite hooks. It installs `libYaaglNativePsoCache.dylib`, explicitly signs both nested dylibs, reseals the framework, and verifies every intermediate/final identity. If `--pso-module PATH` is omitted, the sidecar is built from the current source and required to match the pinned raw hash; Yaagl/package builds can pass the already-built pinned sidecar instead. The prepared framework remains under ignored `build/` output and is not committed to this repository.
+
+The Apple Game Porting Toolkit license permits non-commercial distribution of the Framework in its entirety, while Section 2D also restricts modification of Apple Software. This repository therefore keeps the FP64 patch as an explicit local preparation step. Redistribution of a modified framework requires a licensing determination separate from the Wine code review.
 
 ## v1.1.0 public runtime
 
@@ -72,6 +57,7 @@ For a beta CLI install, pass `--app-path "/Applications/Yaagl ZZZ OS DX12 Beta.a
 - sRGB, PQ, and scRGB transfers preserve their defined luminance conversions and reject non-finite or invalid ranges. Disabled sharpening accepts an unused finite sharpness in `[0,1]` without running RCAS. Jitter phase queries use the pinned SDK's truncation (1600→2000 yields 12), and a null dispatch descriptor returns `FFX_API_RETURN_ERROR_PARAMETER`.
 - Distortion fields, AMD debug shader views and tear/reset overlays, custom DX12 backend allocation callbacks, and more than one generated output per frame remain unsupported and return an error.
 - Metal4 compute parameter buffers are included in residency before encoding. The configuration cache holds at most eight variants; luminance and rectangle-origin changes reset history without creating new factories, and evicted configurations are retained until in-flight work completes.
+- Configuration hits are checked before allocating a temporary configuration or retaining its device/compiler. Existing key equality and the eight-entry limit are unchanged; native Metal4 and legacy probes observed zero C++ allocations on hits.
 - Configure calls that only notify the swapchain reuse the immutable binding while the application callbacks and user contexts are unchanged, so they avoid unnecessary presenter drains; real callback changes retire the old binding through the native swapchain, and pending per-frame HUD-less snapshots survive ordinary Configure calls. This is a pacing/lifetime correction, not a measured FPS or image-quality improvement.
 
 ### Frame-generation verification boundaries
@@ -101,7 +87,7 @@ Next verification should use game captures with disocclusion and mixed motion at
 
 The runtime branch `fix/runtime-lifecycle` has no cursor ring-buffer instrumentation, collector, decoder, or diagnostic patch. The complete diagnostic version is preserved on `experiment/cursor-diagnostics` in the sibling `../zzz-wine-cursor-diagnostics` worktree; recording instructions and tools live there. Cursor reconciliation coalescing and direct-warp input correction remain in both branches. Source separation does not change an already installed runtime.
 
-The uninstrumented x86_64 `winemac.so` and `win32u.so` were rebuilt and observed loading in an isolated Wine probe. Sixteen cursor moves, clip/cursor-handle checks, and RawInput delivery passed; setting the trace environment variable produced no trace files. The 18-patch tuned overlay matched all 15 affected cursor/MSync source files and regenerated protocol headers on a reconstructed baseline. This is not visual/game verification or full pinned-P3 preparation. A separate pre-existing packaging gap remains unchanged: the quilt does not carry `dlls/winemac.drv/window.c`'s detach-before-destroy lifetime fix; full runtime-source/quilt equivalence is not claimed.
+The uninstrumented x86_64 `winemac.so` and `win32u.so` were rebuilt and observed loading in an isolated Wine probe. Sixteen cursor moves, clip/cursor-handle checks, and RawInput delivery passed; setting the trace environment variable produced no trace files. An earlier 18-patch overlay check matched the then-current cursor/MSync sources and regenerated protocol headers on a reconstructed baseline; it predates the MSync cutover and does not verify the current 16-patch stack. This is not visual/game verification or full pinned-P3 preparation. A separate pre-existing packaging gap remains unchanged: the quilt does not carry `dlls/winemac.drv/window.c`'s detach-before-destroy lifetime fix; full runtime-source/quilt equivalence is not claimed.
 
 ### Unreleased cursor reconciliation coalescing
 
@@ -119,6 +105,8 @@ Run `python3 scripts/test-cursor-warp-correction.py` for eight deterministic inp
 
 Shared Metal4 replay and legacy encode handling are restored directly inside `ngx-hooks.mm`, rather than retained as an outer compatibility wrapper. `bridge.mm` publishes the NGX replay/encode entrypoints directly in slots 17/18; they recognize and execute FSR-recorded commands before interpreting any NGX descriptor. The separate `d3dmetal-replay-hooks.{hpp,mm}` layer and its build entries have been removed.
 
+Each transport now classifies a command once and returns `NotRecorded`, `Succeeded`, or `Failed`. Only `NotRecorded` forwards to stock NGX; recognized failures still raise the existing exception. Command recognition checks, packet layout, and the 25-slot dispatch ABI are unchanged.
+
 The published v1.1.0/v1.1.1 runtime remains FSR-only. The **unreleased schema-6 candidate**, built additively on the current Wine source rather than rolling back to v1.0.5, restores the pinned stock GPTK `nvngx.dll` (SHA-256 `f6bc9d77fd1e898fec8c6339d367bd8e0f338992c9c0c66d59b30c6e9e0743e4`) and `nvngx.so` → `../../external/libd3dshared.dylib` (pinned target SHA-256 `d932330841e77682d47688641e0ac17049a2aff498deafac88921983dc16eedb`). The stage record includes their provenance, symlink target, signed artifact inventory, and automatic per-game GPU policy. Historical schema-5 records retain their original manual-selection policy; metadata refresh does not relabel old runtime bytes. No existing installer archive or game/prefix is changed.
 
 Native layout **v14** publishes 25 dispatch entries (21 normal hooks plus four special hooks). The only NGX wrappers are shared replay/encode, retaining FSR-first routing and forwarding ordinary NGX commands directly to the original D3DMetal replay/encode. The NGX private-output shadow/copy adapter has been removed; FSR backend output handling is unchanged. NGX Evaluate/record observation detours, diagnostic controls, and optional exposure/temporal corrections have been removed; stock NGX handles those calls directly. Current FSR, display routing, GPU-completion/resource-lifetime and Wine MSync fixes remain, as does the system-default MetalFX model. GPU identity follows the per-game launcher policy above. The old frame-probe capture layer remains absent.
@@ -129,17 +117,19 @@ The current source retires completed execution leases without waiting for alloca
 
 ### Unreleased lifecycle corrections
 
-MSync message dispatch regression: `python3 scripts/test-msync-message-dispatch.py -v` on macOS. Ten cases exercise the production C bodies, including high-ID registration/unregister, malformed close rejection, and close delivery through a real owned Mach port.
+MSync message dispatch regression: `python3 scripts/test-msync-message-dispatch.py -v` on macOS exercises the production message pump and client close sender, including high-ID waits and size-qualified header-only close delivery.
 
-- The in-process synchronization cache now allocates full 64 KiB blocks even when its 24-byte entries do not divide that size. This fixes the `anon_mmap_alloc` assertion introduced by the MSync export-ID change when a higher handle needs another cache block, without padding entries or removing ownership checks. The `ntdll` sync regression keeps 4,096 events live and checks independent signal/reset/wait state. Its extracted test body passed 18,432 assertions on a rebuilt runtime in an isolated prefix; a separate 2,740-event API smoke passed the previously crashing high-handle operation. The test remains in the source test suite; the runtime quilt carries only the production fix. No Beta installation or game validation is implied.
-- MSync leaves the borrowed alert index alone at thread exit. Cache exports have process-owned, one-shot IDs and are reclaimed after native process death. Rebuild `ntdll` and `wineserver` together: server protocol **968** for tuned and **969** for safe-msync, MSync Mach wire **3**; existing request numbers are preserved. Protocol 969 is reserved for the safe-msync request layout and must not be reused by tuned.
-- Server-internal MSync export retirement uses a dedicated message ID and carries the shared index separately, so high thread-ID bits cannot turn a wait registration or unregister into a close. Exact message size, the server cookie, and index range are checked before releasing a reference. Invalid close messages are discarded rather than interpreted as waits; client wait messages and the shared-memory layout are unchanged. An isolated rebuilt Wine run passed repeated 4,096-event cache reuse, 256 multi-object wakeups with observed armed registrations, and child-process exit with outstanding exports.
-- The shared MSync patch no longer assumes the cursor protocol is present. Tuned and safe-msync apply separate final protocol-version patches; safe-msync does not import cursor/window changes. Both ordered overlays passed the actual prepare overlay functions, repeat-application validation, source-inheritance inventory checks, and byte-identical `tools/make_requests` regeneration on a reconstructed pre-tuned baseline. The pinned-upstream preflight was not exercised because the prepared P3 baseline is unavailable. The P3 manifest hash matches the updated graphics-bridge patch.
+- The in-process synchronization cache uses its original 16-byte entries and direct shared-index close path; no process-owned export IDs, export-retirement request, or enlarged cache entries are required. The borrowed alert index remains open at thread exit instead of being closed as an owned Unix descriptor.
+- MSync wire format remains **2**: a header-only message with `MSYNC_SHM_CLOSE_FLAG` carries the shared index for close. The server distinguishes a close or signal from a wait by the exact header size before interpreting the ID. A larger wait registration or unregister message can therefore contain a high thread ID without becoming a close. There is no close cookie or dedicated close message ID.
+- Rebuild `ntdll` and `wineserver` together for the MSync changes. The tuned overlay retains server protocol **966** from its cursor patch; safe-msync inherits P3 protocol **963** and does not import cursor/window changes. The ordered overlays contain 16 tuned patches or five safe-msync patches, without the obsolete 0015 export/protocol patches. This source-only cutover does not imply a Beta install or game validation.
 - macdrv detaches window state under the window-data lock, then closes the Cocoa window and releases queued surface events outside that lock, for both destruction and top-level-to-child reparenting.
 - Native FG callbacks enter their owning context's callback scope, avoiding configure/dispatch lock inversion. Unchanged callbacks reuse a binding without allocation or presenter waits; obsolete bindings are reclaimed only after successful replacement and the required drain.
+- Native PSO and function caches no longer expose the unused `forgetDevice` methods. Device destruction retains `withDeviceRetired`, including cache-admission blocking during retirement and a fresh scope for later reuse of the address.
+- FG generation/Prepare validation reads the atomic provider mode once without taking a validation-only configuration lock. Actual dispatch and callback synchronization remain unchanged; other dispatch types do not acquire an extra mode snapshot.
 - FG bridge **v4** retires the exact completed frame after failed/skipped generation too. Older pending frames and recorded commands keep their snapshots. Rebuild the FG PE/Unix modules and native sidecar together.
 - SR prepared frames retain their scaler activation number, preserving reactive-variant resets across delayed encodes and dropped activation frames.
 - MF async commands start with an owned reference; source errors complete pending reads/seeks with failure. WM parser reinitialization disconnects before joining the reader thread on failure. IOHID startup publishes its state atomically without waiting for the run-loop mutex.
+- Staged-runtime integrity verification hashes each resolved artifact target once per invocation, while checking every inventory entry against its own expected hash. Required NGX records, pinned hashes and the existing symlink-target check remain enforced; digests are never cached across invocations.
 
 These current-source corrections do not update installed Beta or existing archives and do not establish a game-FPS improvement.
 
@@ -208,9 +198,7 @@ Unreleased MSync fixes abandoned-mutex `WaitAll` nontermination and transactiona
 zzz-wine-d3dmetal-dx12/
 ├── dlls/                   # Wine sources, including FSR upscaler/FG builtins
 ├── d3dmetal-pso-cache/     # Native PSO cache and FSR → MetalFX backend
-├── external/               # Local GPTK framework input
 ├── include/                # Shared Wine/FSR bridge headers
-├── installer/              # SwiftUI installer and CLI source
 ├── patches/                # Wine tuned and P3 patch series
 ├── scripts/                # Build, verification, staging, and packaging tools
 └── server/                 # Native wineserver and MSync implementation
@@ -224,9 +212,9 @@ zzz-wine-d3dmetal-dx12/
 - Xcode Command Line Tools
 - LLVM MinGW toolchain
 - Bison, pkg-config, and GStreamer dependencies
-- Prepared P3 source/host/dependency/provenance inputs, a local GPTK overlay, and the Steam helper payload; this repository does not download those external inputs
+- Prepared P3 source/host/dependency/provenance inputs and the Steam helper payload. The legacy P3 packager still expects a complete GPTK overlay for the D3D12/DXGI/NGX/libd3dshared components; prepare-d3dmetal-runtime.mjs supplies only the separately pinned D3DMetal framework and must not be used as that full overlay.
 
-### Runtime and installer
+### Legacy P3 runtime packaging
 
 ```bash
 export WINE_P3_ROOT="/absolute/path/to/prepared/wine-p3"
@@ -240,7 +228,6 @@ export WINE_RUNTIME_ID=11.17-zzz-dx12-tuned-stage-parallel-cache-warmup-cursor-r
 ./scripts/build-wine-tuned.sh all
 ./scripts/package-wine-p3-runtime.sh build/wine-tuned/host "$GPTK_SOURCE" \
   build/wine-tuned/provenance.json build/wine-tuned/package
-./installer/build.sh
 ```
 
 ### Upstream Yaagl integration
@@ -258,7 +245,6 @@ v1.1.1 republishes the v1.1.0 runtime unchanged; only `ZZZWineDX12Installer.zip`
 |`wine-11.17-zzz-core-macos26.tar.xz`|Split core archive (`wine/` root)|
 |`d3dmetal-gptk4b2-zzz-v1.1.0.tar.xz`|Split backend overlay (relative `lib/`)|
 
-Each archive has a `.sha256` sidecar. By default, `installer/build.sh` reads the full runtime archive at `build/release-v1.1.1/wine-11.17-zzz-dx12-gptk4b2-macos26.tar.xz` (override with `RUNTIME_ARCHIVE_SOURCE`).
 
 ```bash
 # Use a verified current schema-4 source runtime and pinned external inputs.

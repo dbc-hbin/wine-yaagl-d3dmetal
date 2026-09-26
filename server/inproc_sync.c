@@ -23,7 +23,6 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 
 #include "ntstatus.h"
 #include "winternl.h"
@@ -32,7 +31,6 @@
 #include "handle.h"
 #include "request.h"
 #include "thread.h"
-#include "process.h"
 #include "user.h"
 #include "msync.h"
 
@@ -209,7 +207,7 @@ void abandon_inproc_mutexes( thread_id_t tid )
         ioctl( mutex->fd, NTSYNC_IOC_MUTEX_KILL, &tid );
 }
 
-static int get_obj_inproc_sync( struct object *obj, int *type, unsigned __int64 *export_id )
+static int get_obj_inproc_sync( struct object *obj, int *type )
 {
     struct object *sync;
     int fd = -1;
@@ -379,19 +377,9 @@ void abandon_inproc_mutexes( thread_id_t tid )
     if (do_msync()) msync_abandon_mutexes( tid );
 }
 
-struct msync_export
-{
-    struct list entry;
-    unsigned __int64 id;
-    unsigned int shm_idx;
-};
-
-static unsigned __int64 next_export_id;
-
-static int get_obj_inproc_sync( struct object *obj, int *type, unsigned __int64 *export_id )
+static int get_obj_inproc_sync( struct object *obj, int *type )
 {
     struct object *sync;
-    struct msync_export *export;
     int shm_idx = -1;
 
     if (!do_msync()) return -1;
@@ -400,41 +388,17 @@ static int get_obj_inproc_sync( struct object *obj, int *type, unsigned __int64 
     {
         struct inproc_sync *inproc = (struct inproc_sync *)sync;
 
-        if (!(export = mem_alloc( sizeof(*export) )))
+        if (!msync_grab_object( inproc->msync ))
             set_error( STATUS_NO_MEMORY );
-        else if (!msync_grab_object( inproc->msync ))
-        {
-            free( export );
-            set_error( STATUS_NO_MEMORY );
-        }
         else
         {
-            if (next_export_id == ~(unsigned __int64)0)
-                fatal_error( "msync export id space exhausted\n" );
-            export->id = ++next_export_id;
-            export->shm_idx = inproc->msync->shm_idx;
-            list_add_tail( &current->process->msync_exports, &export->entry );
-            *export_id = export->id;
             *type = inproc->type;
-            shm_idx = (int)export->shm_idx;
+            shm_idx = (int)inproc->msync->shm_idx;
         }
     }
 
     release_object( sync );
     return shm_idx;
-}
-
-void release_process_msync_exports( struct process *process )
-{
-    struct msync_export *export, *next;
-
-    LIST_FOR_EACH_ENTRY_SAFE( export, next, &process->msync_exports, struct msync_export, entry )
-    {
-        if (!msync_release_export( export->shm_idx ))
-            fatal_error( "could not release msync export %llu\n", (unsigned long long)export->id );
-        list_remove( &export->entry );
-        free( export );
-    }
 }
 
 #else /* NTSYNC_IOC_EVENT_READ */
@@ -481,19 +445,12 @@ void abandon_inproc_mutexes( thread_id_t tid )
 {
 }
 
-static int get_obj_inproc_sync( struct object *obj, int *type, unsigned __int64 *export_id )
+static int get_obj_inproc_sync( struct object *obj, int *type )
 {
     return -1;
 }
 
 #endif /* NTSYNC_IOC_EVENT_READ */
-
-#if !defined(__APPLE__)
-void release_process_msync_exports( struct process *process )
-{
-    assert( list_empty( &process->msync_exports ) );
-}
-#endif
 
 DECL_HANDLER(get_inproc_sync_fd)
 {
@@ -504,7 +461,7 @@ DECL_HANDLER(get_inproc_sync_fd)
 
     reply->access = get_handle_access( current->process, req->handle );
 
-    if ((fd = get_obj_inproc_sync( obj, &reply->type, &reply->export_id )) < 0)
+    if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0)
     {
         if (!get_error()) set_error( STATUS_NOT_IMPLEMENTED );
     }
@@ -515,25 +472,4 @@ DECL_HANDLER(get_inproc_sync_fd)
     }
 
     release_object( obj );
-}
-
-DECL_HANDLER(close_inproc_sync_export)
-{
-#ifdef __APPLE__
-    struct msync_export *export;
-
-    LIST_FOR_EACH_ENTRY( export, &current->process->msync_exports, struct msync_export, entry )
-    {
-        if (export->id != req->export_id || export->shm_idx != req->shm_idx) continue;
-        if (!msync_release_export( export->shm_idx ))
-        {
-            set_error( STATUS_UNSUCCESSFUL );
-            return;
-        }
-        list_remove( &export->entry );
-        free( export );
-        return;
-    }
-#endif
-    set_error( STATUS_INVALID_HANDLE );
 }

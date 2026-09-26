@@ -727,18 +727,16 @@ bool record(NativeCommandList& commandList, const RecordRequest& request) noexce
     return success;
 }
 
-bool isRecordedCommand(const void* command) noexcept {
-    if (!command || loadAt<std::uint32_t>(command) != kRecordedHeader) return false;
+ReplayResult replay(void* mplReplayer, const void* command) noexcept {
+    if (!command || loadAt<std::uint32_t>(command) != kRecordedHeader)
+        return ReplayResult::NotRecorded;
     const RecordedCommand value = loadAt<RecordedCommand>(command);
     if (value.magic != kRecordedMagic || !value.owner)
-        return false;
+        return ReplayResult::NotRecorded;
     const auto ownerBits = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(value.owner));
-    return value.cookie == (kRecordedCookie ^ ownerBits) && value.reserved == 0;
-}
-
-bool replay(void* mplReplayer, const void* command) noexcept {
-    if (!mplReplayer || !isRecordedCommand(command) || !ensureInitialized()) return false;
-    const RecordedCommand value = loadAt<RecordedCommand>(command);
+    if (value.cookie != (kRecordedCookie ^ ownerBits) || value.reserved != 0)
+        return ReplayResult::NotRecorded;
+    if (!mplReplayer || !ensureInitialized()) return ReplayResult::Failed;
     auto* owner = reinterpret_cast<YAAGLMetalFXRecordedOwner*>(value.owner);
     auto* state = reinterpret_cast<OwnerState*>(owner->_state);
     void* commandBuffer = loadAt<void*>(mplReplayer, kReplayerCommandBuffer);
@@ -749,7 +747,7 @@ bool replay(void* mplReplayer, const void* command) noexcept {
     void* waitFenceImp = loadAt<void*>(mplReplayer, kReplayerWaitFenceImp);
     if (!commandBuffer || !encoder || !argumentTable || !fence || !updateFenceImp ||
         !waitFenceImp || !state)
-        return false;
+        return ReplayResult::Failed;
 
     const std::uint8_t* image = gRuntime.image;
     void* updateSelector = loadAt<void*>(image + kSelUpdateFenceAfterStages);
@@ -758,7 +756,7 @@ bool replay(void* mplReplayer, const void* command) noexcept {
     void* computeSelector = loadAt<void*>(image + kSelComputeCommandEncoder);
     void* tableSelector = loadAt<void*>(image + kSelSetArgumentTable);
     if (!updateSelector || !waitSelector || !endSelector || !computeSelector || !tableSelector)
-        return false;
+        return ReplayResult::Failed;
 
     using FenceBoundary = void (*)(void*, void*, void*, std::uint64_t);
     using MsgVoid = void (*)(void*, void*);
@@ -786,11 +784,11 @@ bool replay(void* mplReplayer, const void* command) noexcept {
         // Begin does: create a fresh encoder, restore its shared argument table,
         // then wait on the fence MetalFX publishes before subsequent D3D work.
         replacement = sendObject(commandBuffer, computeSelector);
-        if (!replacement) return false;
+        if (!replacement) return ReplayResult::Failed;
         storeAt<void*>(mplReplayer, kReplayerComputeEncoder, replacement);
         sendSetObject(replacement, tableSelector, argumentTable);
         waitFence(replacement, waitSelector, fence, kComputeStage);
-        return encoded;
+        return encoded ? ReplayResult::Succeeded : ReplayResult::Failed;
     } @catch (id) {
         // If the backend or an Objective-C boundary raised after the old encoder
         // was ended, make one best-effort attempt to restore an MPL compute
@@ -806,7 +804,7 @@ bool replay(void* mplReplayer, const void* command) noexcept {
             } @catch (id) {
             }
         }
-        return false;
+        return ReplayResult::Failed;
     }
 }
 

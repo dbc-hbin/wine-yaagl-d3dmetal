@@ -586,15 +586,13 @@ static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_
 struct inproc_sync
 {
     LONG           refcount;  /* reference count of the sync object */
-    int            fd;        /* unix file descriptor or MSync shared index */
-    unsigned __int64 export_id; /* server-owned MSync export, zero for fd */
+    int            fd;        /* unix file descriptor */
     unsigned int   access;    /* handle access rights */
     unsigned short type;      /* enum inproc_sync_type as short to save space */
     unsigned short closed;    /* fd has been closed but sync is still referenced */
 };
 
-#define INPROC_SYNC_CACHE_BLOCK_BYTES 65536
-#define INPROC_SYNC_CACHE_BLOCK_SIZE  (INPROC_SYNC_CACHE_BLOCK_BYTES / sizeof(struct inproc_sync))
+#define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
 #define INPROC_SYNC_CACHE_ENTRIES     128
 
 static struct inproc_sync *inproc_sync_cache[INPROC_SYNC_CACHE_ENTRIES];
@@ -632,8 +630,8 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync 
         if (!entry) inproc_sync_cache[0] = inproc_sync_cache_initial_block;
         else
         {
-            /* The entry size need not divide the page-aligned block size. */
-            void *ptr = anon_mmap_alloc( INPROC_SYNC_CACHE_BLOCK_BYTES, PROT_READ | PROT_WRITE );
+            static const size_t size = INPROC_SYNC_CACHE_BLOCK_SIZE * sizeof(struct inproc_sync);
+            void *ptr = anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
             if (ptr == MAP_FAILED) return sync;
             inproc_sync_cache[entry] = ptr;
         }
@@ -651,7 +649,6 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync 
     }
 
     cache->fd = sync->fd;
-    cache->export_id = sync->export_id;
     cache->access = sync->access;
     cache->type = sync->type;
     cache->closed = sync->closed;
@@ -684,23 +681,15 @@ static void release_inproc_sync( struct inproc_sync *sync )
     /* save the fd now; as soon as the refcount hits 0 we cannot
      * access the cache anymore */
     int fd = sync->fd;
-    unsigned __int64 export_id = sync->export_id;
     LONG ref = InterlockedDecrement( &sync->refcount );
 
     assert( ref >= 0 );
     if (!ref)
     {
         if (do_msync())
-        {
-            SERVER_START_REQ( close_inproc_sync_export )
-            {
-                req->shm_idx = fd;
-                req->export_id = export_id;
-                if (wine_server_call( req )) ERR( "Failed to release MSync export %llu for %d\n", (unsigned long long)export_id, fd );
-            }
-            SERVER_END_REQ;
-        }
-        else close( fd );
+            msync_close( fd );
+        else
+            close( fd );
     }
 }
 
@@ -745,12 +734,10 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync 
             if (do_msync())
             {
                 sync->fd = reply->shm_idx;
-                sync->export_id = reply->export_id;
             }
             else
             {
                 sync->fd = wine_server_receive_fd( &fd_handle );
-                sync->export_id = 0;
                 assert( wine_server_ptr_handle(fd_handle) == handle );
             }
             sync->access = reply->access;

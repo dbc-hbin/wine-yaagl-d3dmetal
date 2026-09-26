@@ -23,6 +23,7 @@
 
 extern int do_msync(void);
 extern void msync_init(void);
+extern void msync_close( int obj );
 
 #ifdef __APPLE__
 

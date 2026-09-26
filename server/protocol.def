@@ -4233,7 +4233,6 @@ enum inproc_sync_type
     int           type;         /* inproc sync type */
     unsigned int access;        /* handle access rights */
     unsigned int shm_idx;       /* optional for index-based sync implementations */
-    unsigned __int64 export_id; /* process-owned reference to the shared index */
 @END
 
 
@@ -4343,11 +4342,4 @@ enum inproc_sync_type
     VARARG(obj_attr,object_attributes); /* object attributes */
 @REPLY
     obj_handle_t        handle;         /* handle to the ALPC port */
-@END
-
-
-/* Release a process-owned in-process synchronization export. */
-@REQ(close_inproc_sync_export)
-    unsigned int shm_idx;
-    unsigned __int64 export_id;
 @END
