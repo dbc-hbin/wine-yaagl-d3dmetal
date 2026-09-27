@@ -126,7 +126,9 @@ std::shared_ptr<metalfx::Feature> takeIdleBackend(const metalfx::CreateInfo& cre
             if (!idle.backend || idle.device != device || idle.compiler != compiler ||
                 idle.backend->mode() != mode || !sameCreate(idle.create, create)) continue;
             backend = std::move(idle.backend);
-            idle = {};
+            // Keep occupied entries at the front so the next park evicts only when full.
+            std::move(&idle + 1, gIdleBackends.end(), &idle);
+            gIdleBackends.back() = {};
             break;
         }
     }
