@@ -155,7 +155,7 @@ def main():
                     'dlls/amd_fidelityfx_framegeneration_dx12/main.c',
                     'scripts/wine-launch-wrapper.sh']
     manifest = {
-        'schemaVersion': 1, 'runtimeId': 'wine-11.17-d3dmetal-gptk4.0b2-2',
+        'schemaVersion': 1, 'runtimeId': 'wine-11.17-d3dmetal-gptk4.0b2-3',
         'archive': NAME, 'archiveRoot': 'wine', 'wineVersion': 'wine-11.17',
         'framework': {'destination': 'lib/external/D3DMetal.framework',
                       'installation': 'native autopatch before loading Wine',
