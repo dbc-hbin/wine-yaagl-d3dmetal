@@ -905,6 +905,12 @@ struct window_surface *create_shm_surface( HWND window, HWND parent, const RECT 
     }
 
     surface = (struct shm_window_surface *)window_surface_create( sizeof(*surface), &shm_surface_funcs, window, &r, &info, bitmap );
+    if (!surface)
+    {
+        NtGdiDeleteObjectApp( bitmap );
+        NtClose( mapping );
+        return NULL;
+    }
     surface->info = info;
 
     TRACE( "crating surface %p for visible_rect %s of window %p\n", surface,

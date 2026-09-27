@@ -2321,8 +2321,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         win = get_win_ptr( parent );
         if (win == WND_OTHER_PROCESS)
         {
+            /* borrowed sentinel; replaced by an owned shm surface below */
             new_surface = &dummy_surface;
-            window_surface_add_ref( new_surface );
             dummy_shm_surface = TRUE;
         }
         else if (win && win != WND_DESKTOP) release_win_ptr( win );
@@ -2343,10 +2343,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
     /* CX HACK 23950 */
     if (dummy_shm_surface && new_surface == &dummy_surface)
-    {
-        window_surface_release( new_surface );
         new_surface = create_shm_surface( hwnd, parent, &new_rects->visible, old_surface );
-    }
 
     if (old_surface != new_surface) swp_flags |= SWP_FRAMECHANGED;  /* force refreshing non-client area */
 
@@ -2506,6 +2503,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         update_client_surfaces( toplevel );
     }
 
+    /* CX HACK 23950: drop the reference returned by create_shm_surface */
+    if (dummy_shm_surface && new_surface) window_surface_release( new_surface );
     return ret;
 }
 

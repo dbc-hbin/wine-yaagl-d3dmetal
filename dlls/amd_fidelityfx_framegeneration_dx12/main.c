@@ -767,7 +767,8 @@ static void clear_swapchain_claim(struct fg_context *context)
 }
 
 static ffxReturnCode_t translated_dispatch(struct fg_context *context,
-                                         const ffxDispatchDescHeader *header)
+                                         const ffxDispatchDescHeader *header,
+                                         BOOL *submitted)
 {
     struct yaagl_fsr_fg_dispatch_packet packet;
     struct frame_config_snapshot *config;
@@ -832,7 +833,10 @@ static ffxReturnCode_t translated_dispatch(struct fg_context *context,
     /*
      * A dispatch error, including result 4, is an error in this already
      * selected mode.  Never run native interpolation for the same frame.
+     * Rejections above leave the frame retryable; once the translator sees
+     * the frame, this is its single attempt.
      */
+    *submitted = TRUE;
     return bridge_call(&packet);
 }
 
@@ -1107,7 +1111,7 @@ static ffxReturnCode_t dispatch_context(struct fg_context *context,
                                       const ffxDispatchDescHeader *desc)
 {
     ffxReturnCode_t result;
-    BOOL direct_generation = FALSE;
+    BOOL direct_generation = FALSE, submitted = FALSE;
     uint64_t direct_frame = 0;
 
     if (!in_context_callback(context))
@@ -1175,8 +1179,11 @@ static ffxReturnCode_t dispatch_context(struct fg_context *context,
                 result = translated_prepare(context, desc);
             break;
         case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION:
-            result = translated_dispatch(context, desc);
-            if (result == FFX_API_RETURN_OK && context->native_config_valid &&
+            result = translated_dispatch(context, desc, &submitted);
+            /* A failed submitted frame would otherwise pin its snapshot and the
+             * PE pruning floor until OFF; the swapchain callback also retires
+             * failed frames. */
+            if (submitted && context->native_config_valid &&
                 (context->native_config.flags &
                  FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY))
             {

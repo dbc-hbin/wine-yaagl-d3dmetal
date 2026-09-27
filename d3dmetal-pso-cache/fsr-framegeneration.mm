@@ -204,6 +204,31 @@ Object privateTexture(id<MTLDevice> device, MTLPixelFormat format,
     return result;
 }
 
+// MetalFX retains the per-frame resources assigned to the cached interpolator.
+// The execution lease owns them for GPU lifetime, so drop the interpolator's
+// references on every exit from encode, including failures and exceptions.
+class API_AVAILABLE(macos(26.0)) InterpolatorBindings final {
+public:
+    explicit InterpolatorBindings(id<MTLFXFrameInterpolatorBase> effect) noexcept
+        : effect_(effect) {}
+    InterpolatorBindings(const InterpolatorBindings&) = delete;
+    InterpolatorBindings& operator=(const InterpolatorBindings&) = delete;
+    ~InterpolatorBindings() {
+        @try {
+            effect_.colorTexture = nil;
+            effect_.prevColorTexture = nil;
+            effect_.depthTexture = nil;
+            effect_.motionTexture = nil;
+            effect_.uiTexture = nil;
+            effect_.outputTexture = nil;
+            effect_.fence = nil;
+        } @catch (id) {
+        }
+    }
+private:
+    id<MTLFXFrameInterpolatorBase> effect_;
+};
+
 Object makePipeline(id<MTLDevice> device, NSString* name) {
     NSError* error = nil;
     NSString* source = [NSString stringWithUTF8String:kFsrKernelsSource];
@@ -994,6 +1019,7 @@ bool PreparedFrame::encode(
                                  execution->objects))
                     return fail("encode_motion_normalize");
 
+                const InterpolatorBindings bindings(effect);
                 effect.colorTexture = (id<MTLTexture>)current.get();
                 effect.prevColorTexture = (id<MTLTexture>)previous.get();
                 effect.depthTexture = (id<MTLTexture>)normalizedDepth.get();
@@ -1460,5 +1486,9 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
 
 extern "C" __attribute__((visibility("default"))) std::uint32_t
 yaagl_fsr_fg_api(std::uint32_t operation, void* arguments) noexcept {
-    return yaagl::pso::fsr::framegeneration::api(operation, arguments);
+    // Wine game threads have no autorelease pool; api() catches every
+    // exception, so this pool is always drained on return.
+    @autoreleasepool {
+        return yaagl::pso::fsr::framegeneration::api(operation, arguments);
+    }
 }

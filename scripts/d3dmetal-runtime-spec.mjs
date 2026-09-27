@@ -41,7 +41,7 @@ export const D3DMETAL_RUNTIME_HASHES = Object.freeze({
   stagePatched: D3DMETAL_STAGE_LOCK_PATCHED_SHA256,
   compositePreSign: "b7b06c767d4ec71ea76a3fd8918a79db0e7fdbb30a555062adff61bfd5f4e1b0",
   compositePayload: D3DMETAL_PSO_CACHE_PATCHED_PAYLOAD_SHA256,
-  finalD3DMetal: "ebd6be389eb34576b4158accf9e785ad58f9a2ef3c4ca03f4d188a85c1338637",
-  rawSidecar: "a2fe5f470854d3c350be3c4b6d8e4ffe67d15768db66114d5a82a8e6d0c8fbed",
-  signedSidecar: "e5e69f05c069bafd242759e86c64332de005be8bccdd6d9c882f379ece16f75f",
+  finalD3DMetal: "fad6269f278e2e3e83adfd1697cfaff510e92be1bbaac15bfb6f622a3b524ecb",
+  rawSidecar: "4659c0b88fceccdc5a498de4cc31f66e74bb23626b851d3eba3f4fc93304bc14",
+  signedSidecar: "84b17c9a6c80985258f3d10f79f41f3944d9445141bbbcc3cac3f4531e8d0fad",
 });

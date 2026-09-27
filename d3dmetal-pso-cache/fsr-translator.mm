@@ -234,8 +234,13 @@ std::uint32_t destroy(yaagl_fsr_packet_header& packet) {
     {
         std::lock_guard lock(state->mutex);
         state->retired = true;
+        // Recorded frames can outlive the context; they must not refill pools.
+        if (state->backend) state->backend->setDormant(true);
         state->backend.reset();
-        for (auto& cached : state->inactiveBackends) cached.backend.reset();
+        for (auto& cached : state->inactiveBackends) {
+            if (cached.backend) cached.backend->setDormant(true);
+            cached.backend.reset();
+        }
         state->executionDevice.reset();
         state->device.reset();
     }
@@ -301,6 +306,8 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
             std::swap(state->generationOutput, cached.output);
             std::swap(state->generationDevice, cached.device);
             std::swap(state->generationCompiler, cached.compiler);
+            state->backend->setDormant(false);
+            if (cached.backend) cached.backend->setDormant(true);
             reused = true;
             break;
         }
@@ -317,6 +324,7 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
                 return result;
             }
             if (state->backend) {
+                state->backend->setDormant(true);
                 state->inactiveBackends[state->nextEviction] =
                     {state->generationOutput, state->generationDevice,
                      state->generationCompiler, std::move(state->backend)};
@@ -412,17 +420,21 @@ yaagl_fsr_api(std::uint32_t operation, void* arguments) noexcept {
     auto& header = *static_cast<yaagl_fsr_packet_header*>(arguments);
     if (header.operation != operation || header.size < sizeof(header)) return 6;
     if (!available() && operation != YAAGL_FSR_CONFIGURE) return 3;
-    try {
-        @try {
-            switch (operation) {
-            case YAAGL_FSR_CREATE: return create(*static_cast<yaagl_fsr_create_packet*>(arguments));
-            case YAAGL_FSR_DESTROY: return destroy(header);
-            case YAAGL_FSR_CONFIGURE: return configure(*static_cast<yaagl_fsr_configure_packet*>(arguments));
-            case YAAGL_FSR_QUERY: return 2;
-            case YAAGL_FSR_DISPATCH: return dispatch(*static_cast<yaagl_fsr_dispatch_packet*>(arguments));
-            default: return 2;
-            }
-        } @catch (NSException*) { return 3; }
-    } catch (const std::bad_alloc&) { return 5; }
-    catch (...) { return 3; }
+    // Wine game threads have no autorelease pool; without this one, objects
+    // autoreleased while recording accumulate until the thread exits.
+    @autoreleasepool {
+        try {
+            @try {
+                switch (operation) {
+                case YAAGL_FSR_CREATE: return create(*static_cast<yaagl_fsr_create_packet*>(arguments));
+                case YAAGL_FSR_DESTROY: return destroy(header);
+                case YAAGL_FSR_CONFIGURE: return configure(*static_cast<yaagl_fsr_configure_packet*>(arguments));
+                case YAAGL_FSR_QUERY: return 2;
+                case YAAGL_FSR_DISPATCH: return dispatch(*static_cast<yaagl_fsr_dispatch_packet*>(arguments));
+                default: return 2;
+                }
+            } @catch (NSException*) { return 3; }
+        } catch (const std::bad_alloc&) { return 5; }
+        catch (...) { return 3; }
+    }
 }

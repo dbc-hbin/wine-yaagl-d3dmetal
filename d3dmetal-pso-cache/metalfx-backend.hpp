@@ -157,6 +157,11 @@ public:
 
     CommandMode mode() const noexcept;
 
+    // A dormant feature still prepares, encodes and replays, but keeps no idle
+    // scratch: pools are drained now and later GPU-completion returns are
+    // released instead of pooled. Clearing it re-enables pooling.
+    void setDormant(bool dormant) noexcept;
+
 private:
     friend class PreparedFrame;
     explicit Feature(std::shared_ptr<Impl> impl) noexcept;

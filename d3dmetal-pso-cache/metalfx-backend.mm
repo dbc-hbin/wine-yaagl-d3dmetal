@@ -441,6 +441,9 @@ struct Feature::Impl {
     std::array<id<MTLBuffer>, 6> idleBuffers{};
     NSUInteger idleTextureBytes = 0;
     std::size_t nextTextureSlot = 0;
+    // Set while the translator caches this feature inactive. Checked under the
+    // pool mutexes so late GPU-completion returns release instead of refilling.
+    std::atomic<bool> dormant{false};
 
     struct CachedBundle {
         ExecutionResources resources;
@@ -473,6 +476,10 @@ struct Feature::Impl {
         }
         {
             std::lock_guard<std::mutex> lock(scratchMutex);
+            if (dormant.load(std::memory_order_relaxed)) {
+                releaseObject(texture);
+                return;
+            }
             // A hard byte cap prevents old output resolutions accumulating GPU
             // allocations even when the fixed slot count has spare entries.
             for (auto& slot : idleTextures) {
@@ -505,10 +512,12 @@ struct Feature::Impl {
         if (!buffer) return;
         {
             std::lock_guard<std::mutex> lock(scratchMutex);
-            for (auto& slot : idleBuffers) {
-                if (slot) continue;
-                slot = std::exchange(buffer, nil);
-                return;
+            if (!dormant.load(std::memory_order_relaxed)) {
+                for (auto& slot : idleBuffers) {
+                    if (slot) continue;
+                    slot = std::exchange(buffer, nil);
+                    return;
+                }
             }
         }
         releaseObject(buffer);
@@ -518,10 +527,11 @@ struct Feature::Impl {
         // The lease is retained until GPU completion. Commit the empty set
         // before allowing any scratch allocation it named into the general pool.
         if (resources.residency && commandMode == CommandMode::Metal4 &&
+            !dormant.load(std::memory_order_relaxed) &&
             emptyResidencySet(resources.residency)) {
             std::lock_guard<std::mutex> lock(bundleMutex);
             for (auto& slot : idleResidencies) {
-                if (slot) continue;
+                if (slot || dormant.load(std::memory_order_relaxed)) continue;
                 slot = std::exchange(resources.residency, nil);
                 break;
             }
@@ -586,6 +596,8 @@ struct Feature::Impl {
         ExecutionResources displaced;
         {
             std::lock_guard<std::mutex> lock(bundleMutex);
+            // The caller releases the resources through returnResources().
+            if (dormant.load(std::memory_order_relaxed)) return;
             CachedBundle* slot = nullptr;
             for (auto& entry : idleBundles) {
                 if (entry.resources.residency) continue;
@@ -614,6 +626,29 @@ struct Feature::Impl {
             }
         }
         for (auto& resources : displaced) returnResources(resources);
+    }
+
+    // Pools only hold GPU-completed resources; active leases are untouched.
+    void setDormant(bool value) noexcept {
+        dormant.store(value);
+        if (!value) return;
+        std::array<ExecutionResources, 2> bundles;
+        std::array<id, 2> residencies{};
+        {
+            std::lock_guard<std::mutex> lock(bundleMutex);
+            for (std::size_t i = 0; i != idleBundles.size(); ++i) {
+                idleBundles[i].resources.swap(bundles[i]);
+                idleBundles[i].owner = nullptr;
+            }
+            residencies.swap(idleResidencies);
+        }
+        for (auto& resources : bundles) resources.release();
+        for (auto& set : residencies) releaseObject(set);
+        std::lock_guard<std::mutex> lock(scratchMutex);
+        for (auto& texture : idleTextures) releaseObject(texture);
+        for (auto& buffer : idleBuffers) releaseObject(buffer);
+        idleTextureBytes = 0;
+        nextTextureSlot = 0;
     }
 
     ~Impl() {
@@ -710,16 +745,12 @@ id<MTLTexture> acquireScratch(Feature::Impl& feature, id<MTLTexture> source,
                               NSUInteger height = 0) noexcept {
     const NSUInteger actualWidth = width ? width : source.width;
     const NSUInteger actualHeight = height ? height : source.height;
-    id<MTLTexture> texture = feature.takeTexture(format, actualWidth, actualHeight, usage);
-    if (!texture) return makeScratchTexture(feature.device, source, format, usage, suffix,
-                                            actualWidth, actualHeight);
-    @try {
-        texture.label = source.label ? [source.label stringByAppendingString:suffix] : nil;
+    // A pooled texture keeps the label from its creation. Relabeling every
+    // acquisition would build a new string per scratch texture per frame.
+    if (id<MTLTexture> texture = feature.takeTexture(format, actualWidth, actualHeight, usage))
         return texture;
-    } @catch (id) {
-        [texture release];
-        return nil;
-    }
+    return makeScratchTexture(feature.device, source, format, usage, suffix,
+                              actualWidth, actualHeight);
 }
 
 id<MTLTexture> acquireExposure(Feature::Impl& feature) noexcept {
@@ -1871,6 +1902,30 @@ bool copyOutputLegacy(const PreparedFrame::Impl& frame,
     }
 }
 
+// The cached scaler retains every texture and fence assigned for a frame. The
+// execution lease owns them for GPU lifetime, so drop the scaler's references
+// on every exit from encode, including failures and exceptions.
+class ScalerBindings final {
+public:
+    explicit ScalerBindings(id scaler) noexcept : scaler_(scaler) {}
+    ScalerBindings(const ScalerBindings&) = delete;
+    ScalerBindings& operator=(const ScalerBindings&) = delete;
+    ~ScalerBindings() {
+        @try {
+            [scaler_ setColorTexture:nil];
+            [scaler_ setDepthTexture:nil];
+            [scaler_ setMotionTexture:nil];
+            [scaler_ setOutputTexture:nil];
+            [scaler_ setExposureTexture:nil];
+            if (@available(macOS 27.0, *)) [scaler_ setReactiveMaskTexture:nil];
+            [scaler_ setFence:nil];
+        } @catch (id) {
+        }
+    }
+private:
+    id scaler_;
+};
+
 void configureScalerForFrame(Feature::Impl& feature, ScalerGeneration& generation,
                              const PreparedFrame::Impl& frame,
                              ExecutionLease::Impl& lease, id<MTLFence> fence,
@@ -1949,6 +2004,10 @@ std::shared_ptr<Feature> Feature::create(const CreateContext& context,
 
 CommandMode Feature::mode() const noexcept {
     return impl_ ? impl_->commandMode : CommandMode::Legacy;
+}
+
+void Feature::setDormant(bool dormant) noexcept {
+    if (impl_) impl_->setDormant(dormant);
 }
 
 std::shared_ptr<const PreparedFrame> Feature::prepare(
@@ -2120,6 +2179,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
         Feature::Impl& feature = *impl_->feature;
         ScalerGeneration& generation = *impl_->generation;
         std::lock_guard<std::mutex> lock(generation.encodeMutex);
+        const ScalerBindings bindings(generation.scaler);
         const bool generationInitialized = generation.encodedActivation != 0;
         const bool inputExtentChanged = generation.hasLastInputContent &&
             (generation.lastInputContentWidth != impl_->frame.inputContent.width ||
