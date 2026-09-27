@@ -2342,7 +2342,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
             pendingChanges = [[NSMutableArray alloc] init];
         });
         dispatch_sync(queue, ^{
-            [pendingChanges addObject:@[ @(display), @(flags) ]];
+            /* The CG callback thread has no pool; pendingChanges retains the record. */
+            @autoreleasepool
+            {
+                [pendingChanges addObject:@[ @(display), @(flags) ]];
+            }
             if (!scheduled) schedule = scheduled = TRUE;
         });
 

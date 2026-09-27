@@ -21,7 +21,7 @@
          primaryScreenHeightValid = FALSE;
          [self sendDisplaysChanged:FALSE];
          [self adjustWindowLevels];
-@@ -2222,28 +2221,59 @@
+@@ -2222,28 +2221,63 @@
             next mouse move event starts over from an absolute baseline. */
          forceNextMouseMoveAbsolute = TRUE;
  
@@ -69,7 +69,11 @@
 +            pendingChanges = [[NSMutableArray alloc] init];
          });
 +        dispatch_sync(queue, ^{
-+            [pendingChanges addObject:@[ @(display), @(flags) ]];
++            /* The CG callback thread has no pool; pendingChanges retains the record. */
++            @autoreleasepool
++            {
++                [pendingChanges addObject:@[ @(display), @(flags) ]];
++            }
 +            if (!scheduled) schedule = scheduled = TRUE;
 +        });
 +

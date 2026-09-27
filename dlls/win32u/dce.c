@@ -772,6 +772,7 @@ struct shm_window_surface
     struct window_surface header;
     HANDLE      section;
     HWND        parent;
+    DWORD       parent_pid; /* owns section; the parent HWND may be destroyed first */
     BITMAPINFO  info;
 };
 
@@ -812,13 +813,11 @@ static void shm_surface_destroy( struct window_surface *window_surface )
     unsigned int status;
     CLIENT_ID cid;
     HANDLE h2;
-    DWORD pid;
 
     TRACE( "freeing %p\n", surface );
     if (surface->section)
     {
-        get_window_thread( surface->parent, &pid );
-        cid.UniqueProcess = ULongToHandle(pid);
+        cid.UniqueProcess = ULongToHandle(surface->parent_pid);
         cid.UniqueThread  = 0;
         status = NtOpenProcess( &parent_process, PROCESS_DUP_HANDLE, &attr, &cid );
         if (status)
@@ -858,7 +857,7 @@ struct window_surface *create_shm_surface( HWND window, HWND parent, const RECT 
     HANDLE mapping;
     unsigned int status;
     HBITMAP bitmap;
-    DWORD pid;
+    DWORD pid = 0;
     RECT r;
 
     TRACE( "hwnd %p parent %p\n", window, parent );
@@ -930,6 +929,7 @@ struct window_surface *create_shm_surface( HWND window, HWND parent, const RECT 
         return NULL;
     }
 
+    surface->parent_pid = pid;
     status = NtDuplicateObject( GetCurrentProcess(), mapping, parent_process,
                                 &surface->section, FILE_MAP_READ, FALSE, 0 );
     NtClose( parent_process );

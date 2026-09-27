@@ -38,7 +38,7 @@
         "d3dmetal_macdrv_win_data ABI 120"
       ],
       "status": "present",
-      "sha256": "8a8a4c2bee9105ddaeb6fb4fa96f8993e83f56c8309113b722ea7ad6f0b91609"
+      "sha256": "9816466531669fb1a5d5cfcd91d0ba33cca7d2a0e0e606f58813572fe8ad206e"
     },
     {
       "file": "0003-zzz-compatibility.patch",
