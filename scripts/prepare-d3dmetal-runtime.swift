@@ -79,6 +79,16 @@ private func path(_ value: String) -> URL {
     URL(fileURLWithPath: value, relativeTo: URL(fileURLWithPath: files.currentDirectoryPath, isDirectory: true)).standardizedFileURL
 }
 
+private func executableDirectory() throws -> URL {
+    var length: UInt32 = 0
+    _ = _NSGetExecutablePath(nil, &length)
+    guard length > 0 else { try fail("could not determine executable path length") }
+    var buffer = [CChar](repeating: 0, count: Int(length))
+    let status = buffer.withUnsafeMutableBufferPointer { _NSGetExecutablePath($0.baseAddress, &length) }
+    guard status == 0 else { try fail("could not determine executable path") }
+    return URL(fileURLWithPath: String(cString: buffer)).resolvingSymlinksInPath().deletingLastPathComponent()
+}
+
 private func parseArguments() throws -> Options? {
     var options = Options()
     let arguments = Array(CommandLine.arguments.dropFirst())
@@ -351,8 +361,7 @@ private func prepare(_ options: Options, recipe: Recipe) throws {
     guard sumsText == "\(release.assets.framework.sha256)  \(release.assets.framework.name)" else {
         try fail("release SHA256SUMS does not match the pinned framework asset")
     }
-    let sidecar = options.psoModule ?? URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
-        .deletingLastPathComponent().appendingPathComponent("libYaaglNativePsoCache.dylib")
+    let sidecar = try options.psoModule ?? executableDirectory().appendingPathComponent("libYaaglNativePsoCache.dylib")
     let sourceHash = try hashFile(sidecar)
     guard sourceHash == hashes.rawSidecar || sourceHash == hashes.signedSidecar else {
         try fail("unexpected native PSO module: \(sourceHash)")

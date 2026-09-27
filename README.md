@@ -1,15 +1,15 @@
-# Yaagl Wine DX12 runtime
+# Wine 11.17 D3DMetal (GPTK 4.0b2, experimental)
 
 [한국어](README.ko.md)
 
 Wine 11.17 runtime source for Yaagl, using GPTK 4.0b2 D3DMetal and MetalFX.
-Requires Apple Silicon, macOS 26+, and Rosetta 2. No standalone installer or Apple framework is bundled.
+Targets Apple Silicon, macOS 26+, and Rosetta 2; macOS 26 hardware has not been tested. No standalone installer or Apple framework is bundled.
 
 ## D3DMetal autopatch
 
 Installation uses a native helper and bundled sidecar; Node.js, Python, and Xcode tools are not required.
 Yaagl must obtain Apple license consent in its UI before invoking the helper with `--accept-apple-license`.
-The helper verifies pinned downloads, patches, and signatures before publishing the prepared framework.
+The helper resolves its sidecar beside the real executable, including PATH/symlink launches, and verifies downloads, patches, and signatures before publishing the framework.
 
 ## Build the autopatch bundle
 
@@ -21,7 +21,15 @@ node scripts/build-d3dmetal-autopatch.mjs build/d3dmetal-autopatch
 
 Output: `build/d3dmetal-autopatch/` and `build/d3dmetal-autopatch.tar.gz`.
 
-With `MTL_HUD_ENABLED=1`, Metal HUD keeps its MetalFX “Frame Interpolator” row after the first interpolation. When no MetalFX frame-generation context is still interpolating, the sidecar removes that row about 0.5 s later; the next interpolation shows it again.
+## Package the Wine runtime
+
+```sh
+scripts/build-yaagl-overlay.sh BASE_WINE_ROOT build/yaagl-overlay
+python3 scripts/package-yaagl-runtime.py BASE_WINE_ROOT build/yaagl-overlay build/d3dmetal-autopatch build/yaagl-release
+```
+
+The archive excludes Apple’s `D3DMetal.framework`; prepare it in `wine/lib/external/` before loading Wine.
+Metal HUD hides the MetalFX “Frame Interpolator” row about 0.5 s after frame generation stops.
 
 ## Licenses
 
