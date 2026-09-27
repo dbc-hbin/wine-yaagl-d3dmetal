@@ -103,8 +103,8 @@ struct IdleBackend {
     void* compiler = nullptr;
     std::shared_ptr<metalfx::Feature> backend;
 };
-// Three covers a 4K/QHD/FHD round trip; idle cost is up to ~0.75 GiB of scalers.
-constexpr std::size_t kIdleBackendLimit = 3;
+// Two covers returning to the previous size; idle cost is up to ~0.58 GiB of scalers.
+constexpr std::size_t kIdleBackendLimit = 2;
 std::mutex gIdleMutex;
 std::array<IdleBackend, kIdleBackendLimit> gIdleBackends{}; // [0] is most recent
 
