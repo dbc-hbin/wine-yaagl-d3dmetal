@@ -21,6 +21,8 @@ node scripts/build-d3dmetal-autopatch.mjs build/d3dmetal-autopatch
 
 Output: `build/d3dmetal-autopatch/` and `build/d3dmetal-autopatch.tar.gz`.
 
+With `MTL_HUD_ENABLED=1`, Metal HUD keeps its MetalFX “Frame Interpolator” row after the first interpolation. When no MetalFX frame-generation context is still interpolating, the sidecar removes that row about 0.5 s later; the next interpolation shows it again.
+
 ## Licenses
 
 See [COPYING.LIB](COPYING.LIB) and [NOTICES.md](NOTICES.md). Apple GPTK has separate license terms.

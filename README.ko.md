@@ -21,6 +21,8 @@ node scripts/build-d3dmetal-autopatch.mjs build/d3dmetal-autopatch
 
 산출물: `build/d3dmetal-autopatch/`, `build/d3dmetal-autopatch.tar.gz`.
 
+`MTL_HUD_ENABLED=1`이면 Metal HUD는 첫 보간 이후 MetalFX “Frame Interpolator” 항목을 계속 표시합니다. 보간 중인 MetalFX FG context가 모두 꺼지면 사이드카가 약 0.5초 뒤 이 항목을 지우고, 다음 보간 때 다시 표시됩니다.
+
 ## 라이선스
 
 [COPYING.LIB](COPYING.LIB), [NOTICES.md](NOTICES.md)를 참고하세요. Apple GPTK에는 별도 라이선스가 적용됩니다.

@@ -80,6 +80,61 @@ R send(id object, SEL selector, A... arguments) {
         object, selector, arguments...);
 }
 
+/*
+ * Metal HUD adds its "Frame Interpolator: Enabled" row on the first MetalFX
+ * interpolation encode and never removes it, although it has a removal method.
+ * Call that method when this process stops interpolating so the row reflects
+ * the current state; the next encode adds it back. The class exists only while
+ * MTL_HUD_ENABLED loads libMTLHud, so this is a no-op without the HUD.
+ */
+void hideHudFrameInterpolator() noexcept {
+    @try {
+        Class service = NSClassFromString(@"MTLHUDService");
+        SEL instance = NSSelectorFromString(@"instance");
+        SEL disable = NSSelectorFromString(@"metalFXFrameInterpolatorDisable");
+        if (!service || ![service respondsToSelector:instance]) return;
+        id hud = send<id>((id)service, instance);
+        if ([hud respondsToSelector:disable]) send<void>(hud, disable);
+    } @catch (NSException*) {
+    }
+}
+
+/*
+ * The row is process-wide. `interpolating` counts contexts that have
+ * interpolated since their last OFF; only a native FSR fallback never counts.
+ * MetalFX reports each encode to the HUD asynchronously, when the frame reaches
+ * its layer (measured at most one frame, 19 ms, later). A removal therefore
+ * waits 500 ms and runs only if nothing counts and no encode outside a counted
+ * context happened after it was scheduled; such an encode schedules its own.
+ */
+struct HudRow {
+    std::mutex mutex;
+    unsigned interpolating = 0;
+    std::uint64_t activity = 0;
+} hudRow;
+
+// Call with hudRow.mutex held.
+void scheduleHudRowRemoval() noexcept {
+    const std::uint64_t activity = ++hudRow.activity;
+    if (!NSClassFromString(@"MTLHUDService")) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            std::lock_guard lock(hudRow.mutex);
+            if (!hudRow.interpolating && hudRow.activity == activity)
+                hideHudFrameInterpolator();
+        }
+    });
+}
+
+// Call with the context's executionMutex held; `counted` is State::hudCounted.
+void releaseHudRow(bool& counted) noexcept {
+    if (!counted) return;
+    counted = false;
+    std::lock_guard lock(hudRow.mutex);
+    if (!--hudRow.interpolating) scheduleHudRowRemoval();
+}
+
 class Object {
 public:
     Object() noexcept = default;
@@ -307,6 +362,8 @@ struct State {
     bool generationEnabled = true;
     // Protected by executionMutex while encoding; configuration also holds mutex.
     std::uint64_t generationEpoch = 0;
+    // Protected by executionMutex; set while this context holds a HudRow count.
+    bool hudCounted = false;
     bool hasMode = false;
     Mode mode = Mode::Legacy;
     Object metalDevice;
@@ -1095,6 +1152,19 @@ bool PreparedFrame::encode(
                     }
                 }
 
+                const bool currentGeneration =
+                    impl_->generationEpoch == state.generationEpoch && state.generationEnabled;
+                // Record the encode before MetalFX can report it to the HUD.
+                if (!currentGeneration || !state.hudCounted) {
+                    std::lock_guard lock(hudRow.mutex);
+                    if (currentGeneration) {
+                        state.hudCounted = true;
+                        ++hudRow.interpolating;
+                    } else {
+                        // A command recorded before OFF or DESTROY re-adds the row.
+                        scheduleHudRowRemoval();
+                    }
+                }
                 if (configuration.mode == Mode::Metal4)
                     [(id<MTL4FXFrameInterpolator>)interpolator.get()
                         encodeToCommandBuffer:(id<MTL4CommandBuffer>)buffer];
@@ -1111,7 +1181,7 @@ bool PreparedFrame::encode(
                     return fail("encode_output_scatter");
                 // A queued command may encode after OFF (or after a subsequent ON).
                 // Its output remains owned by the command, but must not seed new history.
-                if (impl_->generationEpoch == state.generationEpoch && state.generationEnabled) {
+                if (currentGeneration) {
                     state.history = current;
                     state.historyConfiguration = impl_->snapshot->configuration;
                     state.historyDispatch = impl_->dispatch;
@@ -1195,6 +1265,10 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                 std::lock_guard lock(state->mutex);
                 state->retired = true;
                 state->frames.clear();
+                // Commands recorded before DESTROY may still encode; mark them stale.
+                std::lock_guard executionLock(state->executionMutex);
+                ++state->generationEpoch;
+                releaseHudRow(state->hudCounted);
                 return finish(Ok);
             }
             if (operation == YAAGL_FSR_FG_RETIRE_FRAME) {
@@ -1228,6 +1302,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                 std::lock_guard executionLock(state->executionMutex);
                 state->generationEnabled = config.enabled != 0;
                 if (!state->generationEnabled) {
+                    releaseHudRow(state->hudCounted);
                     ++state->generationEpoch;
                     state->frames.clear();
                     state->configurations.clear();
