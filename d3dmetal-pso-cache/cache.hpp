@@ -21,8 +21,6 @@ public:
     ~NativeResult();
 
     [[nodiscard]] id state() const noexcept { return state_; }
-    [[nodiscard]] id reflection() const noexcept { return reflection_; }
-    [[nodiscard]] NSError* error() const noexcept { return error_; }
     [[nodiscard]] bool hasError() const noexcept { return error_ != nil; }
 
     // Transfer this result's owned reference to the caller.

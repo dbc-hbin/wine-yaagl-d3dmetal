@@ -206,11 +206,9 @@ struct State {
     std::mutex leaseLock;
     std::array<id, kMaxResources> textures{};
     std::size_t textureCount = 0;
-    std::uint64_t featureID = 0;
-    std::uint64_t evaluationID = 0;
 
     State(const RecordRequest& request)
-        : prepared(request.prepared), featureID(request.featureID), evaluationID(request.evaluationID) {
+        : prepared(request.prepared) {
         if (!request.resources) return;
         for (std::size_t i = 0; i < request.resourceCount && i < kMaxResources; ++i) {
             const MetalResource* resource = request.resources[i].resource;
@@ -227,12 +225,11 @@ struct State {
         for (std::size_t i = 0; i < textureCount; ++i) [textures[i] release];
     }
 
-    bool encode(void* command, void* commandBuffer, void* fence) noexcept {
+    bool encode(void* commandBuffer, void* fence) noexcept {
         metalfx::Error error{};
         bool encoded = false;
         try {
             std::lock_guard<std::mutex> lock(leaseLock);
-            const metalfx::EncodeIdentity identity{featureID, evaluationID, command};
             std::shared_ptr<ExecutionSlot> slot;
             encoded = std::visit([&](const auto& frame) -> bool {
                 using T = std::decay_t<decltype(frame)>;
@@ -255,7 +252,7 @@ struct State {
                     std::lock_guard<std::mutex> slotLock(slot->mutex);
                     Lease& lease = std::get<Lease>(slot->lease);
                     if constexpr (std::is_same_v<T, std::shared_ptr<const metalfx::PreparedFrame>>)
-                        return frame && frame->encode(commandBuffer, fence, lease, &error, &identity);
+                        return frame && frame->encode(commandBuffer, fence, lease, &error);
                     else
                         return frame && frame->encode(commandBuffer, fence, lease);
                 }
@@ -308,10 +305,6 @@ bool initialize(const void* d3dmetalImageBase) noexcept {
     return true;
 }
 
-bool available() noexcept {
-    return ensureInitialized();
-}
-
 bool resolveCommandList(NativeCommandList& commandList) noexcept {
     if (!ensureInitialized() || commandList.kind != CommandListKind::legacy || !commandList.wrapper)
         return false;
@@ -340,7 +333,6 @@ bool queryResourceMetadata(void* d3d12Resource, ResourceMetadata& out) noexcept 
         reinterpret_cast<GetInternal>(const_cast<std::uint8_t*>(gRuntime.image) + kGetInternalResource)(
             &internal, d3d12Resource);
         if (!internal) return false;
-        out.dxgiFormat = loadAt<std::uint32_t>(internal, 0x48);
         out.resourceFlags = loadAt<std::uint32_t>(internal, 0x58);
         releaseInternalTexture(internal);
         return true;
@@ -458,7 +450,7 @@ ReplayResult replay(void* d3dmCommandEncoder, const void* command) noexcept {
         void* commandBuffer = getExternalCommandBuffer(d3dmCommandEncoder);
         if (!commandBuffer) return ReplayResult::Failed;
 
-        encoded = owner->state.encode(const_cast<void*>(command), commandBuffer, fence);
+        encoded = owner->state.encode(commandBuffer, fence);
 
         // Re-enter D3DMetal through its ordinary blit encoder creation path,
         // then wait on the same fence the scaler was given. This is the exact

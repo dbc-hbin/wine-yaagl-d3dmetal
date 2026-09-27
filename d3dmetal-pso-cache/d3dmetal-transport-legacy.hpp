@@ -7,7 +7,6 @@
 namespace yaagl::pso::d3dmetal::legacy {
 
 struct ResourceMetadata {
-    std::uint32_t dxgiFormat = 0;
     std::uint32_t resourceFlags = 0;
 
     bool allowsUnorderedAccess() const noexcept {
@@ -18,7 +17,6 @@ struct ResourceMetadata {
 // Pins the GPTK 4.0b2 legacy MTL3 command transport. Passing nullptr locates
 // D3DMetal through MPLCreateContext, matching the primary transport helper.
 bool initialize(const void* d3dmetalImageBase = nullptr) noexcept;
-bool available() noexcept;
 
 // Completes the legacy half of d3dmetal::unwrapCommandList(). The primary
 // helper identifies D3D12GraphicsCommandListMTL and owns its private interface;
@@ -26,9 +24,9 @@ bool available() noexcept;
 bool resolveCommandList(NativeCommandList& commandList) noexcept;
 
 // Mirrors D3D12Texture::GetDesc without calling a public Windows ABI method.
-// The returned values are the original DXGI_FORMAT and D3D12_RESOURCE_FLAGS,
-// before D3DMetal chooses a Metal view. The temporary native resource owner is
-// balanced inside this call.
+// The returned value is the original D3D12_RESOURCE_FLAGS, before D3DMetal
+// chooses a Metal view. The temporary native resource owner is balanced inside
+// this call.
 bool queryResourceMetadata(void* d3d12Resource, ResourceMetadata& out) noexcept;
 
 // Reserve the native legacy temporal opcode as a carrier, replace only its

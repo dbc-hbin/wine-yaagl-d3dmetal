@@ -118,21 +118,7 @@ ContractStatus validateFrame(const CreateContract& create, const yaagl_fsr_dispa
     output.operations.capOutputToTemporalMaxScale = true;
     output.operations.sharpening = input.enable_sharpening != 0;
     output.operations.sharpness = input.sharpness;
-    output.frameTimeDelta = input.frame_time_delta;
-    output.cameraNear = input.camera_near;
-    output.cameraFar = input.camera_far;
-    output.cameraFovVertical = input.camera_fov_vertical;
-    output.viewSpaceToMeters = input.view_space_to_meters;
     return ContractStatus::Ok;
-}
-
-const char* contractStatusName(ContractStatus status) noexcept {
-    switch (status) {
-    case ContractStatus::Ok: return "ok";
-    case ContractStatus::InvalidParameter: return "invalid_parameter";
-    case ContractStatus::Unsupported: return "unsupported";
-    }
-    return "invalid_parameter";
 }
 
 } // namespace yaagl::pso::fsr

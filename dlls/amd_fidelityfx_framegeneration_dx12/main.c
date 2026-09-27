@@ -107,7 +107,6 @@ static const GUID stable_swapchain_iid =
 
 struct native_api
 {
-    HMODULE module;
     ffxReturnCode_t (WINAPI *create)(ffxContext *, ffxCreateContextDescHeader *,
                                     const ffxAllocationCallbacks *);
     ffxReturnCode_t (WINAPI *destroy)(ffxContext *, const ffxAllocationCallbacks *);
@@ -254,7 +253,6 @@ static BOOL CALLBACK initialize_native(INIT_ONCE *once, void *parameter, void **
     }
 
     memset(&api, 0, sizeof(api));
-    api.module = module;
     api.create = (void *)GetProcAddress(module, "ffxCreateContext");
     api.destroy = (void *)GetProcAddress(module, "ffxDestroyContext");
     api.configure = (void *)GetProcAddress(module, "ffxConfigure");

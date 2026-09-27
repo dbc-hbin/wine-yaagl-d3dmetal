@@ -39,7 +39,6 @@ struct CreateInfo {
     ParameterValue<bool> outputSubrects{};
 
     constexpr std::uint32_t flags() const noexcept { return featureFlags.value; }
-    constexpr bool hdr() const noexcept { return (flags() & FeatureFlagIsHDR) != 0; }
     constexpr bool lowResolutionMotionVectors() const noexcept {
         return (flags() & FeatureFlagMVLowRes) != 0;
     }

@@ -334,15 +334,11 @@ struct OwnerState {
     std::mutex leaseLock;
     std::array<id, kMaxResources> textures{};
     std::size_t textureCount = 0;
-    std::uint64_t featureID = 0;
-    std::uint64_t evaluationID = 0;
 
     OwnerState(PreparedWork frame,
                const std::array<UseEntry, kMaxResources>& uses,
-               std::size_t count,
-               std::uint64_t feature,
-               std::uint64_t evaluation)
-        : prepared(std::move(frame)), featureID(feature), evaluationID(evaluation) {
+               std::size_t count)
+        : prepared(std::move(frame)) {
         @try {
             for (std::size_t i = 0; i < count; ++i) {
                 textures[i] = [uses[i].texture retain];
@@ -362,7 +358,7 @@ struct OwnerState {
             [textures[i] release];
     }
 
-    bool encode(void* command, void* commandBuffer, void* fence) noexcept {
+    bool encode(void* commandBuffer, void* fence) noexcept {
         if (!prepared) return false;
         metalfx::Error error{};
         bool encoded = false;
@@ -372,7 +368,6 @@ struct OwnerState {
             // PreparedFrame publishes its ExecutionLease before any command;
             // keeping this slot through a false return preserves partially
             // encoded resource ownership as well.
-            const metalfx::EncodeIdentity identity{featureID, evaluationID, command};
             std::shared_ptr<ExecutionSlot> slot;
             encoded = std::visit([&](const auto& frame) -> bool {
                 using T = std::decay_t<decltype(frame)>;
@@ -383,7 +378,7 @@ struct OwnerState {
                     std::lock_guard<std::mutex> slotLock(slot->mutex);
                     Lease& lease = std::get<Lease>(slot->lease);
                     if constexpr (std::is_same_v<T, std::shared_ptr<const metalfx::PreparedFrame>>)
-                        return frame && frame->encode(commandBuffer, fence, lease, &error, &identity);
+                        return frame && frame->encode(commandBuffer, fence, lease, &error);
                     else
                         return frame && frame->encode(commandBuffer, fence, lease);
                 }
@@ -456,10 +451,6 @@ bool initialize(const void* d3dmetalImageBase) noexcept {
     gRuntime.ready = true;
     gReady.store(true, std::memory_order_release);
     return true;
-}
-
-bool available() noexcept {
-    return ensureInitialized();
 }
 
 bool unwrapCommandList(void* d3d12CommandList, NativeCommandList& out) noexcept {
@@ -639,8 +630,7 @@ bool record(NativeCommandList& commandList, const RecordRequest& request) noexce
 
     try {
         @try {
-            unownedState = new OwnerState(request.prepared, uses, useCount,
-                                          request.featureID, request.evaluationID);
+            unownedState = new OwnerState(request.prepared, uses, useCount);
             owner = [[YAAGLMetalFXRecordedOwner alloc] initWithState:unownedState];
             if (!owner) {
                 delete unownedState;
@@ -778,7 +768,7 @@ ReplayResult replay(void* mplReplayer, const void* command) noexcept {
         sendVoid(encoder, endSelector);
         storeAt<void*>(mplReplayer, kReplayerComputeEncoder, nullptr);
 
-        encoded = state->encode(const_cast<void*>(command), commandBuffer, fence);
+        encoded = state->encode(commandBuffer, fence);
 
         // Re-enter the ordinary MPL compute stream exactly as ComputeEncoder::
         // Begin does: create a fresh encoder, restore its shared argument table,

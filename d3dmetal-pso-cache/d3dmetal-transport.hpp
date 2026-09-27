@@ -100,8 +100,6 @@ struct PreparedWork {
             else return static_cast<bool>(frame);
         }, value);
     }
-
-    void reset() noexcept { value = std::monostate{}; }
 };
 
 struct ExecutionSlot;
@@ -145,14 +143,11 @@ struct RecordRequest {
     PreparedWork prepared;
     const ResourceUse* resources = nullptr;
     std::size_t resourceCount = 0;
-    std::uint64_t featureID = 0;
-    std::uint64_t evaluationID = 0;
 };
 
 // Pins every private D3DMetal code/data contract used below.  Passing nullptr
 // locates D3DMetal from MPLCreateContext in the current process.
 bool initialize(const void* d3dmetalImageBase = nullptr) noexcept;
-bool available() noexcept;
 
 // Public DX12 command-list -> private MPL/legacy transport.  MPL returns the
 // current IMPLCommandList and IMPLCommandAllocator.  Legacy is identified but

@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -19,36 +18,6 @@
 
 namespace yaagl::pso::metalfx {
 namespace {
-
-std::atomic<const EncodeObserver*> gEncodeObserver{nullptr};
-
-class EncodeObservationScope final {
-public:
-    EncodeObservationScope() noexcept
-        : observer_(gEncodeObserver.load(std::memory_order_acquire)) {}
-    bool enabled() const noexcept { return observer_ != nullptr; }
-    void begin(const EncodeObservation& observation) noexcept {
-        if (!observer_) return;
-        const int saved = errno;
-        @try { token_ = observer_->begin(observation); }
-        @catch (id) { token_ = nullptr; } // Diagnostics must not fail rendering.
-        errno = saved;
-    }
-    void completed() noexcept { completed_ = true; }
-    ~EncodeObservationScope() {
-        if (!token_ || !observer_) return;
-        const int saved = errno;
-        @try { observer_->end(token_, completed_); }
-        @catch (id) {} // The observer owns failure reporting and GPU lifetimes.
-        errno = saved;
-    }
-    EncodeObservationScope(const EncodeObservationScope&) = delete;
-    EncodeObservationScope& operator=(const EncodeObservationScope&) = delete;
-private:
-    const EncodeObserver* observer_ = nullptr;
-    void* token_ = nullptr;
-    bool completed_ = false;
-};
 
 template <typename T>
 T retainObject(T object) noexcept {
@@ -441,8 +410,8 @@ struct Feature::Impl {
     std::array<id<MTLBuffer>, 6> idleBuffers{};
     NSUInteger idleTextureBytes = 0;
     std::size_t nextTextureSlot = 0;
-    // Set while the translator caches this feature inactive. Checked under the
-    // pool mutexes so late GPU-completion returns release instead of refilling.
+    // Set once the owner drops this feature. Checked under the pool mutexes
+    // so late GPU-completion returns release instead of refilling.
     std::atomic<bool> dormant{false};
 
     struct CachedBundle {
@@ -673,10 +642,7 @@ struct ExecutionLease::Impl : ExecutionResources {
     id argumentTable = nil;
     id fsrArgumentTable = nil;
     id<MTLFence> fence = nil;
-    bool effectiveReset = false;
-    bool generationInitialized = false;
     bool replayEligible = false;
-    void* scaler = nullptr;
     ~Impl() {
         releaseObject(fence);
         releaseObject(fsrArgumentTable);
@@ -1208,16 +1174,13 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
         }
 
         id scaler = nil;
-        {
-            IndependentFactoryScope factoryScope;
-            if (feature.commandMode == CommandMode::Metal4) {
-                if (@available(macOS 26.0, *)) {
-                    id<MTL4Compiler> compiler = reinterpret_cast<id<MTL4Compiler>>(feature.compiler);
-                    scaler = [descriptor newTemporalScalerWithDevice:feature.device compiler:compiler];
-                }
-            } else {
-                scaler = [descriptor newTemporalScalerWithDevice:feature.device];
+        if (feature.commandMode == CommandMode::Metal4) {
+            if (@available(macOS 26.0, *)) {
+                id<MTL4Compiler> compiler = reinterpret_cast<id<MTL4Compiler>>(feature.compiler);
+                scaler = [descriptor newTemporalScalerWithDevice:feature.device compiler:compiler];
             }
+        } else {
+            scaler = [descriptor newTemporalScalerWithDevice:feature.device];
         }
         if (!scaler) {
             setError(error, ErrorCode::ScalerCreationFailed,
@@ -2130,11 +2093,6 @@ PreparedFrame::PreparedFrame(std::shared_ptr<Impl> impl) noexcept : impl_(std::m
 
 PreparedFrame::~PreparedFrame() = default;
 
-void installEncodeObserver(const EncodeObserver* observer) noexcept {
-    gEncodeObserver.store(observer && observer->begin && observer->end ? observer : nullptr,
-                          std::memory_order_release);
-}
-
 CommandMode PreparedFrame::mode() const noexcept {
     return impl_ && impl_->feature ? impl_->feature->commandMode : CommandMode::Legacy;
 }
@@ -2149,7 +2107,7 @@ TemporalOutputInfo PreparedFrame::temporalOutputInfo() const noexcept {
 
 bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
                            std::shared_ptr<const ExecutionLease>& leaseResult,
-                           Error* error, const EncodeIdentity* identity) const noexcept {
+                           Error* error) const noexcept {
     clearError(error);
     leaseResult.reset();
     if (!impl_ || !impl_->feature || !commandBuffer || !fencePointer) {
@@ -2179,37 +2137,12 @@ bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
         ScalerGeneration& generation = *impl_->generation;
         std::lock_guard<std::mutex> lock(generation.encodeMutex);
         const ScalerBindings bindings(generation.scaler);
-        const bool generationInitialized = generation.encodedActivation != 0;
         const bool inputExtentChanged = generation.hasLastInputContent &&
             (generation.lastInputContentWidth != impl_->frame.inputContent.width ||
              generation.lastInputContentHeight != impl_->frame.inputContent.height);
         const bool effectiveReset = impl_->frame.resetHistory.value ||
                                     generation.encodedActivation != impl_->activation ||
                                     inputExtentChanged;
-        lease->effectiveReset = effectiveReset;
-        lease->generationInitialized = generationInitialized;
-        lease->scaler = reinterpret_cast<void*>(generation.scaler);
-        EncodeObservationScope observation;
-        const auto beginObservation = [&]() noexcept {
-            if (!observation.enabled()) return;
-            EncodeObservation value{};
-            value.mode = feature.commandMode;
-            value.prepared = this;
-            value.create = &feature.create;
-            value.frame = &impl_->frame;
-            value.callerTextures = impl_->textures;
-            value.scaler = reinterpret_cast<void*>(generation.scaler);
-            value.commandBuffer = commandBuffer;
-            value.fence = fencePointer;
-            if (identity) {
-                value.featureID = identity->featureID;
-                value.evaluationID = identity->evaluationID;
-                value.recordedCommand = identity->recordedCommand;
-            }
-            value.effectiveReset = effectiveReset;
-            value.generationInitialized = generationInitialized;
-            observation.begin(value);
-        };
         @try {
             if (feature.commandMode == CommandMode::Metal4) {
                 if (@available(macOS 26.0, *)) {
@@ -2246,7 +2179,6 @@ bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
                     }
                     configureScalerForFrame(feature, generation, *impl_, *lease, lease->fence,
                                             effectiveReset);
-                    beginObservation();
                     [generation.scaler encodeToCommandBuffer:command];
                     if (!encodeFsrFinishMetal4(*impl_, *lease, command, lease->fence)) {
                         setError(error, ErrorCode::EncodeFailed,
@@ -2298,7 +2230,6 @@ bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
                 }
                 configureScalerForFrame(feature, generation, *impl_, *lease, lease->fence,
                                         effectiveReset);
-                beginObservation();
                 [generation.scaler encodeToCommandBuffer:command];
                 if (!encodeFsrFinishLegacy(*impl_, *lease, command, lease->fence)) {
                     setError(error, ErrorCode::EncodeFailed,
@@ -2321,7 +2252,6 @@ bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
         generation.lastInputContentHeight = impl_->frame.inputContent.height;
         generation.hasLastInputContent = true;
         generation.encodedActivation = impl_->activation;
-        observation.completed();
         lease->replayEligible = true;
         return true;
     } catch (...) {
@@ -2333,17 +2263,5 @@ bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
 ExecutionLease::ExecutionLease(std::shared_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
 ExecutionLease::~ExecutionLease() = default;
-
-bool ExecutionLease::effectiveReset() const noexcept {
-    return impl_ && impl_->effectiveReset;
-}
-
-bool ExecutionLease::generationInitialized() const noexcept {
-    return impl_ && impl_->generationInitialized;
-}
-
-void* ExecutionLease::scaler() const noexcept {
-    return impl_ ? impl_->scaler : nullptr;
-}
 
 } // namespace yaagl::pso::metalfx

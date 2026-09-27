@@ -22,16 +22,10 @@ struct CreateContract {
 struct FrameContract {
     metalfx::FrameInfo backend;
     metalfx::FrameOperations operations;
-    float frameTimeDelta = 0.0f;
-    float cameraNear = 0.0f;
-    float cameraFar = 0.0f;
-    float cameraFovVertical = 0.0f;
-    float viewSpaceToMeters = 0.0f;
 };
 
 ContractStatus validateCreate(const yaagl_fsr_create_packet&, CreateContract&) noexcept;
 ContractStatus validateFrame(const CreateContract&, const yaagl_fsr_dispatch_packet&, FrameContract&,
                              const char** detail = nullptr) noexcept;
-const char* contractStatusName(ContractStatus) noexcept;
 
 } // namespace yaagl::pso::fsr

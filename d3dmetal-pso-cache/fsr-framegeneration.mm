@@ -315,7 +315,6 @@ struct Configuration {
     MTLPixelFormat depth = MTLPixelFormatInvalid;
     MTLPixelFormat motion = MTLPixelFormatRG16Float;
     NSUInteger width = 0, height = 0, outputWidth = 0, outputHeight = 0;
-    MTLTextureUsage colorUsage = 0, uiUsage = 0, depthUsage = 0, motionUsage = 0, outputUsage = 0;
     Object decodePipeline;
     Object depthPipeline;
     Object motionPipeline;
@@ -458,15 +457,8 @@ std::shared_ptr<Configuration> configure(
         if (@available(macOS 27.0, *))
             descriptor.requiresPrevColorTexture = YES;
 
-        metalfx::IndependentFactoryScope scope;
         result->factory = result->makeInterpolator();
         if (!result->factory) return {};
-        auto interpolator = (id<MTLFXFrameInterpolatorBase>)result->factory.get();
-        result->colorUsage = interpolator.colorTextureUsage;
-        result->uiUsage = interpolator.uiTextureUsage;
-        result->depthUsage = interpolator.depthTextureUsage;
-        result->motionUsage = interpolator.motionTextureUsage;
-        result->outputUsage = interpolator.outputTextureUsage;
         result->decodePipeline = makePipeline(device, @"yaagl_fg_decode_crop");
         result->depthPipeline = makePipeline(device, @"yaagl_fg_resample_depth");
         result->motionPipeline = makePipeline(device, @"yaagl_fg_normalize_motion");
@@ -530,7 +522,6 @@ static_assert(sizeof(Barrier) == 32);
 
 bool record(void* list, Command& command, const Resources& resources,
             const std::shared_ptr<const PreparedFrame>& prepared,
-            std::uint64_t context, std::uint64_t frame,
             const std::array<std::uint64_t, 3>& addresses,
             const std::array<std::uint32_t, 3>& states, unsigned resourceCount,
             bool generate) {
@@ -555,7 +546,7 @@ bool record(void* list, Command& command, const Resources& resources,
     auto transition = reinterpret_cast<ResourceBarrier>(
         (*static_cast<void***>(list))[26]);
     if (count) transition(list, count, barriers.data());
-    transport::RecordRequest request{prepared, uses.data(), resourceCount, context, frame};
+    transport::RecordRequest request{prepared, uses.data(), resourceCount};
     bool result = command.value.kind == transport::CommandListKind::legacy
         ? transport::legacy::record(command.value, request)
         : transport::record(command.value, request);
@@ -1537,8 +1528,8 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
              */
             if (!generate && state->generationEnabled)
                 state->frames.emplace(frame, implementation->snapshot);
-            if (!record(list, command, resources, prepared, header.context,
-                        frame, addresses, states, resourceCount, generate)) {
+            if (!record(list, command, resources, prepared, addresses, states,
+                        resourceCount, generate)) {
                 if (!generate) state->frames.erase(frame);
                 return finish(Runtime);
             }

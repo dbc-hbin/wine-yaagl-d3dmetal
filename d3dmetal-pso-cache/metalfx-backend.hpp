@@ -8,24 +8,6 @@
 
 namespace yaagl::pso::metalfx {
 
-namespace detail {
-inline thread_local bool independentFactory = false;
-}
-
-class IndependentFactoryScope final {
-public:
-    IndependentFactoryScope() noexcept : previous_(detail::independentFactory) {
-        detail::independentFactory = true;
-    }
-    ~IndependentFactoryScope() { detail::independentFactory = previous_; }
-    IndependentFactoryScope(const IndependentFactoryScope&) = delete;
-    IndependentFactoryScope& operator=(const IndependentFactoryScope&) = delete;
-private:
-    bool previous_;
-};
-
-inline bool independentFactoryActive() noexcept { return detail::independentFactory; }
-
 enum class CommandMode : std::uint8_t {
     Legacy,
     Metal4,
@@ -96,45 +78,6 @@ struct TemporalOutputInfo {
 class PreparedFrame;
 class ExecutionLease;
 
-// Optional observation only. These IDs are the translator's immutable recorded
-// evaluation identity, NOT GPU frame/Present IDs. Replays share this identity
-// but an observer must assign a separate encode ID to every execution.
-struct EncodeIdentity {
-    std::uint64_t featureID = 0;
-    std::uint64_t evaluationID = 0;
-    const void* recordedCommand = nullptr;
-};
-
-struct EncodeObservation {
-    CommandMode mode = CommandMode::Legacy;
-    const PreparedFrame* prepared = nullptr;
-    const CreateInfo* create = nullptr;
-    const FrameInfo* frame = nullptr;
-    TextureSet callerTextures{};
-    void* scaler = nullptr;
-    void* commandBuffer = nullptr;
-    void* fence = nullptr;
-    std::uint64_t featureID = 0;
-    std::uint64_t evaluationID = 0;
-    const void* recordedCommand = nullptr;
-    bool effectiveReset = false;
-    bool generationInitialized = false;
-};
-
-struct EncodeObserver {
-    // All pointers in the observation are borrowed during this encode only.
-    // An observer must freeze metadata and independently retain any resources
-    // needed by its asynchronous GPU-completion/readback machinery.
-    void* (*begin)(const EncodeObservation&) noexcept = nullptr;
-    // Runs after required caller-output copyback, or with false on an encode
-    // failure. This is CPU encoding completion, never GPU completion.
-    void (*end)(void*, bool completedNormally) noexcept = nullptr;
-};
-
-// Install a static-lifetime immutable callback table during module setup, before
-// work starts. nullptr disables observation. It must not alter scaler settings.
-void installEncodeObserver(const EncodeObserver* observer) noexcept;
-
 class Feature final {
 public:
     struct Impl;
@@ -187,8 +130,7 @@ public:
     // captured transient resources.
     bool encode(void* commandBuffer, void* fence,
                 std::shared_ptr<const ExecutionLease>& lease,
-                Error* error = nullptr,
-                const EncodeIdentity* identity = nullptr) const noexcept;
+                Error* error = nullptr) const noexcept;
 
     CommandMode mode() const noexcept;
     TemporalOutputInfo temporalOutputInfo() const noexcept;
@@ -212,13 +154,6 @@ public:
 
     ExecutionLease(const ExecutionLease&) = delete;
     ExecutionLease& operator=(const ExecutionLease&) = delete;
-
-    // Diagnostics for transport logging. generationInitialized() describes the
-    // generation state immediately before this execution. A false value with
-    // effectiveReset()==true identifies the one-time fresh-generation reset.
-    bool effectiveReset() const noexcept;
-    bool generationInitialized() const noexcept;
-    void* scaler() const noexcept;
 
 private:
     friend class PreparedFrame;

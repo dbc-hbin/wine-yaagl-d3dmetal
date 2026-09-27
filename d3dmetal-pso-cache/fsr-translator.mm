@@ -6,7 +6,6 @@
 #include "../include/yaagl_fsr_bridge.h"
 
 #import <Foundation/Foundation.h>
-#import <Metal/Metal.h>
 
 #include <array>
 #include <atomic>
@@ -284,11 +283,8 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
         createInfo.output = output;
         metalfx::CreateContext context{command.native.device, command.native.compiler, mode};
         metalfx::Error backendError;
-        std::shared_ptr<metalfx::Feature> backend;
-        {
-            metalfx::IndependentFactoryScope scope;
-            backend = metalfx::Feature::create(context, createInfo, &backendError);
-        }
+        std::shared_ptr<metalfx::Feature> backend =
+            metalfx::Feature::create(context, createInfo, &backendError);
         if (!backend) {
             const auto result = backendResult(backendError.code);
             logFailedFrame(state.get(), dispatchID, result, backendError.message.c_str(), packet);
@@ -337,17 +333,14 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
         mapped.values[3].texture, mapped.values[4].texture, mapped.values[5].texture,
         mapped.values[6].texture};
     metalfx::Error backendError;
-    std::shared_ptr<const metalfx::PreparedFrame> prepared;
-    {
-        metalfx::IndependentFactoryScope scope;
-        prepared = state->backend->prepare(frame.backend, textures, &backendError, frame.operations);
-    }
+    std::shared_ptr<const metalfx::PreparedFrame> prepared =
+        state->backend->prepare(frame.backend, textures, &backendError, frame.operations);
     if (!prepared) {
         const auto result = backendResult(backendError.code);
         logFailedFrame(state.get(), dispatchID, result, backendError.message.c_str(), packet);
         return result;
     }
-    const d3dmetal::RecordRequest request{prepared, uses.data(), useCount, state->id, dispatchID};
+    const d3dmetal::RecordRequest request{prepared, uses.data(), useCount};
     const bool recorded = command.native.kind == d3dmetal::CommandListKind::legacy
         ? d3dmetal::legacy::record(command.native, request)
         : d3dmetal::record(command.native, request);

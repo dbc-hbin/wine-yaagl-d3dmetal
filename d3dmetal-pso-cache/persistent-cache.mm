@@ -70,7 +70,7 @@ int openDirectoryAt(int parent, const char* name) noexcept {
 }
 
 void adviseFile(int directory, const char* name, std::uint64_t perFileLimit,
-                std::uint64_t& budget, PersistentCacheWarmupResult& result) noexcept {
+                std::uint64_t& budget) noexcept {
     if (budget == 0) return;
     FileDescriptor file(openat(directory, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
     if (file.get() < 0) return;
@@ -82,16 +82,13 @@ void adviseFile(int directory, const char* name, std::uint64_t perFileLimit,
     if (count == 0) return;
     radvisory advice {0, static_cast<int>(count)};
     if (fcntl(file.get(), F_RDADVISE, &advice) != 0) return;
-    ++result.filesAdvised;
-    result.bytesAdvised += count;
     budget -= count;
 }
 
-void warmGpuDirectory(int directory, std::uint64_t& budget,
-                      PersistentCacheWarmupResult& result) noexcept {
-    adviseFile(directory, "version.bin", kVersionAdviceLimit, budget, result);
+void warmGpuDirectory(int directory, std::uint64_t& budget) noexcept {
+    adviseFile(directory, "version.bin", kVersionAdviceLimit, budget);
     for (const char* name : kCacheNames) {
-        adviseFile(directory, name, kCacheAdviceLimit, budget, result);
+        adviseFile(directory, name, kCacheAdviceLimit, budget);
     }
 }
 
@@ -111,24 +108,23 @@ const char* currentExecutableLeaf() noexcept {
 
 } // namespace
 
-static PersistentCacheWarmupResult warmPersistentCachesAtImpl(
+static void warmPersistentCachesAtImpl(
     const char* cacheRoot, const char* executableName) noexcept {
-    PersistentCacheWarmupResult result;
     try {
-        if (cacheRoot == nullptr || cacheRoot[0] != '/' || !safeLeaf(executableName)) return result;
+        if (cacheRoot == nullptr || cacheRoot[0] != '/' || !safeLeaf(executableName)) return;
         FileDescriptor root(open(cacheRoot, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW));
-        if (root.get() < 0) return result;
+        if (root.get() < 0) return;
         FileDescriptor d3dm(openDirectoryAt(root.get(), "d3dm"));
-        if (d3dm.get() < 0) return result;
+        if (d3dm.get() < 0) return;
         FileDescriptor executable(openDirectoryAt(d3dm.get(), executableName));
-        if (executable.get() < 0) return result;
+        if (executable.get() < 0) return;
         FileDescriptor cache(openDirectoryAt(executable.get(), "shaders.cache"));
-        if (cache.get() < 0) return result;
+        if (cache.get() < 0) return;
 
         FileDescriptor enumerationFd(dup(cache.get()));
-        if (enumerationFd.get() < 0) return result;
+        if (enumerationFd.get() < 0) return;
         DIR* rawDirectory = fdopendir(enumerationFd.get());
-        if (rawDirectory == nullptr) return result;
+        if (rawDirectory == nullptr) return;
         static_cast<void>(enumerationFd.release());
         std::uint64_t budget = kTotalAdviceBudget;
         std::size_t scanned = 0;
@@ -143,30 +139,27 @@ static PersistentCacheWarmupResult warmPersistentCachesAtImpl(
                 !S_ISDIR(status.st_mode)) continue;
             FileDescriptor gpu(openDirectoryAt(cache.get(), entry->d_name));
             if (gpu.get() < 0) continue;
-            ++result.directoriesVisited;
-            warmGpuDirectory(gpu.get(), budget, result);
+            warmGpuDirectory(gpu.get(), budget);
         }
         closedir(rawDirectory);
     } catch (...) {
         // Cache warming is advisory and must never affect process startup.
     }
-    return result;
 }
 
-PersistentCacheWarmupResult warmPersistentCachesFromEnvironment() noexcept {
+void warmPersistentCachesFromEnvironment() noexcept {
     const char* enabled = std::getenv("YAAGL_D3DMETAL_CACHE_WARMUP");
-    if (enabled == nullptr || std::strcmp(enabled, "1") != 0) return {};
+    if (enabled == nullptr || std::strcmp(enabled, "1") != 0) return;
     try {
         std::string root;
         const std::size_t length = confstr(_CS_DARWIN_USER_CACHE_DIR, nullptr, 0);
-        if (length == 0 || length > PATH_MAX) return {};
+        if (length == 0 || length > PATH_MAX) return;
         root.resize(length);
-        if (confstr(_CS_DARWIN_USER_CACHE_DIR, root.data(), root.size()) != length) return {};
+        if (confstr(_CS_DARWIN_USER_CACHE_DIR, root.data(), root.size()) != length) return;
         if (!root.empty() && root.back() == '\0') root.pop_back();
         const char* executable = currentExecutableLeaf();
-        return warmPersistentCachesAtImpl(root.c_str(), executable);
+        warmPersistentCachesAtImpl(root.c_str(), executable);
     } catch (...) {
-        return {};
     }
 }
 
