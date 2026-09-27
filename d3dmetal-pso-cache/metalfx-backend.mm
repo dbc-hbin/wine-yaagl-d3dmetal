@@ -629,16 +629,8 @@ struct Feature::Impl {
     }
 
     // Pools only hold GPU-completed resources; active leases are untouched.
-    void setDormant(bool value) noexcept {
-        dormant.store(value);
-        if (!value) {
-            // A woken feature serves a new owner: its first executed frame must
-            // reset history even if the owner's first recorded frame never runs.
-            std::lock_guard<std::mutex> lock(mutex);
-            if (currentGeneration) ++currentGeneration->activation;
-            if (alternateGeneration) ++alternateGeneration->activation;
-            return;
-        }
+    void markDormant() noexcept {
+        dormant.store(true);
         std::array<ExecutionResources, 2> bundles;
         std::array<id, 2> residencies{};
         {
@@ -2013,8 +2005,8 @@ CommandMode Feature::mode() const noexcept {
     return impl_ ? impl_->commandMode : CommandMode::Legacy;
 }
 
-void Feature::setDormant(bool dormant) noexcept {
-    if (impl_) impl_->setDormant(dormant);
+void Feature::markDormant() noexcept {
+    if (impl_) impl_->markDormant();
 }
 
 std::shared_ptr<const PreparedFrame> Feature::prepare(

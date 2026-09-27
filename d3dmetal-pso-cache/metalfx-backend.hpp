@@ -157,11 +157,10 @@ public:
 
     CommandMode mode() const noexcept;
 
-    // A dormant feature still prepares, encodes and replays, but keeps no idle
-    // scratch: pools are drained now and later GPU-completion returns are
-    // released instead of pooled. Clearing it re-enables pooling and starts a
-    // new activation, so the next executed frame resets temporal history.
-    void setDormant(bool dormant) noexcept;
+    // Called when the owner drops the feature. Recorded frames may still prepare
+    // their encode and replay, but idle scratch is drained now and later
+    // GPU-completion returns are released instead of pooled.
+    void markDormant() noexcept;
 
 private:
     friend class PreparedFrame;

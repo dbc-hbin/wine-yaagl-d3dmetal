@@ -8,7 +8,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -86,70 +85,9 @@ struct State {
     metalfx::Extent generationOutput{};
     void* generationDevice = nullptr;
     void* generationCompiler = nullptr;
-    bool generationNeedsReset = false;
     bool retired = false;
 };
 std::unordered_map<std::uint64_t, std::shared_ptr<State>> gContexts;
-
-// Features no live context owns. Games recreate the FSR context on every
-// resolution change, so a per-context cache is never hit; keeping the most
-// recent idle features process-wide lets a return to an earlier size skip the
-// synchronous MetalFX scaler build (~130 ms at 4K) on the game thread. Each
-// entry is owned by exactly one place at a time: a live context or this cache.
-// Recorded PreparedFrames retain evicted features independently through GPU work.
-struct IdleBackend {
-    metalfx::CreateInfo create{};
-    void* device = nullptr;
-    void* compiler = nullptr;
-    std::shared_ptr<metalfx::Feature> backend;
-};
-// Two covers returning to the previous size; idle cost is up to ~0.58 GiB of scalers.
-constexpr std::size_t kIdleBackendLimit = 2;
-std::mutex gIdleMutex;
-std::array<IdleBackend, kIdleBackendLimit> gIdleBackends{}; // [0] is most recent
-
-bool sameCreate(const metalfx::CreateInfo& a, const metalfx::CreateInfo& b) noexcept {
-    return a.input.width == b.input.width && a.input.height == b.input.height &&
-           a.output.width == b.output.width && a.output.height == b.output.height &&
-           a.featureFlags.value == b.featureFlags.value &&
-           a.featureFlags.present == b.featureFlags.present &&
-           a.outputSubrects.value == b.outputSubrects.value &&
-           a.outputSubrects.present == b.outputSubrects.present;
-}
-
-std::shared_ptr<metalfx::Feature> takeIdleBackend(const metalfx::CreateInfo& create, void* device,
-                                                  void* compiler, metalfx::CommandMode mode) noexcept {
-    std::shared_ptr<metalfx::Feature> backend;
-    {
-        std::lock_guard lock(gIdleMutex);
-        for (auto& idle : gIdleBackends) {
-            if (!idle.backend || idle.device != device || idle.compiler != compiler ||
-                idle.backend->mode() != mode || !sameCreate(idle.create, create)) continue;
-            backend = std::move(idle.backend);
-            // Keep occupied entries at the front so the next park evicts only when full.
-            std::move(&idle + 1, gIdleBackends.end(), &idle);
-            gIdleBackends.back() = {};
-            break;
-        }
-    }
-    if (backend) backend->setDormant(false);
-    return backend;
-}
-
-void parkIdleBackend(std::shared_ptr<metalfx::Feature> backend, const metalfx::CreateInfo& create,
-                     void* device, void* compiler) noexcept {
-    if (!backend) return;
-    // Recorded frames can outlive their owner; a parked feature must not refill pools.
-    backend->setDormant(true);
-    IdleBackend evicted;
-    {
-        std::lock_guard lock(gIdleMutex);
-        evicted = std::move(gIdleBackends.back());
-        std::move_backward(gIdleBackends.begin(), gIdleBackends.end() - 1, gIdleBackends.end());
-        gIdleBackends.front() = {create, device, compiler, std::move(backend)};
-    }
-    // The evicted feature is released outside the lock.
-}
 
 void logEvent(const char* event, const State* state, std::uint64_t dispatch,
               std::uint32_t result, const char* detail = nullptr) noexcept {
@@ -284,12 +222,9 @@ std::uint32_t destroy(yaagl_fsr_packet_header& packet) {
     {
         std::lock_guard lock(state->mutex);
         state->retired = true;
-        if (state->backend) {
-            auto create = state->create.backend;
-            create.output = state->generationOutput;
-            parkIdleBackend(std::move(state->backend), create, state->generationDevice,
-                            state->generationCompiler);
-        }
+        // Recorded frames can outlive the context; they must not refill pools.
+        if (state->backend) state->backend->markDormant();
+        state->backend.reset();
         state->executionDevice.reset();
         state->device.reset();
     }
@@ -347,32 +282,26 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
     if (newGeneration) {
         auto createInfo = state->create.backend;
         createInfo.output = output;
-        auto backend = takeIdleBackend(createInfo, command.native.device, command.native.compiler, mode);
-        if (!backend) {
-            metalfx::CreateContext context{command.native.device, command.native.compiler, mode};
-            metalfx::Error backendError;
+        metalfx::CreateContext context{command.native.device, command.native.compiler, mode};
+        metalfx::Error backendError;
+        std::shared_ptr<metalfx::Feature> backend;
+        {
             metalfx::IndependentFactoryScope scope;
             backend = metalfx::Feature::create(context, createInfo, &backendError);
-            if (!backend) {
-                const auto result = backendResult(backendError.code);
-                logFailedFrame(state.get(), dispatchID, result, backendError.message.c_str(), packet);
-                return result;
-            }
         }
-        if (state->backend) {
-            auto previous = state->create.backend;
-            previous.output = state->generationOutput;
-            parkIdleBackend(std::move(state->backend), previous, state->generationDevice,
-                            state->generationCompiler);
+        if (!backend) {
+            const auto result = backendResult(backendError.code);
+            logFailedFrame(state.get(), dispatchID, result, backendError.message.c_str(), packet);
+            return result;
         }
+        // Recorded frames can outlive the replaced feature; they must not refill pools.
+        if (state->backend) state->backend->markDormant();
+        // A fresh feature resets temporal history on its first executed frame.
         state->backend = std::move(backend);
         state->generationOutput = output;
         state->generationDevice = command.native.device;
         state->generationCompiler = command.native.compiler;
-        // A retained scaler's history belongs to its previous output run.
-        state->generationNeedsReset = true;
     }
-    if (state->generationNeedsReset) frame.backend.resetHistory = {true, true};
 
     ResourceScope mapped;
     const std::array<void*, 7> resources{
@@ -423,7 +352,6 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
         ? d3dmetal::legacy::record(command.native, request)
         : d3dmetal::record(command.native, request);
     if (!recorded) { logEvent("error", state.get(), dispatchID, kRuntime, "command_record_failed"); return kRuntime; }
-    state->generationNeedsReset = false;
     if (dispatchID <= 120) {
         const auto temporal = prepared->temporalOutputInfo();
         logFrame("dispatch", state.get(), dispatchID, kOk, "ok", packet, &temporal);
