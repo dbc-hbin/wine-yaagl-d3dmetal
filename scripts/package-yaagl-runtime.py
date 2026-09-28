@@ -166,7 +166,7 @@ def main():
         if not (wine / relative).exists():
             raise ValueError(f'missing GPTK companion module: {relative}')
     manifest = {
-        'schemaVersion': 1, 'runtimeId': 'wine-11.17-d3dmetal-gptk4.0b2-3',
+        'schemaVersion': 1, 'runtimeId': 'wine-11.17-d3dmetal-gptk4.0b2-4',
         'archive': NAME, 'archiveRoot': 'wine', 'wineVersion': 'wine-11.17',
         'framework': {'destination': 'lib/external/D3DMetal.framework',
                       'installation': 'native autopatch before loading Wine',
