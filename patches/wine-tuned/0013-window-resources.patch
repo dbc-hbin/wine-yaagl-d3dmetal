@@ -1,10 +1,11 @@
 --- a/dlls/winemac.drv/cocoa_app.m
 +++ b/dlls/winemac.drv/cocoa_app.m
-@@ -107,6 +107,7 @@
+@@ -107,7 +107,8 @@
  
      - (void) setupObservations;
      - (void) applicationDidBecomeActive:(NSNotification *)notification;
 +    - (void) cgDisplaysWereReconfigured:(NSArray*)changes;
+     - (void) setCursorWithSelector:(SEL)selector frames:(NSArray*)frames;
  
      static void PerformRequest(void *info);
  

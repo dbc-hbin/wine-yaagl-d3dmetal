@@ -7,20 +7,14 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
+from wine_artifacts import load_catalog, profile_artifacts, profile_sources
 
 ROOT = Path(__file__).resolve().parents[1]
 NAME = 'wine-11.17-d3dmetal-gptk4.0b2-macos26.tar.xz'
-CHANGES = {
-    'bin/wineserver': 'arm64/server/wineserver',
-    'lib/wine/x86_64-unix/ntdll.so': 'x64/dlls/ntdll/ntdll.so',
-    'lib/wine/x86_64-unix/win32u.so': 'x64/dlls/win32u/win32u.so',
-    'lib/wine/x86_64-unix/winemac.so': 'x64/dlls/winemac.drv/winemac.so',
-    'lib/wine/x86_64-windows/amd_fidelityfx_framegeneration_dx12.dll':
-        'x64/dlls/amd_fidelityfx_framegeneration_dx12/x86_64-windows/amd_fidelityfx_framegeneration_dx12.dll',
-}
 METADATA = ('yaagl-wine-p3-provenance.json', 'yaagl-wine-runtime-files.json',
             'yaagl-wine-p3-graphics-artifacts.json', 'yaagl-wine-p3-runtime.txt',
             'zzz-frame-probe-stage.json')
@@ -70,6 +64,26 @@ def verify_base(base):
     return provenance, sha(base / METADATA[1])
 
 
+def verify_built_artifact(path, artifact):
+    architecture = artifact['architecture']
+    if artifact['format'] == 'macho':
+        subprocess.run(['lipo', '-verify_arch', architecture, str(path)], check=True,
+                       capture_output=True)
+        if architecture == 'arm64' and subprocess.run(
+                ['lipo', '-verify_arch', 'x86_64', str(path)], capture_output=True).returncode == 0:
+            raise ValueError(f'arm64 server unexpectedly contains x86_64: {path}')
+    else:
+        with path.open('rb') as stream:
+            header = stream.read(64)
+            if len(header) < 64 or header[:2] != b'MZ':
+                raise ValueError(f'invalid PE artifact: {path}')
+            stream.seek(struct.unpack_from('<I', header, 0x3c)[0])
+            signature = stream.read(6)
+        expected = 0x8664 if architecture == 'x86_64' else 0x014c
+        if len(signature) != 6 or signature[:4] != b'PE\0\0' or struct.unpack_from('<H', signature, 4)[0] != expected:
+            raise ValueError(f'invalid PE machine for {architecture}: {path}')
+
+
 def relocate(source, target, baseline, wine):
     shutil.copy2(source, target)
     if target.suffix not in ('.so', '') or target.name.endswith('.dll'):
@@ -103,6 +117,10 @@ def main():
     if len(sys.argv) != 5:
         raise SystemExit('usage: package-yaagl-runtime.py BASE_WINE_ROOT OVERLAY_DIR AUTOPATCH_DIR OUTPUT_DIR')
     base, overlay, autopatch, output = map(lambda p: Path(p).resolve(), sys.argv[1:])
+    catalog = load_catalog()
+    profile = 'yaagl-overlay'
+    artifacts = profile_artifacts(profile, catalog)
+    build_dirs = catalog['profiles'][profile]['buildDirs']
     provenance, baseline_inventory_sha = verify_base(base)
     output.mkdir(parents=True, exist_ok=True)
     wine = output / 'wine'
@@ -112,11 +130,13 @@ def main():
     shutil.copytree(base, wine, symlinks=True)
     # The verified baseline wrapper predates this release; ship the current policy.
     shutil.copy2(ROOT / 'scripts/wine-launch-wrapper.sh', wine / 'bin/wine')
-    for relative, source in CHANGES.items():
+    for artifact in artifacts:
+        relative = artifact['installedPath']
         target = wine / relative
-        built = overlay / source
+        built = overlay / build_dirs[artifact['buildTree']] / artifact['makeTarget']
         if not target.is_file() or not built.is_file():
             raise ValueError(f'missing built module or baseline: {relative}')
+        verify_built_artifact(built, artifact)
         relocate(built, target, base / relative, wine)
     if subprocess.check_output([str(wine / 'bin/wine'), '--version'], text=True).strip() != 'wine-11.17':
         raise ValueError('rebuilt ntdll does not identify Wine 11.17')
@@ -145,15 +165,6 @@ def main():
                      'lib/wine/x86_64-unix/amd_fidelityfx_upscaler_dx12.so'):
         if not (wine / relative).exists():
             raise ValueError(f'missing GPTK companion module: {relative}')
-    source_paths = ['dlls/ntdll/unix/msync.c', 'dlls/ntdll/unix/msync.h',
-                    'dlls/ntdll/unix/sync.c', 'dlls/ntdll/unix/process.c',
-                    'dlls/ntdll/unix/server.c', 'server/msync.c', 'server/msync.h',
-                    'server/inproc_sync.c', 'server/process.c', 'server/process.h',
-                    'server/object.h', 'server/protocol.def', 'include/wine/server_protocol.h',
-                    'server/request_handlers.h', 'server/request_trace.h',
-                    'dlls/winemac.drv/cocoa_app.m', 'dlls/win32u/input.c',
-                    'dlls/amd_fidelityfx_framegeneration_dx12/main.c',
-                    'scripts/wine-launch-wrapper.sh']
     manifest = {
         'schemaVersion': 1, 'runtimeId': 'wine-11.17-d3dmetal-gptk4.0b2-3',
         'archive': NAME, 'archiveRoot': 'wine', 'wineVersion': 'wine-11.17',
@@ -162,10 +173,12 @@ def main():
                       'included': False},
         'baseline': {'sourceCommit': provenance['sourceCommit'],
                      'inventorySha256': baseline_inventory_sha},
-        'rebuiltArtifacts': [{'path': path, 'buildSha256': sha(overlay / source),
-                              'packagedSha256': sha(wine / path)}
-                             for path, source in CHANGES.items()],
-        'changedSourceInputs': [{'path': path, 'sha256': sha(ROOT / path)} for path in source_paths],
+        'rebuiltArtifacts': [{'path': item['installedPath'],
+                              'buildSha256': sha(overlay / build_dirs[item['buildTree']] / item['makeTarget']),
+                              'packagedSha256': sha(wine / item['installedPath'])}
+                             for item in artifacts],
+        'changedSourceInputs': [{'path': path, 'sha256': sha(ROOT / path)}
+                                for path in profile_sources(profile, catalog)],
         'autopatch': {'directory': 'libexec/yaagl-d3dmetal',
                       'manifestSha256': sha(helper_dest / HELPERS[2]),
                       'helperSha256': sha(helper_dest / HELPERS[0]),

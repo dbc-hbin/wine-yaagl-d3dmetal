@@ -74,6 +74,13 @@ enum class ResourceAccess : std::uint8_t {
     write = 1,
 };
 
+enum class ResourceMapResult : std::uint8_t {
+    mapped,
+    metadataUnavailable,
+    notUnorderedAccess,
+    mapFailed,
+};
+
 struct ResourceUse {
     const MetalResource* resource = nullptr;
     ResourceAccess access = ResourceAccess::read;
@@ -155,10 +162,47 @@ bool initialize(const void* d3dmetalImageBase = nullptr) noexcept;
 bool unwrapCommandList(void* d3d12CommandList, NativeCommandList& out) noexcept;
 void releaseCommandList(NativeCommandList& commandList) noexcept;
 
-// Use D3DMetal's native D3D12 resource bridge.  The temporary D3D12Texture COM
-// ownership is balanced before return; the Metal texture itself is retained.
-bool mapResource(void* d3d12Resource, MetalResource& out) noexcept;
+// Use D3DMetal's native D3D12 resource bridge. Required write access is checked
+// against the original D3D12 flags before extracting a Metal texture. The
+// temporary native owner is balanced; a successful Metal view is retained.
+ResourceMapResult mapResource(void* d3d12Resource, MetalResource& out,
+                              ResourceAccess required) noexcept;
 void releaseResource(MetalResource& resource) noexcept;
+
+namespace detail {
+
+// Keep the native-boundary operations substitutable without adding runtime
+// dispatch to the resource hot path. The owner is acquired exactly once and
+// released even if a boundary throws before completing an operation.
+template<class Native>
+ResourceMapResult mapResourceNative(void* resource, MetalResource& out,
+                                    ResourceAccess required, Native& native) noexcept {
+    if (out.texture) native.releaseMetal(out.texture);
+    out = {};
+    void* owner = nullptr;
+    struct OwnerGuard {
+        Native& native;
+        void*& owner;
+        ~OwnerGuard() { if (owner) native.releaseInternal(owner); }
+    } guard{native, owner};
+    ResourceMapResult failure = ResourceMapResult::metadataUnavailable;
+    try {
+        if (!resource || !native.acquire(resource, owner) || !owner) return failure;
+        if (required == ResourceAccess::write && !(native.flags(owner) & 0x4u))
+            return ResourceMapResult::notUnorderedAccess;
+        failure = ResourceMapResult::mapFailed;
+        void* texture = native.texture(owner);
+        TextureView view{};
+        if (!texture || !native.view(texture, view) || !native.retain(texture)) return failure;
+        out.texture = texture;
+        out.view = view;
+        return ResourceMapResult::mapped;
+    } catch (...) {
+        return failure;
+    }
+}
+
+} // namespace detail
 
 // Records one immutable custom temporal command through MPL's normal compute
 // scheduler.  The supplied prepared object is retained once and is released

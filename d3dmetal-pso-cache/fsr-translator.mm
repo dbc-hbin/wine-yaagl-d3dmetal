@@ -305,7 +305,6 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
         frame.backend.exposureMode == metalfx::ExposureMode::Texture ? frame.backend.exposureTexture.value : nullptr,
         frame.backend.reactiveMask.value, frame.backend.compositionMask.value};
     std::array<d3dmetal::ResourceUse, 7> uses{};
-    std::array<d3dmetal::legacy::ResourceMetadata, 7> metadata{};
     std::size_t useCount = 0;
     for (std::size_t i = 0; i < resources.size(); ++i) {
         if (!resources[i]) continue;
@@ -316,11 +315,20 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
             logEvent("error", state.get(), dispatchID, kParameter, "resource_device_mismatch");
             return kParameter;
         }
-        if (!d3dmetal::legacy::queryResourceMetadata(resources[i], metadata[i])) { logEvent("error", state.get(), dispatchID, kNoProvider, "resource_metadata_unavailable"); return kNoProvider; }
-        if (i == 3 && !metadata[i].allowsUnorderedAccess()) { logEvent("error", state.get(), dispatchID, kParameter, "output_not_uav"); return kParameter; }
-        if (!d3dmetal::mapResource(resources[i], mapped.values[i])) { logEvent("error", state.get(), dispatchID, kNoProvider, "resource_map_failed"); return kNoProvider; }
-        uses[useCount++] = {&mapped.values[i], i == 3 ? d3dmetal::ResourceAccess::write
-                                                      : d3dmetal::ResourceAccess::read};
+        const auto access = i == 3 ? d3dmetal::ResourceAccess::write : d3dmetal::ResourceAccess::read;
+        switch (d3dmetal::mapResource(resources[i], mapped.values[i], access)) {
+        case d3dmetal::ResourceMapResult::mapped: break;
+        case d3dmetal::ResourceMapResult::metadataUnavailable:
+            logEvent("error", state.get(), dispatchID, kNoProvider, "resource_metadata_unavailable");
+            return kNoProvider;
+        case d3dmetal::ResourceMapResult::notUnorderedAccess:
+            logEvent("error", state.get(), dispatchID, kParameter, "output_not_uav");
+            return kParameter;
+        case d3dmetal::ResourceMapResult::mapFailed:
+            logEvent("error", state.get(), dispatchID, kNoProvider, "resource_map_failed");
+            return kNoProvider;
+        }
+        uses[useCount++] = {&mapped.values[i], access};
     }
     for (std::size_t i = 0; i < mapped.values.size(); ++i) {
         if (i == 3 || !mapped.values[i].texture) continue;

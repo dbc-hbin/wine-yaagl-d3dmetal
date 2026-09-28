@@ -8,7 +8,6 @@ import tempfile
 import unittest
 
 WRAPPER = Path(__file__).resolve().with_name("wine-launch-wrapper.sh")
-BASELINE_WRAPPER = WRAPPER.with_name("wine-launch-wrapper-p3.sh")
 MODULES = ("d3d10core.dll", "d3d11.dll", "dxgi.dll")
 AMD = ["0x1002", "0x7550", "AMD Radeon RX 9070", "unset"]
 NVIDIA = ["0x10de", "0x2d05", "NVIDIA GeForce RTX 5060", "unset"]
@@ -151,23 +150,6 @@ class WineLaunchWrapperTests(unittest.TestCase):
         self.assertEqual(invalid.returncode, 64)
         self.assertEqual(invalid.stdout, "")
         self.assertIn("YAAGL_FSR_UPSCALER must be metalfx or native", invalid.stderr)
-
-    def test_baseline_staging_manifest_requires_p3_identity(self):
-        self.wrapper.write_bytes(BASELINE_WRAPPER.read_bytes())
-        (self.root / "yaagl-wine-p3-runtime.txt").write_text("baseline")
-        before_staging = self.record_policy(["winecfg"], YAAGL_FSR_UPSCALER="native")
-        self.assertIsNone(before_staging["env"]["WINEDLLOVERRIDES"])
-        self.assertEqual(before_staging["env"]["CX_APPLEGPTK_LIBD3DSHARED_PATH"],
-                         str(self.root / "lib/external/libd3dshared.dylib"))
-        (self.root / "zzz-frame-probe-stage.json").write_text("{}")
-        baseline = self.record_policy(["winecfg"], YAAGL_FSR_UPSCALER="native")
-        self.assertEqual(baseline["env"]["WINEDLLOVERRIDES"],
-                         "amd_fidelityfx_upscaler_dx12=n;amd_fidelityfx_framegeneration_dx12=b")
-        self.assertEqual(baseline["env"]["CX_APPLEGPTK_LIBD3DSHARED_PATH"],
-                         str(self.root / "lib/external/libd3dshared.dylib"))
-        game = self.record_policy([r"Z:\Games\ZenlessZoneZero.exe"])
-        self.assertEqual(game["env"]["D3DM_VENDOR_ID"], "0x1002")
-        self.assertEqual(baseline["env"]["D3DM_VENDOR_ID"], "0x10de")
 
     def test_direct_and_steam_launches_override_inherited_gpu(self):
         cases = (

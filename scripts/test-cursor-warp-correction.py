@@ -33,11 +33,9 @@ static void record(double fx, double fy, double tx, double ty, double before, do
 static void movement(double time, double dx, double dy, double x, double y,
                      double expected_x, double expected_y)
 {
-    double sx, sy;
-    unsigned int finished = warp_correction_match(&state, time, dx, dy, x, y);
-    warp_correction_consume(&state, finished, &sx, &sy);
-    assert(dx - sx == expected_x);
-    assert(dy - sy == expected_y);
+    warp_correction_apply(&state, time, x, y, &dx, &dy);
+    assert(dx == expected_x);
+    assert(dy == expected_y);
 }
 
 int main(int argc, char **argv)

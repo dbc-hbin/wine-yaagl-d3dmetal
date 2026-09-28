@@ -764,69 +764,37 @@ static void clear_swapchain_claim(struct fg_context *context)
     ReleaseSRWLockExclusive(&contexts_lock);
 }
 
+struct normalized_dispatch
+{
+    /* A pending selection may change before dispatch_context acquires its lock. */
+    ffxReturnCode_t metalfx_error;
+    BOOL native_only;
+    union
+    {
+        struct yaagl_fsr_fg_prepare_packet prepare;
+        struct yaagl_fsr_fg_dispatch_packet generation;
+    } packet;
+};
+
 static ffxReturnCode_t translated_dispatch(struct fg_context *context,
-                                         const ffxDispatchDescHeader *header,
+                                         struct yaagl_fsr_fg_dispatch_packet *packet,
                                          BOOL *submitted)
 {
-    struct yaagl_fsr_fg_dispatch_packet packet;
     struct frame_config_snapshot *config;
-    const ffxDispatchDescFrameGeneration *desc = (const void *)header;
-    int64_t rect_right, rect_bottom;
-
-    if (header->pNext) return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
-    if (!desc->commandList || !desc->presentColor.resource ||
-        desc->numGeneratedFrames != 1 || !desc->outputs[0].resource ||
-        desc->outputs[0].resource == desc->presentColor.resource ||
-        desc->backbufferTransferFunction > FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SCRGB ||
-        !isfinite(desc->minMaxLuminance[0]) ||
-        !isfinite(desc->minMaxLuminance[1]) ||
-        desc->minMaxLuminance[0] > desc->minMaxLuminance[1] ||
-        (desc->backbufferTransferFunction == FFX_API_BACKBUFFER_TRANSFER_FUNCTION_PQ &&
-         desc->minMaxLuminance[1] <= 0.0f) ||
-        (desc->backbufferTransferFunction == FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SCRGB &&
-         desc->minMaxLuminance[1] <= desc->minMaxLuminance[0]))
+    config = find_frame_config(context, packet->frame_id);
+    if (config && packet->output == (uint64_t)(uintptr_t)config->hudless.resource)
         return FFX_API_RETURN_ERROR_PARAMETER;
 
-    if (desc->generationRect.width || desc->generationRect.height)
-    {
-        rect_right = (int64_t)desc->generationRect.left + desc->generationRect.width;
-        rect_bottom = (int64_t)desc->generationRect.top + desc->generationRect.height;
-        if (desc->generationRect.left < 0 || desc->generationRect.top < 0 ||
-            desc->generationRect.width <= 0 || desc->generationRect.height <= 0 ||
-            rect_right > context->display_width || rect_bottom > context->display_height)
-            return FFX_API_RETURN_ERROR_PARAMETER;
-    }
-
-    config = find_frame_config(context, desc->frameID);
-    if (config && (desc->outputs[0].resource == config->hudless.resource))
-        return FFX_API_RETURN_ERROR_PARAMETER;
-
-    memset(&packet, 0, sizeof(packet));
-    initialize_packet(&packet.header, sizeof(packet), YAAGL_FSR_FG_DISPATCH,
+    initialize_packet(&packet->header, sizeof(*packet), YAAGL_FSR_FG_DISPATCH,
                       context->translated);
-
-    packet.command_list = (uint64_t)(uintptr_t)desc->commandList;
-    packet.frame_id = desc->frameID;
-    packet.present_color = (uint64_t)(uintptr_t)desc->presentColor.resource;
-    packet.present_color_state = desc->presentColor.state;
-    packet.output = (uint64_t)(uintptr_t)desc->outputs[0].resource;
-    packet.output_state = desc->outputs[0].state;
     if (config)
     {
-        packet.hudless_color = (uint64_t)(uintptr_t)config->hudless.resource;
-        packet.hudless_color_state = config->hudless.state;
+        packet->hudless_color = (uint64_t)(uintptr_t)config->hudless.resource;
+        packet->hudless_color_state = config->hudless.state;
     }
-    packet.num_generated_frames = desc->numGeneratedFrames;
-    packet.reset = desc->reset ||
+    packet->reset = packet->reset ||
         (context->have_last_prepare_frame_id &&
-         desc->frameID != context->last_prepare_frame_id);
-    packet.backbuffer_transfer_function = desc->backbufferTransferFunction;
-    packet.generation_rect_left = desc->generationRect.left;
-    packet.generation_rect_top = desc->generationRect.top;
-    packet.generation_rect_width = desc->generationRect.width;
-    packet.generation_rect_height = desc->generationRect.height;
-    packet.min_luminance = desc->minMaxLuminance[0];
-    packet.max_luminance = desc->minMaxLuminance[1];
+         packet->frame_id != context->last_prepare_frame_id);
 
     /*
      * A dispatch error, including result 4, is an error in this already
@@ -835,7 +803,7 @@ static ffxReturnCode_t translated_dispatch(struct fg_context *context,
      * the frame, this is its single attempt.
      */
     *submitted = TRUE;
-    return bridge_call(&packet);
+    return bridge_call(packet);
 }
 
 #define COPY_PREPARE_FIELDS(packet, desc) do \
@@ -869,81 +837,20 @@ static ffxReturnCode_t translated_dispatch(struct fg_context *context,
 } while (0)
 
 static ffxReturnCode_t translated_prepare(struct fg_context *context,
-                                        const ffxDispatchDescHeader *header)
+                                        struct yaagl_fsr_fg_prepare_packet *packet)
 {
-    struct yaagl_fsr_fg_prepare_packet packet;
-    const ffxApiHeader *entry;
     ffxReturnCode_t result;
-    BOOL have_camera = FALSE;
-
-    memset(&packet, 0, sizeof(packet));
-    initialize_packet(&packet.header, sizeof(packet), YAAGL_FSR_FG_PREPARE,
+    initialize_packet(&packet->header, sizeof(*packet), YAAGL_FSR_FG_PREPARE,
                       context->translated);
 
-    if (header->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2)
-    {
-        const struct ffxDispatchDescFrameGenerationPrepareV2 *desc = (const void *)header;
-        if (header->pNext) return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
-        COPY_PREPARE_FIELDS(packet, desc);
-        COPY_CAMERA_FIELDS(packet, desc);
-        packet.reset = desc->reset;
-        have_camera = TRUE;
-    }
-    else
-    {
-        const struct ffxDispatchDescFrameGenerationPrepare *desc = (const void *)header;
-        COPY_PREPARE_FIELDS(packet, desc);
-        /* The pinned provider explicitly ignores V1 unused_reset. */
-
-        for (entry = header->pNext; entry; entry = entry->pNext)
-        {
-            const struct ffxDispatchDescFrameGenerationPrepareCameraInfo *camera;
-            if (entry->type != FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO)
-                return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
-            if (have_camera) return FFX_API_RETURN_ERROR_PARAMETER;
-            camera = (const void *)entry;
-            COPY_CAMERA_FIELDS(packet, camera);
-            have_camera = TRUE;
-        }
-    }
-
-    packet.camera_info_present = have_camera;
-
-    if (!packet.command_list || !packet.depth || !packet.motion_vectors ||
-        packet.depth == packet.motion_vectors ||
-        !packet.render_width || !packet.render_height ||
-        !isfinite(packet.jitter_x) || !isfinite(packet.jitter_y) ||
-        !isfinite(packet.motion_scale_x) || !isfinite(packet.motion_scale_y) ||
-        !isfinite(packet.frame_time_delta_ms) || packet.frame_time_delta_ms < 0.0f ||
-        !isfinite(packet.camera_near) ||
-        (!context->depth_infinite && !isfinite(packet.camera_far)) ||
-        !isfinite(packet.camera_fov_vertical_radians) ||
-        packet.camera_fov_vertical_radians <= 0.0f ||
-        packet.camera_fov_vertical_radians >= 3.141592654f ||
-        !isfinite(packet.view_space_to_meters) ||
-        packet.render_width > context->max_render_width ||
-        packet.render_height > context->max_render_height)
-        return FFX_API_RETURN_ERROR_PARAMETER;
-
-    if (have_camera)
-    {
-        unsigned int i;
-        for (i = 0; i < 3; ++i)
-            if (!isfinite(packet.camera_position[i]) ||
-                !isfinite(packet.camera_up[i]) ||
-                !isfinite(packet.camera_right[i]) ||
-                !isfinite(packet.camera_forward[i]))
-                return FFX_API_RETURN_ERROR_PARAMETER;
-    }
-
     if (context->have_last_prepare_frame_id &&
-        packet.frame_id != context->last_prepare_frame_id + 1)
-        packet.reset = TRUE;
+        packet->frame_id != context->last_prepare_frame_id + 1)
+        packet->reset = TRUE;
 
-    result = bridge_call(&packet);
+    result = bridge_call(packet);
     if (result == FFX_API_RETURN_OK)
     {
-        context->last_prepare_frame_id = packet.frame_id;
+        context->last_prepare_frame_id = packet->frame_id;
         context->have_last_prepare_frame_id = TRUE;
     }
     return result;
@@ -967,18 +874,22 @@ static ffxReturnCode_t select_native(struct fg_context *context)
 }
 
 static ffxReturnCode_t validate_public_dispatch(
-    const struct fg_context *context, const ffxDispatchDescHeader *header)
+    const struct fg_context *context, const ffxDispatchDescHeader *header,
+    struct normalized_dispatch *normalized)
 {
+    const enum context_mode mode = context_mode(context);
+
+    memset(normalized, 0, sizeof(*normalized));
     if (header->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION)
     {
         const ffxDispatchDescFrameGeneration *desc = (const void *)header;
-        const enum context_mode mode = context_mode(context);
+        struct yaagl_fsr_fg_dispatch_packet *packet = &normalized->packet.generation;
         int64_t right, bottom;
-
         unsigned int i;
 
-        if (mode == CONTEXT_METALFX && header->pNext)
-            return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
+        if (header->pNext) normalized->metalfx_error = FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
+        if (mode == CONTEXT_METALFX && normalized->metalfx_error)
+            return normalized->metalfx_error;
         if (!desc->commandList || !desc->presentColor.resource ||
             !desc->numGeneratedFrames || desc->numGeneratedFrames > 4 ||
             desc->backbufferTransferFunction > FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SCRGB ||
@@ -992,10 +903,12 @@ static ffxReturnCode_t validate_public_dispatch(
             return FFX_API_RETURN_ERROR_PARAMETER;
         for (i = 0; i < desc->numGeneratedFrames; ++i)
             if (!desc->outputs[i].resource) return FFX_API_RETURN_ERROR_PARAMETER;
-        if (mode == CONTEXT_METALFX &&
+        if (!normalized->metalfx_error &&
             (desc->numGeneratedFrames != 1 ||
              desc->outputs[0].resource == desc->presentColor.resource))
-            return FFX_API_RETURN_ERROR_PARAMETER;
+            normalized->metalfx_error = FFX_API_RETURN_ERROR_PARAMETER;
+        if (mode == CONTEXT_METALFX && normalized->metalfx_error)
+            return normalized->metalfx_error;
         if (desc->generationRect.width || desc->generationRect.height)
         {
             right = (int64_t)desc->generationRect.left + desc->generationRect.width;
@@ -1005,15 +918,29 @@ static ffxReturnCode_t validate_public_dispatch(
                 right > context->display_width || bottom > context->display_height)
                 return FFX_API_RETURN_ERROR_PARAMETER;
         }
+        packet->command_list = (uint64_t)(uintptr_t)desc->commandList;
+        packet->frame_id = desc->frameID;
+        packet->present_color = (uint64_t)(uintptr_t)desc->presentColor.resource;
+        packet->present_color_state = desc->presentColor.state;
+        packet->output = (uint64_t)(uintptr_t)desc->outputs[0].resource;
+        packet->output_state = desc->outputs[0].state;
+        packet->num_generated_frames = desc->numGeneratedFrames;
+        packet->reset = desc->reset;
+        packet->backbuffer_transfer_function = desc->backbufferTransferFunction;
+        packet->generation_rect_left = desc->generationRect.left;
+        packet->generation_rect_top = desc->generationRect.top;
+        packet->generation_rect_width = desc->generationRect.width;
+        packet->generation_rect_height = desc->generationRect.height;
+        packet->min_luminance = desc->minMaxLuminance[0];
+        packet->max_luminance = desc->minMaxLuminance[1];
         return FFX_API_RETURN_OK;
     }
 
     if (header->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE ||
         header->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2)
     {
-        struct yaagl_fsr_fg_prepare_packet packet;
+        struct yaagl_fsr_fg_prepare_packet *packet = &normalized->packet.prepare;
         const ffxApiHeader *entry;
-        const enum context_mode mode = context_mode(context);
         BOOL have_camera = FALSE;
         unsigned int i;
 
@@ -1027,53 +954,61 @@ static ffxReturnCode_t validate_public_dispatch(
               FFX_FRAMEGENERATION_FLAG_RESERVED_2))
             return FFX_API_RETURN_ERROR_PARAMETER;
 
-        memset(&packet, 0, sizeof(packet));
         if (header->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2)
         {
             const struct ffxDispatchDescFrameGenerationPrepareV2 *desc = (const void *)header;
-            if (mode == CONTEXT_METALFX && header->pNext)
-                return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
-            COPY_PREPARE_FIELDS(packet, desc);
-            COPY_CAMERA_FIELDS(packet, desc);
+            if (header->pNext)
+            {
+                normalized->native_only = TRUE;
+                normalized->metalfx_error = FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
+            }
+            if (mode == CONTEXT_METALFX && normalized->metalfx_error)
+                return normalized->metalfx_error;
+            COPY_PREPARE_FIELDS((*packet), desc);
+            COPY_CAMERA_FIELDS((*packet), desc);
+            packet->reset = desc->reset;
             have_camera = TRUE;
         }
         else
         {
             const struct ffxDispatchDescFrameGenerationPrepare *desc = (const void *)header;
-            COPY_PREPARE_FIELDS(packet, desc);
+            COPY_PREPARE_FIELDS((*packet), desc);
+            /* The pinned provider explicitly ignores V1 unused_reset. */
             for (entry = header->pNext; entry; entry = entry->pNext)
             {
                 const struct ffxDispatchDescFrameGenerationPrepareCameraInfo *camera;
                 if (entry->type != FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO)
                 {
-                    if (mode == CONTEXT_METALFX)
-                        return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
+                    normalized->native_only = TRUE;
+                    normalized->metalfx_error = FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
+                    if (mode == CONTEXT_METALFX) return normalized->metalfx_error;
                     break;
                 }
                 if (have_camera) return FFX_API_RETURN_ERROR_PARAMETER;
                 camera = (const void *)entry;
-                COPY_CAMERA_FIELDS(packet, camera);
+                COPY_CAMERA_FIELDS((*packet), camera);
                 have_camera = TRUE;
             }
         }
-        if (!packet.command_list || !packet.depth || !packet.motion_vectors ||
-            packet.depth == packet.motion_vectors || !packet.render_width ||
-            !packet.render_height || packet.render_width > context->max_render_width ||
-            packet.render_height > context->max_render_height ||
-            !isfinite(packet.jitter_x) || !isfinite(packet.jitter_y) ||
-            !isfinite(packet.motion_scale_x) || !isfinite(packet.motion_scale_y) ||
-            !isfinite(packet.frame_time_delta_ms) || packet.frame_time_delta_ms < 0.0f ||
-            !isfinite(packet.camera_near) ||
-            (!context->depth_infinite && !isfinite(packet.camera_far)) ||
-            !isfinite(packet.camera_fov_vertical_radians) ||
-            packet.camera_fov_vertical_radians <= 0.0f ||
-            packet.camera_fov_vertical_radians >= 3.141592654f ||
-            !isfinite(packet.view_space_to_meters))
+        packet->camera_info_present = have_camera;
+        if (!packet->command_list || !packet->depth || !packet->motion_vectors ||
+            packet->depth == packet->motion_vectors || !packet->render_width ||
+            !packet->render_height || packet->render_width > context->max_render_width ||
+            packet->render_height > context->max_render_height ||
+            !isfinite(packet->jitter_x) || !isfinite(packet->jitter_y) ||
+            !isfinite(packet->motion_scale_x) || !isfinite(packet->motion_scale_y) ||
+            !isfinite(packet->frame_time_delta_ms) || packet->frame_time_delta_ms < 0.0f ||
+            !isfinite(packet->camera_near) ||
+            (!context->depth_infinite && !isfinite(packet->camera_far)) ||
+            !isfinite(packet->camera_fov_vertical_radians) ||
+            packet->camera_fov_vertical_radians <= 0.0f ||
+            packet->camera_fov_vertical_radians >= 3.141592654f ||
+            !isfinite(packet->view_space_to_meters))
             return FFX_API_RETURN_ERROR_PARAMETER;
         if (have_camera)
             for (i = 0; i < 3; ++i)
-                if (!isfinite(packet.camera_position[i]) || !isfinite(packet.camera_up[i]) ||
-                    !isfinite(packet.camera_right[i]) || !isfinite(packet.camera_forward[i]))
+                if (!isfinite(packet->camera_position[i]) || !isfinite(packet->camera_up[i]) ||
+                    !isfinite(packet->camera_right[i]) || !isfinite(packet->camera_forward[i]))
                     return FFX_API_RETURN_ERROR_PARAMETER;
     }
     return FFX_API_RETURN_OK;
@@ -1088,27 +1023,15 @@ static BOOL prepare_has_native_only_flags(uint32_t flags)
                        FFX_FRAMEGENERATION_FLAG_RESERVED_2));
 }
 
-static BOOL prepare_requires_native(const ffxDispatchDescHeader *header)
-{
-    const ffxApiHeader *entry;
-
-    if (header->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2)
-        return header->pNext != NULL;
-    if (header->type != FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE)
-        return FALSE;
-    for (entry = header->pNext; entry; entry = entry->pNext)
-        if (entry->type != FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO)
-            return TRUE;
-    return FALSE;
-}
-
 #undef COPY_PREPARE_FIELDS
 #undef COPY_CAMERA_FIELDS
 
 static ffxReturnCode_t dispatch_context(struct fg_context *context,
-                                      const ffxDispatchDescHeader *desc)
+                                      const ffxDispatchDescHeader *desc,
+                                      struct normalized_dispatch *normalized)
 {
     ffxReturnCode_t result;
+    enum context_mode mode;
     BOOL direct_generation = FALSE, submitted = FALSE;
     uint64_t direct_frame = 0;
 
@@ -1124,9 +1047,8 @@ static ffxReturnCode_t dispatch_context(struct fg_context *context,
                 return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
             }
 
-            if (prepare_has_native_only_flags(
-                    ((const struct prepare_desc_prefix *)desc)->flags) ||
-                prepare_requires_native(desc))
+            if (normalized->native_only || prepare_has_native_only_flags(
+                    normalized->packet.prepare.flags))
             {
                 result = select_native(context);
                 if (result == FFX_API_RETURN_OK)
@@ -1136,7 +1058,7 @@ static ffxReturnCode_t dispatch_context(struct fg_context *context,
             }
 
             EnterCriticalSection(&context->dispatch_lock);
-            result = translated_prepare(context, desc);
+            result = translated_prepare(context, &normalized->packet.prepare);
             LeaveCriticalSection(&context->dispatch_lock);
             if (result == BRIDGE_INELIGIBLE)
             {
@@ -1160,7 +1082,12 @@ static ffxReturnCode_t dispatch_context(struct fg_context *context,
     }
 
     EnterCriticalSection(&context->dispatch_lock);
-    if (context_mode(context) != CONTEXT_METALFX)
+    mode = context_mode(context);
+    if (mode == CONTEXT_METALFX && normalized->metalfx_error)
+    {
+        result = normalized->metalfx_error;
+    }
+    else if (mode != CONTEXT_METALFX)
     {
         result = native.dispatch(&context->original, desc);
     }
@@ -1170,14 +1097,13 @@ static ffxReturnCode_t dispatch_context(struct fg_context *context,
         {
         case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE:
         case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2:
-            if (prepare_has_native_only_flags(
-                    ((const struct prepare_desc_prefix *)desc)->flags))
+            if (prepare_has_native_only_flags(normalized->packet.prepare.flags))
                 result = FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
             else
-                result = translated_prepare(context, desc);
+                result = translated_prepare(context, &normalized->packet.prepare);
             break;
         case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION:
-            result = translated_dispatch(context, desc, &submitted);
+            result = translated_dispatch(context, &normalized->packet.generation, &submitted);
             /* A failed submitted frame would otherwise pin its snapshot and the
              * PE pruning floor until OFF; the swapchain callback also retires
              * failed frames. */
@@ -1186,7 +1112,7 @@ static ffxReturnCode_t dispatch_context(struct fg_context *context,
                  FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY))
             {
                 direct_generation = TRUE;
-                direct_frame = ((const struct ffxDispatchDescFrameGeneration *)desc)->frameID;
+                direct_frame = normalized->packet.generation.frame_id;
             }
             break;
         default:
@@ -1199,6 +1125,19 @@ static ffxReturnCode_t dispatch_context(struct fg_context *context,
     if (direct_generation)
         retire_frame_configs(context, direct_frame);
     return result;
+}
+
+static ffxReturnCode_t dispatch_validated(struct fg_context *context,
+                                         const ffxDispatchDescHeader *desc)
+{
+    struct normalized_dispatch normalized;
+    ffxReturnCode_t result = validate_public_dispatch(context, desc, &normalized);
+
+    if (result != FFX_API_RETURN_OK) return result;
+    if (in_callback() &&
+        desc->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WAIT_FOR_PRESENTS_DX12)
+        return FFX_API_RETURN_ERROR_PARAMETER;
+    return dispatch_context(context, desc, &normalized);
 }
 
 static ffxReturnCode_t present_callback(ffxCallbackDescFrameGenerationPresent *desc,
@@ -1243,8 +1182,10 @@ static ffxReturnCode_t generation_callback(ffxDispatchDescFrameGeneration *desc,
      */
     if (binding->generate)
         result = binding->generate(desc, binding->generate_user);
+    else if (!valid_chain(&desc->header))
+        result = FFX_API_RETURN_ERROR_PARAMETER;
     else
-        result = dispatch_context(binding->context, &desc->header);
+        result = dispatch_validated(binding->context, &desc->header);
 
     /*
      * The native swapchain tests numGeneratedFrames even after a failing
@@ -2126,15 +2067,7 @@ ffxReturnCode_t WINAPI ffxDispatch(ffxContext *handle,
     context = acquire_context(handle);
     if (!context) return FFX_API_RETURN_ERROR_PARAMETER;
 
-    result = validate_public_dispatch(context, desc);
-    if (result == FFX_API_RETURN_OK)
-    {
-        if (in_callback() &&
-            desc->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WAIT_FOR_PRESENTS_DX12)
-            result = FFX_API_RETURN_ERROR_PARAMETER;
-        else
-            result = dispatch_context(context, desc);
-    }
+    result = dispatch_validated(context, desc);
 
     if (result != FFX_API_RETURN_OK)
         report_validation(context, L"Invalid or unsupported frame-generation dispatch.");

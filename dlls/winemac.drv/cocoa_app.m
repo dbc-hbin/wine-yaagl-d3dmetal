@@ -95,6 +95,24 @@ static NSString* WineLocalizedString(unsigned int stringID)
 @end
 
 
+/* The active app may have an empty desktop under the pointer.  A nonzero
+   native window number not owned by NSApp is instead an overlay, not Wine. */
+static BOOL active_wine_window_at_point(NSPoint point, WineWindow **result)
+{
+    NSInteger number = [NSWindow windowNumberAtPoint:point belowWindowWithWindowNumber:0];
+    WineWindow *window = (WineWindow *)[NSApp windowWithWindowNumber:number];
+
+    *result = nil;
+    if (number && !window) return FALSE;
+    if (window && (![window isKindOfClass:[WineWindow class]] || ![window isVisible] ||
+                   [window isMiniaturized] || [window isClosing] ||
+                   !NSMouseInRect(point, [window contentRectForFrameRect:[window frame]], NO)))
+        return FALSE;
+
+    *result = window;
+    return TRUE;
+}
+
 @interface WineApplicationController ()
 
 @property (readwrite, copy, nonatomic) NSEvent* lastFlagsChanged;
@@ -930,20 +948,12 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
     - (BOOL) mouseIsOverWineWindow
     {
-        NSPoint point;
-        NSInteger windowNumber;
-        WineWindow* window;
+        WineWindow *window;
 
         if (![NSApp isActive] || [NSApp isHidden])
             return FALSE;
 
-        point = [NSEvent mouseLocation];
-        windowNumber = [NSWindow windowNumberAtPoint:point belowWindowWithWindowNumber:0];
-        window = (WineWindow*)[NSApp windowWithWindowNumber:windowNumber];
-
-        return [window isKindOfClass:[WineWindow class]] && [window isVisible] &&
-               ![window isMiniaturized] && ![window isClosing] &&
-               NSMouseInRect(point, [window contentRectForFrameRect:[window frame]], NO);
+        return active_wine_window_at_point([NSEvent mouseLocation], &window) && window != nil;
     }
 
     - (void) updateCursor:(BOOL)mouseIsOverWineWindow
@@ -1431,7 +1441,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
         BOOL drag = [anEvent type] != NSEventTypeMouseMoved;
         CGPoint eventPoint = CGEventGetLocation([anEvent CGEvent]);
         double deltaX = [anEvent deltaX], deltaY = [anEvent deltaY];
-        unsigned int warpsFinished;
 
         /* Direct cursor warps (no event tap) fold their displacement into the
            delta of a later event.  Subtract our own warp displacement before
@@ -1440,16 +1449,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
            not leave a stale correction to distort later real movement.  The
            zero-delta notification around a warp does not consume its pending
            displacement: the captured nonzero movement follows it later. */
-        warpsFinished = warp_correction_match(&warpCorrections, [anEvent timestamp], deltaX, deltaY,
-                                              eventPoint.x, eventPoint.y);
-        if (warpsFinished)
-        {
-            double subtractX, subtractY;
-
-            warp_correction_consume(&warpCorrections, warpsFinished, &subtractX, &subtractY);
-            deltaX -= subtractX;
-            deltaY -= subtractY;
-        }
+        warp_correction_apply(&warpCorrections, [anEvent timestamp], eventPoint.x, eventPoint.y,
+                              &deltaX, &deltaY);
 
         if ([windowsBeingDragged count])
             targetWindow = nil;
@@ -2720,7 +2721,6 @@ bool macdrv_get_native_cursor_context(struct macdrv_native_cursor_context *conte
 
     OnMainThread(^{
         NSPoint point = [NSEvent mouseLocation];
-        NSInteger number;
         WineWindow *window;
 
         if (![NSApp isActive])
@@ -2731,21 +2731,16 @@ bool macdrv_get_native_cursor_context(struct macdrv_native_cursor_context *conte
                app is inactive; updateCursor still prevents native application until activation. */
             if (![fallback isKindOfClass:[WineWindow class]] || ![fallback isVisible] ||
                 [fallback isMiniaturized] || [fallback isClosing] ||
-                !NSPointInRect(point, [fallback frame]))
+                !NSPointInRect(point, [fallback frame]) ||
+                !NSMouseInRect(point, [fallback contentRectForFrameRect:[fallback frame]], NO))
                 return;
             window = fallback;
         }
         else
         {
             if ([NSApp isHidden]) return;
-            number = [NSWindow windowNumberAtPoint:point belowWindowWithWindowNumber:0];
-            window = (WineWindow *)[NSApp windowWithWindowNumber:number];
-            if (number && !window) return;
+            if (!active_wine_window_at_point(point, &window)) return;
         }
-        if (window && (![window isKindOfClass:[WineWindow class]] || ![window isVisible] ||
-                       [window isMiniaturized] || [window isClosing] ||
-                       !NSMouseInRect(point, [window contentRectForFrameRect:[window frame]], NO)))
-            return;
 
         context->window = macdrv_get_window_hwnd((macdrv_window)window);
         ret = true;

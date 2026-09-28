@@ -124,6 +124,15 @@ bool verifyImage(const std::uint8_t* image) noexcept {
     if (!pinHex(image, 0x411ae, "415653504889fb4885f6747d48c7042400000000488b7ef8")) return false;
     if (!pinHex(image, 0x41203, "4885ff743b48c704240000000048b80100000001000000f0482987d0010000")) return false;
     if (!pinHex(image, 0x4128c, "415653504885ff7444488b87c80000004881c7c8000000ff5020")) return false;
+    // GetDesc's external interface is internal+0x10, so its +0x18 descriptor
+    // source is internal+0x28. Constructor copies pin flags at internal+0x58.
+    if (!pinHex(image, 0x14eba0, "48895708488b159d293a0048895710")) return false;
+    if (!pinHex(image, 0x14ebff,
+                "410f1000410f104810410f105020410f114728410f114f38410f115748498b503049895758"))
+        return false;
+    if (!pinHex(image, 0x1505cc,
+                "488b070f1040180f1048280f1050380f1147080f114f180f115728488b4048"))
+        return false;
 
     // Generic compute scheduler path used to create the custom command slot.
     if (!pinHex(image, 0x14d92, "554889e54157415641554154534883ec284c8b65104c8b7d18")) return false;
@@ -263,6 +272,57 @@ bool supportedPlaneView(id<MTLTexture> texture, TextureView& view) noexcept {
         view.planes = 2;
     return true;
 }
+
+void releaseMetalTexture(void* texture) noexcept {
+    if (!texture) return;
+    @try {
+        [reinterpret_cast<id>(texture) release];
+    } @catch (id) {
+    }
+}
+
+struct NativeResourceBridge {
+    const std::uint8_t* image;
+
+    bool acquire(void* resource, void*& owner) const noexcept {
+        @try {
+            using GetInternal = void (*)(void**, void*);
+            reinterpret_cast<GetInternal>(const_cast<std::uint8_t*>(image) + kGetInternalResource)(
+                &owner, resource);
+            return owner != nullptr;
+        } @catch (id) {
+            return false;
+        }
+    }
+    std::uint32_t flags(void* owner) const noexcept {
+        return loadAt<std::uint32_t>(owner, 0x58);
+    }
+    void* texture(void* owner) const noexcept {
+        @try {
+            using GetMetal = void* (*)(void*);
+            return reinterpret_cast<GetMetal>(const_cast<std::uint8_t*>(image) + kGetMetalTexture)(owner);
+        } @catch (id) {
+            return nullptr;
+        }
+    }
+    bool view(void* texture, TextureView& out) const noexcept {
+        @try {
+            return supportedPlaneView(reinterpret_cast<id<MTLTexture>>(texture), out);
+        } @catch (id) {
+            return false;
+        }
+    }
+    bool retain(void* texture) const noexcept {
+        @try {
+            [reinterpret_cast<id>(texture) retain];
+            return true;
+        } @catch (id) {
+            return false;
+        }
+    }
+    void releaseInternal(void* owner) const noexcept { releaseInternalTexture(owner); }
+    void releaseMetal(void* texture) const noexcept { releaseMetalTexture(texture); }
+};
 
 struct UseEntry {
     id<MTLTexture> texture = nil;
@@ -543,48 +603,18 @@ void releaseCommandList(NativeCommandList& commandList) noexcept {
     commandList = {};
 }
 
-bool mapResource(void* d3d12Resource, MetalResource& out) noexcept {
-    releaseResource(out);
-    if (!d3d12Resource || !ensureInitialized()) return false;
-    const std::uint8_t* image = gRuntime.image;
-    void* internal = nullptr;
-    id<MTLTexture> metal = nil;
-
-    @try {
-        using GetInternal = void (*)(void**, void*);
-        reinterpret_cast<GetInternal>(const_cast<std::uint8_t*>(image) + kGetInternalResource)(
-            &internal, d3d12Resource);
-        if (!internal) return false;
-        using GetMetal = void* (*)(void*);
-        metal = reinterpret_cast<id<MTLTexture>>(
-            reinterpret_cast<GetMetal>(const_cast<std::uint8_t*>(image) + kGetMetalTexture)(internal));
-        if (!metal) {
-            releaseInternalTexture(internal);
-            return false;
-        }
-        TextureView view{};
-        if (!supportedPlaneView(metal, view)) {
-            releaseInternalTexture(internal);
-            return false;
-        }
-        [metal retain];
-        releaseInternalTexture(internal);
-        out.texture = reinterpret_cast<void*>(metal);
-        out.view = view;
-        return true;
-    } @catch (id) {
-        if (internal) releaseInternalTexture(internal);
-        return false;
+ResourceMapResult mapResource(void* d3d12Resource, MetalResource& out,
+                              ResourceAccess required) noexcept {
+    if (!d3d12Resource || !ensureInitialized()) {
+        releaseResource(out);
+        return ResourceMapResult::metadataUnavailable;
     }
+    NativeResourceBridge native{gRuntime.image};
+    return detail::mapResourceNative(d3d12Resource, out, required, native);
 }
 
 void releaseResource(MetalResource& resource) noexcept {
-    if (resource.texture) {
-        @try {
-            [reinterpret_cast<id>(resource.texture) release];
-        } @catch (id) {
-        }
-    }
+    releaseMetalTexture(resource.texture);
     resource = {};
 }
 

@@ -12,14 +12,12 @@ case "$WINE_BUILD_PROFILE" in
     ROOT="$REPO_DIR/build/wine-tuned"
     PROVENANCE_NAME=wine-11.17-git.913e31f-zzz-dx12-tuned-gptk4b2
     RUNTIME_ID=11.17-zzz-dx12-tuned
-    PACKAGE_COMMAND=scripts/package-wine-p3-runtime.sh
     ;;
   safe-msync)
     BUILD_LABEL=build-wine-safe-msync
     ROOT="$REPO_DIR/build/wine-safe-msync"
     PROVENANCE_NAME=wine-11.17-git.913e31f-zzz-dx12-p3-safe-msync-gptk4b2
     RUNTIME_ID=11.17-p3-safe-msync
-    PACKAGE_COMMAND=scripts/package-wine-safe-msync-runtime.sh
     ;;
   *)
     echo "build-wine-tuned: unknown WINE_BUILD_PROFILE: $WINE_BUILD_PROFILE" >&2
@@ -29,15 +27,14 @@ esac
 PROVENANCE_NAME=${WINE_PACKAGE_NAME:-$PROVENANCE_NAME}
 RUNTIME_ID=${WINE_RUNTIME_ID:-$RUNTIME_ID}
 SOURCE_DIR="$ROOT/source"
-BUILD_X64="$ROOT/build-x64"
-BUILD_ARM64="$ROOT/build-arm64"
+BUILD_X64="$ROOT/$(/usr/bin/python3 "$REPO_DIR/scripts/wine_artifacts.py" build-dir "$WINE_BUILD_PROFILE" x86_64)"
+BUILD_ARM64="$ROOT/$(/usr/bin/python3 "$REPO_DIR/scripts/wine_artifacts.py" build-dir "$WINE_BUILD_PROFILE" arm64)"
 HOST_DIR="$ROOT/host"
 PREPARED_FILE="$ROOT/prepared.json"
 BUILD_STATE_FILE="$ROOT/build-state.json"
 CONFIG_X64_STATE_FILE="$ROOT/configure-x64.state.json"
 CONFIG_ARM64_STATE_FILE="$ROOT/configure-arm64.state.json"
 PROVENANCE_FILE="$ROOT/provenance.json"
-ROOT_REL=${ROOT#"$REPO_DIR/"}
 BASE_ROOT=${WINE_P3_ROOT:-"$REPO_DIR/build/wine-p3"}
 BASE_SOURCE="$BASE_ROOT/source"
 BASE_HOST="$BASE_ROOT/host"
@@ -64,80 +61,22 @@ JOBS=$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null || echo 4)
 # Mach wire format remains version 2 with header-only CLOSE_FLAG messages.
 PATCH_INVENTORY='0001-msync-tuned.patch
 0002-native-x86-server.patch
-0003-msync-reliability.patch
 0004-macdrv-reset-rawinput-baseline.patch
 0005-upstream-media-fixes.patch
 0006-upstream-macos-fixes.patch
-0007-msync-resource-reuse.patch
 0008-media-resources.patch
 0009-device-resources.patch
 0010-network-resources.patch
 0011-audio-resources.patch
-0012-msync-shared-pages.patch
 0013-window-resources.patch
-0014-core-resources.patch
-0017-cursor-reconciliation-coalescing.patch
-0018-confinement-warp-correction.patch'
+0014-core-resources.patch'
 
-# key|build tree|make target|installed path|architecture|format|changed sources (comma-separated)
-# This is the single authoritative source/artifact inventory. Source exclusions,
-# build state, install overlay, and provenance are all derived from it.
-ARTIFACT_INVENTORY='ntdll|x86_64|dlls/ntdll/ntdll.so|lib/wine/x86_64-unix/ntdll.so|x86_64|macho|dlls/ntdll/unix/msync.c,dlls/ntdll/unix/msync.h,dlls/ntdll/unix/loader.c,server/protocol.def,include/wine/server_protocol.h,include/wine/msync.h,include/Makefile.in,dlls/ntdll/unix/signal_arm.c,dlls/ntdll/unix/signal_arm64.c,dlls/ntdll/unix/signal_i386.c,dlls/ntdll/unix/signal_x86_64.c,dlls/ntdll/unix/thread.c,dlls/ntdll/unix/unix_private.h
-winemac|x86_64|dlls/winemac.drv/winemac.so|lib/wine/x86_64-unix/winemac.so|x86_64|macho|dlls/winemac.drv/cocoa_app.h,dlls/winemac.drv/cocoa_app.m,dlls/winemac.drv/cocoa_event.h,dlls/winemac.drv/cocoa_event.m,dlls/winemac.drv/cocoa_window.h,dlls/winemac.drv/cocoa_window.m,dlls/winemac.drv/macdrv.h,dlls/winemac.drv/macdrv_cocoa.h,dlls/winemac.drv/event.c,dlls/winemac.drv/mouse.c,dlls/winemac.drv/surface.c,dlls/winemac.drv/window.c,include/wine/gdi_driver.h,dlls/winemac.drv/cocoa_warpconsumption.h
-winemac64|x86_64|dlls/winemac.drv/x86_64-windows/winemac.drv|lib/wine/x86_64-windows/winemac.drv|x86_64|pe|dlls/winemac.drv/cocoa_app.h,dlls/winemac.drv/cocoa_app.m,dlls/winemac.drv/cocoa_event.h,dlls/winemac.drv/cocoa_event.m,dlls/winemac.drv/cocoa_window.h,dlls/winemac.drv/cocoa_window.m,dlls/winemac.drv/surface.c,include/wine/gdi_driver.h
-winemac32|x86_64|dlls/winemac.drv/i386-windows/winemac.drv|lib/wine/i386-windows/winemac.drv|i386|pe|dlls/winemac.drv/cocoa_app.h,dlls/winemac.drv/cocoa_app.m,dlls/winemac.drv/cocoa_event.h,dlls/winemac.drv/cocoa_event.m,dlls/winemac.drv/cocoa_window.h,dlls/winemac.drv/cocoa_window.m,dlls/winemac.drv/surface.c,include/wine/gdi_driver.h
-wineserver|arm64|server/wineserver|bin/wineserver|arm64|macho|server/msync.c,server/msync.h,server/main.c,include/wine/msync.h,include/Makefile.in,server/thread.c,server/thread.h,server/request.c,server/sock.c,server/mach.c,server/registry.c,server/inproc_sync.c,server/queue.c,server/request_handlers.h,server/request_trace.h,server/user.h,server/window.c,server/protocol.def,include/wine/server_protocol.h
-win32u|x86_64|dlls/win32u/win32u.so|lib/wine/x86_64-unix/win32u.so|x86_64|macho|dlls/win32u/opengl.c,dlls/win32u/dce.c,dlls/win32u/message.c,server/protocol.def,include/wine/server_protocol.h,include/wine/gdi_driver.h
-win32u64|x86_64|dlls/win32u/x86_64-windows/win32u.dll|lib/wine/x86_64-windows/win32u.dll|x86_64|pe|dlls/win32u/dce.c,dlls/win32u/message.c,include/wine/gdi_driver.h
-win32u32|x86_64|dlls/win32u/i386-windows/win32u.dll|lib/wine/i386-windows/win32u.dll|i386|pe|dlls/win32u/dce.c,dlls/win32u/message.c,include/wine/gdi_driver.h
-winegstreamer|x86_64|dlls/winegstreamer/winegstreamer.so|lib/wine/x86_64-unix/winegstreamer.so|x86_64|macho|dlls/winegstreamer/wg_parser.c,dlls/winegstreamer/wg_transform.c,dlls/winegstreamer/media_sink.c,dlls/winegstreamer/gst_private.h,dlls/winegstreamer/main.c,dlls/winegstreamer/media_source.c,dlls/winegstreamer/quartz_parser.c,dlls/winegstreamer/wm_reader.c
-winegstreamer64|x86_64|dlls/winegstreamer/x86_64-windows/winegstreamer.dll|lib/wine/x86_64-windows/winegstreamer.dll|x86_64|pe|dlls/winegstreamer/wg_parser.c,dlls/winegstreamer/wg_transform.c,dlls/winegstreamer/media_sink.c,dlls/winegstreamer/gst_private.h,dlls/winegstreamer/main.c,dlls/winegstreamer/media_source.c,dlls/winegstreamer/quartz_parser.c,dlls/winegstreamer/wm_reader.c
-winegstreamer32|x86_64|dlls/winegstreamer/i386-windows/winegstreamer.dll|lib/wine/i386-windows/winegstreamer.dll|i386|pe|dlls/winegstreamer/wg_parser.c,dlls/winegstreamer/wg_transform.c,dlls/winegstreamer/media_sink.c,dlls/winegstreamer/gst_private.h,dlls/winegstreamer/main.c,dlls/winegstreamer/media_source.c,dlls/winegstreamer/quartz_parser.c,dlls/winegstreamer/wm_reader.c
-resampledmo64|x86_64|dlls/resampledmo/x86_64-windows/resampledmo.dll|lib/wine/x86_64-windows/resampledmo.dll|x86_64|pe|dlls/resampledmo/resampler.c
-resampledmo32|x86_64|dlls/resampledmo/i386-windows/resampledmo.dll|lib/wine/i386-windows/resampledmo.dll|i386|pe|dlls/resampledmo/resampler.c
-mfreadwrite64|x86_64|dlls/mfreadwrite/x86_64-windows/mfreadwrite.dll|lib/wine/x86_64-windows/mfreadwrite.dll|x86_64|pe|dlls/mfreadwrite/reader.c,dlls/mfreadwrite/writer.c
-mfreadwrite32|x86_64|dlls/mfreadwrite/i386-windows/mfreadwrite.dll|lib/wine/i386-windows/mfreadwrite.dll|i386|pe|dlls/mfreadwrite/reader.c,dlls/mfreadwrite/writer.c
-amstream64|x86_64|dlls/amstream/x86_64-windows/amstream.dll|lib/wine/x86_64-windows/amstream.dll|x86_64|pe|dlls/amstream/ddrawstream.c
-amstream32|x86_64|dlls/amstream/i386-windows/amstream.dll|lib/wine/i386-windows/amstream.dll|i386|pe|dlls/amstream/ddrawstream.c
-imm3264|x86_64|dlls/imm32/x86_64-windows/imm32.dll|lib/wine/x86_64-windows/imm32.dll|x86_64|pe|dlls/imm32/Makefile.in
-imm3232|x86_64|dlls/imm32/i386-windows/imm32.dll|lib/wine/i386-windows/imm32.dll|i386|pe|dlls/imm32/Makefile.in
-winecoreaudio|x86_64|dlls/winecoreaudio.drv/winecoreaudio.so|lib/wine/x86_64-unix/winecoreaudio.so|x86_64|macho|dlls/winecoreaudio.drv/coreaudio.c
-winebus|x86_64|dlls/winebus.sys/winebus.so|lib/wine/x86_64-unix/winebus.so|x86_64|macho|dlls/winebus.sys/main.c,dlls/winebus.sys/bus_iohid.c,dlls/winebus.sys/bus_sdl.c,dlls/winebus.sys/hid.c
-winebus64|x86_64|dlls/winebus.sys/x86_64-windows/winebus.sys|lib/wine/x86_64-windows/winebus.sys|x86_64|pe|dlls/winebus.sys/main.c,dlls/winebus.sys/bus_iohid.c,dlls/winebus.sys/bus_sdl.c,dlls/winebus.sys/hid.c
-winebus32|x86_64|dlls/winebus.sys/i386-windows/winebus.sys|lib/wine/i386-windows/winebus.sys|i386|pe|dlls/winebus.sys/main.c,dlls/winebus.sys/bus_iohid.c,dlls/winebus.sys/bus_sdl.c,dlls/winebus.sys/hid.c
-hidclass64|x86_64|dlls/hidclass.sys/x86_64-windows/hidclass.sys|lib/wine/x86_64-windows/hidclass.sys|x86_64|pe|dlls/hidclass.sys/pnp.c
-hidclass32|x86_64|dlls/hidclass.sys/i386-windows/hidclass.sys|lib/wine/i386-windows/hidclass.sys|i386|pe|dlls/hidclass.sys/pnp.c
-dinput64|x86_64|dlls/dinput/x86_64-windows/dinput.dll|lib/wine/x86_64-windows/dinput.dll|x86_64|pe|dlls/dinput/joystick_hid.c
-dinput32|x86_64|dlls/dinput/i386-windows/dinput.dll|lib/wine/i386-windows/dinput.dll|i386|pe|dlls/dinput/joystick_hid.c
-dinput864|x86_64|dlls/dinput8/x86_64-windows/dinput8.dll|lib/wine/x86_64-windows/dinput8.dll|x86_64|pe|dlls/dinput/joystick_hid.c
-dinput832|x86_64|dlls/dinput8/i386-windows/dinput8.dll|lib/wine/i386-windows/dinput8.dll|i386|pe|dlls/dinput/joystick_hid.c
-xinput1164|x86_64|dlls/xinput1_1/x86_64-windows/xinput1_1.dll|lib/wine/x86_64-windows/xinput1_1.dll|x86_64|pe|dlls/xinput1_3/main.c
-xinput1132|x86_64|dlls/xinput1_1/i386-windows/xinput1_1.dll|lib/wine/i386-windows/xinput1_1.dll|i386|pe|dlls/xinput1_3/main.c
-xinput1264|x86_64|dlls/xinput1_2/x86_64-windows/xinput1_2.dll|lib/wine/x86_64-windows/xinput1_2.dll|x86_64|pe|dlls/xinput1_3/main.c
-xinput1232|x86_64|dlls/xinput1_2/i386-windows/xinput1_2.dll|lib/wine/i386-windows/xinput1_2.dll|i386|pe|dlls/xinput1_3/main.c
-xinput1364|x86_64|dlls/xinput1_3/x86_64-windows/xinput1_3.dll|lib/wine/x86_64-windows/xinput1_3.dll|x86_64|pe|dlls/xinput1_3/main.c
-xinput1332|x86_64|dlls/xinput1_3/i386-windows/xinput1_3.dll|lib/wine/i386-windows/xinput1_3.dll|i386|pe|dlls/xinput1_3/main.c
-xinput1464|x86_64|dlls/xinput1_4/x86_64-windows/xinput1_4.dll|lib/wine/x86_64-windows/xinput1_4.dll|x86_64|pe|dlls/xinput1_3/main.c
-xinput1432|x86_64|dlls/xinput1_4/i386-windows/xinput1_4.dll|lib/wine/i386-windows/xinput1_4.dll|i386|pe|dlls/xinput1_3/main.c
-xinputuap64|x86_64|dlls/xinputuap/x86_64-windows/xinputuap.dll|lib/wine/x86_64-windows/xinputuap.dll|x86_64|pe|dlls/xinput1_3/main.c
-xinputuap32|x86_64|dlls/xinputuap/i386-windows/xinputuap.dll|lib/wine/i386-windows/xinputuap.dll|i386|pe|dlls/xinput1_3/main.c
-wininet64|x86_64|dlls/wininet/x86_64-windows/wininet.dll|lib/wine/x86_64-windows/wininet.dll|x86_64|pe|dlls/wininet/netconnection.c,dlls/wininet/http.c
-wininet32|x86_64|dlls/wininet/i386-windows/wininet.dll|lib/wine/i386-windows/wininet.dll|i386|pe|dlls/wininet/netconnection.c,dlls/wininet/http.c
-winhttp64|x86_64|dlls/winhttp/x86_64-windows/winhttp.dll|lib/wine/x86_64-windows/winhttp.dll|x86_64|pe|dlls/winhttp/net.c
-winhttp32|x86_64|dlls/winhttp/i386-windows/winhttp.dll|lib/wine/i386-windows/winhttp.dll|i386|pe|dlls/winhttp/net.c
-ws2_3264|x86_64|dlls/ws2_32/x86_64-windows/ws2_32.dll|lib/wine/x86_64-windows/ws2_32.dll|x86_64|pe|dlls/ws2_32/socket.c
-ws2_3232|x86_64|dlls/ws2_32/i386-windows/ws2_32.dll|lib/wine/i386-windows/ws2_32.dll|i386|pe|dlls/ws2_32/socket.c'
-
+# The validated catalog is the only artifact/source inventory for both profiles.
+ARTIFACT_INVENTORY=$(/usr/bin/python3 "$REPO_DIR/scripts/wine_artifacts.py" rows "$WINE_BUILD_PROFILE")
 if [ "$WINE_BUILD_PROFILE" = safe-msync ]; then
   PATCH_INVENTORY='0001-msync-tuned.patch
-0002-native-x86-server.patch
-0003-msync-reliability.patch
-0007-msync-resource-reuse.patch
-0012-msync-shared-pages.patch'
-  ARTIFACT_INVENTORY='ntdll|x86_64|dlls/ntdll/ntdll.so|lib/wine/x86_64-unix/ntdll.so|x86_64|macho|dlls/ntdll/unix/msync.c,dlls/ntdll/unix/msync.h,include/wine/msync.h,dlls/ntdll/unix/thread.c
-wineserver|arm64|server/wineserver|bin/wineserver|arm64|macho|server/msync.c,server/msync.h,server/thread.c,server/inproc_sync.c,server/main.c,server/registry.c,server/mach.c,include/wine/msync.h,include/Makefile.in'
+0002-native-x86-server.patch'
 fi
-
 usage() {
   cat <<'EOF'
 Usage: scripts/build-wine-tuned.sh <action>
@@ -877,7 +816,7 @@ write_provenance() {
   BUILD_ARM64_VALUE=$BUILD_ARM64 PREPARED_VALUE=$PREPARED_FILE \
   X64_ARGS_VALUE=$ROOT/configure-x64.args ARM64_ARGS_VALUE=$ROOT/configure-arm64.args \
   ARTIFACT_INVENTORY_VALUE=$ARTIFACT_INVENTORY INSPECTED_UPSTREAM_TIP_VALUE=$INSPECTED_UPSTREAM_TIP \
-  BACKPORTED_UPSTREAM_COMMITS_VALUE=$BACKPORTED_UPSTREAM_COMMITS PROVENANCE_NAME_VALUE=$PROVENANCE_NAME RUNTIME_ID_VALUE=$RUNTIME_ID BUILD_PROFILE_VALUE=$WINE_BUILD_PROFILE PACKAGE_COMMAND_VALUE=$PACKAGE_COMMAND ROOT_REL_VALUE=$ROOT_REL \
+  BACKPORTED_UPSTREAM_COMMITS_VALUE=$BACKPORTED_UPSTREAM_COMMITS PROVENANCE_NAME_VALUE=$PROVENANCE_NAME RUNTIME_ID_VALUE=$RUNTIME_ID BUILD_PROFILE_VALUE=$WINE_BUILD_PROFILE \
   /usr/bin/python3 - "$tmp" <<'PY'
 import datetime, hashlib, json, os, pathlib, sys
 
@@ -925,10 +864,6 @@ payload = {
     "preparedManifest": os.environ["PREPARED_VALUE"],
     "appleComponentsDownloaded": False, "systemPrefixWritten": False,
     "baselineMutated": False,
-    "packagingHandoff": {"command": os.environ["PACKAGE_COMMAND_VALUE"],
-        "hostPrefix": os.environ["ROOT_REL_VALUE"] + "/host",
-        "provenance": os.environ["ROOT_REL_VALUE"] + "/provenance.json",
-        "defaultOutputDir": os.environ["ROOT_REL_VALUE"] + "/package"},
 }
 with open(sys.argv[1], "w", encoding="utf-8") as stream:
     json.dump(payload, stream, indent=2)
@@ -975,7 +910,6 @@ cmd_install() {
   trap - EXIT HUP INT TERM
   write_provenance "$base_tree_sha" "$inherited_tree_sha"
   info "installed mixed-architecture $WINE_BUILD_PROFILE host with the complete rebuilt artifact inventory: $HOST_DIR"
-  info "packaging: $PACKAGE_COMMAND $HOST_DIR $PROVENANCE_FILE $ROOT/package"
 }
 
 cmd_all() {

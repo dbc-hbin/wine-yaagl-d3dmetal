@@ -25,8 +25,6 @@ constexpr std::uint64_t kNativeHeader = 0x24060000000000e0ULL;
 constexpr std::uint64_t kMagic = 0x59474c4c44534c32ULL; // "YGLLDSL2"
 constexpr std::uint64_t kCookie = 0x9ac7e125d155c2b3ULL;
 
-constexpr std::uintptr_t kGetInternalResource = 0x411ae;
-constexpr std::uintptr_t kGetMetalTexture = 0x4128c;
 constexpr std::uintptr_t kReserveTemporalRecord = 0x103938;
 constexpr std::uintptr_t kRetainResource = 0xe1d76;
 constexpr std::uintptr_t kInsertSync = 0x179214;
@@ -129,25 +127,6 @@ bool verifyImage(const std::uint8_t* image) noexcept {
     if (!pinHex(image, 0x16aa30,
                 "498b3ef04c2967100f95c04885ff0f94c108c17506488b07ff5008")) return false;
 
-    // GetDesc receives the external ID3D12Resource interface at texture+0x10;
-    // its +0x18 source therefore means INTERNAL texture+0x28, not +0x18.
-    // Verify both the external interface installation and the constructor's
-    // actual descriptor copies. Format is internal+0x48; flags are +0x58.
-    if (!pinHex(image, 0x14eba0, "48895708488b159d293a0048895710")) return false;
-    if (!pinHex(image, 0x14ebff,
-                "410f1000410f104810410f105020410f114728410f114f38410f115748498b503049895758"))
-        return false;
-    if (!pinHex(image, kGetInternalResource,
-                "415653504889fb4885f6747d48c7042400000000488b7ef8")) return false;
-    if (!pinHex(image, 0x41203,
-                "4885ff743b48c704240000000048b80100000001000000f0482987d0010000"))
-        return false;
-    if (!pinHex(image, kGetMetalTexture,
-                "415653504885ff7444488b87c80000004881c7c8000000ff5020")) return false;
-    if (!pinHex(image, 0x1505cc,
-                "488b070f1040180f1048280f1050380f1147080f114f180f115728488b4048"))
-        return false;
-
     // Native MTL3 temporal replay establishes exactly this boundary: sync,
     // all-encoder flush -> external MTLCommandBuffer, shared fence, scaler
     // encode, new compute encoder waits on fence, sync again.
@@ -187,17 +166,6 @@ const std::uint8_t* locateImage() noexcept {
 bool ensureInitialized() noexcept {
     if (gReady.load(std::memory_order_acquire)) return true;
     return initialize(nullptr);
-}
-
-void releaseInternalTexture(void* texture) noexcept {
-    if (!texture) return;
-    auto* refs = reinterpret_cast<std::uint64_t*>(static_cast<std::uint8_t*>(texture) + 0x1d0);
-    const std::uint64_t remaining = __atomic_sub_fetch(refs, 0x100000001ULL, __ATOMIC_SEQ_CST);
-    if (remaining != 0) return;
-    void* embedded = static_cast<std::uint8_t*>(texture) + 0x1c0;
-    void** vtable = loadAt<void**>(embedded);
-    if (vtable && vtable[1])
-        reinterpret_cast<void (*)(void*)>(vtable[1])(embedded);
 }
 
 struct State {
@@ -322,24 +290,6 @@ bool resolveCommandList(NativeCommandList& commandList) noexcept {
     commandList.device = metalDevice;
     commandList.compiler = nullptr;
     return true;
-}
-
-bool queryResourceMetadata(void* d3d12Resource, ResourceMetadata& out) noexcept {
-    out = {};
-    if (!d3d12Resource || !ensureInitialized()) return false;
-    void* internal = nullptr;
-    @try {
-        using GetInternal = void (*)(void**, void*);
-        reinterpret_cast<GetInternal>(const_cast<std::uint8_t*>(gRuntime.image) + kGetInternalResource)(
-            &internal, d3d12Resource);
-        if (!internal) return false;
-        out.resourceFlags = loadAt<std::uint32_t>(internal, 0x58);
-        releaseInternalTexture(internal);
-        return true;
-    } @catch (id) {
-        if (internal) releaseInternalTexture(internal);
-        return false;
-    }
 }
 
 bool record(NativeCommandList& commandList, const RecordRequest& request) noexcept {

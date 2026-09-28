@@ -481,10 +481,9 @@ bool mapOne(Resources& resources, unsigned index, const State& state,
     if (!address || index >= resources.values.size()) return false;
     void* resource = pointer(address);
     if (!matches(resource, true, state.luid)) return false;
-    transport::legacy::ResourceMetadata metadata{};
-    if (!transport::legacy::queryResourceMetadata(resource, metadata) ||
-        (output && !metadata.allowsUnorderedAccess()) ||
-        !transport::mapResource(resource, resources.values[index]))
+    const auto access = output ? transport::ResourceAccess::write : transport::ResourceAccess::read;
+    if (transport::mapResource(resource, resources.values[index], access) !=
+        transport::ResourceMapResult::mapped)
         return false;
     const auto& view = resources.values[index].view;
     return view.mipCount == 1 && view.sliceCount == 1 && view.planes == 1 &&
