@@ -215,8 +215,16 @@ static int *shm_tid_map;
 
 static const mach_msg_bits_t msgh_bits_send = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
 
-static inline void server_register_wait( unsigned int msgh_id, const int *objs,
-                                         void **objs_shm, int alert_obj, void *alert_obj_shm, int count )
+static inline void remove_multiple_waiter( void *shm )
+{
+    struct event *obj = (struct event *)shm;
+
+    if (__atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST ) < 0)
+        __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST );
+}
+
+static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, const int *objs,
+                                                      void **objs_shm, int alert_obj, void *alert_obj_shm, int count )
 {
     int i, is_mutex;
     mach_msg_return_t mr;
@@ -251,13 +259,20 @@ static inline void server_register_wait( unsigned int msgh_id, const int *objs,
 
     if (mr != MACH_MSG_SUCCESS)
     {
+        /* The server never saw this registration: drop the waiter references we took. */
         ERR("Failed to send server register wait: %#x (%s)\n", mr, mach_error_string( mr ));
-        abort_thread(1);
+        if (alert_obj)
+        {
+            remove_multiple_waiter( alert_obj_shm );
+            count--;
+        }
+        for (i = 0; i < count; i++) remove_multiple_waiter( objs_shm[i] );
     }
+    return mr;
 }
 
-static inline void server_remove_wait( unsigned int msgh_id, const int *objs, void **objs_shm,
-                                       int alert_obj, void *alert_obj_shm, int count )
+static inline mach_msg_return_t server_remove_wait( unsigned int msgh_id, const int *objs, void **objs_shm,
+                                                    int alert_obj, void *alert_obj_shm, int count )
 {
     int i;
     mach_msg_return_t mr;
@@ -269,21 +284,13 @@ static inline void server_remove_wait( unsigned int msgh_id, const int *objs, vo
 
     for (i = 0; i < count; i++)
     {
-        struct event *obj = (struct event *)objs_shm[i];
-
-        int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
-        if (refs < 0)
-            __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
+        remove_multiple_waiter( objs_shm[i] );
         message.shm_idx[i] = objs[i];
     }
 
     if (alert_obj)
     {
-        struct event *obj = (struct event *)alert_obj_shm;
-
-        int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
-        if (refs < 0)
-            __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
+        remove_multiple_waiter( alert_obj_shm );
         message.shm_idx[count++] = alert_obj;
     }
 
@@ -296,10 +303,8 @@ static inline void server_remove_wait( unsigned int msgh_id, const int *objs, vo
                      0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
 
     if (mr != MACH_MSG_SUCCESS)
-    {
         ERR("Failed to send server remove wait: %#x (%s)\n", mr, mach_error_string( mr ));
-        abort_thread(1);
-    }
+    return mr;
 }
 
 static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
@@ -371,7 +376,12 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
 
     __atomic_store_n( addr, 2, __ATOMIC_RELEASE );
     msgh_id = (tid << 8) | total_count;
-    server_register_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+    if (server_register_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count ) != MACH_MSG_SUCCESS)
+    {
+        /* Nobody will ever release the registration spin; leave our slot idle. */
+        __atomic_store_n( addr, 0, __ATOMIC_RELEASE );
+        return STATUS_UNSUCCESSFUL;
+    }
 
     while (__atomic_load_n( addr, __ATOMIC_ACQUIRE ) == 2)
     {
@@ -379,13 +389,7 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
         {
             int i;
             for (i = 0; i < count; i++)
-            {
-                struct event *obj = (struct event *)objs_shm[i];
-
-                int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
-                if (refs < 0)
-                    __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
-            }
+                remove_multiple_waiter( objs_shm[i] );
             return STATUS_PENDING;
         }
     }
@@ -397,7 +401,8 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
             ns_timeleft = update_timeout( *end ) * 100;
             if (!ns_timeleft)
             {
-                server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+                if (server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count ) != MACH_MSG_SUCCESS)
+                    return STATUS_UNSUCCESSFUL;
                 return STATUS_TIMEOUT;
             }
         }
@@ -407,7 +412,8 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
             break;
     } while (ret == -EINTR || ret == -EFAULT);
 
-    server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+    if (server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count ) != MACH_MSG_SUCCESS)
+        return STATUS_UNSUCCESSFUL;
 
     if (ret == -ETIMEDOUT) return STATUS_TIMEOUT;
 
@@ -939,7 +945,7 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
             else
                 ret = msync_wait_multiple( objs, objs_shm, alert_obj, alert_obj_shm, count, timeout ? &end : NULL, current_tid );
 
-            if (ret == STATUS_TIMEOUT) return STATUS_TIMEOUT;
+            if (ret != STATUS_SUCCESS && ret != STATUS_PENDING) return ret;
         } /* while (1) */
     }
     else
@@ -1007,6 +1013,8 @@ tryagain:
 
                 if (status == STATUS_TIMEOUT) return STATUS_TIMEOUT;
                 if (status == STATUS_USER_APC) goto userapc;
+                /* Nothing is acquired before every object has been waited on. */
+                if (status != STATUS_SUCCESS && status != STATUS_PENDING) return status;
             }
 
             /* If we got here and we haven't timed out, that means all of the

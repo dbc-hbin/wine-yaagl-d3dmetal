@@ -3,14 +3,15 @@
 [한국어](README.ko.md)
 
 A clean CrossOver 26.3 / Wine 11.0 build path for Yaagl.
-Display name: **Wine 11.0 D3DMetal (CX 26.3, GPTK 4.0b2, experimental)**; stable runtime ID: `wine-cx26.3-d3dmetal-gptk4.0b2-1`.
+Display name: **Wine 11.0 D3DMetal (CX 26.3, GPTK 4.0b2, experimental)**; runtime ID: `wine-cx26.3-d3dmetal-gptk4.0b2-2`.
+Experimental A/B alternative to the Wine 11.17 runtime; no performance advantage is assumed.
 Targets Apple Silicon, macOS 26+, and Rosetta 2; macOS 26 hardware requires separate validation.
 The Wine loader and Unix modules are x86_64, Windows modules are i386/x86_64, and wineserver is ARM64.
 
 ## Selected features
 
 - Yaagl MF video and Timeout compatibility, preserving work-queue release, bounded heap access, and explicit Timeout OFF.
-- ARM64 wineserver, retaining CX's MSync algorithm and server protocol. MSync shared-page addresses are initialized before mapping, and mapping failures stop before accessing the failed address. Failed wait-registration/removal sends terminate the affected Wine thread instead of returning into an endless retry/log loop; normal contention, timeouts, and spin behavior are unchanged.
+- ARM64 wineserver, retaining CX's MSync algorithm and server protocol. MSync shared-page addresses are initialized before mapping, and mapping failures stop before accessing the failed address. Failed wait-registration/removal sends return `STATUS_UNSUCCESSFUL` through wait-any and wait-all, as in 11.17, rather than retrying indefinitely or terminating an individual thread. Failed registration releases its waiter references and resets its slot; normal contention, timeouts, and spin behavior are unchanged.
 - FSR API translation to MetalFX SR/FG with native FG fallback.
   Valid MetalFX/automatic-provider FFX memory-usage queries (V1/V2) return success with both byte counts set to zero, matching D3DMetal DLSS compatibility behavior. Zero means unreported usage, not a measured footprint; native FG/swapchain queries retain their native results. No allocation tracking or query-time GPU allocation is added.
 - GPTK 4.0b2 FP64 codec, stage-lock, native PSO/function/RT caches, and required display/resource lifetime handling.

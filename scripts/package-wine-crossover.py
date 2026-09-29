@@ -31,7 +31,7 @@ OVERLAY = (
        'framegeneration/include/ffx_framegeneration_api_types.h',
        'framegeneration/include/dx12/ffx_api_framegeneration_dx12.h')),
 )
-RUNTIME_ID = 'wine-cx26.3-d3dmetal-gptk4.0b2-1'
+RUNTIME_ID = 'wine-cx26.3-d3dmetal-gptk4.0b2-2'
 RUNTIME_NAME = 'Wine 11.0 D3DMetal (CX 26.3, GPTK 4.0b2, experimental)'
 ARCHIVE_OUT = 'wine-cx26.3-d3dmetal-gptk4.0b2-macos26.tar.xz'
 GRAPHICS_INPUTS = frozenset({

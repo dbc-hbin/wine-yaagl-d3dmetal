@@ -7,9 +7,11 @@ failures fail closed instead of crashing or flooding:
   the uninitialized hint that turned VM_FLAGS_ANYWHERE into KERN_NO_SPACE);
 - a real mach_vm_map() failure exits through fatal_error() instead of
   memset()ing an invalid address;
-- ntdll's register/remove wait sends terminate the thread when the server
-  port is dead, instead of returning STATUS_PENDING into an endless retry,
-  while healthy sends still reach the server port intact.
+- ntdll's register/remove wait sends return STATUS_UNSUCCESSFUL when the
+  server port is dead, instead of STATUS_PENDING into an endless retry or
+  terminating the thread, without leaking multiple_waiters references or
+  leaving the tid wait slot mid-registration, while healthy sends still reach
+  the server port intact.
 """
 
 import pathlib
@@ -139,13 +141,6 @@ CLIENT_PROLOGUE = r'''
 
 #define ERR(...) fprintf( stderr, __VA_ARGS__ )
 
-/* ntdll's abort_thread() for the last thread: _exit() with the status. */
-static void __attribute__((noreturn)) abort_thread( int status )
-{
-    fflush( stderr );
-    _exit( status );
-}
-
 static NTSTATUS test_query_system_time( LARGE_INTEGER *time )
 {
     struct timespec now;
@@ -231,9 +226,15 @@ int main( int argc, char **argv )
     if (!strcmp( scenario, "register-dead" ))
     {
         /* wineserver went away: our send right is now a dead name */
+        struct event *alert = mmap( NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0 );
+        alert->msync_type = MSYNC_AUTO_EVENT;
         destroy_receive_right();
-        status = msync_wait_multiple( objs, objs_shm, 0, NULL, 1, &end, TID );
-        fail( "register send failure", status, event );
+        status = msync_wait_multiple( objs, objs_shm, OBJ + 1, alert, 1, &end, TID );
+        if (status != STATUS_UNSUCCESSFUL) fail( "register send failure", status, event );
+        if (event->multiple_waiters) fail( "waiter count leaked", status, event );
+        if (alert->multiple_waiters) fail( "alert waiter count leaked", status, alert );
+        if (shm_tid_map[TID]) fail( "wait slot left registering", status, event );
+        return 0;
     }
 
     if (!strcmp( scenario, "healthy-contention" ))
@@ -252,7 +253,12 @@ int main( int argc, char **argv )
     pthread_create( &thread, NULL, server_thread, NULL );
     status = msync_wait_multiple( objs, objs_shm, 0, NULL, 1, &end, TID );
     pthread_join( thread, NULL );
-    if (kill_port_after_register) fail( "remove send failure", status, event );
+    if (kill_port_after_register)
+    {
+        if (status != STATUS_UNSUCCESSFUL) fail( "remove send failure", status, event );
+        if (event->multiple_waiters) fail( "waiter count leaked", status, event );
+        return 0;
+    }
 
     if (status != STATUS_TIMEOUT) fail( "timeout status", status, event );
     if (event->multiple_waiters) fail( "waiter count leaked", status, event );
@@ -314,10 +320,10 @@ class MsyncFailureTest(unittest.TestCase):
         self.run_scenarios(server_program(), {"map": 0, "map-fail": 1})
 
     def test_client_wait_registration_sends(self):
-        # Dead server port: abort_thread(1) instead of returning into a retry loop.
+        # Dead server port: STATUS_UNSUCCESSFUL with clean refs, not a retry loop or thread abort.
         self.run_scenarios(client_program(), {
-            "register-dead": 1,
-            "remove-dead": 1,
+            "register-dead": 0,
+            "remove-dead": 0,
             "healthy-contention": 0,
             "healthy-timeout": 0,
         })

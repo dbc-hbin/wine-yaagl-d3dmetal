@@ -3,14 +3,15 @@
 [English](README.md)
 
 Yaagl용 CrossOver 26.3 기반 Wine 11.0 클린 빌드 경로입니다.
-표시 이름: **Wine 11.0 D3DMetal (CX 26.3, GPTK 4.0b2, experimental)**, 고정 런타임 ID: `wine-cx26.3-d3dmetal-gptk4.0b2-1`.
+표시 이름: **Wine 11.0 D3DMetal (CX 26.3, GPTK 4.0b2, experimental)**, 런타임 ID: `wine-cx26.3-d3dmetal-gptk4.0b2-2`.
+Wine 11.17과 A/B 비교하기 위한 시험용 런타임이며, 성능 우위를 전제하지 않습니다.
 Apple Silicon·macOS 26 이상·Rosetta 2를 대상으로 하며, macOS 26 실기기 검증은 별도로 필요합니다.
 Wine 로더와 Unix 모듈은 x86_64, Windows 모듈은 i386/x86_64, wineserver는 ARM64로 빌드합니다.
 
 ## 포함 범위
 
 - Yaagl의 MF 영상 재생·Timeout 호환 처리. MF 작업 큐 해제와 Timeout 안전 검사·명시적 OFF를 유지합니다.
-- ARM64 wineserver. CX의 MSync 알고리즘과 서버 프로토콜은 유지합니다. 공유 페이지의 매핑 주소를 초기화하고, 매핑 실패 시 잘못된 주소에 접근하기 전에 종료합니다. 대기 등록·해제의 Mach 전송 실패는 해당 Wine 스레드를 종료해 무한 재시도·로그 반복을 막으며, 정상 경합·타임아웃·스핀 동작은 바꾸지 않습니다.
+- ARM64 wineserver. CX의 MSync 알고리즘과 서버 프로토콜은 유지합니다. 공유 페이지의 매핑 주소를 초기화하고, 매핑 실패 시 잘못된 주소에 접근하기 전에 종료합니다. 대기 등록·해제의 Mach 전송 실패는 무한 재시도나 개별 스레드 종료 대신 11.17처럼 wait-any·wait-all 호출자에게 `STATUS_UNSUCCESSFUL`을 반환합니다. 등록 실패 시 대기 참조와 슬롯을 되돌리며, 정상 경합·타임아웃·스핀 동작은 바꾸지 않습니다.
 - FSR API를 MetalFX SR·FG로 연결하는 모듈과 native FG fallback.
   MetalFX·자동 제공자의 유효한 FFX 메모리 조회(V1/V2)는 D3DMetal의 DLSS 호환 정책처럼 두 바이트 값을 0으로 채우고 성공을 반환합니다. 0은 실측 사용량이 아니라 통계 미제공을 뜻하며, native FG·swapchain 조회는 기존 native 결과를 유지합니다. 자원 추적이나 조회를 위한 GPU 할당은 추가하지 않습니다.
 - GPTK 4.0b2의 FP64 codec·stage-lock·native PSO/함수/RT 캐시 패치와 필요한 화면·자원 수명 처리.
