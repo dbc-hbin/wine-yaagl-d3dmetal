@@ -11,6 +11,7 @@ The Wine loader and Unix modules are x86_64, Windows modules are i386/x86_64, an
 - Yaagl MF video and Timeout compatibility, preserving work-queue release, bounded heap access, and explicit Timeout OFF.
 - ARM64 wineserver, retaining CX's MSync implementation and server protocol.
 - FSR API translation to MetalFX SR/FG with native FG fallback.
+  Valid MetalFX/automatic-provider FFX memory-usage queries (V1/V2) return success with both byte counts set to zero, matching D3DMetal DLSS compatibility behavior. Zero means unreported usage, not a measured footprint; native FG/swapchain queries retain their native results. No allocation tracking or query-time GPU allocation is added.
 - GPTK 4.0b2 FP64 codec, stage-lock, native PSO/function/RT caches, and required display/resource lifetime handling.
 - Per-game GPU identity: RX 9070 for ZZZ; RTX 5060 for other launches.
 - Metal HUD Frame Interpolator row cleanup when FG stops.
@@ -67,6 +68,7 @@ Focused boundary checks:
 node --test scripts/prepare-d3dmetal-runtime.test.mjs scripts/metalir-fp64-codec-patch.test.mjs
 python3 scripts/test-resource-map.py
 python3 scripts/test-fg-normalization.py
+python3 scripts/test-fsr-memory-query.py
 python3 scripts/test-wine-launch-wrapper.py
 ```
 

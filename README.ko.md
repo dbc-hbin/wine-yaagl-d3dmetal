@@ -11,6 +11,7 @@ Wine 로더와 Unix 모듈은 x86_64, Windows 모듈은 i386/x86_64, wineserver�
 - Yaagl의 MF 영상 재생·Timeout 호환 처리. MF 작업 큐 해제와 Timeout 안전 검사·명시적 OFF를 유지합니다.
 - ARM64 wineserver. CX의 MSync와 서버 프로토콜은 그대로 유지합니다.
 - FSR API를 MetalFX SR·FG로 연결하는 모듈과 native FG fallback.
+  MetalFX·자동 제공자의 유효한 FFX 메모리 조회(V1/V2)는 D3DMetal의 DLSS 호환 정책처럼 두 바이트 값을 0으로 채우고 성공을 반환합니다. 0은 실측 사용량이 아니라 통계 미제공을 뜻하며, native FG·swapchain 조회는 기존 native 결과를 유지합니다. 자원 추적이나 조회를 위한 GPU 할당은 추가하지 않습니다.
 - GPTK 4.0b2의 FP64 codec·stage-lock·native PSO/함수/RT 캐시 패치와 필요한 화면·자원 수명 처리.
 - ZZZ에는 RX 9070, 다른 실행에는 RTX 5060을 노출하는 GPU 정책.
 - FG가 멈췄을 때 Metal HUD의 Frame Interpolator 행을 정리하는 처리.
@@ -67,6 +68,7 @@ Yaagl은 Apple 라이선스 동의를 받은 뒤 `wine/libexec/yaagl-d3dmetal/pr
 node --test scripts/prepare-d3dmetal-runtime.test.mjs scripts/metalir-fp64-codec-patch.test.mjs
 python3 scripts/test-resource-map.py
 python3 scripts/test-fg-normalization.py
+python3 scripts/test-fsr-memory-query.py
 python3 scripts/test-wine-launch-wrapper.py
 ```
 
