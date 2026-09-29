@@ -729,7 +729,10 @@ static void LISTBOX_SetRedraw( LB_DESCR *descr, BOOL on )
         {     /* page was changed while setredraw false, refresh automatically */
             InvalidateRect(descr->self, NULL, TRUE);
             if ((descr->top_item + descr->page_size) > descr->nb_items)
-                descr->top_item = LISTBOX_GetMaxTopIndex(descr);
+            {      /* reset top of page if less than number of items/page */
+                descr->top_item = descr->nb_items - descr->page_size;
+                if (descr->top_item < 0) descr->top_item = 0;
+            }
             descr->style &= ~LBS_DISPLAYCHANGED;
         }
         LISTBOX_UpdateScroll( descr );
@@ -2798,8 +2801,6 @@ static LRESULT CALLBACK LISTBOX_WindowProc( HWND hwnd, UINT msg, WPARAM wParam, 
         return descr->focus_item;
 
     case LB_SETTOPINDEX:
-        if (((INT)wParam < 0) || ((INT)wParam >= descr->nb_items))
-            return LB_ERR;
         return LISTBOX_SetTopItem( descr, wParam, TRUE );
 
     case LB_SETCOLUMNWIDTH:

@@ -1,0 +1,56 @@
+From: Yaagl CX26.3 port <yaagl-cx@local>
+Target: CodeWeavers CrossOver 26.3.0, Wine 11.0 sources/wine
+Archive-SHA256: ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872
+Subject: [PATCH 2/2] Map tuned ARM64 wineserver to AMD64/I386 clients
+Provenance: Historical patch 0002-native-x86-server.patch from commit
+  54f2563 (formerly patches/wine-tuned/), adapted to
+  pristine CX26.3 server registry/mach source. No server protocol or MSync edits.
+Dependency: Build native arm64 wineserver with -DWINE_TUNED_X86_SERVER;
+  without that macro CX defaults remain unchanged.
+
+--- a/server/registry.c
++++ b/server/registry.c
+@@ -1867,9 +1867,14 @@
+ #elif defined(__aarch64__)
+     if (prefix_type == PREFIX_64BIT)
+     {
++#ifdef WINE_TUNED_X86_SERVER
++        supported_machines[count++] = IMAGE_FILE_MACHINE_AMD64;
++        supported_machines[count++] = IMAGE_FILE_MACHINE_I386;
++#else
+         supported_machines[count++] = IMAGE_FILE_MACHINE_ARM64;
+         supported_machines[count++] = IMAGE_FILE_MACHINE_I386;
+         supported_machines[count++] = IMAGE_FILE_MACHINE_ARMNT;
++#endif
+     }
+ #else
+ #error Unsupported machine
+--- a/server/mach.c
++++ b/server/mach.c
+@@ -178,7 +178,12 @@
+ /* retrieve the thread x86 registers */
+ void get_thread_context( struct thread *thread, struct context_data *context, unsigned int flags )
+ {
+-#if defined(__i386__) || defined(__x86_64__)
++#if defined(__aarch64__) && defined(WINE_TUNED_X86_SERVER)
++    /* As in the Rosetta fallback, x86 debug registers cannot be read cross-process. */
++    assert( flags == SERVER_CTX_DEBUG_REGISTERS );
++    memset( &context->debug, 0, sizeof(context->debug) );
++    context->flags |= SERVER_CTX_DEBUG_REGISTERS;
++#elif defined(__i386__) || defined(__x86_64__)
+     x86_debug_state_t state;
+     mach_msg_type_number_t count = sizeof(state) / sizeof(int);
+     mach_msg_type_name_t type;
+@@ -264,7 +269,11 @@
+ /* set the thread x86 registers */
+ void set_thread_context( struct thread *thread, const struct context_data *context, unsigned int flags )
+ {
+-#if defined(__i386__) || defined(__x86_64__)
++#if defined(__aarch64__) && defined(WINE_TUNED_X86_SERVER)
++    /* As in the Rosetta fallback, x86 debug registers cannot be set cross-process. */
++    assert( flags == SERVER_CTX_DEBUG_REGISTERS );
++    set_error( STATUS_UNSUCCESSFUL );
++#elif defined(__i386__) || defined(__x86_64__)
+     x86_debug_state_t state;
+     mach_msg_type_number_t count = sizeof(state) / sizeof(int);
+     mach_msg_type_name_t type;

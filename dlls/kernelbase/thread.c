@@ -23,6 +23,7 @@
 #include <limits.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winnls.h"
@@ -382,6 +383,19 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetThreadTimes( HANDLE thread, LPFILETIME creation
 
 
 /***********************************************************************
+ *	     GetThreadUILanguage   (kernelbase.@)
+ */
+LANGID WINAPI DECLSPEC_HOTPATCH GetThreadUILanguage(void)
+{
+    LANGID lang;
+
+    FIXME(": stub, returning default language.\n");
+    NtQueryDefaultUILanguage( &lang );
+    return lang;
+}
+
+
+/***********************************************************************
  *	     OpenThread   (kernelbase.@)
  */
 HANDLE WINAPI DECLSPEC_HOTPATCH OpenThread( DWORD access, BOOL inherit, DWORD id )
@@ -636,6 +650,18 @@ BOOL WINAPI DECLSPEC_HOTPATCH SetThreadStackGuarantee( ULONG *size )
     }
     if (new_size > prev_size) NtCurrentTeb()->GuaranteedStackBytes = (new_size + 4095) & ~4095;
     return TRUE;
+}
+
+
+/**********************************************************************
+ *	SetThreadUILanguage   (kernelbase.@)
+ */
+LANGID WINAPI DECLSPEC_HOTPATCH SetThreadUILanguage( LANGID langid )
+{
+    TRACE( "(0x%04x) stub - returning success\n", langid );
+
+    if (!langid) langid = GetThreadUILanguage();
+    return langid;
 }
 
 
@@ -1126,15 +1152,12 @@ BOOL WINAPI DECLSPEC_HOTPATCH ConvertFiberToThread(void)
 {
     struct fiber_data *fiber = NtCurrentTeb()->Tib.FiberData;
 
-    if (!NtCurrentTeb()->HasFiberData)
+    if (fiber)
     {
-        SetLastError( ERROR_ALREADY_THREAD );
-        return FALSE;
+        relocate_thread_actctx_stack( &NtCurrentTeb()->ActivationContextStack );
+        NtCurrentTeb()->Tib.FiberData = NULL;
+        HeapFree( GetProcessHeap(), 0, fiber );
     }
-    relocate_thread_actctx_stack( &NtCurrentTeb()->ActivationContextStack );
-    NtCurrentTeb()->Tib.FiberData = NULL;
-    NtCurrentTeb()->HasFiberData = FALSE;
-    HeapFree( GetProcessHeap(), 0, fiber );
     return TRUE;
 }
 
@@ -1155,8 +1178,27 @@ LPVOID WINAPI DECLSPEC_HOTPATCH ConvertThreadToFiberEx( LPVOID param, DWORD flag
 {
     struct fiber_data *fiber;
 
-    if (NtCurrentTeb()->HasFiberData)
+    if (NtCurrentTeb()->Tib.FiberData)
     {
+        /* CrossOver hack for bug 20987 */
+        static int is_halo_mcc = -1;
+
+        if (is_halo_mcc == -1)
+        {
+            static const WCHAR mcc[] = {'M','C','C','-','W','i','n','6','4','-',
+                'S','h','i','p','p','i','n','g','.','e','x','e',0};
+            WCHAR path[MAX_PATH];
+            DWORD len = ARRAY_SIZE(mcc) - 1, len2 = GetModuleFileNameW( NULL, path, MAX_PATH );
+
+            is_halo_mcc = len <= len2 && !lstrcmpiW( path + len2 - len, mcc );
+        }
+
+        if (is_halo_mcc)
+        {
+            TRACE("CrossOver hack: faking success\n");
+            return NtCurrentTeb()->Tib.FiberData;
+        }
+
         SetLastError( ERROR_ALREADY_FIBER );
         return NULL;
     }
@@ -1176,7 +1218,6 @@ LPVOID WINAPI DECLSPEC_HOTPATCH ConvertThreadToFiberEx( LPVOID param, DWORD flag
     fiber->fls_slots        = NtCurrentTeb()->FlsSlots;
     relocate_thread_actctx_stack( &fiber->actctx.stack_space );
     NtCurrentTeb()->Tib.FiberData = fiber;
-    NtCurrentTeb()->HasFiberData = TRUE;
     return fiber;
 }
 
@@ -1207,7 +1248,7 @@ void WINAPI DECLSPEC_HOTPATCH DeleteFiber( LPVOID fiber_ptr )
  */
 BOOL WINAPI DECLSPEC_HOTPATCH IsThreadAFiber(void)
 {
-    return NtCurrentTeb()->HasFiberData;
+    return NtCurrentTeb()->Tib.FiberData != NULL;
 }
 
 

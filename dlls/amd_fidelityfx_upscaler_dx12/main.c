@@ -247,7 +247,7 @@ static void pe_log_result(const char *api, const ffxContext *handle, uint64_t ty
         fprintf(file, "{\"schema\":1,\"component\":\"fsr-pe\",\"event\":\"api\","
                       "\"sequence\":%ld,\"api\":\"%s\",\"type\":%llu,"
                       "\"handleAddress\":%llu,\"contextValue\":%llu,\"result\":%u,\"reason\":\"%s\"}\n",
-                sequence, api, (unsigned long long)type, (unsigned long long)(uintptr_t)handle,
+                (long)sequence, api, (unsigned long long)type, (unsigned long long)(uintptr_t)handle,
                 (unsigned long long)(uintptr_t)(handle ? *handle : NULL), result, reason);
         fclose(file);
     }

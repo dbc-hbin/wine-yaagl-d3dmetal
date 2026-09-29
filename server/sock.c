@@ -96,6 +96,7 @@
 #endif
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
 #include "winerror.h"
@@ -164,22 +165,11 @@ union unix_sockaddr
 #endif
 };
 
-struct poll_req;
-
-struct poll_req_socket
-{
-    struct list entry;
-    struct poll_req *req;
-    struct sock *sock;
-    int mask;
-    obj_handle_t handle;
-    int flags;
-    unsigned int status;
-};
+static struct list poll_list = LIST_INIT( poll_list );
 
 struct poll_req
 {
-    struct list owner_entry;
+    struct list entry;
     struct async *async;
     struct iosb *iosb;
     struct timeout_user *timeout;
@@ -187,7 +177,14 @@ struct poll_req
     int exclusive;
     int pending;
     unsigned int count;
-    struct poll_req_socket sockets[1];
+    struct
+    {
+        struct sock *sock;
+        int mask;
+        obj_handle_t handle;
+        int flags;
+        unsigned int status;
+    } sockets[1];
 };
 
 struct accept_req
@@ -270,8 +267,6 @@ struct sock
     struct async_queue  accept_q;    /* queue for asynchronous accepts */
     struct async_queue  connect_q;   /* queue for asynchronous connects */
     struct async_queue  poll_q;      /* queue for asynchronous polls */
-    struct list         poll_memberships; /* poll requests containing this socket */
-    struct list         poll_requests; /* poll requests issued on this socket */
     struct object      *ifchange_obj; /* the interface change notification object */
     struct list         ifchange_entry; /* entry in ifchange notification list */
     struct list         accept_list; /* list of pending accept requests */
@@ -485,24 +480,43 @@ static void poll_socket( struct sock *poll_sock, struct async *async, int exclus
 
 static const struct object_ops sock_ops =
 {
-    .size         = sizeof(struct sock),
-    .type         = &file_type,
-    .dump         = sock_dump,
-    .get_fd       = sock_get_fd,
-    .get_sync     = default_fd_get_sync,
-    .close_handle = sock_close_handle,
-    .destroy      = sock_destroy,
+    sizeof(struct sock),          /* size */
+    &file_type,                   /* type */
+    sock_dump,                    /* dump */
+    NULL,                         /* add_queue */
+    NULL,                         /* remove_queue */
+    NULL,                         /* signaled */
+    NULL,                         /* satisfied */
+    no_signal,                    /* signal */
+    sock_get_fd,                  /* get_fd */
+    default_fd_get_sync,          /* get_sync */
+    default_map_access,           /* map_access */
+    default_get_sd,               /* get_sd */
+    default_set_sd,               /* set_sd */
+    no_get_full_name,             /* get_full_name */
+    no_lookup_name,               /* lookup_name */
+    no_link_name,                 /* link_name */
+    NULL,                         /* unlink_name */
+    no_open_file,                 /* open_file */
+    no_kernel_obj_list,           /* get_kernel_obj_list */
+    sock_close_handle,            /* close_handle */
+    sock_destroy                  /* destroy */
 };
 
 static const struct fd_ops sock_fd_ops =
 {
-    .get_poll_events = sock_get_poll_events,
-    .poll_event      = sock_poll_event,
-    .get_fd_type     = sock_get_fd_type,
-    .get_file_info   = default_fd_get_file_info,
-    .ioctl           = sock_ioctl,
-    .cancel_async    = sock_cancel_async,
-    .reselect_async  = sock_reselect_async,
+    sock_get_poll_events,         /* get_poll_events */
+    sock_poll_event,              /* poll_event */
+    sock_get_fd_type,             /* get_fd_type */
+    no_fd_read,                   /* read */
+    no_fd_write,                  /* write */
+    no_fd_flush,                  /* flush */
+    default_fd_get_file_info,     /* get_file_info */
+    no_fd_get_volume_info,        /* get_volume_info */
+    sock_ioctl,                   /* ioctl */
+    sock_cancel_async,            /* cancel_async */
+    no_fd_queue_async,            /* queue_async */
+    sock_reselect_async           /* reselect_async */
 };
 
 static int sockaddr_from_unix( const union unix_sockaddr *uaddr, struct WS_sockaddr *wsaddr, socklen_t wsaddrlen )
@@ -1094,15 +1108,11 @@ static void free_poll_req( void *private )
 
     if (req->timeout) remove_timeout_user( req->timeout );
 
-    list_remove( &req->owner_entry );
-    list_init( &req->owner_entry );
     for (i = 0; i < req->count; ++i)
-    {
-        list_remove( &req->sockets[i].entry );
         release_object( req->sockets[i].sock );
-    }
     release_object( req->async );
     release_object( req->iosb );
+    list_remove( &req->entry );
     free( req );
 }
 
@@ -1221,25 +1231,18 @@ static void complete_async_poll( struct poll_req *req, unsigned int status )
 static void complete_async_polls( struct sock *sock, int event, int error )
 {
     int flags = get_poll_flags( sock, event );
-    struct list *cursor = sock->poll_memberships.next;
+    struct poll_req *req, *next;
 
-    while (cursor != &sock->poll_memberships)
+    LIST_FOR_EACH_ENTRY_SAFE( req, next, &poll_list, struct poll_req, entry )
     {
-        struct poll_req_socket *member = LIST_ENTRY( cursor, struct poll_req_socket, entry );
-        struct poll_req *req = member->req;
-        struct list *next = cursor->next;
-        BOOL signaled = FALSE;
         unsigned int i;
 
-        if (req->iosb->status != STATUS_PENDING)
-        {
-            cursor = next;
-            continue;
-        }
+        if (req->iosb->status != STATUS_PENDING) continue;
 
         for (i = 0; i < req->count; ++i)
         {
-            if (req->sockets[i].sock != sock || !(req->sockets[i].mask & flags)) continue;
+            if (req->sockets[i].sock != sock) continue;
+            if (!(req->sockets[i].mask & flags)) continue;
 
             if (debug_level)
                 fprintf( stderr, "completing poll for socket %p, wanted %#x got %#x\n",
@@ -1247,15 +1250,13 @@ static void complete_async_polls( struct sock *sock, int event, int error )
 
             req->sockets[i].flags = req->sockets[i].mask & flags;
             req->sockets[i].status = sock_get_ntstatus( error );
-            signaled = TRUE;
-        }
 
-        if (signaled && req->pending)
-        {
-            complete_async_poll( req, STATUS_SUCCESS );
-            cursor = sock->poll_memberships.next;
+            if (req->pending)
+            {
+                complete_async_poll( req, STATUS_SUCCESS );
+                break;
+            }
         }
-        else cursor = next;
     }
 }
 
@@ -1540,7 +1541,7 @@ static int sock_get_poll_events( struct fd *fd )
 {
     struct sock *sock = get_fd_user( fd );
     unsigned int mask = sock->mask & ~sock->reported_events;
-    struct poll_req_socket *member;
+    struct poll_req *req;
     int ev = 0;
 
     assert( sock->obj.ops == &sock_ops );
@@ -1548,10 +1549,18 @@ static int sock_get_poll_events( struct fd *fd )
     if (!sock->type) /* not initialized yet */
         return -1;
 
-    LIST_FOR_EACH_ENTRY( member, &sock->poll_memberships, struct poll_req_socket, entry )
+    LIST_FOR_EACH_ENTRY( req, &poll_list, struct poll_req, entry )
     {
-        if (member->req->iosb->status != STATUS_PENDING) continue;
-        ev |= poll_flags_from_afd( sock, member->mask );
+        unsigned int i;
+
+        if (req->iosb->status != STATUS_PENDING) continue;
+
+        for (i = 0; i < req->count; ++i)
+        {
+            if (req->sockets[i].sock != sock) continue;
+
+            ev |= poll_flags_from_afd( sock, req->sockets[i].mask );
+        }
     }
 
     switch (sock->state)
@@ -1650,10 +1659,9 @@ static enum server_fd_type sock_get_fd_type( struct fd *fd )
 
 static void sock_cancel_async( struct fd *fd, struct async *async )
 {
-    struct sock *poll_sock = get_fd_user( fd );
     struct poll_req *req;
 
-    LIST_FOR_EACH_ENTRY( req, &poll_sock->poll_requests, struct poll_req, owner_entry )
+    LIST_FOR_EACH_ENTRY( req, &poll_list, struct poll_req, entry )
     {
         unsigned int i;
 
@@ -1667,7 +1675,6 @@ static void sock_cancel_async( struct fd *fd, struct async *async )
             if (sock->main_poll == req)
                 sock->main_poll = NULL;
         }
-        break;
     }
 
     async_terminate( async, STATUS_CANCELLED );
@@ -1703,6 +1710,7 @@ static int sock_close_handle( struct object *obj, struct process *process, obj_h
     if (sock->obj.handle_count == 1) /* last handle */
     {
         struct accept_req *accept_req, *accept_next;
+        struct poll_req *poll_req, *poll_next;
 
         if (sock->accept_recv_req)
             async_terminate( sock->accept_recv_req->async, STATUS_CANCELLED );
@@ -1713,34 +1721,25 @@ static int sock_close_handle( struct object *obj, struct process *process, obj_h
         if (sock->connect_req)
             async_terminate( sock->connect_req->async, STATUS_CANCELLED );
 
+        LIST_FOR_EACH_ENTRY_SAFE( poll_req, poll_next, &poll_list, struct poll_req, entry )
         {
-            struct list *cursor = sock->poll_memberships.next;
+            struct iosb *iosb = poll_req->iosb;
+            BOOL signaled = FALSE;
+            unsigned int i;
 
-            while (cursor != &sock->poll_memberships)
+            if (iosb->status != STATUS_PENDING) continue;
+
+            for (i = 0; i < poll_req->count; ++i)
             {
-                struct poll_req_socket *member = LIST_ENTRY( cursor, struct poll_req_socket, entry );
-                struct poll_req *poll_req = member->req;
-                struct list *next = cursor->next;
-                unsigned int i;
-
-                if (poll_req->iosb->status != STATUS_PENDING)
+                if (poll_req->sockets[i].sock == sock)
                 {
-                    cursor = next;
-                    continue;
+                    signaled = TRUE;
+                    poll_req->sockets[i].flags = AFD_POLL_CLOSE;
+                    poll_req->sockets[i].status = 0;
                 }
-
-                for (i = 0; i < poll_req->count; ++i)
-                {
-                    if (poll_req->sockets[i].sock == sock)
-                    {
-                        poll_req->sockets[i].flags = AFD_POLL_CLOSE;
-                        poll_req->sockets[i].status = 0;
-                    }
-                }
-
-                complete_async_poll( poll_req, STATUS_SUCCESS );
-                cursor = sock->poll_memberships.next;
             }
+
+            if (signaled) complete_async_poll( poll_req, STATUS_SUCCESS );
         }
     }
     return async_close_obj_handle( obj, process, handle );
@@ -1752,19 +1751,6 @@ static void sock_destroy( struct object *obj )
     unsigned int i;
 
     assert( obj->ops == &sock_ops );
-
-    while (!list_empty( &sock->poll_requests ))
-    {
-        struct poll_req *req = LIST_ENTRY( list_head( &sock->poll_requests ), struct poll_req, owner_entry );
-
-        list_remove( &req->owner_entry );
-        list_init( &req->owner_entry );
-        for (i = 0; i < req->count; ++i)
-        {
-            if (req->sockets[i].sock->main_poll == req)
-                req->sockets[i].sock->main_poll = NULL;
-        }
-    }
 
     /* FIXME: special socket shutdown stuff? */
 
@@ -1843,8 +1829,6 @@ static struct sock *create_socket(void)
     init_async_queue( &sock->poll_q );
     memset( sock->errors, 0, sizeof(sock->errors) );
     list_init( &sock->accept_list );
-    list_init( &sock->poll_memberships );
-    list_init( &sock->poll_requests );
     return sock;
 }
 
@@ -2759,11 +2743,6 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
             set_error( STATUS_INVALID_ADDRESS );
             return;
         }
-        if (sock->state == SOCK_UNCONNECTED) /* clear events */
-        {
-            sock->pending_events &= ~AFD_POLL_CONNECT_ERR;
-            sock->reported_events &= ~AFD_POLL_CONNECT_ERR;
-        }
         if (unix_addr.addr.sa_family == AF_INET && !memcmp( &unix_addr.in.sin_addr, magic_loopback_addr, 4 ))
             unix_addr.in.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
 
@@ -3022,7 +3001,7 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
     {
         const struct afd_message_select_params *params = get_req_data();
 
-        if (get_req_data_size() < sizeof(*params))
+        if (get_req_data_size() < sizeof(params))
         {
             set_error( STATUS_BUFFER_TOO_SMALL );
             return;
@@ -3086,6 +3065,18 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
         if (unix_addr.addr.sa_family == AF_INET)
         {
+#if defined(__APPLE__)
+            /* CW Hack 24472. macOS does not support binding to any loopback
+             * address other than 127.0.0.1. This is an incomplete and incorrect
+             * rewrite, but it's enough to satisfy GOG Galaxy. */
+            if ((unix_addr.in.sin_addr.s_addr & 0xff) == 127 &&
+                unix_addr.in.sin_addr.s_addr != htonl( INADDR_LOOPBACK ))
+            {
+                fprintf(stderr, "HACK: rewriting bind loopback address to 127.0.0.1\n");
+                bind_addr.in.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
+            }
+#endif
+
             if (!memcmp( &unix_addr.in.sin_addr, magic_loopback_addr, 4 )
                     || bind_to_interface( sock, &unix_addr.in ))
                 bind_addr.in.sin_addr.s_addr = htonl( INADDR_ANY );
@@ -3602,7 +3593,7 @@ static void handle_exclusive_poll(struct poll_req *req)
         struct sock *sock = req->sockets[i].sock;
         struct poll_req *main_poll = sock->main_poll;
 
-        if (main_poll && main_poll != req && main_poll->exclusive && req->exclusive)
+        if (main_poll && main_poll->exclusive && req->exclusive)
         {
             complete_async_poll( main_poll, STATUS_SUCCESS );
             main_poll = NULL;
@@ -3629,7 +3620,6 @@ static void poll_socket( struct sock *poll_sock, struct async *async, int exclus
     if (!(req = mem_alloc( offsetof( struct poll_req, sockets[count] ) )))
         return;
 
-    list_init( &req->owner_entry );
     req->timeout = NULL;
     req->pending = 0;
     if (timeout && timeout != TIMEOUT_INFINITE &&
@@ -3650,8 +3640,6 @@ static void poll_socket( struct sock *poll_sock, struct async *async, int exclus
             free( req );
             return;
         }
-        list_init( &req->sockets[i].entry );
-        req->sockets[i].req = req;
         req->sockets[i].handle = sockets[i].socket;
         req->sockets[i].mask = sockets[i].flags;
         req->sockets[i].flags = 0;
@@ -3664,9 +3652,7 @@ static void poll_socket( struct sock *poll_sock, struct async *async, int exclus
 
     handle_exclusive_poll(req);
 
-    list_add_tail( &poll_sock->poll_requests, &req->owner_entry );
-    for (i = 0; i < count; ++i)
-        list_add_tail( &req->sockets[i].sock->poll_memberships, &req->sockets[i].entry );
+    list_add_tail( &poll_list, &req->entry );
     async_set_completion_callback( async, free_poll_req, req );
     queue_async( &poll_sock->poll_q, async );
 
@@ -3726,17 +3712,43 @@ struct ifchange
 
 static const struct object_ops ifchange_ops =
 {
-    .size    = sizeof(struct ifchange),
-    .type    = &no_type,
-    .dump    = ifchange_dump,
-    .get_fd  = ifchange_get_fd,
-    .destroy = ifchange_destroy,
+    sizeof(struct ifchange), /* size */
+    &no_type,                /* type */
+    ifchange_dump,           /* dump */
+    no_add_queue,            /* add_queue */
+    NULL,                    /* remove_queue */
+    NULL,                    /* signaled */
+    no_satisfied,            /* satisfied */
+    no_signal,               /* signal */
+    ifchange_get_fd,         /* get_fd */
+    default_get_sync,        /* get_sync */
+    default_map_access,      /* map_access */
+    default_get_sd,          /* get_sd */
+    default_set_sd,          /* set_sd */
+    no_get_full_name,        /* get_full_name */
+    no_lookup_name,          /* lookup_name */
+    no_link_name,            /* link_name */
+    NULL,                    /* unlink_name */
+    no_open_file,            /* open_file */
+    no_kernel_obj_list,      /* get_kernel_obj_list */
+    no_close_handle,         /* close_handle */
+    ifchange_destroy         /* destroy */
 };
 
 static const struct fd_ops ifchange_fd_ops =
 {
-    .get_poll_events = ifchange_get_poll_events,
-    .poll_event      = ifchange_poll_event,
+    ifchange_get_poll_events, /* get_poll_events */
+    ifchange_poll_event,      /* poll_event */
+    NULL,                     /* get_fd_type */
+    no_fd_read,               /* read */
+    no_fd_write,              /* write */
+    no_fd_flush,              /* flush */
+    no_fd_get_file_info,      /* get_file_info */
+    no_fd_get_volume_info,    /* get_volume_info */
+    no_fd_ioctl,              /* ioctl */
+    NULL,                     /* cancel_async */
+    NULL,                     /* queue_async */
+    NULL                      /* reselect_async */
 };
 
 static void ifchange_dump( struct object *obj, int verbose )
@@ -3922,11 +3934,27 @@ static struct object *socket_device_open_file( struct object *obj, unsigned int 
 
 static const struct object_ops socket_device_ops =
 {
-    .size        = sizeof(struct object),
-    .type        = &device_type,
-    .dump        = socket_device_dump,
-    .lookup_name = socket_device_lookup_name,
-    .open_file   = socket_device_open_file,
+    sizeof(struct object),      /* size */
+    &device_type,               /* type */
+    socket_device_dump,         /* dump */
+    no_add_queue,               /* add_queue */
+    NULL,                       /* remove_queue */
+    NULL,                       /* signaled */
+    no_satisfied,               /* satisfied */
+    no_signal,                  /* signal */
+    no_get_fd,                  /* get_fd */
+    default_get_sync,           /* get_sync */
+    default_map_access,         /* map_access */
+    default_get_sd,             /* get_sd */
+    default_set_sd,             /* set_sd */
+    default_get_full_name,      /* get_full_name */
+    socket_device_lookup_name,  /* lookup_name */
+    directory_link_name,        /* link_name */
+    default_unlink_name,        /* unlink_name */
+    socket_device_open_file,    /* open_file */
+    no_kernel_obj_list,         /* get_kernel_obj_list */
+    no_close_handle,            /* close_handle */
+    no_destroy                  /* destroy */
 };
 
 static void socket_device_dump( struct object *obj, int verbose )
@@ -3955,13 +3983,10 @@ static struct object *socket_device_open_file( struct object *obj, unsigned int 
     return &sock->obj;
 }
 
-struct object *create_socket_device( struct object *root, struct unicode_str name,
+struct object *create_socket_device( struct object *root, const struct unicode_str *name,
                                      unsigned int attr, const struct security_descriptor *sd )
 {
-    struct object_params params = { .ops = &socket_device_ops, .root = root,
-                                    .name = name, .attr = attr, .sd = sd };
-
-    return create_named_object( &params );
+    return create_named_object( root, &socket_device_ops, name, attr, sd );
 }
 
 DECL_HANDLER(recv_socket)
@@ -4011,7 +4036,7 @@ DECL_HANDLER(recv_socket)
     sock->pending_events &= ~(req->oob ? AFD_POLL_OOB : AFD_POLL_READ);
     sock->reported_events &= ~(req->oob ? AFD_POLL_OOB : AFD_POLL_READ);
 
-    if ((async = create_request_async( fd, &req->async, 0 )))
+    if ((async = create_request_async( fd, get_fd_comp_flags( fd ), &req->async, 0 )))
     {
         set_error( status );
 
@@ -4121,7 +4146,8 @@ DECL_HANDLER(send_socket)
     if (status == STATUS_PENDING && !force_async && sock->nonblocking)
         status = STATUS_DEVICE_NOT_READY;
 
-    if ((async = create_request_async( fd, &req->async, req->flags & SERVER_SOCKET_IO_SYSTEM )))
+    if ((async = create_request_async( fd, get_fd_comp_flags( fd ), &req->async,
+                                       req->flags & SERVER_SOCKET_IO_SYSTEM )))
     {
         struct send_req *send_req;
         struct iosb *iosb = async_get_iosb( async );

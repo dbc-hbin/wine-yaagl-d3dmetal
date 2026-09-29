@@ -56,6 +56,7 @@
 #undef _CDECL
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winnls.h"
@@ -64,17 +65,18 @@
 #include "mmdeviceapi.h"
 #include "initguid.h"
 #include "audioclient.h"
-#include "devpkey.h"
 #include "wine/debug.h"
 #include "wine/unixlib.h"
 
 #include "unixlib.h"
+#include "coreaudio_cocoa.h"
 
 #if !defined(MAC_OS_VERSION_12_0) || MAC_OS_X_VERSION_MAX_ALLOWED < MAC_OS_VERSION_12_0
 #define kAudioObjectPropertyElementMain kAudioObjectPropertyElementMaster
 #endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(coreaudio);
+WINE_DECLARE_DEBUG_CHANNEL(winediag);
 
 struct coreaudio_stream
 {
@@ -88,19 +90,22 @@ struct coreaudio_stream
     DWORD flags;
     AUDCLNT_SHAREMODE share;
     HANDLE event;
-    HANDLE timer_thread;
 
     BOOL playing, please_quit;
     REFERENCE_TIME period;
     UINT32 period_frames;
-    UINT32 bufsize_frames;
+    UINT32 bufsize_frames, resamp_bufsize_frames;
     UINT32 lcl_offs_frames, held_frames, wri_offs_frames, tmp_buffer_frames;
     UINT32 cap_bufsize_frames, cap_offs_frames, cap_held_frames;
+    UINT32 wrap_bufsize_frames;
     UINT64 written_frames;
     INT32 getbuf_last;
     WAVEFORMATEX *fmt;
     BYTE *local_buffer, *cap_buffer, *wrap_buffer, *resamp_buffer, *tmp_buffer;
 };
+
+static const REFERENCE_TIME def_period = 100000;
+static const REFERENCE_TIME min_period = 50000;
 
 static ULONG_PTR zero_bits = 0;
 
@@ -195,6 +200,27 @@ static BOOL device_has_channels(AudioDeviceID device, EDataFlow flow)
     }
     free(buffers);
     return ret;
+}
+
+static NTSTATUS unix_process_attach(void *args)
+{
+#ifdef _WIN64
+    if (NtCurrentTeb()->WowTebOffset)
+    {
+        SYSTEM_BASIC_INFORMATION info;
+
+        NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL);
+        zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
+    }
+#endif
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS unix_main_loop(void *args)
+{
+    struct main_loop_params *params = args;
+    NtSetEvent(params->event, NULL);
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS unix_get_endpoint_ids(void *args)
@@ -431,24 +457,21 @@ static OSStatus ca_capture_cb(void *user, AudioUnitRenderActionFlags *flags,
 
     os_unfair_lock_lock(&stream->lock);
 
-    if(stream->cap_held_frames >= stream->cap_bufsize_frames - stream->cap_offs_frames)
-        cap_wri_offs_frames = stream->cap_held_frames -
-                              (stream->cap_bufsize_frames - stream->cap_offs_frames);
-    else
-        cap_wri_offs_frames = stream->cap_offs_frames + stream->cap_held_frames;
-
-    if(nframes > stream->cap_bufsize_frames){
-        os_unfair_lock_unlock(&stream->lock);
-        return kAudio_ParamError;
-    }
+    cap_wri_offs_frames = (stream->cap_offs_frames + stream->cap_held_frames) % stream->cap_bufsize_frames;
 
     list.mNumberBuffers = 1;
     list.mBuffers[0].mNumberChannels = stream->fmt->nChannels;
     list.mBuffers[0].mDataByteSize = nframes * stream->fmt->nBlockAlign;
 
-    if(!stream->playing || nframes > stream->cap_bufsize_frames - cap_wri_offs_frames)
+    if(!stream->playing || cap_wri_offs_frames + nframes > stream->cap_bufsize_frames){
+        if(stream->wrap_bufsize_frames < nframes){
+            free(stream->wrap_buffer);
+            stream->wrap_buffer = malloc(list.mBuffers[0].mDataByteSize);
+            stream->wrap_bufsize_frames = nframes;
+        }
+
         list.mBuffers[0].mData = stream->wrap_buffer;
-    else
+    }else
         list.mBuffers[0].mData = stream->cap_buffer + cap_wri_offs_frames * stream->fmt->nBlockAlign;
 
     sc = AudioUnitRender(stream->unit, flags, ts, bus, nframes, &list);
@@ -465,18 +488,12 @@ static OSStatus ca_capture_cb(void *user, AudioUnitRenderActionFlags *flags,
                     stream->wrap_buffer, list.mBuffers[0].mDataByteSize);
         }
 
-        nframes = list.mBuffers[0].mDataByteSize / stream->fmt->nBlockAlign;
-        if(nframes > stream->cap_bufsize_frames - stream->cap_held_frames){
-            UINT32 overflow_frames = nframes - (stream->cap_bufsize_frames - stream->cap_held_frames);
-
-            if(overflow_frames >= stream->cap_bufsize_frames - stream->cap_offs_frames)
-                stream->cap_offs_frames = overflow_frames -
-                                          (stream->cap_bufsize_frames - stream->cap_offs_frames);
-            else
-                stream->cap_offs_frames += overflow_frames;
+        stream->cap_held_frames += list.mBuffers[0].mDataByteSize / stream->fmt->nBlockAlign;
+        if(stream->cap_held_frames > stream->cap_bufsize_frames){
+            stream->cap_offs_frames += stream->cap_held_frames % stream->cap_bufsize_frames;
+            stream->cap_offs_frames %= stream->cap_bufsize_frames;
             stream->cap_held_frames = stream->cap_bufsize_frames;
-        }else
-            stream->cap_held_frames += nframes;
+        }
     }
 
     os_unfair_lock_unlock(&stream->lock);
@@ -704,100 +721,9 @@ static AudioDeviceID dev_id_from_device(const char *device)
     return id;
 }
 
-static HRESULT get_device_period_frame_range(AudioDeviceID dev_id, EDataFlow flow,
-                                             unsigned int *min_period_frames,
-                                             unsigned int *max_period_frames)
-{
-    AudioObjectPropertyAddress addr;
-    AudioValueRange range;
-    UInt32 size;
-    OSStatus sc;
-
-    addr.mSelector = kAudioDevicePropertyBufferFrameSizeRange;
-    addr.mScope = get_scope(flow);
-    addr.mElement = kAudioObjectPropertyElementMain;
-    size = sizeof(range);
-    sc = AudioObjectGetPropertyData(dev_id, &addr, 0, NULL, &size, &range);
-    if (sc != noErr)
-    {
-        WARN("Failed to get device buffer frame size range: %x\n", (int)sc);
-        return osstatus_to_hresult(sc);
-    }
-
-    *min_period_frames = range.mMinimum;
-    *max_period_frames = range.mMaximum;
-    return S_OK;
-}
-
-static HRESULT get_device_period_frame_size(AudioDeviceID dev_id, EDataFlow flow,
-                                            unsigned int *period_frames)
-{
-    AudioObjectPropertyAddress addr;
-    UInt32 size;
-    OSStatus sc;
-
-    addr.mSelector = kAudioDevicePropertyBufferFrameSize;
-    addr.mScope = get_scope(flow);
-    addr.mElement = kAudioObjectPropertyElementMain;
-    size = sizeof(*period_frames);
-    sc = AudioObjectGetPropertyData(dev_id, &addr, 0, NULL, &size, period_frames);
-    if (sc != noErr)
-    {
-        WARN("Failed to get device buffer frame size: %x\n", (int)sc);
-        return osstatus_to_hresult(sc);
-    }
-
-    return S_OK;
-}
-
-static HRESULT set_device_period_frame_size(AudioDeviceID dev_id, EDataFlow flow,
-                                            unsigned int period_frames)
-{
-    AudioObjectPropertyAddress addr;
-    UInt32 size;
-    OSStatus sc;
-
-    addr.mSelector = kAudioDevicePropertyBufferFrameSize;
-    addr.mScope = get_scope(flow);
-    addr.mElement = kAudioObjectPropertyElementMain;
-    size = sizeof(period_frames);
-    sc = AudioObjectSetPropertyData(dev_id, &addr, 0, NULL, size, &period_frames);
-    if (sc != noErr)
-    {
-        WARN("Failed to set device buffer frame size: %x\n", (int)sc);
-        return osstatus_to_hresult(sc);
-    }
-
-    return S_OK;
-}
-
-static HRESULT get_device_sample_rate(AudioDeviceID dev_id, EDataFlow flow,
-                                      unsigned int *n_samples_per_sec)
-{
-    AudioObjectPropertyAddress addr;
-    Float64 rate;
-    UInt32 size;
-    OSStatus sc;
-
-    addr.mSelector = kAudioDevicePropertyNominalSampleRate;
-    addr.mScope = get_scope(flow);
-    addr.mElement = kAudioObjectPropertyElementMain;
-    size = sizeof(Float64);
-    sc = AudioObjectGetPropertyData(dev_id, &addr, 0, NULL, &size, &rate);
-    if (sc != noErr)
-    {
-        WARN("Unable to get device nominal sample rate: %x\n", (int)sc);
-        return osstatus_to_hresult(sc);
-    }
-
-    *n_samples_per_sec = rate;
-    return S_OK;
-}
-
 static NTSTATUS unix_create_stream(void *args)
 {
     struct create_stream_params *params = args;
-    unsigned int min_period_frames, max_period_frames;
     struct coreaudio_stream *stream;
     AURenderCallbackStruct input;
     OSStatus sc;
@@ -816,27 +742,12 @@ static NTSTATUS unix_create_stream(void *args)
         goto end;
     }
 
+    stream->period = params->period;
     stream->period_frames = muldiv(params->period, stream->fmt->nSamplesPerSec, 10000000);
-    if (stream->period_frames == 0)
-    {
-        params->result = E_INVALIDARG;
-        goto end;
-    }
-
     stream->dev_id = dev_id_from_device(params->device);
     stream->flow = params->flow;
     stream->flags = params->flags;
     stream->share = params->share;
-
-    if (FAILED(params->result = get_device_period_frame_range(stream->dev_id, stream->flow,
-                                                              &min_period_frames,
-                                                              &max_period_frames)))
-        goto end;
-
-    stream->period_frames = max(min_period_frames, min(stream->period_frames, max_period_frames));
-    stream->period = muldiv(stream->period_frames, 10000000, stream->fmt->nSamplesPerSec);
-    if (FAILED(params->result = set_device_period_frame_size(stream->dev_id, stream->flow, stream->period_frames)))
-        goto end;
 
     stream->bufsize_frames = muldiv(params->duration, stream->fmt->nSamplesPerSec, 10000000);
     if(params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
@@ -866,9 +777,34 @@ static NTSTATUS unix_create_stream(void *args)
         goto end;
     }
 
+    if (stream->flow == eCapture) {
+        /* On 10.14 and later:
+         * Check the audio capture/microphone authorization status, and explicitly
+         * request it if the user hasn't previously granted or denied permission.
+         */
+        int authstatus = CoreAudio_get_capture_authorization_status();
+        TRACE("Audio capture authorization status: %d\n", authstatus);
+
+        if (authstatus == NOT_DETERMINED)
+            authstatus = CoreAudio_request_capture_authorization();
+
+        if (authstatus == 0)
+            ERR_(winediag)("Microphone/audio capture permission was denied. "
+                           "This can be enabled under Security & Privacy in System Preferences.\n");
+    }
+
     sc = AudioUnitInitialize(stream->unit);
     if(sc != noErr){
         WARN("Couldn't initialize: %x\n", (int)sc);
+        params->result = osstatus_to_hresult(sc);
+        goto end;
+    }
+
+    /* we play audio continuously because AudioOutputUnitStart sometimes takes
+     * a while to return */
+    sc = AudioOutputUnitStart(stream->unit);
+    if(sc != noErr){
+        WARN("Unit failed to start: %x\n", (int)sc);
         params->result = osstatus_to_hresult(sc);
         goto end;
     }
@@ -882,76 +818,15 @@ static NTSTATUS unix_create_stream(void *args)
     silence_buffer(stream, stream->local_buffer, stream->bufsize_frames);
 
     if(stream->flow == eCapture){
-        UInt32 max_frames, converter_input_bytes, converter_input_frames, property_size;
-
-        property_size = sizeof(max_frames);
-        sc = AudioUnitGetProperty(stream->unit, kAudioUnitProperty_MaximumFramesPerSlice,
-                                  kAudioUnitScope_Global, 0, &max_frames, &property_size);
-        if(sc != noErr){
-            WARN("Couldn't get maximum frames per slice: %x\n", (int)sc);
-            params->result = osstatus_to_hresult(sc);
-            goto end;
-        }
-
-        if(!stream->fmt->nBlockAlign || stream->period_frames > UINT_MAX / stream->fmt->nBlockAlign){
-            params->result = E_OUTOFMEMORY;
-            goto end;
-        }
-
-        converter_input_bytes = stream->period_frames * stream->fmt->nBlockAlign;
-        property_size = sizeof(converter_input_bytes);
-        sc = AudioConverterGetProperty(stream->converter, kAudioConverterPropertyCalculateInputBufferSize,
-                                       &property_size, &converter_input_bytes);
-        if(sc != noErr){
-            WARN("Couldn't get converter input buffer size: %x\n", (int)sc);
-            params->result = osstatus_to_hresult(sc);
-            goto end;
-        }
-        converter_input_frames = converter_input_bytes / stream->fmt->nBlockAlign +
-                                 !!(converter_input_bytes % stream->fmt->nBlockAlign);
-
         stream->cap_bufsize_frames = muldiv(params->duration, stream->dev_desc.mSampleRate, 10000000);
-        stream->cap_bufsize_frames = max(stream->cap_bufsize_frames, max_frames);
-        stream->cap_bufsize_frames = max(stream->cap_bufsize_frames, converter_input_frames);
-
-        if(!stream->cap_bufsize_frames ||
-           stream->cap_bufsize_frames > UINT_MAX / stream->fmt->nBlockAlign){
-            params->result = E_OUTOFMEMORY;
-            goto end;
-        }
-
         stream->cap_buffer = malloc(stream->cap_bufsize_frames * stream->fmt->nBlockAlign);
-        stream->wrap_buffer = malloc(stream->cap_bufsize_frames * stream->fmt->nBlockAlign);
-        stream->resamp_buffer = malloc(stream->period_frames * stream->fmt->nBlockAlign);
-        if(!stream->cap_buffer || !stream->wrap_buffer || !stream->resamp_buffer){
-            params->result = E_OUTOFMEMORY;
-            goto end;
-        }
     }
-
-    /* we play audio continuously because AudioOutputUnitStart sometimes takes
-     * a while to return */
-    sc = AudioOutputUnitStart(stream->unit);
-    if(sc != noErr){
-        WARN("Unit failed to start: %x\n", (int)sc);
-        params->result = osstatus_to_hresult(sc);
-        goto end;
-    }
-
     params->result = S_OK;
 
 end:
     if(FAILED(params->result)){
         if(stream->converter) AudioConverterDispose(stream->converter);
         if(stream->unit) AudioComponentInstanceDispose(stream->unit);
-        free(stream->resamp_buffer);
-        free(stream->wrap_buffer);
-        free(stream->cap_buffer);
-        if(stream->local_buffer){
-            size = 0;
-            NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
-                                &size, MEM_RELEASE);
-        }
         free(stream->fmt);
         free(stream);
     } else {
@@ -968,10 +843,10 @@ static NTSTATUS unix_release_stream( void *args )
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
     SIZE_T size;
 
-    if(stream->timer_thread){
+    if(params->timer_thread){
         stream->please_quit = TRUE;
-        NtWaitForSingleObject(stream->timer_thread, FALSE, NULL);
-        NtClose(stream->timer_thread);
+        NtWaitForSingleObject(params->timer_thread, FALSE, NULL);
+        NtClose(params->timer_thread);
     }
 
     if(stream->unit){
@@ -1149,6 +1024,7 @@ static NTSTATUS unix_get_mix_format(void *args)
     AudioObjectPropertyAddress addr;
     AudioChannelLayout *layout;
     AudioBufferList *buffers;
+    Float64 rate;
     UInt32 size;
     OSStatus sc;
     int i;
@@ -1221,8 +1097,15 @@ static NTSTATUS unix_get_mix_format(void *args)
         params->fmt->dwChannelMask = get_channel_mask(params->fmt->Format.nChannels);
     }
 
-    if(FAILED(params->result = get_device_sample_rate(dev_id, params->flow, &params->fmt->Format.nSamplesPerSec)))
+    addr.mSelector = kAudioDevicePropertyNominalSampleRate;
+    size = sizeof(Float64);
+    sc = AudioObjectGetPropertyData(dev_id, &addr, 0, NULL, &size, &rate);
+    if(sc != noErr){
+        WARN("Unable to get _NominalSampleRate property: %x\n", (int)sc);
+        params->result = osstatus_to_hresult(sc);
         return STATUS_SUCCESS;
+    }
+    params->fmt->Format.nSamplesPerSec = rate;
 
     params->fmt->Format.wBitsPerSample = 32;
     params->fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
@@ -1259,33 +1142,11 @@ static NTSTATUS unix_is_format_supported(void *args)
 static NTSTATUS unix_get_device_period(void *args)
 {
     struct get_device_period_params *params = args;
-    unsigned int n_samples_per_sec;
-    AudioDeviceID dev_id;
-
-    dev_id = dev_id_from_device(params->device);
-    if (FAILED(params->result = get_device_sample_rate(dev_id, params->flow, &n_samples_per_sec)))
-        return STATUS_SUCCESS;
 
     if (params->def_period)
-    {
-        unsigned int period_frames;
-
-        if (FAILED(params->result = get_device_period_frame_size(dev_id, params->flow, &period_frames)))
-            return STATUS_SUCCESS;
-
-        *params->def_period = muldiv(period_frames, 10000000, n_samples_per_sec);
-    }
-
+        *params->def_period = def_period;
     if (params->min_period)
-    {
-        unsigned int min_period_frames, max_period_frames;
-
-        if (FAILED(params->result = get_device_period_frame_range(dev_id, params->flow,
-                                                                  &min_period_frames, &max_period_frames)))
-            return STATUS_SUCCESS;
-
-        *params->min_period = muldiv(min_period_frames, 10000000, n_samples_per_sec);
-    }
+        *params->min_period = min_period;
 
     params->result = S_OK;
 
@@ -1316,8 +1177,14 @@ static OSStatus feed_cb(AudioConverterRef converter, UInt32 *nframes, AudioBuffe
     data->mBuffers[0].mDataByteSize = *nframes * stream->fmt->nBlockAlign;
     data->mBuffers[0].mNumberChannels = stream->fmt->nChannels;
 
-    if(*nframes > stream->cap_bufsize_frames - stream->cap_offs_frames){
+    if(stream->cap_offs_frames + *nframes > stream->cap_bufsize_frames){
         UINT32 chunk_frames = stream->cap_bufsize_frames - stream->cap_offs_frames;
+
+        if(stream->wrap_bufsize_frames < *nframes){
+            free(stream->wrap_buffer);
+            stream->wrap_buffer = malloc(data->mBuffers[0].mDataByteSize);
+            stream->wrap_bufsize_frames = *nframes;
+        }
 
         memcpy(stream->wrap_buffer, stream->cap_buffer + stream->cap_offs_frames * stream->fmt->nBlockAlign,
                chunk_frames * stream->fmt->nBlockAlign);
@@ -1328,11 +1195,8 @@ static OSStatus feed_cb(AudioConverterRef converter, UInt32 *nframes, AudioBuffe
     }else
         data->mBuffers[0].mData = stream->cap_buffer + stream->cap_offs_frames * stream->fmt->nBlockAlign;
 
-    if(*nframes >= stream->cap_bufsize_frames - stream->cap_offs_frames)
-        stream->cap_offs_frames = *nframes -
-                                  (stream->cap_bufsize_frames - stream->cap_offs_frames);
-    else
-        stream->cap_offs_frames += *nframes;
+    stream->cap_offs_frames += *nframes;
+    stream->cap_offs_frames %= stream->cap_bufsize_frames;
     stream->cap_held_frames -= *nframes;
 
     if(packets)
@@ -1357,6 +1221,12 @@ static void capture_resample(struct coreaudio_stream *stream)
         converted_list.mNumberBuffers = 1;
         converted_list.mBuffers[0].mNumberChannels = stream->fmt->nChannels;
         converted_list.mBuffers[0].mDataByteSize = wanted_frames * stream->fmt->nBlockAlign;
+
+        if(stream->resamp_bufsize_frames < wanted_frames){
+            free(stream->resamp_buffer);
+            stream->resamp_buffer = malloc(converted_list.mBuffers[0].mDataByteSize);
+            stream->resamp_bufsize_frames = wanted_frames;
+        }
 
         converted_list.mBuffers[0].mData = stream->resamp_buffer;
 
@@ -1504,37 +1374,10 @@ static NTSTATUS unix_get_current_padding(void *args)
     return STATUS_SUCCESS;
 }
 
-static void unix_timer_loop(void *args)
-{
-    struct coreaudio_stream *stream = args;
-    LARGE_INTEGER delay, next, last;
-    int adjust;
-
-    delay.QuadPart = -stream->period;
-    NtQueryPerformanceCounter(&last, NULL);
-    next.QuadPart = last.QuadPart + stream->period;
-
-    while(!stream->please_quit){
-        NtSetEvent(stream->event, NULL);
-        NtDelayExecution(FALSE, &delay);
-        NtQueryPerformanceCounter(&last, NULL);
-
-        adjust = next.QuadPart - last.QuadPart;
-        if(adjust > stream->period / 2)
-            adjust = stream->period / 2;
-        else if(adjust < -stream->period / 2)
-            adjust = -stream->period / 2;
-
-        delay.QuadPart = -(stream->period + adjust);
-        next.QuadPart += stream->period;
-    }
-}
-
 static NTSTATUS unix_start(void *args)
 {
     struct start_params *params = args;
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
-    static const WCHAR name[] = {'a','u','d','i','o','_','c','l','i','e','n','t','_','t','i','m','e','r',0};
 
     os_unfair_lock_lock(&stream->lock);
 
@@ -1548,8 +1391,6 @@ static NTSTATUS unix_start(void *args)
     }
 
     os_unfair_lock_unlock(&stream->lock);
-    if(params->result == S_OK && (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) && !stream->timer_thread)
-        create_unix_thread(&stream->timer_thread, name, unix_timer_loop, stream);
 
     return STATUS_SUCCESS;
 }
@@ -1598,6 +1439,35 @@ static NTSTATUS unix_reset(void *args)
     }
 
     os_unfair_lock_unlock(&stream->lock);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS unix_timer_loop(void *args)
+{
+    struct timer_loop_params *params = args;
+    struct coreaudio_stream *stream = handle_get_stream(params->stream);
+    LARGE_INTEGER delay, next, last;
+    int adjust;
+
+    delay.QuadPart = -stream->period;
+    NtQueryPerformanceCounter(&last, NULL);
+    next.QuadPart = last.QuadPart + stream->period;
+
+    while(!stream->please_quit){
+        NtSetEvent(stream->event, NULL);
+        NtDelayExecution(FALSE, &delay);
+        NtQueryPerformanceCounter(&last, NULL);
+
+        adjust = next.QuadPart - last.QuadPart;
+        if(adjust > stream->period / 2)
+            adjust = stream->period / 2;
+        else if(adjust < -stream->period / 2)
+            adjust = -stream->period / 2;
+
+        delay.QuadPart = -(stream->period + adjust);
+        next.QuadPart += stream->period;
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -1863,76 +1733,12 @@ static NTSTATUS unix_is_started(void *args)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS get_device_vid_pid(const char *device, DWORD *vid, DWORD *pid)
-{
-    UInt32 type_property;
-    UInt32 size;
-    OSStatus sc;
-    AudioObjectPropertyAddress addr;
-    const AudioDeviceID dev_id = dev_id_from_device(device);
-
-    addr.mScope = kAudioObjectPropertyScopeGlobal;
-    addr.mElement = kAudioObjectPropertyElementMain;
-    addr.mSelector = kAudioDevicePropertyTransportType;
-    type_property = 0;
-    size = sizeof(type_property);
-    sc = AudioObjectGetPropertyData(dev_id, &addr, 0, NULL, &size, &type_property);
-    if(sc == noErr && type_property == kAudioDeviceTransportTypeUSB){
-        CFStringRef property_value = NULL;
-
-        addr.mSelector = kAudioDevicePropertyModelUID;
-        size = sizeof(property_value);
-        sc = AudioObjectGetPropertyData(dev_id, &addr, 0, NULL, &size, &property_value);
-        if(sc == noErr){
-            WCHAR output[255];
-
-            size = min(CFStringGetLength(property_value), ARRAY_SIZE(output) - 1);
-            CFStringGetCharacters(property_value, CFRangeMake(0, size), (UniChar*)output);
-            output[size] = 0;
-            CFRelease(property_value);
-
-            if(size > 10 && output[size - 5] == ':' && output[size - 10] == ':'){
-                *vid = wcstoul(&output[size - 9], NULL, 16);
-                *pid = wcstoul(&output[size - 4], NULL, 16);
-                return STATUS_SUCCESS;
-            }
-        }
-    }
-    return STATUS_UNSUCCESSFUL;
-}
-
 static NTSTATUS unix_get_prop_value(void *args)
 {
     struct get_prop_value_params *params = args;
-    const PROPERTYKEY *prop = params->prop;
-
-    if(IsEqualPropertyKey(*prop, DEVPKEY_Device_InstanceId)){
-        DWORD vid = 0, pid = 0;
-
-        if (SUCCEEDED(get_device_vid_pid(params->device, &vid, &pid))){
-            int len;
-            char buf[128];
-            PROPVARIANT *out = params->value;
-
-            len = sizeof(buf);
-            snprintf(buf, len, "{1}.USB\\VID_%04X&PID_%04X", vid, pid);
-
-            len = strlen(buf) + 1;
-            if(*params->buffer_size < len * sizeof(WCHAR)){
-                params->result = E_NOT_SUFFICIENT_BUFFER;
-                *params->buffer_size = len * sizeof(WCHAR);
-                return STATUS_SUCCESS;
-            }
-
-            out->vt = VT_LPWSTR;
-            out->pwszVal = params->buffer;
-            ntdll_umbstowcs(buf, len, out->pwszVal, len);
-            params->result = S_OK;
-            return STATUS_SUCCESS;
-        }
-    }
 
     params->result = E_NOTIMPL;
+
     return STATUS_SUCCESS;
 }
 
@@ -1992,16 +1798,16 @@ static NTSTATUS unix_set_event_handle(void *args)
 
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
+    unix_process_attach,
     unix_not_implemented,
-    unix_not_implemented,
-    unix_not_implemented,
-    unix_not_implemented,
+    unix_main_loop,
     unix_get_endpoint_ids,
     unix_create_stream,
     unix_release_stream,
     unix_start,
     unix_stop,
     unix_reset,
+    unix_timer_loop,
     unix_get_render_buffer,
     unix_release_render_buffer,
     unix_get_capture_buffer,
@@ -2037,13 +1843,17 @@ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
 
 typedef UINT PTR32;
 
-static NTSTATUS unix_wow64_process_attach(void *args)
+static NTSTATUS unix_wow64_main_loop(void *args)
 {
-    SYSTEM_BASIC_INFORMATION info;
-
-    NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL);
-    zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
-    return STATUS_SUCCESS;
+    struct
+    {
+        PTR32 event;
+    } *params32 = args;
+    struct main_loop_params params =
+    {
+        .event = ULongToHandle(params32->event)
+    };
+    return unix_main_loop(&params);
 }
 
 static NTSTATUS unix_wow64_get_endpoint_ids(void *args)
@@ -2110,11 +1920,13 @@ static NTSTATUS unix_wow64_release_stream(void *args)
     struct
     {
         stream_handle stream;
+        PTR32 timer_thread;
         HRESULT result;
     } *params32 = args;
     struct release_stream_params params =
     {
         .stream = params32->stream,
+        .timer_thread = ULongToHandle(params32->timer_thread)
     };
     unix_release_stream(&params);
     params32->result = params.result;
@@ -2442,16 +2254,16 @@ static NTSTATUS unix_wow64_get_prop_value(void *args)
 
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
-    unix_wow64_process_attach,
+    unix_process_attach,
     unix_not_implemented,
-    unix_not_implemented,
-    unix_not_implemented,
+    unix_wow64_main_loop,
     unix_wow64_get_endpoint_ids,
     unix_wow64_create_stream,
     unix_wow64_release_stream,
     unix_start,
     unix_stop,
     unix_reset,
+    unix_timer_loop,
     unix_wow64_get_render_buffer,
     unix_release_render_buffer,
     unix_wow64_get_capture_buffer,

@@ -791,12 +791,6 @@ static UINT open_package( const WCHAR *product, const WCHAR *usersid,
 
     if ((localpath = msi_reg_get_val_str( props, L"LocalPackage" )))
     {
-        if (lstrlenW( localpath ) >= ARRAY_SIZE(sourcepath))
-        {
-            free( localpath );
-            RegCloseKey( props );
-            return ERROR_INSTALL_SOURCE_ABSENT;
-        }
         lstrcpyW( sourcepath, localpath );
         free( localpath );
     }
@@ -1809,9 +1803,6 @@ UINT WINAPI MsiGetPatchInfoA( LPCSTR patch, LPCSTR attr, LPSTR buffer, LPDWORD b
     if (!patch || !attr)
         return ERROR_INVALID_PARAMETER;
 
-    if (buffer && !buflen)
-        return ERROR_INVALID_PARAMETER;
-
     if (!(patchW = strdupAtoW( patch )))
         goto done;
 
@@ -1858,9 +1849,6 @@ UINT WINAPI MsiGetPatchInfoW( LPCWSTR patch, LPCWSTR attr, LPWSTR buffer, LPDWOR
     TRACE("%s %s %p %p\n", debugstr_w(patch), debugstr_w(attr), buffer, buflen);
 
     if (!patch || !attr)
-        return ERROR_INVALID_PARAMETER;
-
-    if (buffer && !buflen)
         return ERROR_INVALID_PARAMETER;
 
     if (wcscmp( INSTALLPROPERTY_LOCALPACKAGEW, attr ))
@@ -2413,7 +2401,7 @@ LANGID WINAPI MsiLoadStringA( MSIHANDLE handle, UINT id, LPSTR lpBuffer,
     LANGID r;
     INT len;
 
-    if (!(bufW = malloc(nBufferMax * sizeof(WCHAR)))) return 0;
+    bufW = malloc(nBufferMax * sizeof(WCHAR));
     r = MsiLoadStringW(handle, id, bufW, nBufferMax, lang);
     if( r )
     {
@@ -3580,7 +3568,7 @@ static USERINFOSTATE MSI_GetUserInfo(LPCWSTR szProduct,
     {
         if (lpUserNameBuf && !user)
         {
-            if (*pcchUserNameBuf) (*pcchUserNameBuf)--;
+            (*pcchUserNameBuf)--;
             goto done;
         }
 
@@ -3609,7 +3597,7 @@ static USERINFOSTATE MSI_GetUserInfo(LPCWSTR szProduct,
     {
         if (!serial)
         {
-            if (*pcchSerialBuf) (*pcchSerialBuf)--;
+            (*pcchSerialBuf)--;
             goto done;
         }
 

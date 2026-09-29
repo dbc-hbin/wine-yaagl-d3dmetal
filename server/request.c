@@ -49,6 +49,7 @@
 #endif
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "wincon.h"
@@ -82,15 +83,38 @@ static void master_socket_poll_event( struct fd *fd, int event );
 
 static const struct object_ops master_socket_ops =
 {
-    .size    = sizeof(struct master_socket),
-    .type    = &no_type,
-    .dump    = master_socket_dump,
-    .destroy = master_socket_destroy,
+    sizeof(struct master_socket),  /* size */
+    &no_type,                      /* type */
+    master_socket_dump,            /* dump */
+    no_add_queue,                  /* add_queue */
+    NULL,                          /* remove_queue */
+    NULL,                          /* signaled */
+    NULL,                          /* satisfied */
+    no_signal,                     /* signal */
+    no_get_fd,                     /* get_fd */
+    default_get_sync,              /* get_sync */
+    default_map_access,            /* map_access */
+    default_get_sd,                /* get_sd */
+    default_set_sd,                /* set_sd */
+    no_get_full_name,              /* get_full_name */
+    no_lookup_name,                /* lookup_name */
+    no_link_name,                  /* link_name */
+    NULL,                          /* unlink_name */
+    no_open_file,                  /* open_file */
+    no_kernel_obj_list,            /* get_kernel_obj_list */
+    no_close_handle,               /* close_handle */
+    master_socket_destroy          /* destroy */
 };
 
 static const struct fd_ops master_socket_fd_ops =
 {
-    .poll_event = master_socket_poll_event,
+    NULL,                          /* get_poll_events */
+    master_socket_poll_event,      /* poll_event */
+    NULL,                          /* flush */
+    NULL,                          /* get_fd_type */
+    NULL,                          /* ioctl */
+    NULL,                          /* queue_async */
+    NULL                           /* reselect_async */
 };
 
 
@@ -129,26 +153,11 @@ void fatal_error( const char *err, ... )
     exit(1);
 }
 
-static void free_req_data( struct thread *thread )
-{
-    if (thread->req_data != thread->req_buffer.data) free( thread->req_data );
-    thread->req_data = NULL;
-}
-
-static void free_reply_data( struct thread *thread )
-{
-    if (thread->reply_data != thread->reply_buffer.data) free( thread->reply_data );
-    thread->reply_data = NULL;
-}
-
 /* allocate the reply data */
 void *set_reply_data_size( data_size_t size )
 {
     assert( size <= get_reply_max_size() );
-    if (size && size <= sizeof(current->reply_buffer.data))
-        current->reply_data = current->reply_buffer.data;
-    else if (size && !(current->reply_data = mem_alloc( size )))
-        size = 0;
+    if (size && !(current->reply_data = mem_alloc( size ))) size = 0;
     current->reply_size = size;
     return current->reply_data;
 }
@@ -156,54 +165,51 @@ void *set_reply_data_size( data_size_t size )
 static const struct object_attributes empty_attributes;
 
 /* return object attributes from the current request */
-bool get_req_object_attributes( struct object_params *params )
+const struct object_attributes *get_req_object_attributes( const struct security_descriptor **sd,
+                                                           struct unicode_str *name,
+                                                           struct object **root )
 {
     const struct object_attributes *attr = get_req_data();
     data_size_t size = get_req_data_size();
 
-    params->root = NULL;
-    params->sd   = NULL;
+    if (root) *root = NULL;
 
     if (!size)
     {
-        params->name.len = 0;
-        params->attr     = 0;
-        params->objattr  = &empty_attributes;
-        return true;
+        *sd = NULL;
+        name->len = 0;
+        return &empty_attributes;
     }
+
     if ((size < sizeof(*attr)) || (size - sizeof(*attr) < attr->sd_len) ||
         (size - sizeof(*attr) - attr->sd_len < attr->name_len))
     {
         set_error( STATUS_ACCESS_VIOLATION );
-        return false;
+        return NULL;
     }
     if (attr->sd_len && !sd_is_valid( (const struct security_descriptor *)(attr + 1), attr->sd_len ))
     {
         set_error( STATUS_INVALID_SECURITY_DESCR );
-        return false;
+        return NULL;
     }
     if ((attr->name_len & (sizeof(WCHAR) - 1)) || attr->name_len >= 65534)
     {
         set_error( STATUS_OBJECT_NAME_INVALID );
-        return false;
+        return NULL;
     }
-    if (attr->rootdir && attr->name_len)
+    if (root && attr->rootdir && attr->name_len)
     {
-        if (!(params->root = get_handle_obj( current->process, attr->rootdir, 0, NULL ))) return false;
+        if (!(*root = get_handle_obj( current->process, attr->rootdir, 0, NULL ))) return NULL;
     }
-    if (attr->sd_len) params->sd = (const struct security_descriptor *)(attr + 1);
-
-    params->name.len = attr->name_len;
-    params->name.str = (const WCHAR *)(attr + 1) + attr->sd_len / sizeof(WCHAR);
-    params->attr     = attr->attributes;
-    params->objattr  = attr;
-    return true;
+    *sd = attr->sd_len ? (const struct security_descriptor *)(attr + 1) : NULL;
+    name->len = attr->name_len;
+    name->str = (const WCHAR *)(attr + 1) + attr->sd_len / sizeof(WCHAR);
+    return attr;
 }
 
 /* return a pointer to the request data following an object attributes structure */
-const void *get_req_data_after_objattr( const struct object_params *params, data_size_t *len )
+const void *get_req_data_after_objattr( const struct object_attributes *attr, data_size_t *len )
 {
-    const struct object_attributes *attr = params->objattr;
     data_size_t size = (sizeof(*attr) + (attr->sd_len & ~1) + (attr->name_len & ~1) + 3) & ~3;
 
     if (attr == &empty_attributes || size >= get_req_data_size())
@@ -226,7 +232,8 @@ void write_reply( struct thread *thread )
     {
         if (!(thread->reply_towrite -= ret))
         {
-            free_reply_data( thread );
+            free( thread->reply_data );
+            thread->reply_data = NULL;
             /* sent everything, can go back to waiting for requests */
             set_fd_events( thread->request_fd, POLLIN );
             set_fd_events( thread->reply_fd, 0 );
@@ -268,7 +275,8 @@ static void send_reply( union generic_reply *reply )
             return;
         }
     }
-    free_reply_data( current );
+    free( current->reply_data );
+    current->reply_data = NULL;
     return;
 
  error:
@@ -331,9 +339,7 @@ void read_request( struct thread *thread )
             call_req_handler( thread );
             return;
         }
-        if (thread->req_toread <= sizeof(thread->req_buffer.data))
-            thread->req_data = thread->req_buffer.data;
-        else if (!(thread->req_data = malloc( thread->req_toread )))
+        if (!(thread->req_data = malloc( thread->req_toread )))
         {
             fatal_protocol_error( thread, "no memory for %u bytes request %d\n",
                                   thread->req_toread, thread->req.request_header.req );
@@ -352,7 +358,8 @@ void read_request( struct thread *thread )
         if (!(thread->req_toread -= ret))
         {
             call_req_handler( thread );
-            free_req_data( thread );
+            free( thread->req_data );
+            thread->req_data = NULL;
             return;
         }
     }
@@ -556,8 +563,7 @@ static void master_socket_poll_event( struct fd *fd, int event )
         fcntl( client, F_SETFL, O_NONBLOCK );
         if ((process = create_process( client, NULL, 0, NULL, NULL, NULL, 0, NULL )))
         {
-            struct thread *thread = create_thread( -1, process, NULL );
-            if (thread) add_process_thread( process, thread );
+            create_thread( -1, process, NULL );
             release_object( process );
         }
     }

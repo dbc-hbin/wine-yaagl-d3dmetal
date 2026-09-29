@@ -6,14 +6,13 @@ UNIX_LIBS    = \
 	-lwin32u \
 	-framework AppKit \
 	-framework Carbon \
+	-framework CoreVideo \
 	-framework Foundation \
 	-framework IOKit \
 	-framework Metal \
 	-framework OpenGL \
 	-framework QuartzCore \
 	-framework Security \
-
-VER_FILEDESCRIPTION_STR = "Wine Mac driver"
 
 SOURCES = \
 	clipboard.c \
@@ -22,6 +21,7 @@ SOURCES = \
 	cocoa_cursorclipping.m \
 	cocoa_display.m \
 	cocoa_event.m \
+	cocoa_icon_utils.m \
 	cocoa_main.m \
 	cocoa_opengl.m \
 	cocoa_status_item.m \

@@ -76,7 +76,6 @@ static UINT UPDATE_execute( struct tagMSIVIEW *view, MSIRECORD *record )
             i++;
 
         cols_count = i;
-        if (cols_count > r) return ERROR_FUNCTION_FAILED;
         where_count = r - i;
 
         if (where_count > 0)

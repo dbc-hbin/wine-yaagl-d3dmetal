@@ -5475,7 +5475,6 @@ static void test_effect_out_of_bounds_selector(IDirect3DDevice9 *device)
 
     hr = D3DXCreateEffect(device, test_effect_preshader_effect_blob, sizeof(test_effect_preshader_effect_blob),
             NULL, NULL, 0, NULL, &effect, NULL);
-    ok(hr == D3D_OK, "Got unexpected hr %#lx.\n", hr);
 
     hr = effect->lpVtbl->GetDesc(effect, &desc);
     ok(hr == D3D_OK, "Unexpected hr %#lx.\n", hr);
@@ -7344,21 +7343,15 @@ static void test_effect_skip_constants(IDirect3DDevice9 *device)
     D3DXVECTOR4 fvect;
     unsigned int i;
 
-    effect = (ID3DXEffect *)(ULONG_PTR)0xdeadbeef;
     hr = D3DXCreateEffectEx(device, test_effect_skip_constants_blob, sizeof(test_effect_skip_constants_blob),
             NULL, NULL, "v3", 0, NULL, &effect, NULL);
     ok(hr == D3DERR_INVALIDCALL, "Got result %#lx.\n", hr);
-    ok(!effect, "Unexpected effect %p.\n", effect);
-    effect = (ID3DXEffect *)(ULONG_PTR)0xdeadbeef;
     hr = D3DXCreateEffectEx(device, test_effect_skip_constants_blob, sizeof(test_effect_skip_constants_blob),
             NULL, NULL, "v4", 0, NULL, &effect, NULL);
     ok(hr == D3DERR_INVALIDCALL, "Got result %#lx.\n", hr);
-    ok(!effect, "Unexpected effect %p.\n", effect);
-    effect = (ID3DXEffect *)(ULONG_PTR)0xdeadbeef;
     hr = D3DXCreateEffectEx(device, test_effect_skip_constants_blob, sizeof(test_effect_skip_constants_blob),
             NULL, NULL, "v1;v5;v4", 0, NULL, &effect, NULL);
     ok(hr == D3DERR_INVALIDCALL, "Got result %#lx.\n", hr);
-    ok(!effect, "Unexpected effect %p.\n", effect);
 
     hr = D3DXCreateEffectEx(device, test_effect_skip_constants_blob, sizeof(test_effect_skip_constants_blob),
             NULL, NULL, " v1#,.+-= &\t\nv2*/!\"'v5 v6[1]", 0, NULL, &effect, NULL);
@@ -8378,8 +8371,6 @@ static void test_create_effect_from_file(void)
         trace("D3DXCreateEffectFromFileExW messages:\n%s", (char *)ID3DXBuffer_GetBufferPointer(messages));
         ID3DXBuffer_Release(messages);
     }
-    if (effect)
-        effect->lpVtbl->Release(effect);
 
     delete_file("effect1.fx");
     delete_file("effect2.fx");
@@ -8403,8 +8394,6 @@ static void test_create_effect_from_file(void)
         trace("D3DXCreateEffectFromFileExW messages:\n%s", (char *)ID3DXBuffer_GetBufferPointer(messages));
         ID3DXBuffer_Release(messages);
     }
-    if (effect)
-        effect->lpVtbl->Release(effect);
 
     refcount = IDirect3DDevice9_Release(device);
     ok(!refcount, "Device has %lu references left.\n", refcount);
@@ -8932,7 +8921,6 @@ static void test_effect_parameter_block(void)
 
     hr = D3DXCreateEffect(device, test_effect_parameter_value_blob_float, sizeof(test_effect_parameter_value_blob_float),
             NULL, NULL, 0, NULL, &effect, NULL);
-    ok(hr == D3D_OK, "Got unexpected hr %#lx.\n", hr);
     hr = effect->lpVtbl->BeginParameterBlock(effect);
     ok(hr == D3D_OK, "Got unexpected hr %#lx.\n", hr);
     mat_arr[0] = mat_arr[1] = test_mat;

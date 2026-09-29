@@ -17,6 +17,7 @@
  */
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winternl.h"
@@ -55,6 +56,7 @@ struct func_device
     struct device base;
     HID_DEVICE_ATTRIBUTES attrs;
     HIDP_DEVICE_DESC device_desc;
+    WCHAR serial[256];
 
     ULONG poll_interval;
     KEVENT halt_event;

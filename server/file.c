@@ -38,6 +38,7 @@
 #include <poll.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
 
@@ -87,26 +88,43 @@ static enum server_fd_type file_get_fd_type( struct fd *fd );
 
 static const struct object_ops file_ops =
 {
-    .size                = sizeof(struct file),
-    .type                = &file_type,
-    .dump                = file_dump,
-    .get_fd              = file_get_fd,
-    .get_sync            = default_fd_get_sync,
-    .get_sd              = file_get_sd,
-    .set_sd              = file_set_sd,
-    .get_full_name       = default_fd_get_full_name,
-    .lookup_name         = file_lookup_name,
-    .open_file           = file_open_file,
-    .get_kernel_obj_list = file_get_kernel_obj_list,
-    .destroy             = file_destroy,
+    sizeof(struct file),          /* size */
+    &file_type,                   /* type */
+    file_dump,                    /* dump */
+    NULL,                         /* add_queue */
+    NULL,                         /* remove_queue */
+    NULL,                         /* signaled */
+    NULL,                         /* satisfied */
+    no_signal,                    /* signal */
+    file_get_fd,                  /* get_fd */
+    default_fd_get_sync,          /* get_sync */
+    default_map_access,           /* map_access */
+    file_get_sd,                  /* get_sd */
+    file_set_sd,                  /* set_sd */
+    default_fd_get_full_name,     /* get_full_name */
+    file_lookup_name,             /* lookup_name */
+    no_link_name,                 /* link_name */
+    NULL,                         /* unlink_name */
+    file_open_file,               /* open_file */
+    file_get_kernel_obj_list,     /* get_kernel_obj_list */
+    no_close_handle,              /* close_handle */
+    file_destroy                  /* destroy */
 };
 
 static const struct fd_ops file_fd_ops =
 {
-    .get_fd_type   = file_get_fd_type,
-    .get_file_info = default_fd_get_file_info,
-    .ioctl         = default_fd_ioctl,
-    .queue_async   = default_fd_queue_async,
+    default_fd_get_poll_events,   /* get_poll_events */
+    default_poll_event,           /* poll_event */
+    file_get_fd_type,             /* get_fd_type */
+    no_fd_read,                   /* read */
+    no_fd_write,                  /* write */
+    no_fd_flush,                  /* flush */
+    default_fd_get_file_info,     /* get_file_info */
+    no_fd_get_volume_info,        /* get_volume_info */
+    default_fd_ioctl,             /* ioctl */
+    default_fd_cancel_async,      /* cancel_async */
+    default_fd_queue_async,       /* queue_async */
+    default_fd_reselect_async     /* reselect_async */
 };
 
 /* create a file from a file descriptor */
@@ -541,13 +559,15 @@ static struct object *file_open_file( struct object *obj, unsigned int access,
 {
     struct file *file = (struct file *)obj;
     struct object *new_file = NULL;
+    struct unicode_str nt_name;
     char *unix_name;
 
     assert( obj->ops == &file_ops );
 
     if ((unix_name = dup_fd_name( file->fd, "" )))
     {
-        new_file = create_file( NULL, unix_name, strlen(unix_name), get_nt_name(file->fd), access,
+        get_nt_name( file->fd, &nt_name );
+        new_file = create_file( NULL, unix_name, strlen(unix_name), nt_name, access,
                                 sharing, FILE_OPEN, options, 0, NULL );
         free( unix_name );
     }
@@ -623,30 +643,31 @@ DECL_HANDLER(create_file)
 {
     struct object *file;
     struct fd *root_fd = NULL;
-    struct object_params params;
+    struct unicode_str nt_name;
+    const struct security_descriptor *sd;
+    const struct object_attributes *objattr = get_req_object_attributes( &sd, &nt_name, NULL );
     const char *name;
     data_size_t name_len;
 
-    if (!get_req_object_attributes( &params )) return;
-    if (params.root) release_object( params.root );
+    if (!objattr) return;
 
-    if (params.objattr->rootdir)
+    if (objattr->rootdir)
     {
         struct dir *root;
 
-        if (!(root = get_dir_obj( current->process, params.objattr->rootdir, 0 ))) return;
+        if (!(root = get_dir_obj( current->process, objattr->rootdir, 0 ))) return;
         root_fd = get_obj_fd( (struct object *)root );
         release_object( root );
         if (!root_fd) return;
     }
 
-    name = get_req_data_after_objattr( &params, &name_len );
+    name = get_req_data_after_objattr( objattr, &name_len );
 
     reply->handle = 0;
-    if ((file = create_file( root_fd, name, name_len, params.name, req->access, req->sharing,
-                             req->create, req->options, req->attrs, params.sd )))
+    if ((file = create_file( root_fd, name, name_len, nt_name, req->access, req->sharing,
+                             req->create, req->options, req->attrs, sd )))
     {
-        reply->handle = alloc_handle( current->process, file, req->access, params.attr );
+        reply->handle = alloc_handle( current->process, file, req->access, objattr->attributes );
         release_object( file );
     }
     if (root_fd) release_object( root_fd );

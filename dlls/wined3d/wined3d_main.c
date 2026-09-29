@@ -27,8 +27,6 @@
 #include "initguid.h"
 #include "wined3d_private.h"
 #include "wined3d_gl.h"
-#include <d3d10.h>
-#include <d3d10_1shader.h>
 #include "d3d12.h"
 #define VK_NO_PROTOTYPES
 #include "wine/vulkan.h"
@@ -131,7 +129,13 @@ struct wined3d_settings wined3d_settings =
     .max_sm_cs = UINT_MAX,
     .renderer = WINED3D_RENDERER_AUTO,
     .shader_backend = WINED3D_SHADER_BACKEND_AUTO,
-    .decoder_backend = WINED3D_DECODER_BACKEND_AUTO,
+    .multiply_special = 1,
+};
+
+/* CXGames hacks, not in the main wined3d configuration settings */
+struct cxgames_hacks cxgames_hacks =
+{
+    FALSE,                      /* safe_vs_consts */
 };
 
 enum wined3d_renderer CDECL wined3d_get_renderer(void)
@@ -347,6 +351,11 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
     {
         if (!get_config_key_dword(hkey, appkey, env, "csmt", &wined3d_settings.cs_multithreaded))
             ERR_(winediag)("Setting multithreaded command stream to %#x.\n", wined3d_settings.cs_multithreaded);
+        else if (!get_config_key(hkey, appkey, env, "csmt", buffer, size) && !strcmp(buffer,"disabled"))
+        {
+            wined3d_settings.cs_multithreaded = 0;
+            ERR_(winediag)("Disabling multithreaded command stream.\n");
+        }
         if (!get_config_key_dword(hkey, appkey, env, "MaxVersionGL", &tmpvalue))
         {
             ERR_(winediag)("Setting maximum allowed wined3d GL version to %u.%u.\n",
@@ -364,19 +373,6 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
             {
                 ERR_(winediag)("Using the GLSL shader backend.\n");
                 wined3d_settings.shader_backend = WINED3D_SHADER_BACKEND_GLSL;
-            }
-        }
-        if (!get_config_key(hkey, appkey, env, "decoder_backend", buffer, size))
-        {
-            if (!stricmp(buffer, "vulkan"))
-            {
-                ERR_(winediag)("Using the Vulkan video decoder backend.\n");
-                wined3d_settings.decoder_backend = WINED3D_DECODER_BACKEND_VULKAN;
-            }
-            else if (!stricmp(buffer, "va"))
-            {
-                ERR_(winediag)("Using the VA video decoder backend.\n");
-                wined3d_settings.decoder_backend = WINED3D_DECODER_BACKEND_VA;
             }
         }
         if (!get_config_key_dword(hkey, appkey, env, "VideoPciDeviceID", &tmpvalue))
@@ -436,6 +432,14 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
         if (!get_config_key_dword(hkey, appkey, env, "SampleCount", &wined3d_settings.sample_count))
             ERR_(winediag)("Forcing sample count to %u. This may not be compatible with all applications.\n",
                     wined3d_settings.sample_count);
+        if ( !get_config_key( hkey, appkey, env, "SafeVsConsts", buffer, size) )
+        {
+            if (!strcmp(buffer,"enable"))
+            {
+                TRACE("Advertising only always available shader constants\n");
+                cxgames_hacks.safe_vs_consts = TRUE;
+            }
+        }
         if (!get_config_key(hkey, appkey, env, "CheckFloatConstants", buffer, size)
                 && !strcmp(buffer, "enabled"))
         {
@@ -444,6 +448,8 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
         }
         if (!get_config_key_dword(hkey, appkey, env, "strict_shader_math", &wined3d_settings.strict_shader_math))
             ERR_(winediag)("Setting strict shader math to %#x.\n", wined3d_settings.strict_shader_math);
+        if (!get_config_key_dword(hkey, appkey, env, "multiply_special", &wined3d_settings.multiply_special))
+            ERR_(winediag)("Setting multiply special to %#x.\n", wined3d_settings.multiply_special);
         if (!get_config_key_dword(hkey, appkey, env, "MaxShaderModelVS", &wined3d_settings.max_sm_vs))
             TRACE("Limiting VS shader model to %u.\n", wined3d_settings.max_sm_vs);
         if (!get_config_key_dword(hkey, appkey, env, "MaxShaderModelHS", &wined3d_settings.max_sm_hs))

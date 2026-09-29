@@ -26,12 +26,13 @@
 #include <pthread.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "ntgdi_private.h"
 #include "win32u_private.h"
 #include "ntuser_private.h"
+#include "d3dkmdt.h"
 
 #include <d3d9types.h>
-#include "d3dkmdt.h"
 #include <dxgi.h>
 #include <d3d10.h>
 #include <d3d11.h>
@@ -392,6 +393,99 @@ static void d3dkmt_object_free( struct d3dkmt_object *object )
     free( object );
 }
 
+/* create a struct security_descriptor and contained information in one contiguous piece of memory */
+static unsigned int alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct object_attributes **ret,
+                                             data_size_t *ret_len )
+{
+    unsigned int len = sizeof(**ret);
+    SID *owner = NULL, *group = NULL;
+    ACL *dacl = NULL, *sacl = NULL;
+    SECURITY_DESCRIPTOR *sd;
+
+    *ret = NULL;
+    *ret_len = 0;
+
+    if (!attr) return STATUS_SUCCESS;
+
+    if (attr->Length != sizeof(*attr)) return STATUS_INVALID_PARAMETER;
+
+    if ((sd = attr->SecurityDescriptor))
+    {
+        len += sizeof(struct security_descriptor);
+    if (sd->Revision != SECURITY_DESCRIPTOR_REVISION) return STATUS_UNKNOWN_REVISION;
+        if (sd->Control & SE_SELF_RELATIVE)
+        {
+            SECURITY_DESCRIPTOR_RELATIVE *rel = (SECURITY_DESCRIPTOR_RELATIVE *)sd;
+            if (rel->Owner) owner = (PSID)((BYTE *)rel + rel->Owner);
+            if (rel->Group) group = (PSID)((BYTE *)rel + rel->Group);
+            if ((sd->Control & SE_SACL_PRESENT) && rel->Sacl) sacl = (PSID)((BYTE *)rel + rel->Sacl);
+            if ((sd->Control & SE_DACL_PRESENT) && rel->Dacl) dacl = (PSID)((BYTE *)rel + rel->Dacl);
+        }
+        else
+        {
+            owner = sd->Owner;
+            group = sd->Group;
+            if (sd->Control & SE_SACL_PRESENT) sacl = sd->Sacl;
+            if (sd->Control & SE_DACL_PRESENT) dacl = sd->Dacl;
+        }
+
+        if (owner) len += offsetof( SID, SubAuthority[owner->SubAuthorityCount] );
+        if (group) len += offsetof( SID, SubAuthority[group->SubAuthorityCount] );
+        if (sacl) len += sacl->AclSize;
+        if (dacl) len += dacl->AclSize;
+
+        /* fix alignment for the Unicode name that follows the structure */
+        len = (len + sizeof(WCHAR) - 1) & ~(sizeof(WCHAR) - 1);
+    }
+
+    if (attr->ObjectName)
+    {
+        if ((ULONG_PTR)attr->ObjectName->Buffer & (sizeof(WCHAR) - 1)) return STATUS_DATATYPE_MISALIGNMENT;
+        if (attr->ObjectName->Length & (sizeof(WCHAR) - 1)) return STATUS_OBJECT_NAME_INVALID;
+        len += attr->ObjectName->Length;
+    }
+    else if (attr->RootDirectory) return STATUS_OBJECT_NAME_INVALID;
+
+    len = (len + 3) & ~3;  /* DWORD-align the entire structure */
+
+    if (!(*ret = calloc( len, 1 ))) return STATUS_NO_MEMORY;
+
+    (*ret)->rootdir = wine_server_obj_handle( attr->RootDirectory );
+    (*ret)->attributes = attr->Attributes;
+
+    if (attr->SecurityDescriptor)
+    {
+        struct security_descriptor *descr = (struct security_descriptor *)(*ret + 1);
+        unsigned char *ptr = (unsigned char *)(descr + 1);
+
+        descr->control = sd->Control & ~SE_SELF_RELATIVE;
+        if (owner) descr->owner_len = offsetof( SID, SubAuthority[owner->SubAuthorityCount] );
+        if (group) descr->group_len = offsetof( SID, SubAuthority[group->SubAuthorityCount] );
+        if (sacl) descr->sacl_len = sacl->AclSize;
+        if (dacl) descr->dacl_len = dacl->AclSize;
+
+        memcpy( ptr, owner, descr->owner_len );
+        ptr += descr->owner_len;
+        memcpy( ptr, group, descr->group_len );
+        ptr += descr->group_len;
+        memcpy( ptr, sacl, descr->sacl_len );
+        ptr += descr->sacl_len;
+        memcpy( ptr, dacl, descr->dacl_len );
+        (*ret)->sd_len = (sizeof(*descr) + descr->owner_len + descr->group_len + descr->sacl_len +
+                          descr->dacl_len + sizeof(WCHAR) - 1) & ~(sizeof(WCHAR) - 1);
+    }
+
+    if (attr->ObjectName)
+    {
+        unsigned char *ptr = (unsigned char *)(*ret + 1) + (*ret)->sd_len;
+        (*ret)->name_len = attr->ObjectName->Length;
+        memcpy( ptr, attr->ObjectName->Buffer, (*ret)->name_len );
+    }
+
+    *ret_len = len;
+    return STATUS_SUCCESS;
+}
+
 static struct vulkan_instance *d3dkmt_vulkan_instance; /* Vulkan instance for D3DKMT functions */
 
 static void d3dkmt_init_vulkan(void)
@@ -399,7 +493,7 @@ static void d3dkmt_init_vulkan(void)
     static const struct vulkan_instance_extensions extensions =
     {
         .has_VK_KHR_get_physical_device_properties2 = 1,
-        .has_VK_KHR_external_fence_capabilities = 1,
+        .has_VK_KHR_external_memory_capabilities = 1,
     };
 
     d3dkmt_vulkan_instance = vulkan_instance_create( &extensions );
@@ -458,7 +552,7 @@ NTSTATUS WINAPI NtGdiDdDDIEscape( const D3DKMT_ESCAPE *desc )
     {
         HWND hwnd = UlongToHandle( desc->hContext );
         RECT *rect = desc->pPrivateDriverData;
-        struct ratio dpi = get_dpi_for_window( hwnd );
+        UINT dpi = get_dpi_for_window( hwnd );
         WND *win;
 
         if (desc->PrivateDriverDataSize != sizeof(*rect)) return STATUS_INVALID_PARAMETER;
@@ -497,7 +591,7 @@ static struct vulkan_physical_device *get_vulkan_physical_device( struct vulkan_
 {
     GUID uuid;
 
-    if (!get_gpu_uuid_from_luid( luid, &uuid ))
+    if (!get_vulkan_uuid_from_luid( luid, &uuid ))
     {
         WARN( "Failed to find Vulkan device with LUID %08x:%08x.\n", luid->HighPart, luid->LowPart );
         return NULL;
@@ -615,7 +709,7 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
         if (desc->PrivateDriverDataSize < sizeof(*value))
             return STATUS_INVALID_PARAMETER;
 
-        *value = KMT_DRIVERVERSION_WDDM_3_1;
+        *value = KMT_DRIVERVERSION_WDDM_1_3;
         return STATUS_SUCCESS;
     }
     /* CW HACK 24905 */
@@ -919,7 +1013,7 @@ BOOL get_vulkan_gpus( struct list *gpus )
 
     for (i = 0; i < instance->physical_device_count; ++i)
     {
-        struct gpu_info *gpu;
+        struct vulkan_gpu *gpu;
 
         if (!(gpu = calloc( 1, sizeof(*gpu) ))) break;
         memcpy( &gpu->uuid, devinfo[i].id.deviceUUID, sizeof(gpu->uuid) );
@@ -938,6 +1032,12 @@ BOOL get_vulkan_gpus( struct list *gpus )
 
     free( devinfo );
     return TRUE;
+}
+
+void free_vulkan_gpu( struct vulkan_gpu *gpu )
+{
+    free( gpu->name );
+    free( gpu );
 }
 
 /******************************************************************************
@@ -976,7 +1076,7 @@ NTSTATUS WINAPI NtGdiDdDDIShareObjects( UINT count, const D3DKMT_HANDLE *handles
     }
     else goto failed;
 
-    if ((status = wine_server_alloc_object_attributes( attr, &objattr, &len ))) return status;
+    if ((status = alloc_object_attributes( attr, &objattr, &len ))) return status;
 
     SERVER_START_REQ( d3dkmt_share_objects )
     {
@@ -1530,9 +1630,7 @@ NTSTATUS WINAPI NtGdiDdDDIAcquireKeyedMutex2( D3DKMT_ACQUIREKEYEDMUTEX2 *params 
 
             status = wine_server_call( req );
             params->FenceValue = reply->fence_value;
-            /* server never creates a new handle if one is provided, and always returns a handle if pending */
-            if (reply->wait_handle) wait_handle = wine_server_ptr_handle( reply->wait_handle );
-            else if (wait_handle) NtClose( wait_handle );
+            wait_handle = wine_server_ptr_handle( reply->wait_handle );
         }
         SERVER_END_REQ;
     } while (status == STATUS_PENDING);

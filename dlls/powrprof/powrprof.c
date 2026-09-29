@@ -21,6 +21,7 @@
 #include <stdlib.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winnt.h"
@@ -354,12 +355,6 @@ DWORD WINAPI PowerSettingUnregisterNotification(HPOWERNOTIFY handle)
 {
     FIXME("(%p) stub!\n", handle);
     return ERROR_SUCCESS;
-}
-
-DWORD WINAPI PowerReadACValueIndex(HKEY key, const GUID *scheme, const GUID *subgroup, const GUID *setting, DWORD *index)
-{
-   FIXME("(%p,%s,%s,%s,%p) stub!\n", key, debugstr_guid(scheme), debugstr_guid(subgroup), debugstr_guid(setting), index);
-   return ERROR_SUCCESS;
 }
 
 DWORD WINAPI PowerWriteACValueIndex(HKEY key, const GUID *scheme, const GUID *subgroup, const GUID *setting, DWORD index)

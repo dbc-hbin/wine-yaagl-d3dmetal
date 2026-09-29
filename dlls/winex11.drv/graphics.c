@@ -41,6 +41,7 @@
 #include <limits.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winreg.h"
@@ -1682,7 +1683,7 @@ void init_icm_profile(void)
 
     RtlInitUnicodeString( &name, fullname );
     InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, NULL, NULL );
-    status = NtCreateFile( &file, GENERIC_WRITE | SYNCHRONIZE, &attr, &io, NULL, 0, 0, FILE_CREATE,
+    status = NtCreateFile( &file, GENERIC_WRITE, &attr, &io, NULL, 0, 0, FILE_CREATE,
                            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0 );
     if (!status)
     {

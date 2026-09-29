@@ -569,7 +569,7 @@
 @ stdcall GetGeoInfoEx(ptr long ptr long)
 @ stdcall GetHandleInformation(long ptr)
 # @ stub GetHivePath
-@ stdcall GetIntegratedDisplaySize(ptr)
+# @ stub GetIntegratedDisplaySize
 # @ stub GetIsEdpEnabled
 @ stdcall GetKernelObjectSecurity(long long ptr long ptr)
 @ stdcall GetLargePageMinimum()
@@ -587,7 +587,6 @@
 @ stdcall GetLogicalProcessorInformationEx(long ptr ptr)
 @ stdcall GetLongPathNameA(str ptr long)
 @ stdcall GetLongPathNameW(wstr ptr long)
-@ stdcall GetMachineTypeAttributes(long ptr)
 @ stdcall GetMappedFileNameA(long ptr ptr long)
 @ stdcall GetMappedFileNameW(long ptr ptr long)
 # @ stub GetMemoryErrorHandlingCapabilities
@@ -1052,7 +1051,7 @@
 # @ stub PackageFamilyNameFromFullName
 # @ stub PackageFamilyNameFromId
 # @ stub PackageFamilyNameFromProductId
-@ stdcall PackageFullNameFromId(ptr ptr ptr)
+# @ stub PackageFullNameFromId
 # @ stub PackageFullNameFromProductId
 @ stdcall PackageIdFromFullName(wstr long ptr ptr)
 # @ stub PackageIdFromProductId
@@ -1221,10 +1220,10 @@
 # @ stub PsmIsChildKey
 # @ stub PsmIsDynamicKey
 # @ stub PsmIsValidKey
-@ stdcall PssCaptureSnapshot(ptr long long ptr)
+# @ stub PssCaptureSnapshot
 # @ stub PssDuplicateSnapshot
-@ stdcall PssFreeSnapshot(ptr ptr)
-@ stdcall PssQuerySnapshot(ptr long ptr long)
+# @ stub PssFreeSnapshot
+# @ stub PssQuerySnapshot
 # @ stub PssWalkMarkerCreate
 # @ stub PssWalkMarkerFree
 # @ stub PssWalkMarkerGetPosition
@@ -1282,8 +1281,8 @@
 @ stdcall ReOpenFile(ptr long long long)
 @ stdcall ReadConsoleA(long ptr long ptr ptr)
 @ stdcall ReadConsoleInputA(long ptr long ptr)
-@ stdcall ReadConsoleInputExA(long ptr long ptr long)
-@ stdcall ReadConsoleInputExW(long ptr long ptr long)
+@ stub ReadConsoleInputExA
+@ stub ReadConsoleInputExW
 @ stdcall ReadConsoleInputW(long ptr long ptr)
 @ stdcall ReadConsoleOutputA(long ptr long long ptr)
 @ stdcall ReadConsoleOutputAttribute(long ptr long long ptr)
@@ -1547,7 +1546,7 @@
 @ stdcall SetThreadpoolThreadMaximum(ptr long) ntdll.TpSetPoolMaxThreads
 @ stdcall SetThreadpoolThreadMinimum(ptr long) ntdll.TpSetPoolMinThreads
 @ stdcall SetThreadpoolTimer(ptr ptr long long) ntdll.TpSetTimer
-@ stdcall SetThreadpoolTimerEx(ptr ptr long long) ntdll.TpSetTimerEx
+# @ stub SetThreadpoolTimerEx
 @ stdcall SetThreadpoolWait(ptr long ptr) ntdll.TpSetWait
 # @ stub SetThreadpoolWaitEx
 @ stdcall SetTimeZoneInformation(ptr)

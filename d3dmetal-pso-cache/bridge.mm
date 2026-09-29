@@ -21,7 +21,6 @@
 #include "d3dmetal-transport.hpp"
 #include "display-routing.hpp"
 #include "layout.hpp"
-#include "persistent-cache.hpp"
 #include "rt-key.hpp"
 #include "stage-cache.hpp"
 
@@ -300,7 +299,6 @@ __attribute__((constructor)) void initialize() noexcept {
         if (base == nullptr) return;
         static_cast<void>(fsr::initialize(base));
         static_cast<void>(fsr::framegeneration::initialize(base));
-        warmPersistentCachesFromEnvironment();
         static_cast<void>(runtime());
         for (std::size_t index = 0; index < kHookCount; ++index) {
             originalFunctions[index] = reinterpret_cast<std::uintptr_t>(base + layout::kTrampolines[index]);

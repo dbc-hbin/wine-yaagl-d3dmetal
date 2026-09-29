@@ -5,5 +5,4 @@ SOURCES = \
 	cache.c \
 	name.c \
 	query.c \
-	record.c \
-	service.c
+	record.c

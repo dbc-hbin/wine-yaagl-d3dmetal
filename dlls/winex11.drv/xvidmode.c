@@ -535,23 +535,23 @@ void X11DRV_XF86VM_Init(void)
 /***********************************************************************
  *		GetDeviceGammaRamp
  */
-UINT X11DRV_GetDeviceGammaRamp(PHYSDEV dev, LPVOID ramp)
+BOOL X11DRV_GetDeviceGammaRamp(PHYSDEV dev, LPVOID ramp)
 {
 #ifdef SONAME_LIBXXF86VM
   return X11DRV_XF86VM_GetGammaRamp(ramp);
 #else
-  return -1; /* use default implementation */
+  return FALSE;
 #endif
 }
 
 /***********************************************************************
  *		SetDeviceGammaRamp
  */
-UINT X11DRV_SetDeviceGammaRamp(PHYSDEV dev, LPVOID ramp)
+BOOL X11DRV_SetDeviceGammaRamp(PHYSDEV dev, LPVOID ramp)
 {
 #ifdef SONAME_LIBXXF86VM
   return X11DRV_XF86VM_SetGammaRamp(ramp);
 #else
-  return -1; /* use default implementation */
+  return FALSE;
 #endif
 }

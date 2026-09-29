@@ -21,6 +21,7 @@
 #include <stdarg.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winnt.h"
@@ -33,6 +34,16 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(wow);
 
+
+static BOOL is_32b_prefix_on_wow64( void )
+{
+    UNICODE_STRING val_str, name_str = RTL_CONSTANT_STRING( L"WINEWOW6432BPREFIXMODE" );
+
+    val_str.MaximumLength = 0;
+    if (RtlQueryEnvironmentVariable_U( NULL, &name_str, &val_str ) != STATUS_VARIABLE_NOT_FOUND)
+        return TRUE;
+    return FALSE;
+}
 
 static BOOL is_process_wow64( HANDLE handle )
 {
@@ -200,20 +211,6 @@ static PS_ATTRIBUTE_LIST *ps_attributes_32to64( PS_ATTRIBUTE_LIST **attr, const 
         case PS_ATTRIBUTE_TEB_ADDRESS:
             ret->Attributes[i].Size     = sizeof(TEB *);
             ret->Attributes[i].ValuePtr = Wow64AllocateTemp( ret->Attributes[i].Size );
-            break;
-        case PS_ATTRIBUTE_GROUP_AFFINITY:
-            {
-                GROUP_AFFINITY32 *aff32 = ret->Attributes[i].ValuePtr;
-                GROUP_AFFINITY *aff64;
-                ret->Attributes[i].Size     = sizeof(GROUP_AFFINITY);
-                ret->Attributes[i].ValuePtr = Wow64AllocateTemp( ret->Attributes[i].Size );
-                aff64 = ret->Attributes[i].ValuePtr;
-                aff64->Mask = aff32->Mask;
-                aff64->Group = aff32->Group;
-                aff64->Reserved[0] = aff32->Reserved[0];
-                aff64->Reserved[1] = aff32->Reserved[1];
-                aff64->Reserved[2] = aff32->Reserved[2];
-            }
             break;
         }
     }
@@ -657,9 +654,34 @@ NTSTATUS WINAPI wow64_NtQueryInformationProcess( UINT *args )
         if (retlen) *retlen = sizeof(VM_COUNTERS_EX32);
         return STATUS_INFO_LENGTH_MISMATCH;
 
+    case ProcessWow64Information:  /* ULONG_PTR */
+        /* CW HACK 21111
+         * Spoof the result of NtQueryInformationProcess(ProcessWow64Information) for 'DXSETUP.exe'
+         * when using a 32-bit bottle under Wow64.
+         * The 'DirectX for Modern Games' installer uses this to determine when on a 64-bit OS.
+         */
+        if (is_32b_prefix_on_wow64())
+        {
+            WCHAR filename[512];
+            UNICODE_STRING name_us;
+
+            name_us.Buffer = filename;
+            name_us.MaximumLength = sizeof(filename);
+            status = LdrGetDllFullName( NULL, &name_us );
+            if (len == sizeof(ULONG) && !status && (name_us.Length != name_us.MaximumLength) && (name_us.Length > 22))
+            {
+                filename[name_us.Length / sizeof(WCHAR)] = '\0';
+                if (!wcscmp(&filename[(name_us.Length - 22) / sizeof(WCHAR)], L"DXSETUP.exe"))
+                {
+                    *(ULONG *)ptr = 0;
+                    if (retlen) *retlen = sizeof(ULONG);
+                    return STATUS_SUCCESS;
+                }
+            }
+        }
+        // fallthrough
     case ProcessDebugPort:  /* ULONG_PTR */
     case ProcessAffinityMask:  /* ULONG_PTR */
-    case ProcessWow64Information:  /* ULONG_PTR */
     case ProcessDebugObjectHandle:  /* HANDLE */
         if (retlen) *(volatile ULONG *)retlen |= 0;
         if (len == sizeof(ULONG))
@@ -941,17 +963,12 @@ NTSTATUS WINAPI wow64_NtSetInformationProcess( UINT *args )
     case ProcessPriorityClass:   /* PROCESS_PRIORITY_CLASS */
     case ProcessBasePriority:   /* ULONG */
     case ProcessPriorityBoost:  /* ULONG */
+    case ProcessExecuteFlags:   /* ULONG */
     case ProcessPagePriority:   /* MEMORY_PRIORITY_INFORMATION */
     case ProcessPowerThrottlingState:   /* PROCESS_POWER_THROTTLING_STATE */
     case ProcessLeapSecondInformation:   /* PROCESS_LEAP_SECOND_INFO */
     case ProcessWineGrantAdminToken:   /* NULL */
         return NtSetInformationProcess( handle, class, ptr, len );
-
-    case ProcessExecuteFlags:   /* ULONG */
-        status = NtSetInformationProcess( handle, class, ptr, len );
-        if (!status && pBTCpuNotifyProcessExecuteFlagsChange)
-            pBTCpuNotifyProcessExecuteFlagsChange(*(ULONG *)ptr);
-        return status;
 
     case ProcessAccessToken: /* PROCESS_ACCESS_TOKEN */
         if (len == sizeof(PROCESS_ACCESS_TOKEN32))
@@ -1166,17 +1183,6 @@ NTSTATUS WINAPI wow64_NtTerminateThread( UINT *args )
     if (pBTCpuThreadTerm) pBTCpuThreadTerm( handle, exit_code );
 
     return NtTerminateThread( handle, exit_code );
-}
-
-
-/**********************************************************************
- *           wow64_NtTerminateThread
- */
-NTSTATUS WINAPI wow64_NtWorkerFactoryWorkerReady( UINT *args )
-{
-    HANDLE handle = get_handle( &args );
-
-    return NtWorkerFactoryWorkerReady( handle );
 }
 
 

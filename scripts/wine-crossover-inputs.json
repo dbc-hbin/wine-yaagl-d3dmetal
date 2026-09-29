@@ -1,0 +1,105 @@
+{
+  "schemaVersion": 1,
+  "donor": {
+    "manifest": "yaagl-wine-runtime-files.json",
+    "manifestSha256": "78518754b2ca6e1e5e611ae95c58f19a8984ebb0a58a365343c93a7f4106a5be",
+    "sourceCommit": "f163d14e24fb1f1e2e8e6a1a319ac82fc9e98a8e",
+    "scope": "External GPTK bridge and non-Wine dependency inputs only; no inherited Wine core modules."
+  },
+  "graphics": [
+    {
+      "path": "lib/external/libd3dshared.dylib",
+      "sha256": "d932330841e77682d47688641e0ac17049a2aff498deafac88921983dc16eedb",
+      "size": 223856,
+      "type": "file"
+    },
+    {
+      "path": "lib/wine/x86_64-windows/d3d10.dll",
+      "sha256": "14c84a364a1260497f0a5117ef8efd6e228764ab139a67af1127e8bd013c48c7",
+      "size": 73728,
+      "type": "file"
+    },
+    {
+      "path": "lib/wine/x86_64-windows/d3d11.dll",
+      "sha256": "303b2bb41efa30c890e2e93d39c3d3c565c8557e069eee832f2cb8a37bd4ec26",
+      "size": 139264,
+      "type": "file"
+    },
+    {
+      "path": "lib/wine/x86_64-windows/d3d12.dll",
+      "sha256": "1b7a02cb37ec6b484e2aaa76b5ec9cbb47e63aeec29dbe087d5d1589a3347cfb",
+      "size": 196608,
+      "type": "file"
+    },
+    {
+      "path": "lib/wine/x86_64-windows/dxgi.dll",
+      "sha256": "522a8b37216afb09e614489d88a74118076f4d7e08d2b289df6a6eb6f3e817af",
+      "size": 122880,
+      "type": "file"
+    },
+    {
+      "path": "lib/wine/x86_64-windows/nvapi.dll",
+      "target": "nvapi64.dll",
+      "type": "symlink"
+    },
+    {
+      "path": "lib/wine/x86_64-windows/nvapi64.dll",
+      "sha256": "05eedf19e75c6b4c0dce918577aa6ca3fe5da79d04e42145cf66f498fad3556a",
+      "size": 188416,
+      "type": "file"
+    },
+    {
+      "path": "lib/wine/x86_64-windows/nvngx.dll",
+      "sha256": "f6bc9d77fd1e898fec8c6339d367bd8e0f338992c9c0c66d59b30c6e9e0743e4",
+      "size": 135632,
+      "type": "file"
+    },
+    {
+      "path": "lib/wine/x86_64-unix/d3d10.so",
+      "target": "../../external/libd3dshared.dylib",
+      "type": "symlink"
+    },
+    {
+      "path": "lib/wine/x86_64-unix/d3d11.so",
+      "target": "../../external/libd3dshared.dylib",
+      "type": "symlink"
+    },
+    {
+      "path": "lib/wine/x86_64-unix/d3d12.so",
+      "target": "../../external/libd3dshared.dylib",
+      "type": "symlink"
+    },
+    {
+      "path": "lib/wine/x86_64-unix/dxgi.so",
+      "target": "../../external/libd3dshared.dylib",
+      "type": "symlink"
+    },
+    {
+      "path": "lib/wine/x86_64-unix/nvapi.so",
+      "target": "nvapi64.so",
+      "type": "symlink"
+    },
+    {
+      "path": "lib/wine/x86_64-unix/nvapi64.so",
+      "target": "../../external/libd3dshared.dylib",
+      "type": "symlink"
+    },
+    {
+      "path": "lib/wine/x86_64-unix/nvngx.so",
+      "target": "../../external/libd3dshared.dylib",
+      "type": "symlink"
+    },
+    {
+      "path": "lib/wine/x86_64-windows/amd_fidelityfx_framegeneration_dx12_native.dll",
+      "sha256": "3f5e674a59b400756e98ef31fd583a4eb08ad567ec8dee362886bc96e55ed347",
+      "size": 38245640,
+      "type": "file"
+    }
+  ],
+  "dependencies": {
+    "topLevelDylibs": true,
+    "trees": [
+      "lib/GStreamer.framework"
+    ]
+  }
+}

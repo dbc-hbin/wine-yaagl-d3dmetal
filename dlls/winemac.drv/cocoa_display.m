@@ -22,11 +22,32 @@
 
 #import <AppKit/AppKit.h>
 #import <IOKit/graphics/IOGraphicsLib.h>
+#ifdef HAVE_MTLDEVICE_REGISTRYID
 #import <Metal/Metal.h>
+#endif
 #include <dlfcn.h>
 #include "macdrv_cocoa.h"
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+
+/* CrossOver Hack #20512 */
+@interface NSScreen (SafeAreaInsetsForOldSDKs)
+/* Defining this selector for compiling against older SDKs. */
+@property (readonly) NSEdgeInsets safeAreaInsets API_AVAILABLE(macos(12.0));
+@end
+
+static BOOL needs_skyrim_se_launcher_hack(void)
+{
+    static BOOL did_check = FALSE, needs_hack;
+    if (!did_check)
+    {
+        did_check = TRUE;
+        needs_hack = is_apple_silicon() && is_skyrim_se_launcher();
+    }
+
+    return needs_hack;
+}
+/* End hack. */
 
 static uint64_t dedicated_gpu_id;
 static uint64_t integrated_gpu_id;
@@ -170,6 +191,8 @@ done:
 }
 }
 
+#ifdef HAVE_MTLDEVICE_REGISTRYID
+
 /***********************************************************************
  *              macdrv_get_gpu_info_from_registry_id
  *
@@ -243,7 +266,7 @@ static int macdrv_get_gpus_from_metal(struct macdrv_gpu** new_gpus, int* count)
     if (&MTLCopyAllDevices == NULL)
         return -1;
     NSArray<id<MTLDevice>>* devices = [MTLCopyAllDevices() autorelease];
-    if (!devices.count)
+    if (!devices.count || ![devices[0] respondsToSelector:@selector(registryID)])
         return -1;
 
     gpus = calloc(devices.count, sizeof(*gpus));
@@ -317,12 +340,26 @@ static int macdrv_get_gpu_info_from_display_id_using_metal(struct macdrv_gpu* gp
         return -1;
 
     device = [CGDirectDisplayCopyCurrentMetalDevice(display_id) autorelease];
-    if (device)
+    if (device && [device respondsToSelector:@selector(registryID)])
         return macdrv_get_gpu_info_from_registry_id(gpu, device.registryID);
     else
         return -1;
 }
 }
+
+#else
+
+static int macdrv_get_gpus_from_metal(struct macdrv_gpu** new_gpus, int* count)
+{
+    return -1;
+}
+
+static int macdrv_get_gpu_info_from_display_id_using_metal(struct macdrv_gpu* gpu, CGDirectDisplayID display_id)
+{
+    return -1;
+}
+
+#endif
 
 /***********************************************************************
  *              macdrv_get_gpu_info_from_display_id

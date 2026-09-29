@@ -46,6 +46,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(wgl);
 struct gl_info {
     char *glExtensions;
 
+    char wglExtensions[4096];
+
     GLint max_viewport_dims[2];
 
     unsigned int max_major, max_minor;
@@ -56,8 +58,8 @@ static struct gl_info gl_info;
 
 struct macdrv_context
 {
-    BOOL                    core;
     int                     format;
+    GLint                   renderer_id;
     macdrv_opengl_context   context;
     CGLContextObj           cglcontext;
     HWND                    draw_hwnd;
@@ -95,6 +97,8 @@ static const GLubyte *(*pglGetString)(GLenum name);
 static PFN_glGetIntegerv pglGetIntegerv;
 static void (*pglReadPixels)(GLint x, GLint y, GLsizei width, GLsizei height,
                              GLenum format, GLenum type, void *pixels);
+static void (*pglTexImage3D)( GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const void *pixels );
+static void (*pglTexSubImage3D)( GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels );
 
 
 struct color_mode {
@@ -227,7 +231,6 @@ C_ASSERT(sizeof(((pixel_format_or_code*)0)->format) <= sizeof(((pixel_format_or_
 
 static pixel_format *pixel_formats;
 static int nb_formats, nb_displayable_formats;
-static CGLOpenGLProfile core_profile;
 
 
 static const char* debugstr_attrib(int attrib, int value)
@@ -1203,51 +1206,56 @@ static const pixel_format *get_pixel_format(int format, BOOL allow_nondisplayabl
     return NULL;
 }
 
-static CGLContextObj init_context(CGLOpenGLProfile profile)
-{
-    CGLPixelFormatAttribute attribs[] =
-    {
-        kCGLPFADisplayMask, CGDisplayIDToOpenGLDisplayMask(CGMainDisplayID()),
-        kCGLPFAAccelerated, kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)profile, 0,
-    };
-    CGLPixelFormatObj pix;
-    CGLContextObj context;
-    GLint screens;
-    CGLError err;
-
-    if ((err = CGLChoosePixelFormat(attribs, &pix, &screens)) || !pix)
-    {
-        WARN("CGLChoosePixelFormat() failed with error %d %s\n", err, CGLErrorString(err));
-        return NULL;
-    }
-    if ((err = CGLCreateContext(pix, NULL, &context)) || !context)
-    {
-        WARN("CGLCreateContext() failed with error %d %s\n", err, CGLErrorString(err));
-        context = NULL;
-    }
-    CGLReleasePixelFormat(pix);
-
-    if ((err = CGLSetCurrentContext(context)))
-    {
-        WARN("CGLSetCurrentContext() failed with error %d %s\n", err, CGLErrorString(err));
-        CGLReleaseContext(context);
-        return NULL;
-    }
-
-    return context;
-}
 
 static BOOL init_gl_info(void)
 {
     static const char legacy_extensions[] = " WGL_EXT_extensions_string";
     static const char legacy_ext_swap_control[] = " WGL_EXT_swap_control";
 
+    CGDirectDisplayID display = CGMainDisplayID();
+    CGOpenGLDisplayMask displayMask = CGDisplayIDToOpenGLDisplayMask(display);
+    CGLPixelFormatAttribute attribs[] = {
+        kCGLPFADisplayMask, displayMask,
+        0
+    };
+    CGLPixelFormatAttribute core_attribs[] =
+    {
+        kCGLPFADisplayMask, displayMask,
+        kCGLPFAAccelerated,
+        kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_3_2_Core,
+        0
+    };
+    CGLPixelFormatObj pix;
+    GLint virtualScreens;
+    CGLError err;
     CGLContextObj context;
     CGLContextObj old_context = CGLGetCurrentContext();
     const char *str;
     size_t length;
 
-    if (!(context = init_context(kCGLOGLPVersion_Legacy))) return FALSE;
+    err = CGLChoosePixelFormat(attribs, &pix, &virtualScreens);
+    if (err != kCGLNoError || !pix)
+    {
+        WARN("CGLChoosePixelFormat() failed with error %d %s\n", err, CGLErrorString(err));
+        return FALSE;
+    }
+
+    err = CGLCreateContext(pix, NULL, &context);
+    CGLReleasePixelFormat(pix);
+    if (err != kCGLNoError || !context)
+    {
+        WARN("CGLCreateContext() failed with error %d %s\n", err, CGLErrorString(err));
+        return FALSE;
+    }
+
+    err = CGLSetCurrentContext(context);
+    if (err != kCGLNoError)
+    {
+        WARN("CGLSetCurrentContext() failed with error %d %s\n", err, CGLErrorString(err));
+        CGLReleaseContext(context);
+        return FALSE;
+    }
+
     str = (const char*)pglGetString(GL_EXTENSIONS);
     length = strlen(str) + sizeof(legacy_extensions);
     if (allow_vsync)
@@ -1267,23 +1275,38 @@ static BOOL init_gl_info(void)
 
     CGLSetCurrentContext(old_context);
     CGLReleaseContext(context);
-    core_profile = kCGLOGLPVersion_Legacy;
 
-    if (!(context = init_context(kCGLOGLPVersion_GL3_Core))) return TRUE;
+    err = CGLChoosePixelFormat(core_attribs, &pix, &virtualScreens);
+    if (err != kCGLNoError || !pix)
+    {
+        WARN("CGLChoosePixelFormat() for a core context failed with error %d %s\n",
+             err, CGLErrorString(err));
+        return TRUE;
+    }
+
+    err = CGLCreateContext(pix, NULL, &context);
+    CGLReleasePixelFormat(pix);
+    if (err != kCGLNoError || !context)
+    {
+        WARN("CGLCreateContext() for a core context failed with error %d %s\n",
+             err, CGLErrorString(err));
+        return TRUE;
+    }
+
+    err = CGLSetCurrentContext(context);
+    if (err != kCGLNoError)
+    {
+        WARN("CGLSetCurrentContext() for a core context failed with error %d %s\n",
+             err, CGLErrorString(err));
+        CGLReleaseContext(context);
+        return TRUE;
+    }
+
     str = (const char*)pglGetString(GL_VERSION);
-    TRACE("GL3_Core context version: %s\n", str);
+    TRACE("Core context GL version: %s\n", str);
     sscanf(str, "%u.%u", &gl_info.max_major, &gl_info.max_minor);
     CGLSetCurrentContext(old_context);
     CGLReleaseContext(context);
-    core_profile = kCGLOGLPVersion_GL3_Core;
-
-    if (!(context = init_context(kCGLOGLPVersion_GL4_Core))) return TRUE;
-    str = (const char*)pglGetString(GL_VERSION);
-    TRACE("GL4_Core context version: %s\n", str);
-    sscanf(str, "%u.%u", &gl_info.max_major, &gl_info.max_minor);
-    CGLSetCurrentContext(old_context);
-    CGLReleaseContext(context);
-    core_profile = kCGLOGLPVersion_GL4_Core;
 
     return TRUE;
 }
@@ -1292,7 +1315,7 @@ static BOOL init_gl_info(void)
 /**********************************************************************
  *              create_context
  */
-static BOOL create_context(struct macdrv_context *context, CGLContextObj share, BOOL *shared)
+static BOOL create_context(struct macdrv_context *context, CGLContextObj share, unsigned int major)
 {
     const pixel_format *pf;
     CGLPixelFormatAttribute attribs[64];
@@ -1300,6 +1323,7 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     CGLPixelFormatObj pix;
     GLint virtualScreens;
     CGLError err;
+    BOOL core = major >= 3;
 
     pf = get_pixel_format(context->format, TRUE /* non-displayable */);
     if (!pf)
@@ -1311,6 +1335,14 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
 
     attribs[n++] = kCGLPFAMinimumPolicy;
     attribs[n++] = kCGLPFAClosestPolicy;
+
+    if (context->renderer_id)
+    {
+        attribs[n++] = kCGLPFARendererID;
+        attribs[n++] = context->renderer_id;
+        attribs[n++] = kCGLPFASingleRenderer;
+        attribs[n++] = kCGLPFANoRecovery;
+    }
 
     if (pf->accelerated)
     {
@@ -1326,7 +1358,7 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     if (pf->double_buffer)
         attribs[n++] = kCGLPFADoubleBuffer;
 
-    if (!context->core)
+    if (!core)
     {
         attribs[n++] = kCGLPFAAuxBuffers;
         attribs[n++] = pf->aux_buffers;
@@ -1348,13 +1380,13 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     if (pf->stereo)
         attribs[n++] = kCGLPFAStereo;
 
-    if (pf->accum_mode && !context->core)
+    if (pf->accum_mode && !core)
     {
         attribs[n++] = kCGLPFAAccumSize;
         attribs[n++] = color_modes[pf->accum_mode - 1].color_bits;
     }
 
-    if (pf->pbuffer && !context->core)
+    if (pf->pbuffer && !core)
         attribs[n++] = kCGLPFAPBuffer;
 
     if (pf->sample_buffers && pf->samples)
@@ -1368,10 +1400,13 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     if (pf->backing_store)
         attribs[n++] = kCGLPFABackingStore;
 
-    if (context->core)
+    if (core)
     {
         attribs[n++] = kCGLPFAOpenGLProfile;
-        attribs[n++] = (CGLPixelFormatAttribute)core_profile;
+        if (major == 3)
+            attribs[n++] = (int)kCGLOGLPVersion_GL3_Core;
+        else
+            attribs[n++] = (int)kCGLOGLPVersion_GL4_Core;
     }
 
     attribs[n] = 0;
@@ -1424,23 +1459,28 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     return TRUE;
 }
 
-static BOOL macdrv_surface_create(struct client_surface *client, int format, struct opengl_drawable **drawable)
+static BOOL macdrv_surface_create(HWND hwnd, int format, struct opengl_drawable **drawable)
 {
+    struct macdrv_client_surface *client;
     struct macdrv_win_data *data;
-    HWND hwnd = client->hwnd;
     struct gl_drawable *gl;
 
-    TRACE("client %s, format %d, drawable %p\n", debugstr_client_surface(client), format, drawable);
+    TRACE("hwnd %p, format %d, drawable %p\n", hwnd, format, drawable);
 
     if (!(data = get_win_data(hwnd)))
     {
         FIXME("DC for window %p of other process: not implemented\n", hwnd);
         return FALSE;
     }
+
     data->pixel_format = format;
     release_win_data(data);
 
-    if (!(gl = opengl_drawable_create(sizeof(*gl), &macdrv_surface_funcs, format, client))) return FALSE;
+    if (!(client = macdrv_client_surface_create(hwnd))) return FALSE;
+    gl = opengl_drawable_create(sizeof(*gl), &macdrv_surface_funcs, format, &client->client);
+    client_surface_release(&client->client);
+    if (!gl) return FALSE;
+
     *drawable = &gl->base;
     return TRUE;
 }
@@ -1982,11 +2022,6 @@ static void macdrv_surface_flush(struct opengl_drawable *base, UINT flags)
     if (!context) return;
     if (flags & GL_FLUSH_INTERVAL) set_swap_interval(context, base->interval);
     if (flags & GL_FLUSH_UPDATED) make_context_current(context, context->read_view == client->cocoa_view);
-    if (flags & GL_FLUSH_PRESENT)
-    {
-        macdrv_flush_opengl_context(context->context);
-        client_surface_present(base->client);
-    }
 }
 
 
@@ -2067,13 +2102,14 @@ static UINT macdrv_pbuffer_bind(HDC hdc, struct opengl_drawable *base, GLenum so
  *
  * WGL_ARB_create_context: wglCreateContextAttribsARB
  */
-static BOOL macdrv_context_create(int format, void *share, const int *attrib_list, void **private, BOOL *shared)
+static BOOL macdrv_context_create(int format, void *shared, const int *attrib_list, void **private)
 {
-    struct macdrv_context *share_context = share;
+    struct macdrv_context *share_context = shared;
     struct macdrv_context *context;
     const int *iptr;
     int major = 1, minor = 0, profile = WGL_CONTEXT_CORE_PROFILE_BIT_ARB, flags = 0;
     BOOL core = FALSE;
+    GLint renderer_id = 0;
 
     TRACE("format %d, share_context %p, attrib_list %p\n", format, share_context, attrib_list);
 
@@ -2113,7 +2149,6 @@ static BOOL macdrv_context_create(int format, void *share, const int *attrib_lis
                     RtlSetLastWin32Error(ERROR_INVALID_PROFILE_ARB);
                     return FALSE;
                 }
-                core = value == WGL_CONTEXT_CORE_PROFILE_BIT_ARB;
                 profile = value;
                 break;
 
@@ -2124,16 +2159,18 @@ static BOOL macdrv_context_create(int format, void *share, const int *attrib_lis
         }
     }
 
-    if (major > gl_info.max_major || (major == gl_info.max_major && minor > gl_info.max_minor))
-    {
-        WARN("Profile version %u.%u not supported\n", major, minor);
-        RtlSetLastWin32Error(ERROR_INVALID_VERSION_ARB);
-        return FALSE;
-    }
 
     if ((major == 3 && (minor == 2 || minor == 3)) ||
         (major == 4 && (minor == 0 || minor == 1)))
     {
+        /* CW Hack 24834 */
+        const char *fwd_compat_context = getenv("CX_FWD_COMPAT_GL_CTX");
+        if (fwd_compat_context && fwd_compat_context[0] == '1')
+        {
+            if (!(flags & WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB))
+                flags |= WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB;
+        }
+
         if (!(flags & WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB))
         {
             WARN("OS X only supports forward-compatible 3.2+ contexts\n");
@@ -2146,7 +2183,21 @@ static BOOL macdrv_context_create(int format, void *share, const int *attrib_lis
             RtlSetLastWin32Error(ERROR_INVALID_PROFILE_ARB);
             return FALSE;
         }
+        if (major > gl_info.max_major ||
+            (major == gl_info.max_major && minor > gl_info.max_minor))
+        {
+            WARN("This GL implementation does not support the requested GL version %u.%u\n",
+                 major, minor);
+            RtlSetLastWin32Error(ERROR_INVALID_PROFILE_ARB);
+            return FALSE;
+        }
         core = TRUE;
+    }
+    else if (major >= 3)
+    {
+        WARN("Profile version %u.%u not supported\n", major, minor);
+        RtlSetLastWin32Error(ERROR_INVALID_VERSION_ARB);
+        return FALSE;
     }
     else if (major < 1 || (major == 1 && (minor < 0 || minor > 5)) ||
              (major == 2 && (minor < 0 || minor > 1)))
@@ -2162,18 +2213,11 @@ static BOOL macdrv_context_create(int format, void *share, const int *attrib_lis
         return FALSE;
     }
 
-    if (share_context && share_context->core != core)
-    {
-        WARN("Cannot share core context with compatibility context\n");
-        share_context = NULL;
-        *shared = FALSE;
-    }
-
     if (!(context = calloc(1, sizeof(*context)))) return FALSE;
-    context->core = core;
-    context->format = format;
 
-    if (!create_context(context, share_context ? share_context->cglcontext : NULL, shared))
+    context->format = format;
+    context->renderer_id = renderer_id;
+    if (!create_context(context, share_context ? share_context->cglcontext : NULL, major))
     {
         free(context);
         return FALSE;
@@ -2234,11 +2278,6 @@ static BOOL macdrv_make_current(struct opengl_drawable *draw_base, struct opengl
     {
         macdrv_make_context_current(NULL, NULL, CGRectNull);
         NtCurrentTeb()->glReserved2 = NULL;
-        return TRUE;
-    }
-    if (!draw || !read)
-    {
-        CGLSetCurrentContext(context->cglcontext);
         return TRUE;
     }
 
@@ -2509,13 +2548,150 @@ static BOOL macdrv_pbuffer_updated(HDC hdc, struct opengl_drawable *base, GLenum
     return GL_TRUE;
 }
 
-static void macdrv_init_extensions(struct opengl_funcs *funcs, BOOLEAN extensions[GL_EXTENSION_COUNT])
+
+/* CX HACK 23422 - START
+ * Tomb Raider 1-3 Remastered uses BC7 compressed textures in Remastered mode.
+ *
+ * Credit to nastys
+ */
+
+#define BCDEC_IMPLEMENTATION
+#define BCDEC_STATIC
+#include "opengl_bcdec.h"
+
+static void (*pglCompressedTexImage3D)(GLenum target, GLint level, GLenum internalformat,
+                                       GLsizei width, GLsizei height, GLsizei depth, GLint border,
+                                       GLsizei imageSize, const void *data);
+
+static void (*pglCompressedTexSubImage3D)(GLenum target, GLint level, GLint xoffset, GLint yoffset,
+                                          GLint zoffset, GLsizei width, GLsizei height, GLsizei depth,
+                                          GLenum format, GLsizei imageSize, const void *data);
+
+static void *decode_bptc_unorm_to_rgba(const void *data, GLsizei width, GLsizei height, GLsizei depth)
 {
-    extensions[WGL_WINE_query_renderer] = 1;
+    GLsizei numBlocksX = (width + 3) / 4;
+    GLsizei numBlocksY = (height + 3) / 4;
+    GLsizei numBlocksZ = (depth + 3) / 4;
+    char *pixels;
+
+    if (!data)
+        return NULL;
+
+    pixels = malloc(width * height * depth * 4);
+
+    for (GLsizei z = 0; z < numBlocksZ; z++)
+    {
+        for (GLsizei y = 0; y < numBlocksY; y++)
+        {
+            for (GLsizei x = 0; x < numBlocksX; x++)
+            {
+                GLsizei blockOffsetX = x * 4;
+                GLsizei blockOffsetY = y * 4;
+                GLsizei blockOffsetZ = z;
+                GLsizei blockOffset = blockOffsetZ * numBlocksX * numBlocksY * 4 + blockOffsetY * numBlocksX * 4 + blockOffsetX * 4;
+
+                GLsizei pixelOffsetX = x * 4;
+                GLsizei pixelOffsetY = y * 4;
+                GLsizei pixelOffsetZ = z * width * height * 4;
+                GLsizei pixelOffset = pixelOffsetZ + pixelOffsetY * width * 4 + pixelOffsetX * 4;
+
+                bcdec_bc7((const void*)((const char*)data + blockOffset), (void *)(pixels + pixelOffset), width * 4);
+            }
+        }
+    }
+
+    return pixels;
+}
+
+static void macdrv_glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat,
+                                          GLsizei width, GLsizei height, GLsizei depth, GLint border,
+                                          GLsizei imageSize, const void *data)
+{
+    if ((internalformat == GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM_ARB ||
+         internalformat == GL_COMPRESSED_RGBA_BPTC_UNORM_ARB) &&
+        (target == GL_TEXTURE_2D_ARRAY || target == GL_PROXY_TEXTURE_2D_ARRAY))
+    {
+        char *rawdata = decode_bptc_unorm_to_rgba(data, width, height, depth);
+        pglTexImage3D(target, level, (internalformat == GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM_ARB ? GL_SRGB8_ALPHA8 : GL_RGBA8), width, height, depth, border, GL_RGBA, GL_UNSIGNED_BYTE, rawdata);
+        if (rawdata)
+            free(rawdata);
+    }
+    else
+        pglCompressedTexImage3D(target, level, internalformat, width, height, depth, border, imageSize, data);
+}
+
+static void macdrv_glCompressedTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
+                                             GLint zoffset, GLsizei width, GLsizei height, GLsizei depth,
+                                             GLenum format, GLsizei imageSize, const void *data)
+{
+    if ((format == GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM_ARB ||
+         format == GL_COMPRESSED_RGBA_BPTC_UNORM_ARB) &&
+        (target == GL_TEXTURE_2D_ARRAY || target == GL_PROXY_TEXTURE_2D_ARRAY))
+    {
+        char *pixels = decode_bptc_unorm_to_rgba(data, width, height, depth);
+        pglTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+        if (pixels)
+            free(pixels);
+    }
+    else
+        pglCompressedTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data);
+}
+
+/* CX HACK 23422 - END */
+
+static void register_extension(const char *ext)
+{
+    if (gl_info.wglExtensions[0])
+        strcat(gl_info.wglExtensions, " ");
+    strcat(gl_info.wglExtensions, ext);
+
+    TRACE("'%s'\n", ext);
+}
+
+static const char *macdrv_init_wgl_extensions(struct opengl_funcs *funcs)
+{
+    /*
+     * ARB Extensions
+     */
+
+    if (gluCheckExtension((GLubyte*)"GL_ARB_color_buffer_float", (GLubyte*)gl_info.glExtensions))
+    {
+        register_extension("WGL_ARB_pixel_format_float");
+        register_extension("WGL_ATI_pixel_format_float");
+    }
+
+    if (gluCheckExtension((GLubyte*)"GL_ARB_multisample", (GLubyte*)gl_info.glExtensions))
+        register_extension("WGL_ARB_multisample");
+
+    if (gluCheckExtension((GLubyte*)"GL_ARB_framebuffer_sRGB", (GLubyte*)gl_info.glExtensions))
+        register_extension("WGL_ARB_framebuffer_sRGB");
+
+    if (gluCheckExtension((GLubyte*)"GL_APPLE_pixel_buffer", (GLubyte*)gl_info.glExtensions))
+    {
+        if (gluCheckExtension((GLubyte*)"GL_ARB_texture_rectangle", (GLubyte*)gl_info.glExtensions) ||
+            gluCheckExtension((GLubyte*)"GL_EXT_texture_rectangle", (GLubyte*)gl_info.glExtensions))
+            register_extension("WGL_NV_render_texture_rectangle");
+    }
+
+    /* Presumably identical to [W]GL_ARB_framebuffer_sRGB, above, but clients may
+       check for either, so register them separately. */
+    if (gluCheckExtension((GLubyte*)"GL_EXT_framebuffer_sRGB", (GLubyte*)gl_info.glExtensions))
+        register_extension("WGL_EXT_framebuffer_sRGB");
+
+    if (gluCheckExtension((GLubyte*)"GL_EXT_packed_float", (GLubyte*)gl_info.glExtensions))
+        register_extension("WGL_EXT_pixel_format_packed_float");
+
+    /*
+     * WINE-specific WGL Extensions
+     */
+
+    register_extension("WGL_WINE_query_renderer");
     funcs->p_wglQueryCurrentRendererIntegerWINE = macdrv_wglQueryCurrentRendererIntegerWINE;
     funcs->p_wglQueryCurrentRendererStringWINE = macdrv_wglQueryCurrentRendererStringWINE;
     funcs->p_wglQueryRendererIntegerWINE = macdrv_wglQueryRendererIntegerWINE;
     funcs->p_wglQueryRendererStringWINE = macdrv_wglQueryRendererStringWINE;
+
+    return gl_info.wglExtensions;
 }
 
 /**********************************************************************
@@ -2551,6 +2727,11 @@ UINT macdrv_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, co
     LOAD_FUNCPTR(glGetString);
     LOAD_FUNCPTR(glReadPixels);
     LOAD_FUNCPTR(glCopyColorTable);
+    LOAD_FUNCPTR(glTexImage3D);
+    LOAD_FUNCPTR(glTexSubImage3D);
+    /* CX HACK 23422 */
+    LOAD_FUNCPTR(glCompressedTexImage3D);
+    LOAD_FUNCPTR(glCompressedTexSubImage3D);
 
     if (!init_gl_info())
         goto failed;
@@ -2676,6 +2857,9 @@ static void *macdrv_get_proc_address(const char *name)
 
     /* redirect some OpenGL extension functions */
     if (!strcmp(name, "glCopyColorTable")) return macdrv_glCopyColorTable;
+    /* CX HACK 23422 */
+    if (!strcmp(name, "glCompressedTexImage3D")) return macdrv_glCompressedTexImage3D;
+    if (!strcmp(name, "glCompressedTexSubImage3D")) return macdrv_glCompressedTexSubImage3D;
     return dlsym(opengl_handle, name);
 }
 
@@ -2686,13 +2870,7 @@ static BOOL macdrv_surface_swap(struct opengl_drawable *base)
     TRACE("%s context %p/%p/%p\n", debugstr_opengl_drawable(base), context, (context ? context->context : NULL),
           (context ? context->cglcontext : NULL));
 
-    if (context)
-    {
-        struct macdrv_client_surface *client = impl_from_client_surface(base->client);
-        make_context_current(context, context->read_view == client->cocoa_view);
-        macdrv_flush_opengl_context(context->context);
-    }
-    client_surface_present(base->client);
+    macdrv_flush_opengl_context(context->context);
     return TRUE;
 }
 
@@ -2701,7 +2879,7 @@ static const struct opengl_driver_funcs macdrv_driver_funcs =
     .p_get_proc_address = macdrv_get_proc_address,
     .p_init_pixel_formats = macdrv_init_pixel_formats,
     .p_describe_pixel_format = macdrv_describe_pixel_format,
-    .p_init_extensions = macdrv_init_extensions,
+    .p_init_wgl_extensions = macdrv_init_wgl_extensions,
     .p_surface_create = macdrv_surface_create,
     .p_context_create = macdrv_context_create,
     .p_context_destroy = macdrv_context_destroy,

@@ -2317,9 +2317,9 @@ BOOL WINAPI InternetCrackUrlW(const WCHAR *lpszUrl, DWORD dwUrlLength, DWORD dwF
                 }
             }
             /* if ends in \. or \.. append a backslash */
-            if (len >= 2 && tmppath[len - 1] == '.' &&
+            if (tmppath[len - 1] == '.' &&
                     (tmppath[len - 2] == '\\' ||
-                     (len >= 3 && tmppath[len - 2] == '.' && tmppath[len - 3] == '\\')))
+                     (tmppath[len - 2] == '.' && tmppath[len - 3] == '\\')))
             {
                 if (len < MAX_PATH - 1)
                 {
@@ -4176,26 +4176,28 @@ BOOL WINAPI InternetCheckConnectionW( LPCWSTR lpszUrl, DWORD dwFlags, DWORD dwRe
 
   if (dwFlags & FLAG_ICC_FORCE_CONNECTION)
   {
-      struct server_addr *addr;
+      struct sockaddr_storage saddr;
+      int sa_len = sizeof(saddr);
       WCHAR *host_z;
       int fd;
+      BOOL b;
 
       host_z = strndupW(host, host_len);
       if (!host_z)
           return FALSE;
 
-      addr = GetAddress(host_z, port);
+      b = GetAddress(host_z, port, (struct sockaddr *)&saddr, &sa_len, NULL);
       free(host_z);
-      if(!addr)
+      if(!b)
           goto End;
       init_winsock();
-      fd = create_connect_socket(addr, AF_UNSPEC, INFINITE, NULL, 0);
+      fd = socket(saddr.ss_family, SOCK_STREAM, 0);
       if (fd != -1)
       {
-          rc = TRUE;
+          if (connect(fd, (struct sockaddr *)&saddr, sa_len) == 0)
+              rc = TRUE;
           closesocket(fd);
       }
-      free(addr);
   }
   else
   {

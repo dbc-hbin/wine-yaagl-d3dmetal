@@ -33,6 +33,7 @@
 #endif
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "winternl.h"
 
 #include "file.h"
@@ -178,7 +179,7 @@ void init_thread_context( struct thread *thread )
 void get_thread_context( struct thread *thread, struct context_data *context, unsigned int flags )
 {
 #if defined(__aarch64__) && defined(WINE_TUNED_X86_SERVER)
-    /* Match the existing Rosetta fallback: x86 debug registers cannot be read cross-process. */
+    /* As in the Rosetta fallback, x86 debug registers cannot be read cross-process. */
     assert( flags == SERVER_CTX_DEBUG_REGISTERS );
     memset( &context->debug, 0, sizeof(context->debug) );
     context->flags |= SERVER_CTX_DEBUG_REGISTERS;
@@ -269,7 +270,7 @@ done:
 void set_thread_context( struct thread *thread, const struct context_data *context, unsigned int flags )
 {
 #if defined(__aarch64__) && defined(WINE_TUNED_X86_SERVER)
-    /* Match the existing Rosetta fallback: x86 debug registers cannot be set cross-process. */
+    /* As in the Rosetta fallback, x86 debug registers cannot be set cross-process. */
     assert( flags == SERVER_CTX_DEBUG_REGISTERS );
     set_error( STATUS_UNSUCCESSFUL );
 #elif defined(__i386__) || defined(__x86_64__)

@@ -131,35 +131,15 @@ static HRESULT WINAPI HTMLTextAreaElement_get_status(IHTMLTextAreaElement *iface
 static HRESULT WINAPI HTMLTextAreaElement_put_disabled(IHTMLTextAreaElement *iface, VARIANT_BOOL v)
 {
     HTMLTextAreaElement *This = impl_from_IHTMLTextAreaElement(iface);
-    nsresult nsres;
-
-    TRACE("(%p)->(%x)\n", This, v);
-
-    nsres = nsIDOMHTMLTextAreaElement_SetDisabled(This->nstextarea, v != VARIANT_FALSE);
-    if(NS_FAILED(nsres)) {
-        ERR("SetDisabled failed: %08lx\n", nsres);
-        return E_FAIL;
-    }
-
-    return S_OK;
+    FIXME("(%p)->(%x)\n", This, v);
+    return E_NOTIMPL;
 }
 
 static HRESULT WINAPI HTMLTextAreaElement_get_disabled(IHTMLTextAreaElement *iface, VARIANT_BOOL *p)
 {
     HTMLTextAreaElement *This = impl_from_IHTMLTextAreaElement(iface);
-    nsresult nsres;
-    cpp_bool b;
-
-    TRACE("(%p)->(%p)\n", This, p);
-
-    nsres = nsIDOMHTMLTextAreaElement_GetDisabled(This->nstextarea, &b);
-    if(NS_FAILED(nsres)) {
-        ERR("GetDisabled failed: %08lx\n", nsres);
-        return E_FAIL;
-    }
-
-    *p = variant_bool(b);
-    return S_OK;
+    FIXME("(%p)->(%p)\n", This, p);
+    return E_NOTIMPL;
 }
 
 static HRESULT WINAPI HTMLTextAreaElement_get_form(IHTMLTextAreaElement *iface, IHTMLFormElement **p)

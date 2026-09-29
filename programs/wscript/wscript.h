@@ -16,10 +16,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-/* The sources of this module are also built for the cscript module, which
- * generates its own ihost.h.  Use angle brackets to prevent the compiler from
- * picking up the ihost.h from this directory when building cscript. */
-#include <ihost.h>
+#include "ihost.h"
 
 extern IHost host_obj;
 
@@ -36,7 +33,3 @@ extern WCHAR **argums;
 extern int numOfArgs;
 
 extern VARIANT_BOOL wshInteractive;
-
-extern LONG wshTimeout;
-
-void schedule_timeout(LONG seconds);

@@ -31,9 +31,6 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(bitblt);
 
-extern macdrv_window macdrv_retain_cocoa_window(macdrv_window window);
-extern void macdrv_release_cocoa_window(macdrv_window window);
-
 static inline int get_dib_stride(int width, int bpp)
 {
     return ((width * bpp + 31) >> 3) & ~3;
@@ -54,14 +51,6 @@ struct macdrv_window_surface
 };
 
 static struct macdrv_window_surface *get_mac_surface(struct window_surface *surface);
-
-static CGColorSpaceRef surface_colorspace;
-static pthread_once_t surface_colorspace_once = PTHREAD_ONCE_INIT;
-
-static void create_surface_colorspace(void)
-{
-    surface_colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-}
 
 static CGDataProviderRef data_provider_create(size_t size, void **bits)
 {
@@ -94,13 +83,14 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
 {
     struct macdrv_window_surface *surface = get_mac_surface(window_surface);
     CGImageAlphaInfo alpha_info = (window_surface->alpha_mask ? kCGImageAlphaPremultipliedFirst : kCGImageAlphaNoneSkipFirst);
+    CGColorSpaceRef colorspace;
     CGImageRef image;
-    struct macdrv_win_data *data;
 
-    pthread_once(&surface_colorspace_once, create_surface_colorspace);
+    colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     image = CGImageCreate(color_info->bmiHeader.biWidth, abs(color_info->bmiHeader.biHeight), 8, 32,
-                          color_info->bmiHeader.biSizeImage / abs(color_info->bmiHeader.biHeight), surface_colorspace,
+                          color_info->bmiHeader.biSizeImage / abs(color_info->bmiHeader.biHeight), colorspace,
                           alpha_info | kCGBitmapByteOrder32Little, surface->provider, NULL, retina_on, kCGRenderingIntentDefault);
+    CGColorSpaceRelease(colorspace);
 
     macdrv_window_set_color_image(surface->window, image, cgrect_from_rect(*rect), cgrect_from_rect(*dirty));
     CGImageRelease(image);
@@ -130,19 +120,6 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
         }
     }
 
-    /* The window may have been previously drawn with client_surface, for example, when the window
-     * had been a target for a D3D swapchain. Hide the client_view so that it doesn't occlude the
-     * content in the window_surface */
-    if ((data = get_win_data(window_surface->hwnd)))
-    {
-        if (data->client_view)
-        {
-            macdrv_set_view_hidden(data->client_view, TRUE);
-            data->client_view = NULL;
-        }
-        release_win_data(data);
-    }
-
     return TRUE;
 }
 
@@ -154,7 +131,6 @@ static void macdrv_surface_destroy(struct window_surface *window_surface)
     struct macdrv_window_surface *surface = get_mac_surface(window_surface);
 
     TRACE("freeing %p\n", surface);
-    macdrv_release_cocoa_window(surface->window);
     CGDataProviderRelease(surface->provider);
 }
 
@@ -224,7 +200,7 @@ static struct window_surface *create_surface(HWND hwnd, macdrv_window window, co
     else
     {
         surface = get_mac_surface(window_surface);
-        surface->window = macdrv_retain_cocoa_window(window);
+        surface->window = window;
         surface->provider = provider;
     }
 

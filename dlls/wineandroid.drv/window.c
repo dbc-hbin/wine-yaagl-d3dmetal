@@ -99,7 +99,8 @@ static struct android_win_data *alloc_win_data( HWND hwnd )
     if ((data = calloc( 1, sizeof(*data) )))
     {
         data->hwnd = hwnd;
-        data->window = create_ioctl_window( hwnd, FALSE );
+        data->window = create_ioctl_window( hwnd, FALSE,
+                                            (float)NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) / NtUserGetDpiForWindow( hwnd ));
         pthread_mutex_lock( &win_data_mutex );
         win_data_context[context_idx(hwnd)] = data;
     }
@@ -173,10 +174,8 @@ struct java_event
 
 static struct list event_queue = LIST_INIT( event_queue );
 static struct java_event *current_event;
-int event_source = -1;
+static int event_pipe[2];
 static DWORD desktop_tid;
-
-extern int event_sink;
 
 /***********************************************************************
  *           send_event
@@ -185,7 +184,7 @@ int send_event( const union event_data *data )
 {
     int res;
 
-    if ((res = write( event_sink, data, sizeof(*data) )) != sizeof(*data))
+    if ((res = write( event_pipe[1], data, sizeof(*data) )) != sizeof(*data))
     {
         p__android_log_print( ANDROID_LOG_ERROR, "wine", "failed to send event" );
         return -1;
@@ -248,12 +247,11 @@ void surface_changed( JNIEnv *env, jobject obj, jint win, jobject surface, jbool
 
         if (win->query( win, NATIVE_WINDOW_WIDTH, &width ) < 0) width = 0;
         if (win->query( win, NATIVE_WINDOW_HEIGHT, &height ) < 0) height = 0;
+        data.surface.window = win;
         data.surface.width = width;
         data.surface.height = height;
-        p__android_log_print( ANDROID_LOG_INFO, "wine", "surface_changed: %p %p %s %ux%u",
-                              data.surface.hwnd, win, client ? "client" : "whole", width, height );
-
-        register_native_window( data.surface.hwnd, win, data.surface.client );
+        p__android_log_print( ANDROID_LOG_INFO, "wine", "surface_changed: %p %s %ux%u",
+                              data.surface.hwnd, client ? "client" : "whole", width, height );
     }
     data.type = SURFACE_CHANGED;
     send_event( &data );
@@ -296,7 +294,7 @@ jboolean motion_event( JNIEnv *env, jobject obj, jint win, jint action, jint x, 
     data.motion.input.mi.mouseData   = 0;
     data.motion.input.mi.time        = 0;
     data.motion.input.mi.dwExtraInfo = 0;
-    data.motion.input.mi.dwFlags     = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE_NOCOALESCE;
+    data.motion.input.mi.dwFlags     = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
     switch (action & AMOTION_EVENT_ACTION_MASK)
     {
     case AMOTION_EVENT_ACTION_DOWN:
@@ -345,7 +343,12 @@ static void init_event_queue(void)
     HANDLE handle;
     int ret;
 
-    if (wine_server_fd_to_handle( event_source, GENERIC_READ | SYNCHRONIZE, 0, &handle ))
+    if (pipe2( event_pipe, O_CLOEXEC | O_NONBLOCK ) == -1)
+    {
+        ERR( "could not create data\n" );
+        NtTerminateProcess( 0, 1 );
+    }
+    if (wine_server_fd_to_handle( event_pipe[0], GENERIC_READ | SYNCHRONIZE, 0, &handle ))
     {
         ERR( "Can't allocate handle for event fd\n" );
         NtTerminateProcess( 0, 1 );
@@ -380,7 +383,7 @@ static void pull_events(void)
     {
         if (!(event = malloc( sizeof(*event) ))) break;
 
-        res = read( event_source, &event->data, sizeof(event->data) );
+        res = read( event_pipe[0], &event->data, sizeof(event->data) );
         if (res != sizeof(event->data)) break;
         list_add_tail( &event_queue, &event->entry );
     }
@@ -450,15 +453,17 @@ static int process_events( DWORD mask )
             break;
 
         case SURFACE_CHANGED:
-            TRACE("SURFACE_CHANGED %p %s size %ux%u\n", event->data.surface.hwnd,
-                  event->data.surface.client ? "client" : "whole",
+            TRACE("SURFACE_CHANGED %p %p %s size %ux%u\n", event->data.surface.hwnd,
+                  event->data.surface.window, event->data.surface.client ? "client" : "whole",
                   event->data.surface.width, event->data.surface.height );
 
-            NtUserPostMessage( event->data.surface.hwnd, WM_ANDROID_REFRESH, event->data.surface.client, 0 );
+            register_native_window( event->data.surface.hwnd, event->data.surface.window, event->data.surface.client );
             break;
 
         case MOTION_EVENT:
             {
+                HWND capture = get_capture_window();
+
                 if (event->data.motion.input.mi.dwFlags & (MOUSEEVENTF_LEFTDOWN|MOUSEEVENTF_RIGHTDOWN|MOUSEEVENTF_MIDDLEDOWN))
                     TRACE( "BUTTONDOWN pos %d,%d hwnd %p flags %x\n",
                            event->data.motion.input.mi.dx, event->data.motion.input.mi.dy,
@@ -471,8 +476,21 @@ static int process_events( DWORD mask )
                     TRACE( "MOUSEMOVE pos %d,%d hwnd %p flags %x\n",
                            event->data.motion.input.mi.dx, event->data.motion.input.mi.dy,
                            event->data.motion.hwnd, event->data.motion.input.mi.dwFlags );
+                if (!capture && (event->data.motion.input.mi.dwFlags & MOUSEEVENTF_ABSOLUTE))
+                {
+                    RECT rect;
+                    SetRect( &rect, event->data.motion.input.mi.dx, event->data.motion.input.mi.dy,
+                             event->data.motion.input.mi.dx + 1, event->data.motion.input.mi.dy + 1 );
 
-                NtUserSendHardwareInput( event->data.motion.hwnd, 0, &event->data.motion.input, 0 );
+                    SERVER_START_REQ( update_window_zorder )
+                    {
+                        req->window      = wine_server_user_handle( event->data.motion.hwnd );
+                        req->rect        = wine_server_rectangle( rect );
+                        wine_server_call( req );
+                    }
+                    SERVER_END_REQ;
+                }
+                NtUserSendHardwareInput( capture ? capture : event->data.motion.hwnd, 0, &event->data.motion.input, 0 );
             }
             break;
 
@@ -497,7 +515,7 @@ static int process_events( DWORD mask )
         next = LIST_ENTRY( event_queue.next, struct java_event, entry );
     }
     current_event = previous;
-    return list_empty( &event_queue ) && !check_fd_events( event_source, POLLIN );
+    return list_empty( &event_queue ) && !check_fd_events( event_pipe[0], POLLIN );
 }
 
 
@@ -513,7 +531,7 @@ static int wait_events( int timeout )
         struct pollfd pollfd;
         int ret;
 
-        pollfd.fd = event_source;
+        pollfd.fd = event_pipe[0];
         pollfd.events = POLLIN | POLLHUP;
         ret = poll( &pollfd, 1, timeout );
         if (ret == -1 && errno == EINTR) continue;
@@ -957,6 +975,8 @@ BOOL ANDROID_CreateWindow( HWND hwnd )
     {
         struct android_win_data *data;
 
+        init_event_queue();
+        start_android_device();
         if (!(data = alloc_win_data( hwnd ))) return FALSE;
         release_win_data( data );
     }
@@ -1087,7 +1107,7 @@ void ANDROID_SetParent( HWND hwnd, HWND parent, HWND old_parent )
     TRACE( "win %p parent %p -> %p\n", hwnd, old_parent, parent );
 
     data->parent = (parent == NtUserGetDesktopWindow()) ? 0 : parent;
-    ioctl_set_window_parent( hwnd, parent );
+    ioctl_set_window_parent( hwnd, parent, (float)NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) / NtUserGetDpiForWindow( hwnd ));
     release_win_data( data );
 }
 
@@ -1095,7 +1115,7 @@ void ANDROID_SetParent( HWND hwnd, HWND parent, HWND old_parent )
 /***********************************************************************
  *           ANDROID_SetCapture
  */
-void ANDROID_SetCapture( HWND hwnd, UINT flags, HWND previous )
+void ANDROID_SetCapture( HWND hwnd, UINT flags )
 {
     if (!(flags & (GUI_INMOVESIZE | GUI_INMENUMODE))) return;
     ioctl_set_capture( hwnd );
@@ -1181,7 +1201,7 @@ LRESULT ANDROID_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
         }
         else
         {
-            NtUserExposeWindowSurface( hwnd, 0, NULL );
+            NtUserExposeWindowSurface( hwnd, 0, NULL, 0 );
         }
         return 0;
     default:
@@ -1196,7 +1216,7 @@ ANativeWindow *get_client_window( HWND hwnd )
     ANativeWindow *client;
 
     if (!(data = get_win_data( hwnd ))) return NULL;
-    if (!data->client) data->client = create_ioctl_window( hwnd, TRUE );
+    if (!data->client) data->client = create_ioctl_window( hwnd, TRUE, 1.0f );
     client = grab_ioctl_window( data->client );
     release_win_data( data );
 
@@ -1220,8 +1240,6 @@ BOOL has_client_surface( HWND hwnd )
  */
 BOOL ANDROID_CreateDesktop( const WCHAR *name, UINT width, UINT height )
 {
-    createDesktopView( &event_source );
-    init_event_queue();
     /* wait until we receive the surface changed event */
     while (!screen_width)
     {
@@ -1232,5 +1250,5 @@ BOOL ANDROID_CreateDesktop( const WCHAR *name, UINT width, UINT height )
         }
         process_events( QS_ALLINPUT );
     }
-    return TRUE;
+    return 0;
 }

@@ -41,7 +41,6 @@ enum {
 {
     NSMutableArray* events;
     NSLock*         eventsLock;
-    NSUInteger      cleanupIndex;
 
     int             fds[2]; /* Pipe signaling when there are events queued. */
     int             kq; /* kqueue for waiting in OnMainThread(). */

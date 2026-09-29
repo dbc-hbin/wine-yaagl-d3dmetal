@@ -31,5 +31,4 @@ import "windows.storage.idl";
 
 namespace Windows.Storage.Streams {
     runtimeclass RandomAccessStreamReference;
-    runtimeclass InMemoryRandomAccessStream;
 }

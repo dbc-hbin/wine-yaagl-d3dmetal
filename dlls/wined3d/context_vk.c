@@ -167,22 +167,6 @@ static VkColorComponentFlags vk_colour_write_mask_from_wined3d(uint32_t wined3d_
     return vk_mask;
 }
 
-static VkPolygonMode vk_polygon_mode_from_wined3d(enum wined3d_fill_mode mode)
-{
-    switch (mode)
-    {
-        case WINED3D_FILL_POINT:
-            return VK_POLYGON_MODE_POINT;
-        case WINED3D_FILL_SOLID:
-            return VK_POLYGON_MODE_FILL;
-        case WINED3D_FILL_WIREFRAME:
-            return VK_POLYGON_MODE_LINE;
-        default:
-            FIXME("Unhandled fill mode %#x.\n", mode);
-            return VK_POLYGON_MODE_FILL;
-    }
-}
-
 static VkCullModeFlags vk_cull_mode_from_wined3d(enum wined3d_cull mode)
 {
     switch (mode)
@@ -623,24 +607,45 @@ BOOL wined3d_context_vk_create_bo(struct wined3d_context_vk *context_vk, VkDevic
     return TRUE;
 }
 
-bool wined3d_context_vk_create_image(struct wined3d_context_vk *context_vk,
-        const VkImageCreateInfo *desc, struct wined3d_image_vk *image)
+BOOL wined3d_context_vk_create_image(struct wined3d_context_vk *context_vk, VkImageType vk_image_type,
+        VkImageUsageFlags usage, VkFormat vk_format, unsigned int width, unsigned int height, unsigned int depth,
+        unsigned int sample_count, unsigned int mip_levels, unsigned int layer_count, unsigned int flags,
+        const void *next, struct wined3d_image_vk *image)
 {
     struct wined3d_adapter_vk *adapter_vk = wined3d_adapter_vk(context_vk->c.device->adapter);
     struct wined3d_device_vk *device_vk = wined3d_device_vk(context_vk->c.device);
     const struct wined3d_vk_info *vk_info = context_vk->vk_info;
     VkMemoryRequirements memory_requirements;
+    VkImageCreateInfo create_info;
     unsigned int memory_type_idx;
     VkResult vr;
 
+    create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    create_info.pNext = next;
+    create_info.flags = flags;
+    create_info.imageType = vk_image_type;
+    create_info.format = vk_format;
+    create_info.extent.width = width;
+    create_info.extent.height = height;
+    create_info.extent.depth = depth;
+    create_info.mipLevels = mip_levels;
+    create_info.arrayLayers = layer_count;
+    create_info.samples = sample_count;
+    create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    create_info.usage = usage;
+    create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    create_info.queueFamilyIndexCount = 0;
+    create_info.pQueueFamilyIndices = NULL;
+    create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
     image->command_buffer_id = 0;
 
-    vr = VK_CALL(vkCreateImage(device_vk->vk_device, desc, NULL, &image->vk_image));
+    vr = VK_CALL(vkCreateImage(device_vk->vk_device, &create_info, NULL, &image->vk_image));
     if (vr != VK_SUCCESS)
     {
         ERR("Failed to create image, vr %s.\n", wined3d_debug_vkresult(vr));
         image->vk_image = VK_NULL_HANDLE;
-        return false;
+        return FALSE;
     }
 
     VK_CALL(vkGetImageMemoryRequirements(device_vk->vk_device, image->vk_image,
@@ -653,7 +658,7 @@ bool wined3d_context_vk_create_image(struct wined3d_context_vk *context_vk,
         ERR("Failed to find suitable image memory type.\n");
         VK_CALL(vkDestroyImage(device_vk->vk_device, image->vk_image, NULL));
         image->vk_image = VK_NULL_HANDLE;
-        return false;
+        return FALSE;
     }
 
     image->memory = wined3d_context_vk_allocate_memory(context_vk, memory_type_idx,
@@ -663,7 +668,7 @@ bool wined3d_context_vk_create_image(struct wined3d_context_vk *context_vk,
         ERR("Failed to allocate image memory.\n");
         VK_CALL(vkDestroyImage(device_vk->vk_device, image->vk_image, NULL));
         image->vk_image = VK_NULL_HANDLE;
-        return false;
+        return FALSE;
     }
 
     vr = VK_CALL(vkBindImageMemory(device_vk->vk_device, image->vk_image, image->vk_memory,
@@ -679,10 +684,10 @@ bool wined3d_context_vk_create_image(struct wined3d_context_vk *context_vk,
         image->memory = NULL;
         image->vk_memory = VK_NULL_HANDLE;
         image->vk_image = VK_NULL_HANDLE;
-        return false;
+        return FALSE;
     }
 
-    return true;
+    return TRUE;
 }
 
 static struct wined3d_retired_object_vk *wined3d_context_vk_get_retired_object_vk(struct wined3d_context_vk *context_vk)
@@ -1138,30 +1143,6 @@ void wined3d_context_vk_destroy_vk_video_parameters(struct wined3d_context_vk *c
     o->command_buffer_id = command_buffer_id;
 }
 
-void wined3d_context_vk_destroy_va_decoder(struct wined3d_context_vk *context_vk,
-        uint64_t handle, uint64_t command_buffer_id)
-{
-    struct wined3d_device_vk *device_vk = wined3d_device_vk(context_vk->c.device);
-    struct wined3d_retired_object_vk *o;
-
-    if (context_vk->completed_command_buffer_id >= command_buffer_id)
-    {
-        wined3d_decoder_va_vk_destroy_va_decoder(device_vk, handle);
-        TRACE("Destroyed VA decoder 0x%s.\n", wine_dbgstr_longlong(handle));
-        return;
-    }
-
-    if (!(o = wined3d_context_vk_get_retired_object_vk(context_vk)))
-    {
-        ERR("Leaking VA decoder 0x%s.\n", wine_dbgstr_longlong(handle));
-        return;
-    }
-
-    o->type = WINED3D_RETIRED_DECODER_VA_VK;
-    o->u.va_decoder = handle;
-    o->command_buffer_id = command_buffer_id;
-}
-
 void wined3d_context_vk_destroy_image(struct wined3d_context_vk *context_vk, struct wined3d_image_vk *image)
 {
     wined3d_context_vk_destroy_vk_image(context_vk, image->vk_image, image->command_buffer_id);
@@ -1473,10 +1454,6 @@ static void wined3d_context_vk_cleanup_resources(struct wined3d_context_vk *cont
             case WINED3D_RETIRED_AUX_COMMAND_BUFFER_VK:
                 wined3d_aux_command_pool_vk_complete_buffer(context_vk,
                         o->u.aux_command_buffer.pool, &o->u.aux_command_buffer.buffer);
-                break;
-
-            case WINED3D_RETIRED_DECODER_VA_VK:
-                wined3d_decoder_va_vk_destroy_va_decoder(device_vk, o->u.va_decoder);
                 break;
 
             default:
@@ -2426,7 +2403,6 @@ static void wined3d_context_vk_init_graphics_pipeline_key(struct wined3d_context
     {
         dynamic_states[dynamic_state_count++] = VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT;
         dynamic_states[dynamic_state_count++] = VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE_EXT;
-        dynamic_states[dynamic_state_count++] = VK_DYNAMIC_STATE_POLYGON_MODE_EXT;
         dynamic_states[dynamic_state_count++] = VK_DYNAMIC_STATE_CULL_MODE_EXT;
         dynamic_states[dynamic_state_count++] = VK_DYNAMIC_STATE_FRONT_FACE_EXT;
         dynamic_states[dynamic_state_count++] = VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE_EXT;
@@ -2510,7 +2486,6 @@ static void rasterizer_state_from_wined3d(VkPipelineRasterizationStateCreateInfo
     {
         desc->depthClampEnable = VK_FALSE;
         desc->rasterizerDiscardEnable = is_rasterization_disabled(state->shader[WINED3D_SHADER_TYPE_GEOMETRY]);
-        desc->polygonMode = VK_POLYGON_MODE_FILL;
         desc->cullMode = VK_CULL_MODE_BACK_BIT;
         desc->frontFace = VK_FRONT_FACE_CLOCKWISE;
         desc->depthBiasEnable = VK_FALSE;
@@ -2524,7 +2499,6 @@ static void rasterizer_state_from_wined3d(VkPipelineRasterizationStateCreateInfo
     r = &state->rasterizer_state->desc;
     desc->depthClampEnable = !r->depth_clip;
     desc->rasterizerDiscardEnable = is_rasterization_disabled(state->shader[WINED3D_SHADER_TYPE_GEOMETRY]);
-    desc->polygonMode = vk_polygon_mode_from_wined3d(r->fill_mode);
     desc->cullMode = vk_cull_mode_from_wined3d(r->cull_mode);
     desc->frontFace = r->front_ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
 
@@ -2573,7 +2547,6 @@ static void wined3d_context_vk_set_dynamic_rasterizer_state(const struct wined3d
 
     VK_CALL(vkCmdSetRasterizerDiscardEnableEXT(vk_command_buffer, desc.rasterizerDiscardEnable));
     VK_CALL(vkCmdSetDepthClampEnableEXT(vk_command_buffer, desc.depthClampEnable));
-    VK_CALL(vkCmdSetPolygonModeEXT(vk_command_buffer, desc.polygonMode));
     VK_CALL(vkCmdSetCullModeEXT(vk_command_buffer, desc.cullMode));
     VK_CALL(vkCmdSetFrontFaceEXT(vk_command_buffer, desc.frontFace));
     VK_CALL(vkCmdSetDepthBiasEnableEXT(vk_command_buffer, desc.depthBiasEnable));
@@ -2673,11 +2646,8 @@ static void wined3d_context_vk_set_dynamic_blend_state(const struct wined3d_cont
         static const VkColorComponentFlags default_write_mask[WINED3D_MAX_RENDER_TARGETS] = {X, X, X, X, X, X, X, X};
 #undef X
 
-        if (rt_count)
-        {
-            VK_CALL(vkCmdSetColorBlendEnableEXT(vk_command_buffer, 0, rt_count, default_enable));
-            VK_CALL(vkCmdSetColorWriteMaskEXT(vk_command_buffer, 0, rt_count, default_write_mask));
-        }
+        VK_CALL(vkCmdSetColorBlendEnableEXT(vk_command_buffer, 0, rt_count, default_enable));
+        VK_CALL(vkCmdSetColorWriteMaskEXT(vk_command_buffer, 0, rt_count, default_write_mask));
         return;
     }
 
@@ -2695,12 +2665,9 @@ static void wined3d_context_vk_set_dynamic_blend_state(const struct wined3d_cont
         blend_equation_from_wined3d(context_vk, &equations[i], rt, state->fb.render_targets[i]);
     }
 
-    if (rt_count)
-    {
-        VK_CALL(vkCmdSetColorBlendEnableEXT(vk_command_buffer, 0, rt_count, enable));
-        VK_CALL(vkCmdSetColorWriteMaskEXT(vk_command_buffer, 0, rt_count, write_mask));
-        VK_CALL(vkCmdSetColorBlendEquationEXT(vk_command_buffer, 0, rt_count, equations));
-    }
+    VK_CALL(vkCmdSetColorBlendEnableEXT(vk_command_buffer, 0, rt_count, enable));
+    VK_CALL(vkCmdSetColorWriteMaskEXT(vk_command_buffer, 0, rt_count, write_mask));
+    VK_CALL(vkCmdSetColorBlendEquationEXT(vk_command_buffer, 0, rt_count, equations));
 }
 
 static VkFormat vk_format_from_component_type(enum wined3d_component_type component_type)
@@ -2979,6 +2946,7 @@ static bool wined3d_context_vk_begin_render_pass(struct wined3d_context_vk *cont
     unsigned int fb_width, fb_height, fb_layer_count;
     struct wined3d_rendertarget_view_vk *rtv_vk;
     struct wined3d_rendertarget_view *view;
+    struct wined3d_adapter_vk *adapter_vk;
     const VkPhysicalDeviceLimits *limits;
     struct wined3d_query_vk *query_vk;
     VkCommandBuffer vk_command_buffer;
@@ -2986,12 +2954,14 @@ static bool wined3d_context_vk_begin_render_pass(struct wined3d_context_vk *cont
     unsigned int attachment_count, i;
     struct wined3d_texture *texture;
     VkFramebufferCreateInfo fb_desc;
+    int offset_x = 0, offset_y = 0;
     VkResult vr;
 
     if (context_vk->vk_render_pass)
         return true;
 
-    limits = &wined3d_adapter_vk(device_vk->d.adapter)->device_limits;
+    adapter_vk = wined3d_adapter_vk(device_vk->d.adapter);
+    limits = &adapter_vk->device_limits;
     fb_width = limits->maxFramebufferWidth;
     fb_height = limits->maxFramebufferHeight;
     fb_layer_count = limits->maxFramebufferLayers;
@@ -3110,6 +3080,28 @@ static bool wined3d_context_vk_begin_render_pass(struct wined3d_context_vk *cont
     fb_desc.height = fb_height;
     fb_desc.layers = fb_layer_count;
 
+    /* CX Hack 20098: on Apple's tiled GPUs, we should trim the render area, so that it doesn't
+     * try to preallocate huge amounts of memory for rasterization when there's no attachments.
+     * For now, let's always do that if we're running with MoltenVK. We could detect only
+     * the tiled architecture GPUs if needed.
+     * Note that multiple viewports are disabled when using MoltenVK (for bug 22877).
+     */
+    context_vk->hack_render_area_trimmed_to_viewport = 0;
+    if (adapter_vk->driver_properties.driverID == VK_DRIVER_ID_MOLTENVK &&
+            !attachment_count)
+    {
+        WARN("No attachments, trimming render area to the viewport.\n");
+
+        fb_width = ceilf(state->viewports[0].width);
+        fb_height = ceilf(-state->viewports[0].height);
+        fb_desc.layers = 1;
+
+        offset_x = state->viewports[0].x;
+        offset_y = state->viewports[0].y + state->viewports[0].height;
+
+        context_vk->hack_render_area_trimmed_to_viewport = 1;
+    }
+
     if ((vr = VK_CALL(vkCreateFramebuffer(device_vk->vk_device, &fb_desc, NULL, &context_vk->vk_framebuffer))) < 0)
     {
         WARN("Failed to create Vulkan framebuffer, vr %s.\n", wined3d_debug_vkresult(vr));
@@ -3120,8 +3112,8 @@ static bool wined3d_context_vk_begin_render_pass(struct wined3d_context_vk *cont
     begin_info.pNext = NULL;
     begin_info.renderPass = context_vk->vk_render_pass;
     begin_info.framebuffer = context_vk->vk_framebuffer;
-    begin_info.renderArea.offset.x = 0;
-    begin_info.renderArea.offset.y = 0;
+    begin_info.renderArea.offset.x = offset_x;
+    begin_info.renderArea.offset.y = offset_y;
     begin_info.renderArea.extent.width = fb_width;
     begin_info.renderArea.extent.height = fb_height;
     begin_info.pClearValues = clear_values;
@@ -4056,7 +4048,9 @@ VkCommandBuffer wined3d_context_vk_apply_draw_state(struct wined3d_context_vk *c
 
     wined3d_context_vk_load_buffers(context_vk, state, indirect_vk, indexed);
 
-    if (wined3d_context_is_graphics_state_dirty(&context_vk->c, STATE_FRAMEBUFFER))
+    if (wined3d_context_is_graphics_state_dirty(&context_vk->c, STATE_FRAMEBUFFER) ||
+            (context_vk->hack_render_area_trimmed_to_viewport &&
+            wined3d_context_is_graphics_state_dirty(&context_vk->c, STATE_VIEWPORT)))
         wined3d_context_vk_end_current_render_pass(context_vk);
 
     if (!wined3d_context_vk_begin_render_pass(context_vk, state, vk_info))
@@ -4405,6 +4399,7 @@ static VkCommandPool create_command_pool(struct wined3d_device_vk *device_vk,
 HRESULT wined3d_context_vk_init(struct wined3d_context_vk *context_vk, struct wined3d_swapchain *swapchain)
 {
     const struct wined3d_vk_info *vk_info;
+    struct wined3d_adapter_vk *adapter_vk;
     struct wined3d_device_vk *device_vk;
 
     TRACE("context_vk %p, swapchain %p.\n", context_vk, swapchain);
@@ -4412,7 +4407,8 @@ HRESULT wined3d_context_vk_init(struct wined3d_context_vk *context_vk, struct wi
     memset(context_vk, 0, sizeof(*context_vk));
     wined3d_context_init(&context_vk->c, swapchain);
     device_vk = wined3d_device_vk(swapchain->device);
-    context_vk->vk_info = vk_info = &device_vk->vk_info;
+    adapter_vk = wined3d_adapter_vk(device_vk->d.adapter);
+    context_vk->vk_info = vk_info = &adapter_vk->vk_info;
 
     if (!(context_vk->vk_command_pool = create_command_pool(device_vk,
             vk_info, device_vk->graphics_queue.vk_queue_family_index)))

@@ -93,10 +93,10 @@
 @ stub SspiGetTargetHostName
 @ stub SspiIsAuthIdentityEncrypted
 @ stdcall SspiLocalFree(ptr)
-@ stdcall SspiMarshalAuthIdentity(ptr ptr ptr)
+@ stub SspiMarshalAuthIdentity
 @ stub SspiPrepareForCredRead
 @ stdcall SspiPrepareForCredWrite(ptr wstr ptr ptr ptr ptr ptr)
-@ stdcall SspiUnmarshalAuthIdentity(long ptr ptr)
+@ stub SspiUnmarshalAuthIdentity
 @ stub SspiUnmarshalAuthIdentityInternal
 @ stub SspiValidateAuthIdentity
 @ stdcall SspiZeroAuthIdentity(ptr)

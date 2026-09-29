@@ -3198,28 +3198,8 @@ static BOOL CDecodeSignedMsg_GetParam(CDecodeMsg *msg, DWORD dwParamType,
             SetLastError(CRYPT_E_INVALID_MSG_TYPE);
         break;
     case CMSG_ENCODED_MESSAGE:
-        if (msg->u.signed_data.info)
-        {
-            CRYPT_CONTENT_INFO info;
-
-            ret = CRYPT_AsnEncodeCMSSignedInfo(msg->u.signed_data.info, NULL, &info.Content.cbData);
-            if (ret)
-            {
-                info.Content.pbData = CryptMemAlloc(info.Content.cbData);
-                if (info.Content.pbData)
-                {
-                    ret = CRYPT_AsnEncodeCMSSignedInfo(msg->u.signed_data.info, info.Content.pbData, &info.Content.cbData);
-                    if (ret)
-                    {
-                        char oid_rsa_signed[] = szOID_RSA_signedData;
-
-                        info.pszObjId = oid_rsa_signed;
-                        ret = CryptEncodeObjectEx(X509_ASN_ENCODING, PKCS_CONTENT_INFO, &info, 0, NULL, pvData, pcbData);
-                    }
-                    CryptMemFree(info.Content.pbData);
-                }
-            }
-        }
+        if (msg->msg_data.pbData)
+            ret = CRYPT_CopyParam(pvData, pcbData, msg->msg_data.pbData, msg->msg_data.cbData);
         else
             SetLastError(CRYPT_E_INVALID_MSG_TYPE);
         break;
@@ -3272,10 +3252,7 @@ static BOOL CDecodeSignedMsg_GetParam(CDecodeMsg *msg, DWORD dwParamType,
             if (dwIndex >= msg->u.signed_data.info->cSignerInfo)
                 SetLastError(CRYPT_E_INVALID_INDEX);
             else if (!msg->u.signed_data.info->rgSignerInfo[dwIndex].AuthAttrs.cAttr)
-            {
-                *pcbData = 0;
                 SetLastError(CRYPT_E_ATTRIBUTES_MISSING);
-            }
             else
                 ret = CRYPT_CopyAttr(pvData, pcbData,
                  &msg->u.signed_data.info->rgSignerInfo[dwIndex].AuthAttrs);
@@ -3289,10 +3266,7 @@ static BOOL CDecodeSignedMsg_GetParam(CDecodeMsg *msg, DWORD dwParamType,
             if (dwIndex >= msg->u.signed_data.info->cSignerInfo)
                 SetLastError(CRYPT_E_INVALID_INDEX);
             else if (!msg->u.signed_data.info->rgSignerInfo[dwIndex].UnauthAttrs.cAttr)
-            {
-                *pcbData = 0;
                 SetLastError(CRYPT_E_ATTRIBUTES_MISSING);
-            }
             else
                 ret = CRYPT_CopyAttr(pvData, pcbData,
                  &msg->u.signed_data.info->rgSignerInfo[dwIndex].UnauthAttrs);

@@ -27,6 +27,7 @@
 #include <time.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "winternl.h"
 #include "winbase.h"
 #include "winnls.h"
@@ -760,23 +761,11 @@ BOOL WINAPI GetFirmwareType(FIRMWARE_TYPE *type)
 /**********************************************************************
  *           GetNumaNodeProcessorMask     (KERNEL32.@)
  */
-BOOL WINAPI GetNumaNodeProcessorMask( UCHAR node, ULONGLONG *mask )
+BOOL WINAPI GetNumaNodeProcessorMask(UCHAR node, PULONGLONG mask)
 {
-    SYSTEM_NUMA_INFORMATION info;
-    NTSTATUS status;
-
-    TRACE( "node %u, mask %p.\n", node, mask );
-
-    if ((status = NtQuerySystemInformation( SystemNumaProcessorMap, &info, sizeof(info), NULL )))
-        return set_ntstatus( status );
-
-    if (node > info.HighestNodeNumber || info.ActiveProcessorsGroupAffinity[node].Group)
-    {
-        SetLastError( ERROR_INVALID_PARAMETER );
-        return FALSE;
-    }
-    *mask = info.ActiveProcessorsGroupAffinity[node].Mask;
-    return TRUE;
+    FIXME("(%c %p): stub\n", node, mask);
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    return FALSE;
 }
 
 /**********************************************************************
@@ -802,60 +791,36 @@ BOOL WINAPI GetNumaAvailableMemoryNodeEx(USHORT node, PULONGLONG available_bytes
 /***********************************************************************
  *           GetNumaProcessorNode (KERNEL32.@)
  */
-BOOL WINAPI GetNumaProcessorNode( UCHAR processor, UCHAR *ret_node )
+BOOL WINAPI GetNumaProcessorNode(UCHAR processor, PUCHAR node)
 {
-    PROCESSOR_NUMBER proc = { .Number = processor };
-    USHORT node;
-    BOOL ret;
+    TRACE("(%d, %p)\n", processor, node);
 
-    TRACE(" processor %u, ret_node %p.\n", processor, ret_node );
+    if (processor < system_info.NumberOfProcessors)
+    {
+        *node = 0;
+        return TRUE;
+    }
 
-    ret = GetNumaProcessorNodeEx( &proc, &node );
-    *ret_node = node;
-    return ret;
+    *node = 0xFF;
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return FALSE;
 }
 
 /***********************************************************************
  *           GetNumaProcessorNodeEx (KERNEL32.@)
  */
-BOOL WINAPI GetNumaProcessorNodeEx( PROCESSOR_NUMBER *processor, USHORT *node_number )
+BOOL WINAPI GetNumaProcessorNodeEx(PPROCESSOR_NUMBER processor, PUSHORT node_number)
 {
-    SYSTEM_NUMA_INFORMATION info;
-    NTSTATUS status;
-    unsigned int i;
-    GROUP_AFFINITY *a;
-
-    TRACE( "processor %p, node_number %p.\n", processor, node_number );
-
-    if ((status = NtQuerySystemInformation( SystemNumaProcessorMap, &info, sizeof(info), NULL )))
-        return set_ntstatus( status );
-
-    if (processor->Reserved || processor->Number >= sizeof(a->Mask) * 8) goto not_found;
-
-    for (i = 0; i <= info.HighestNodeNumber; ++i)
-    {
-        a = &info.ActiveProcessorsGroupAffinity[i];
-        if (a->Group == processor->Group && (a->Mask & ((ULONG_PTR)1 << processor->Number)))
-        {
-            *node_number = i;
-            return TRUE;
-        }
-    }
-
-not_found:
-    *node_number = 0xffff;
-    SetLastError( ERROR_INVALID_PARAMETER );
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
     return FALSE;
 }
 
 /***********************************************************************
  *           GetNumaProximityNode (KERNEL32.@)
  */
-BOOL WINAPI GetNumaProximityNode( ULONG proximity_id, UCHAR *node_number )
+BOOL WINAPI GetNumaProximityNode(ULONG  proximity_id, PUCHAR node_number)
 {
-    FIXME( "proximity_id %lu, node_number %p stub.\n", proximity_id, node_number );
-
-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
     return FALSE;
 }
 

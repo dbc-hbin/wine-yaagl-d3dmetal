@@ -1158,14 +1158,7 @@ void drag_drop_leave(void)
 
     TRACE("DND Operation canceled\n");
 
-    if (!(object = get_data_object( TRUE ))) return;
-    if (object->drop_target)
-    {
-        IDropTarget_DragLeave( object->drop_target );
-        IDropTarget_Release( object->drop_target );
-        object->drop_target = NULL;
-    }
-    IDataObject_Release( &object->IDataObject_iface );
+    if ((object = get_data_object( TRUE ))) IDataObject_Release( &object->IDataObject_iface );
 }
 
 DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect )
@@ -1283,6 +1276,8 @@ DWORD drag_drop_drop( HWND hwnd )
     {
         HRESULT hr = IDropTarget_DragLeave( object->drop_target );
         if (FAILED(hr)) WARN( "IDropTarget_DragLeave returned %#lx\n", hr );
+        IDropTarget_Release( object->drop_target );
+        object->drop_target = NULL;
     }
 
     if (drop_file)
@@ -1300,21 +1295,15 @@ DWORD drag_drop_drop( HWND hwnd )
             RECT rect;
 
             drop->pt = object->target_pos;
-            drop->fNC = !ScreenToClient( hwnd_drop, &drop->pt ) || !GetClientRect( hwnd_drop, &rect ) || !PtInRect( &rect, drop->pt );
-            TRACE( "Sending WM_DROPFILES: hwnd_drop %p, pt %s, fNC %u, files %p (%s)\n", hwnd_drop,
+            drop->fNC = !ScreenToClient( hwnd, &drop->pt ) || !GetClientRect( hwnd, &rect ) || !PtInRect( &rect, drop->pt );
+            TRACE( "Sending WM_DROPFILES: hwnd %p, pt %s, fNC %u, files %p (%s)\n", hwnd,
                    wine_dbgstr_point( &drop->pt), drop->fNC, files, debugstr_w(files) );
             GlobalUnlock( medium.hGlobal );
 
-            PostMessageW( hwnd_drop, WM_DROPFILES, (WPARAM)medium.hGlobal, 0 );
+            PostMessageW( hwnd, WM_DROPFILES, (WPARAM)medium.hGlobal, 0 );
             accept = 1;
             effect = DROPEFFECT_COPY;
         }
-    }
-
-     if (object->drop_target)
-    {
-        IDropTarget_Release( object->drop_target );
-        object->drop_target = NULL;
     }
 
     TRACE("effectRequested(0x%lx) accept(%d) performed(0x%lx) at x(%ld),y(%ld)\n",

@@ -28,12 +28,9 @@
 
 #if defined(__aarch64__) || defined(__arm64ec__)
 
-static const ULONG exception_flags_mask = CONTEXT_EXCEPTION_ACTIVE |
-    CONTEXT_SERVICE_ACTIVE | CONTEXT_EXCEPTION_REQUEST | CONTEXT_EXCEPTION_REPORTING;
-
 static inline ULONG ctx_flags_x64_to_arm( ULONG flags )
 {
-    ULONG ret = CONTEXT_ARM64 | (flags & exception_flags_mask);
+    ULONG ret = CONTEXT_ARM64;
 
     flags &= ~CONTEXT_AMD64;
     if (flags & CONTEXT_AMD64_CONTROL) ret |= CONTEXT_ARM64_CONTROL;
@@ -44,7 +41,7 @@ static inline ULONG ctx_flags_x64_to_arm( ULONG flags )
 
 static inline ULONG ctx_flags_arm_to_x64( ULONG flags )
 {
-    ULONG ret = CONTEXT_AMD64 | (flags & exception_flags_mask);
+    ULONG ret = CONTEXT_AMD64;
 
     flags &= ~CONTEXT_ARM64;
     if (flags & CONTEXT_ARM64_CONTROL) ret |= CONTEXT_AMD64_CONTROL;

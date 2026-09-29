@@ -404,7 +404,7 @@ static PSecPkgInfoA _copyPackageInfoFlatWToA(const SecPkgInfoW *infoW)
             if (infoW->Comment)
             {
                 ret->Comment = nextString;
-                WideCharToMultiByte(CP_ACP, 0, infoW->Comment, -1, nextString, commentLen, NULL, NULL);
+                WideCharToMultiByte(CP_ACP, 0, infoW->Comment, -1, nextString, nameLen, NULL, NULL);
             }
             else
                 ret->Comment = NULL;
@@ -636,7 +636,7 @@ static SECURITY_STATUS thunk_ContextAttributesAToW(SecurePackage *package,
                 if (oldUser)
                 {
                     names->sUserName = (char *)strdupAW(oldUser);
-                    package->provider->fnTableA.FreeContextBuffer(oldUser);
+                    package->provider->fnTableW.FreeContextBuffer(oldUser);
                 }
                 break;
             }
@@ -648,7 +648,7 @@ static SECURITY_STATUS thunk_ContextAttributesAToW(SecurePackage *package,
                 if (oldAuth)
                 {
                     names->sAuthorityName = (char *)strdupAW(oldAuth);
-                    package->provider->fnTableA.FreeContextBuffer(oldAuth);
+                    package->provider->fnTableW.FreeContextBuffer(oldAuth);
                 }
                 break;
             }
@@ -661,12 +661,12 @@ static SECURITY_STATUS thunk_ContextAttributesAToW(SecurePackage *package,
                 if (oldSigAlgName)
                 {
                     info->sSignatureAlgorithmName = (char *)strdupAW(oldSigAlgName);
-                    package->provider->fnTableA.FreeContextBuffer(oldSigAlgName);
+                    package->provider->fnTableW.FreeContextBuffer(oldSigAlgName);
                 }
                 if (oldEncAlgName)
                 {
                     info->sEncryptAlgorithmName = (char *)strdupAW(oldEncAlgName);
-                    package->provider->fnTableA.FreeContextBuffer(oldEncAlgName);
+                    package->provider->fnTableW.FreeContextBuffer(oldEncAlgName);
                 }
                 break;
             }
@@ -679,7 +679,7 @@ static SECURITY_STATUS thunk_ContextAttributesAToW(SecurePackage *package,
                 {
                     info->PackageInfo = (PSecPkgInfoA)
                      _copyPackageInfoFlatAToW(oldPkgInfo);
-                    package->provider->fnTableA.FreeContextBuffer(oldPkgInfo);
+                    package->provider->fnTableW.FreeContextBuffer(oldPkgInfo);
                 }
                 break;
             }
@@ -692,7 +692,7 @@ static SECURITY_STATUS thunk_ContextAttributesAToW(SecurePackage *package,
                 {
                     info->PackageInfo = (PSecPkgInfoA)
                      _copyPackageInfoFlatAToW(oldPkgInfo);
-                    package->provider->fnTableA.FreeContextBuffer(oldPkgInfo);
+                    package->provider->fnTableW.FreeContextBuffer(oldPkgInfo);
                 }
                 break;
             }
@@ -710,7 +710,7 @@ static SECURITY_STATUS thunk_ContextAttributesAToW(SecurePackage *package,
                 if (oldServer)
                 {
                     names->sServerName = (char *)strdupAW(oldServer);
-                    package->provider->fnTableA.FreeContextBuffer(oldServer);
+                    package->provider->fnTableW.FreeContextBuffer(oldServer);
                 }
                 break;
             }
@@ -722,7 +722,7 @@ static SECURITY_STATUS thunk_ContextAttributesAToW(SecurePackage *package,
                 if (oldCred)
                 {
                     name->sCredentialName = (char *)strdupAW(oldCred);
-                    package->provider->fnTableA.FreeContextBuffer(oldCred);
+                    package->provider->fnTableW.FreeContextBuffer(oldCred);
                 }
                 break;
             }

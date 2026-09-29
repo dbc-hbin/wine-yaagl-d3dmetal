@@ -1115,11 +1115,7 @@ struct wire_record *marshal_record(MSIHANDLE handle)
     if (!(rec = msihandle2msiinfo(handle, MSIHANDLETYPE_RECORD)))
         return NULL;
 
-    if (!(ret = midl_user_allocate(sizeof(*ret) + rec->count * sizeof(ret->fields[0]))))
-    {
-        msiobj_release(&rec->hdr);
-        return NULL;
-    }
+    ret = midl_user_allocate(sizeof(*ret) + rec->count * sizeof(ret->fields[0]));
     ret->count = rec->count;
     ret->cookie = rec->cookie;
 

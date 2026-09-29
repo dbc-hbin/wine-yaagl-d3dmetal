@@ -87,6 +87,22 @@ enum {
     TOPMOST_FLOAT_INACTIVE_ALL,
 };
 
+/* CrossOver Hack 10912: Mac Edit menu */
+enum {
+    MAC_EDIT_MENU_DISABLED,
+    MAC_EDIT_MENU_BY_MESSAGE,
+    MAC_EDIT_MENU_BY_KEY,
+};
+
+enum {
+    EDIT_COMMAND_COPY,
+    EDIT_COMMAND_CUT,
+    EDIT_COMMAND_DELETE,
+    EDIT_COMMAND_PASTE,
+    EDIT_COMMAND_SELECT_ALL,
+    EDIT_COMMAND_UNDO,
+};
+
 enum {
     GL_SURFACE_IN_FRONT_OPAQUE,
     GL_SURFACE_IN_FRONT_TRANSPARENT,
@@ -106,7 +122,6 @@ typedef struct macdrv_opaque_opengl_context* macdrv_opengl_context;
 typedef struct macdrv_opaque_metal_device* macdrv_metal_device;
 typedef struct macdrv_opaque_metal_view* macdrv_metal_view;
 typedef struct macdrv_opaque_metal_layer* macdrv_metal_layer;
-typedef struct macdrv_opaque_metal_swapchain* macdrv_metal_swapchain;
 typedef struct macdrv_opaque_status_item* macdrv_status_item;
 struct macdrv_event;
 struct macdrv_query;
@@ -116,6 +131,8 @@ struct macdrv_query;
 extern bool macdrv_err_on;
 extern int topmost_float_inactive;
 extern bool capture_displays_for_fullscreen;
+/* CrossOver Hack 10912: Mac Edit menu */
+extern int mac_edit_menu;
 extern bool left_option_is_alt;
 extern bool right_option_is_alt;
 extern bool left_command_is_ctrl;
@@ -203,18 +220,19 @@ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
 extern int macdrv_start_cocoa_app(unsigned long long tickcount);
 extern void macdrv_window_rejected_focus(const struct macdrv_event *event);
 extern void macdrv_beep(void);
-extern void macdrv_set_application_icon(CFArrayRef images);
+extern void macdrv_set_application_icon(CFArrayRef images, CFURLRef url /* CrossOver Hack 13440 */);
 extern void macdrv_quit_reply(int reply);
 extern bool macdrv_using_input_method(void);
 extern void macdrv_set_mouse_capture_window(macdrv_window window);
 extern void macdrv_set_cocoa_retina_mode(bool new_mode);
 
+/* application model user IDs */
+extern int macdrv_set_current_process_explicit_app_user_model_id(const UniChar *aumid, size_t length);
+extern int macdrv_get_current_process_explicit_app_user_model_id(UniChar *buffer, size_t size);
 
 /* cursor */
 extern void macdrv_set_cursor(CFStringRef name, CFArrayRef frames);
-struct macdrv_native_cursor_context;
 extern int macdrv_get_cursor_position(CGPoint *pos);
-extern bool macdrv_get_native_cursor_context(struct macdrv_native_cursor_context *context, macdrv_window candidate);
 extern int macdrv_set_cursor_position(CGPoint pos);
 extern int macdrv_clip_cursor(CGRect rect);
 
@@ -277,6 +295,7 @@ enum {
     APP_QUIT_REQUESTED,
     CLIENT_SURFACE_PRESENTED, /* CW HACK 22435 */
     DISPLAYS_CHANGED,
+    EDIT_MENU_COMMAND, /* CrossOver Hack 10912: Mac Edit menu */
     HOTKEY_PRESS,
     IM_SET_TEXT,
     KEY_PRESS,
@@ -297,7 +316,6 @@ enum {
     WINDOW_CLOSE_REQUESTED,
     WINDOW_DID_MINIMIZE,
     WINDOW_DID_UNMINIMIZE,
-    WINDOW_NATIVE_CURSOR_SYNC,
     WINDOW_DRAG_BEGIN,
     WINDOW_DRAG_END,
     WINDOW_FRAME_CHANGED,
@@ -319,11 +337,6 @@ enum {
 
 typedef uint64_t macdrv_event_mask;
 
-struct macdrv_native_cursor_context
-{
-    void *window;
-};
-
 typedef struct macdrv_event {
     int                 refs;
     int                 deliver;
@@ -340,6 +353,11 @@ typedef struct macdrv_event {
         struct {
             bool activating;
         }                                           displays_changed;
+        /* CrossOver Hack 10912: Mac Edit menu */
+        struct {
+            int             command;
+            unsigned long   time_ms;
+        }                                           edit_menu_command;
         struct {
             unsigned int    vkey;
             unsigned int    mod_flags;
@@ -375,9 +393,6 @@ typedef struct macdrv_event {
             int             x;
             int             y;
             bool            drag;
-            bool            noncoalescible;
-            int             raw_x;
-            int             raw_y;
             unsigned long   time_ms;
         }                                           mouse_moved;
         struct {
@@ -544,18 +559,10 @@ extern void macdrv_release_metal_device(macdrv_metal_device d);
 extern macdrv_metal_view macdrv_view_create_metal_view(macdrv_view v, macdrv_metal_device d);
 extern macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v);
 extern void macdrv_view_release_metal_view(macdrv_metal_view v);
-extern macdrv_metal_swapchain macdrv_create_view_swapchain(macdrv_view v);
-extern macdrv_metal_swapchain macdrv_create_offscreen_swapchain(void* hwnd, CGRect bounds);
-extern macdrv_metal_layer macdrv_swapchain_get_layer(macdrv_metal_swapchain swapchain);
-extern void macdrv_destroy_swapchain(macdrv_metal_swapchain swapchain);
-extern void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int context_id);
-extern void macdrv_window_release_ca_layer_host_view(macdrv_window w, unsigned int context_id);
-extern void macdrv_create_remote_layer(void* hwnd, unsigned int context_id);
-extern void macdrv_release_remote_layer(void* hwnd, unsigned int context_id);
 extern bool macdrv_get_view_backing_size(macdrv_view v, int backing_size[2]);
 extern void macdrv_set_view_backing_size(macdrv_view v, const int backing_size[2]);
 extern uint32_t macdrv_window_background_color(void);
-extern bool macdrv_send_keydown_to_input_source(int keyc, unsigned int flags, int repeat, void *data);
+extern bool macdrv_ime_process_key(int keyc, unsigned int flags, int repeat, void *data);
 extern bool macdrv_is_any_wine_window_visible(void);
 
 
@@ -597,6 +604,10 @@ extern void macdrv_set_status_item_tooltip(macdrv_status_item s, CFStringRef cft
 extern pthread_mutex_t ime_composition_rect_mutex;
 extern CGRect ime_composition_rect;
 extern void macdrv_clear_ime_text(void);
+
+/* CrossOver Hack #20512 */
+extern int is_apple_silicon(void);
+extern int is_skyrim_se_launcher(void);
 
 /* CW HACK 22435 */
 extern void macdrv_client_surface_presented(const macdrv_event *event);

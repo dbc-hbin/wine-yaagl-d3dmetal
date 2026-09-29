@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "wine/winuser16.h"
 #include "wownt32.h"
 #include "winerror.h"
@@ -112,9 +113,9 @@ typedef struct
 } WINPROC_THUNK;
 #pragma pack(pop)
 
-#define MAKE_WNDPROC16(index)   ((WNDPROC)(UINT_PTR)(UINT)MAKELONG(index, 0xffff))
-#define MAX_WINPROCS32          4096
-#define MAX_WINPROCS16          1024
+#define WINPROC_HANDLE (~0u >> 16)
+#define MAX_WINPROCS32 4096
+#define MAX_WINPROCS16 1024
 
 static WNDPROC16 winproc16_array[MAX_WINPROCS16];
 static unsigned int winproc16_used;
@@ -140,7 +141,7 @@ static int winproc_to_index( WNDPROC16 handle )
     else
     {
         index = LOWORD(handle);
-        if (handle != (WNDPROC16)MAKE_WNDPROC16(index)) return -1;
+        if ((ULONG_PTR)handle >> 16 != WINPROC_HANDLE) return -1;
         /* check array limits */
         if (index >= winproc16_used + MAX_WINPROCS32) return -1;
     }
@@ -191,7 +192,8 @@ WNDPROC WINPROC_AllocProc16( WNDPROC16 func )
     if (!func) return NULL;
 
     /* check if the function is already a win proc */
-    if ((index = winproc_to_index( func )) != -1) return MAKE_WNDPROC16(index);
+    if ((index = winproc_to_index( func )) != -1)
+        return (WNDPROC)(ULONG_PTR)(index | (WINPROC_HANDLE << 16));
 
     /* then check if we already have a winproc for that function */
     for (index = 0; index < winproc16_used; index++)
@@ -205,7 +207,7 @@ WNDPROC WINPROC_AllocProc16( WNDPROC16 func )
     winproc16_array[winproc16_used++] = func;
 
 done:
-    ret = MAKE_WNDPROC16(index + MAX_WINPROCS32);
+    ret = (WNDPROC)(ULONG_PTR)((index + MAX_WINPROCS32) | (WINPROC_HANDLE << 16));
     TRACE( "returning %p for %p/16-bit (%d/%d used)\n",
            ret, func, winproc16_used, MAX_WINPROCS16 );
     return ret;
@@ -220,7 +222,7 @@ WNDPROC16 WINPROC_GetProc16( WNDPROC proc, BOOL unicode )
 {
     WNDPROC winproc = wow_handlers32.alloc_winproc( proc, unicode );
 
-    if (winproc != MAKE_WNDPROC16(LOWORD(winproc))) return (WNDPROC16)winproc;
+    if ((ULONG_PTR)winproc >> 16 != WINPROC_HANDLE) return (WNDPROC16)winproc;
     return alloc_win16_thunk( winproc );
 }
 

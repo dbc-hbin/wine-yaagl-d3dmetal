@@ -39,7 +39,6 @@ struct device_desc
     UINT input;
     UINT uid;
     UINT bus_type;
-    UINT bus_id; /* USB: class << 16 | subclass << 8 | protocol, -1 when unset */
     BOOL is_gamepad;
     BOOL is_hidraw;
 
@@ -67,6 +66,10 @@ struct bus_options
     UINT mappings_count;
     struct list devices;
     char **mappings;
+};
+
+struct xbox_bus_options
+{
 };
 
 enum bus_event_type
@@ -146,6 +149,9 @@ enum unix_funcs
     iohid_init,
     iohid_wait,
     iohid_stop,
+    xbox_init,
+    xbox_wait,
+    xbox_stop,
     mouse_create,
     keyboard_create,
     device_remove,
@@ -160,9 +166,9 @@ enum unix_funcs
 static inline const char *debugstr_device_desc(struct device_desc *desc)
 {
     if (!desc) return "(null)";
-    return wine_dbg_sprintf("{vid %04x, pid %04x, version %04x, input %d, uid %08x, is_gamepad %u, is_hidraw %u, bus_type %u, bus_id %08x}",
+    return wine_dbg_sprintf("{vid %04x, pid %04x, version %04x, input %d, uid %08x, is_gamepad %u, is_hidraw %u, bus_type %u}",
                             desc->vid, desc->pid, desc->version, desc->input, desc->uid,
-                            desc->is_gamepad, desc->is_hidraw, desc->bus_type, desc->bus_id);
+                            desc->is_gamepad, desc->is_hidraw, desc->bus_type);
 }
 
 static inline BOOL is_xbox_gamepad(WORD vid, WORD pid)

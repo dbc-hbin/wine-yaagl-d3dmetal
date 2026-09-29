@@ -258,8 +258,8 @@ int main( int argc, char *argv[] )
     init_limits();
 
     sock_init();
-    open_master_socket();
     msync_init_shm();
+    open_master_socket();
     msync_init();
 
     if (debug_level) fprintf( stderr, "wineserver: starting (pid=%ld)\n", (long) getpid() );

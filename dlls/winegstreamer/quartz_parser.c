@@ -745,10 +745,8 @@ static bool amt_from_wg_format_video_mpeg1(AM_MEDIA_TYPE *mt, const struct wg_fo
 {
     MPEG1VIDEOINFO *video_format;
     uint32_t frame_time;
-    DWORD size;
 
-    size = offsetof(MPEG1VIDEOINFO, bSequenceHeader) + format->u.video.codec_data_len;
-    if (!(video_format = CoTaskMemAlloc(size)))
+    if (!(video_format = CoTaskMemAlloc(sizeof(*video_format))))
         return false;
 
     mt->majortype = MEDIATYPE_Video;
@@ -756,10 +754,10 @@ static bool amt_from_wg_format_video_mpeg1(AM_MEDIA_TYPE *mt, const struct wg_fo
     mt->bTemporalCompression = TRUE;
     mt->lSampleSize = 1;
     mt->formattype = FORMAT_MPEGVideo;
-    mt->cbFormat = size;
+    mt->cbFormat = sizeof(MPEG1VIDEOINFO);
     mt->pbFormat = (BYTE *)video_format;
 
-    memset(video_format, 0, size);
+    memset(video_format, 0, sizeof(*video_format));
     if ((frame_time = MulDiv(10000000, format->u.video.fps_d, format->u.video.fps_n)) != -1)
         video_format->hdr.AvgTimePerFrame = frame_time;
     video_format->hdr.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -769,30 +767,6 @@ static bool amt_from_wg_format_video_mpeg1(AM_MEDIA_TYPE *mt, const struct wg_fo
     video_format->hdr.bmiHeader.biBitCount = 12;
     video_format->hdr.bmiHeader.biCompression = mt->subtype.Data1;
     video_format->hdr.bmiHeader.biSizeImage = wg_format_get_max_size(format);
-
-    /* Ignore additional start code units after the sequence header. */
-    size = 12; /* minimum sequence header length */
-    if (format->u.video.codec_data_len >= size
-            && format->u.video.codec_data[0] == 0x00
-            && format->u.video.codec_data[1] == 0x00
-            && format->u.video.codec_data[2] == 0x01
-            && format->u.video.codec_data[3] == 0xb3)
-    {
-        /* has intra quantiser matrix? */
-        if (format->u.video.codec_data[size-1] & 2)
-            size += 64;
-
-        /* has non-intra quantiser matrix? */
-        if (format->u.video.codec_data_len >= size
-                && (format->u.video.codec_data[size-1] & 1))
-            size += 64;
-
-        if (format->u.video.codec_data_len >= size)
-        {
-            video_format->cbSequenceHeader = size;
-            memcpy(video_format->bSequenceHeader, format->u.video.codec_data, size);
-        }
-    }
 
     return true;
 }
@@ -1162,7 +1136,7 @@ static bool amt_to_wg_format_video_mpeg1(const AM_MEDIA_TYPE *mt, struct wg_form
         FIXME("Unknown format type %s.\n", debugstr_guid(&mt->formattype));
         return false;
     }
-    if (!mt->pbFormat || mt->cbFormat < offsetof(MPEG1VIDEOINFO, bSequenceHeader) + video_format->cbSequenceHeader)
+    if (mt->cbFormat < sizeof(VIDEOINFOHEADER) || !mt->pbFormat)
     {
         ERR("Unexpected format size %lu.\n", mt->cbFormat);
         return false;
@@ -1174,13 +1148,6 @@ static bool amt_to_wg_format_video_mpeg1(const AM_MEDIA_TYPE *mt, struct wg_form
     format->u.video.fps_n = 10000000;
     format->u.video.fps_d = video_format->hdr.AvgTimePerFrame;
 
-    format->u.video.codec_data_len = video_format->cbSequenceHeader;
-    if (format->u.video.codec_data_len > sizeof(format->u.video.codec_data))
-    {
-        ERR("Too big codec_data value (%u).\n", format->u.video.codec_data_len);
-        format->u.video.codec_data_len = 0;
-    }
-    memcpy(format->u.video.codec_data, video_format->bSequenceHeader, format->u.video.codec_data_len);
     return true;
 }
 
@@ -1431,36 +1398,22 @@ static void send_buffer(struct parser_source *pin, struct parser *filter, const 
                         TRACE("New format:\n");
                         strmbase_dump_media_type(mt);
 
-                        if (FAILED(hr = wg_parser_stream_enable(pin->wg_stream, &format)))
-                        {
-                            IMediaEventSink *event_sink;
+                        FreeMediaType(&pin->pin.pin.mt);
+                        CopyMediaType(&pin->pin.pin.mt, mt);
+                        pin->current_format = format;
+                        wg_parser_stream_enable(pin->wg_stream, &format);
 
-                            ERR("Failed to enable stream for dynamic format, hr %#lx.\n", hr);
-                            if (filter->filter.graph && SUCCEEDED(IFilterGraph_QueryInterface(filter->filter.graph,
-                                    &IID_IMediaEventSink, (void **)&event_sink)))
-                            {
-                                IMediaEventSink_Notify(event_sink, EC_ERRORABORT, hr, 0);
-                                IMediaEventSink_Release(event_sink);
-                            }
-                        }
-                        else
-                        {
-                            FreeMediaType(&pin->pin.pin.mt);
-                            CopyMediaType(&pin->pin.pin.mt, mt);
-                            pin->current_format = format;
-
-                            /* We can't send the wg_parser_buffer we were about to
-                             * send; it's in the old format.
-                             *
-                             * Also, we need to seek to re-decode any further
-                             * queued buffers. This is not reliably seamless.
-                             * See reader_SetOutputProps() in wm_reader.c.
-                             * In practice it's unlikely to matter, since dynamic
-                             * reconnection is usually done only at the beginning
-                             * of a stream. */
-                            wg_parser_stream_seek(pin->wg_stream, pin->seek.dRate, pin->seek.llCurrent, 0,
-                                    AM_SEEKING_AbsolutePositioning, AM_SEEKING_NoPositioning);
-                        }
+                        /* We can't send the wg_parser_buffer we were about to
+                         * send; it's in the old format.
+                         *
+                         * Also, we need to seek to re-decode any further
+                         * queued buffers. This is not reliably seamless.
+                         * See reader_SetOutputProps() in wm_reader.c.
+                         * In practice it's unlikely to matter, since dynamic
+                         * reconnection is usually done only at the beginning
+                         * of a stream. */
+                        wg_parser_stream_seek(pin->wg_stream, pin->seek.dRate, pin->seek.llCurrent, 0,
+                                AM_SEEKING_AbsolutePositioning, AM_SEEKING_NoPositioning);
                     }
                 }
                 else
@@ -1651,10 +1604,11 @@ static HRESULT parser_init_stream(struct strmbase_filter *iface)
     DWORD stop_flags = AM_SEEKING_NoPositioning;
     const SourceSeeking *seeking;
     unsigned int i;
-    HRESULT hr;
 
     if (!filter->sink_connected)
         return S_OK;
+
+    filter->streaming = true;
 
     for (i = 0; i < filter->source_count; ++i)
     {
@@ -1663,21 +1617,15 @@ static HRESULT parser_init_stream(struct strmbase_filter *iface)
 
         if (source->pin.pin.peer)
         {
-            struct wg_format format;
-
-            ret = amt_to_wg_format(&source->pin.pin.mt, &format);
+            ret = amt_to_wg_format(&source->pin.pin.mt, &source->current_format);
             assert(ret);
-            if (FAILED(hr = wg_parser_stream_enable(source->wg_stream, &format)))
-                return hr;
-            source->current_format = format;
+            wg_parser_stream_enable(source->wg_stream, &source->current_format);
         }
         else
         {
             wg_parser_stream_disable(source->wg_stream);
         }
     }
-
-    filter->streaming = true;
 
     /* DirectShow retains the old seek positions, but resets to them every time
      * it transitions from stopped -> paused. */
@@ -1691,6 +1639,7 @@ static HRESULT parser_init_stream(struct strmbase_filter *iface)
     for (i = 0; i < filter->source_count; ++i)
     {
         struct parser_source *pin = filter->sources[i];
+        HRESULT hr;
 
         if (!pin->pin.pin.peer)
             continue;
@@ -1896,16 +1845,16 @@ static HRESULT decodebin_parser_source_get_media_type(struct parser_source *pin,
     return VFW_S_NO_MORE_ITEMS;
 }
 
-static HRESULT parser_create(UINT32 flags, struct parser **parser)
+static HRESULT parser_create(BOOL output_compressed, struct parser **parser)
 {
     struct parser *object;
 
     if (!(object = calloc(1, sizeof(*object))))
         return E_OUTOFMEMORY;
 
-    object->output_compressed = flags & WG_PARSER_CREATE_FLAG_OUTPUT_COMPRESSED;
+    object->output_compressed = output_compressed;
 
-    if (!(object->wg_parser = wg_parser_create(flags)))
+    if (!(object->wg_parser = wg_parser_create(output_compressed)))
     {
         free(object);
         return E_OUTOFMEMORY;
@@ -1925,7 +1874,7 @@ HRESULT decodebin_parser_create(IUnknown *outer, IUnknown **out)
     struct parser *object;
     HRESULT hr;
 
-    if (FAILED(hr = parser_create(WG_PARSER_CREATE_FLAG_NONE, &object)))
+    if (FAILED(hr = parser_create(FALSE, &object)))
         return hr;
 
     strmbase_filter_init(&object->filter, outer, &CLSID_decodebin_parser, &filter_ops);
@@ -2321,7 +2270,7 @@ static HRESULT WINAPI GSTOutPin_DecideBufferSize(struct strmbase_source *iface,
     {
         MPEG1VIDEOINFO *format = (MPEG1VIDEOINFO *)pin->pin.pin.mt.pbFormat;
         buffer_size = format->hdr.bmiHeader.biSizeImage;
-        buffer_count = 30;
+        buffer_count = 8;
     }
     else if (IsEqualGUID(&pin->pin.pin.mt.formattype, &FORMAT_WaveFormatEx)
             && (IsEqualGUID(&pin->pin.pin.mt.subtype, &MEDIASUBTYPE_PCM)
@@ -2499,7 +2448,7 @@ HRESULT wave_parser_create(IUnknown *outer, IUnknown **out)
     struct parser *object;
     HRESULT hr;
 
-    if (FAILED(hr = parser_create(WG_PARSER_CREATE_FLAG_OUTPUT_COMPRESSED, &object)))
+    if (FAILED(hr = parser_create(TRUE, &object)))
         return hr;
 
     strmbase_filter_init(&object->filter, outer, &CLSID_WAVEParser, &filter_ops);
@@ -2608,7 +2557,7 @@ HRESULT avi_splitter_create(IUnknown *outer, IUnknown **out)
     struct parser *object;
     HRESULT hr;
 
-    if (FAILED(hr = parser_create(WG_PARSER_CREATE_FLAG_OUTPUT_COMPRESSED, &object)))
+    if (FAILED(hr = parser_create(TRUE, &object)))
         return hr;
 
     strmbase_filter_init(&object->filter, outer, &CLSID_AviSplitter, &filter_ops);
@@ -2770,8 +2719,7 @@ HRESULT mpeg_splitter_create(IUnknown *outer, IUnknown **out)
     struct parser *object;
     HRESULT hr;
 
-    if (FAILED(hr = parser_create(WG_PARSER_CREATE_FLAG_OUTPUT_COMPRESSED |
-                                  WG_PARSER_CREATE_FLAG_PTS_REBASED, &object)))
+    if (FAILED(hr = parser_create(TRUE, &object)))
         return hr;
 
     strmbase_filter_init(&object->filter, outer, &CLSID_MPEG1Splitter, &mpeg_splitter_ops);

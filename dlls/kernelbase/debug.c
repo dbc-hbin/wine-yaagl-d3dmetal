@@ -23,6 +23,7 @@
 #include <stdlib.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winternl.h"
@@ -281,7 +282,6 @@ void WINAPI DECLSPEC_HOTPATCH OutputDebugStringW( LPCWSTR str )
     STRING strA;
 
     WARN( "%s\n", debugstr_w(str) );
-    if (!str) return;
 
     RtlInitUnicodeString( &strW, str );
     if (!RtlUnicodeStringToAnsiString( &strA, &strW, TRUE ))
@@ -745,6 +745,19 @@ static BOOL check_resource_write( void *addr )
     return TRUE;
 }
 
+/* CrossOver Hack #22795 */
+static BOOL is_quicken_updateicons(void)
+{
+    WCHAR path[MAX_PATH];
+    DWORD exe_len = wcslen( L"UpdateIcons.exe" );
+    DWORD path_len = GetModuleFileNameW( NULL, path, MAX_PATH );
+
+    if (!wcsstr( path, L"quickenPatch" ))
+        return FALSE;
+
+    return exe_len <= path_len && !lstrcmpiW( path + path_len - exe_len, L"UpdateIcons.exe" );
+}
+
 
 /*******************************************************************
  *         UnhandledExceptionFilter   (kernelbase.@)
@@ -752,7 +765,6 @@ static BOOL check_resource_write( void *addr )
 LONG WINAPI UnhandledExceptionFilter( EXCEPTION_POINTERS *epointers )
 {
     const EXCEPTION_RECORD *rec = epointers->ExceptionRecord;
-    ULONG_PTR debug_port;
     BOOL nested;
 
     if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2)
@@ -766,8 +778,7 @@ LONG WINAPI UnhandledExceptionFilter( EXCEPTION_POINTERS *epointers )
         }
     }
 
-    NtQueryInformationProcess( GetCurrentProcess(), ProcessDebugPort, &debug_port, sizeof(debug_port), NULL );
-    if (!debug_port)
+    if (!NtCurrentTeb()->Peb->BeingDebugged)
     {
         if (rec->ExceptionCode == CONTROL_C_EXIT)
         {
@@ -780,6 +791,13 @@ LONG WINAPI UnhandledExceptionFilter( EXCEPTION_POINTERS *epointers )
         {
             LONG ret = top_filter( epointers );
             if (ret != EXCEPTION_CONTINUE_SEARCH) return ret;
+        }
+
+        /* CrossOver Hack #22795 */
+        if (is_quicken_updateicons())
+        {
+            FIXME( "HACK: crashing without error dialog for Quicken UpdateIcons.exe\n" );
+            TerminateProcess( GetCurrentProcess(), 1 );
         }
 
         if ((GetErrorMode() & SEM_NOGPFAULTERRORBOX) ||

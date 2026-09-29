@@ -2094,15 +2094,6 @@ static const CSIDL_DATA CSIDL_Data[] =
         .path       = L"Screenshots",
         .flags      = KFDF_PRECREATE | KFDF_ROAMABLE,
     },
-    { /* 0x75 */
-        .id         = &FOLDERID_AppDataDocuments,
-        .type       = CSIDL_Type_User,
-        .category   = KF_CATEGORY_PERUSER,
-        .name       = L"AppDataDocuments",
-        .parent     = &FOLDERID_LocalAppData,
-        .path       = L"Documents",
-        .flags      = KFDF_PRECREATE | KFDF_ROAMABLE,
-    },
 };
 
 static int csidl_from_id( const KNOWNFOLDERID *id )
@@ -2641,11 +2632,10 @@ static HRESULT _SHExpandEnvironmentStrings(LPCWSTR szSrc, LPWSTR szDest)
         }
         else if (!wcsnicmp(szTemp, L"%USERPROFILE%", lstrlenW(L"%USERPROFILE%")))
         {
-            WCHAR userName[MAX_PATH];
-            DWORD userLen = MAX_PATH;
+            /* CrossOver Hack 12735 */
+            static const WCHAR userName[] = {'c','r','o','s','s','o','v','e','r',0};
 
             lstrcpyW(szDest, szProfilesPrefix);
-            GetUserNameW(userName, &userLen);
             PathAppendW(szDest, userName);
             PathAppendW(szDest, szTemp + lstrlenW(L"%USERPROFILE%"));
         }
@@ -2811,6 +2801,54 @@ done:
 }
 
 /******************************************************************************
+ * _SHCreateDesktopSymbolicLink  [Internal]
+ *
+ * Sets up a symbolic link for the 'Desktop' shell folder to point into the
+ * users home directory.
+ */
+static void _SHCreateDesktopSymbolicLink( const WCHAR *path )
+{
+    extern void CDECL wine_get_host_version( const char **sysname, const char **release );
+
+    /* CrossOver Hack 12791:
+     * Create the Desktop folder and put a link to the native one inside.
+     */
+    CreateDirectoryW( path, NULL );
+    {
+#       define szLinuxDesktop   L"/My Linux Desktop"
+#       define szMacDesktop     L"/My Mac Desktop"
+#       define szNativeDesktop  L"/My Native Desktop"
+#       define szAndroidDesktop L"/My Android Downloads"
+        static const WCHAR* szDesktops[] = {szAndroidDesktop, szLinuxDesktop, szMacDesktop,
+                                               szNativeDesktop, NULL};
+        const WCHAR* pszNativeDesktop;
+        int i;
+        const char *sysname;
+
+        wine_get_host_version( &sysname, NULL );
+        if (!strcmp( sysname, "Darwin" ))
+            pszNativeDesktop = szMacDesktop;
+        else
+            pszNativeDesktop = szLinuxDesktop; /* FIXME */
+
+        for (i=0; szDesktops[i]; i++)
+        {
+            WCHAR * pszDesktopLink = HeapAlloc(GetProcessHeap(), 0, (wcslen(path) + wcslen(szDesktops[i])+1)*sizeof(WCHAR));
+            wcscpy(pszDesktopLink, path);
+            wcscat(pszDesktopLink, szDesktops[i]);
+            /* Delete the other platforms' links */
+            DeleteFileW(pszDesktopLink);
+            if (wcscmp(szDesktops[i], pszNativeDesktop) != 0)
+                continue;
+
+            /* And create one for the current platform */
+            create_link( pszDesktopLink, "XDG_DESKTOP_DIR", "$HOME/Desktop" );
+            HeapFree(GetProcessHeap(), 0, pszDesktopLink);
+        }
+    }
+}
+
+/******************************************************************************
  * _SHCreateSymbolicLink  [Internal]
  *
  * Sets up a symbolic link for one of the special shell folders to point into
@@ -2828,6 +2866,11 @@ static void _SHCreateSymbolicLink(int nFolder, const WCHAR *path)
             create_link( path, "XDG_DOCUMENTS_DIR", "$HOME/Documents" );
             break;
         case CSIDL_DESKTOPDIRECTORY:
+            if (!getenv("CX_DIRECT_DESKTOP"))
+            {
+                _SHCreateDesktopSymbolicLink( path );
+                break;
+            }
             create_link( path, "XDG_DESKTOP_DIR", "$HOME/Desktop" );
             break;
         case CSIDL_MYPICTURES:
@@ -3272,6 +3315,45 @@ static HRESULT _SHRegisterCommonShellFolders(void)
     return hr;
 }
 
+/* CROSSOVER HACK for bug 13237 - allows updating symlinks in stub bottles */
+void WINAPI wine_update_symbolic_links(HWND hwnd, HINSTANCE handle, LPCWSTR cmdline, INT show)
+{
+    static const int ids[] =
+    {
+        CSIDL_MYPICTURES, CSIDL_MYVIDEO, CSIDL_MYMUSIC, CSIDL_DOWNLOADS, CSIDL_TEMPLATES, CSIDL_PERSONAL
+    };
+    UINT i;
+    WCHAR path[MAX_PATH];
+    int ret;
+
+    TRACE("\n");
+
+    if (!getenv("CX_DIRECT_DESKTOP"))
+    {
+        SHGetFolderPathW( 0, CSIDL_DESKTOPDIRECTORY | CSIDL_FLAG_DONT_VERIFY, 0, 0, path );
+        _SHCreateDesktopSymbolicLink( path );
+    }
+    for (i = 0; i < ARRAY_SIZE(ids); i++) {
+        /* Calculate the Windows path for this folder */
+        SHGetFolderPathW( 0, ids[i], 0, 0, path );
+
+        if (!path[0]) {
+            /* SHGetFolderPathW encountered some error before calculating the path */
+            continue;
+        }
+
+        /* Replace the link. We have to do this manually because SHGetFolderPathW only updates broken links */
+        _SHCreateSymbolicLink( ids[i], path );
+
+        /* _SHCreateSymbolicLink may not have created a link. Fall back to creating a directory. */
+        ret = SHCreateDirectoryExW(0, path, NULL);
+        if (ret && ret != ERROR_ALREADY_EXISTS)
+        {
+            WARN("Failed to create directory %s.\n", debugstr_w(path));
+        }
+    }
+}
+
 /******************************************************************************
  * create_extra_folders  [Internal]
  *
@@ -3352,9 +3434,7 @@ static HRESULT set_folder_attributes(void)
         { &CLSID_RecycleBin, FALSE, FALSE, FALSE,
           SFGAO_FOLDER|SFGAO_DROPTARGET|SFGAO_HASPROPSHEET },
         { &CLSID_ControlPanel, FALSE, TRUE, TRUE,
-          SFGAO_FOLDER|SFGAO_HASSUBFOLDER },
-        { &CLSID_Printers, FALSE, FALSE, FALSE,
-          SFGAO_FOLDER|SFGAO_CANLINK }
+          SFGAO_FOLDER|SFGAO_HASSUBFOLDER }
     };
 
     unsigned int i;

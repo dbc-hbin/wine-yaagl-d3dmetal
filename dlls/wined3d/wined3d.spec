@@ -141,7 +141,7 @@
 @ cdecl wined3d_device_context_issue_query(ptr ptr long)
 @ cdecl wined3d_device_context_map(ptr ptr long ptr ptr long)
 @ cdecl wined3d_device_context_reset_state(ptr)
-@ cdecl wined3d_device_context_resolve_sub_resource(ptr ptr long ptr long long long)
+@ cdecl wined3d_device_context_resolve_sub_resource(ptr ptr long ptr long long)
 @ cdecl wined3d_device_context_set_blend_state(ptr ptr ptr long)
 @ cdecl wined3d_device_context_set_constant_buffers(ptr long long long ptr)
 @ cdecl wined3d_device_context_set_depth_stencil_state(ptr ptr long)
@@ -300,19 +300,16 @@
 @ cdecl wined3d_swapchain_get_desc(ptr ptr)
 @ cdecl wined3d_swapchain_get_device(ptr)
 @ cdecl wined3d_swapchain_get_display_mode(ptr ptr ptr)
-@ cdecl wined3d_swapchain_get_frame_latency_waitable_object(ptr)
 @ cdecl wined3d_swapchain_get_front_buffer(ptr)
 @ cdecl wined3d_swapchain_get_front_buffer_data(ptr ptr long)
 @ cdecl wined3d_swapchain_get_gamma_ramp(ptr ptr)
-@ cdecl wined3d_swapchain_get_max_frame_latency(ptr long)
 @ cdecl wined3d_swapchain_get_parent(ptr)
 @ cdecl wined3d_swapchain_get_raster_status(ptr ptr)
 @ cdecl wined3d_swapchain_get_state(ptr)
 @ cdecl wined3d_swapchain_incref(ptr)
 @ cdecl wined3d_swapchain_present(ptr ptr ptr ptr long long)
-@ cdecl wined3d_swapchain_resize_buffers(ptr long long long long long long long)
+@ cdecl wined3d_swapchain_resize_buffers(ptr long long long long long long)
 @ cdecl wined3d_swapchain_set_gamma_ramp(ptr long ptr)
-@ cdecl wined3d_swapchain_set_max_frame_latency(ptr long)
 @ cdecl wined3d_swapchain_set_palette(ptr ptr)
 @ cdecl wined3d_swapchain_set_window(ptr ptr)
 
@@ -360,7 +357,6 @@
 
 @ stdcall vkd3d_D3DPreprocess(ptr long ptr ptr ptr ptr ptr) D3DPreprocess
 @ stdcall vkd3d_D3DCompile2VKD3D(ptr long ptr ptr ptr ptr ptr long long long ptr long ptr ptr long) D3DCompile2VKD3D
-@ stdcall vkd3d_D3DReflectVKD3D(ptr long ptr ptr long) D3DReflectVKD3D
 
 @ cdecl vkd3d_acquire_vk_queue(ptr)
 @ cdecl vkd3d_create_device(ptr ptr ptr)
@@ -392,7 +388,6 @@
 @ cdecl vkd3d_shader_free_messages(ptr)
 @ cdecl vkd3d_shader_free_root_signature(ptr)
 @ cdecl vkd3d_shader_free_scan_descriptor_info(ptr)
-@ cdecl vkd3d_shader_free_scan_signature_info(ptr)
 @ cdecl vkd3d_shader_free_shader_code(ptr)
 @ cdecl vkd3d_shader_free_shader_signature(ptr)
 @ cdecl vkd3d_shader_get_supported_source_types(ptr)

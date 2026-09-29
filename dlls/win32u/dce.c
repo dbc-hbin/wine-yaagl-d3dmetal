@@ -26,6 +26,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "ntgdi_private.h"
 #include "ntuser_private.h"
 #include "wine/opengl_driver.h"
@@ -49,36 +50,8 @@ static struct list dce_list = LIST_INIT(dce_list);
 
 #define DCE_CACHE_SIZE 64
 
-static struct list dirty_surfaces = LIST_INIT( dirty_surfaces );
+static struct list window_surfaces = LIST_INIT( window_surfaces );
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
-static UINT dirty_generation;
-
-/* Called with the surface mutex held. */
-static void mark_window_surface_dirty( struct window_surface *surface )
-{
-    if (surface == &dummy_surface || IsRectEmpty( &surface->bounds )) return;
-
-    pthread_mutex_lock( &surfaces_lock );
-    if (surface->registered && !surface->dirty)
-    {
-        list_add_tail( &dirty_surfaces, &surface->entry );
-        surface->dirty = TRUE;
-        surface->dirty_generation = dirty_generation;
-    }
-    pthread_mutex_unlock( &surfaces_lock );
-}
-
-/* Called with the surface mutex held. */
-static void clear_window_surface_dirty( struct window_surface *surface )
-{
-    pthread_mutex_lock( &surfaces_lock );
-    if (surface->dirty)
-    {
-        list_remove( &surface->entry );
-        surface->dirty = FALSE;
-    }
-    pthread_mutex_unlock( &surfaces_lock );
-}
 
 /*******************************************************************
  * Dummy window surface for windows that shouldn't get painted.
@@ -172,8 +145,8 @@ struct scaled_surface
 {
     struct window_surface header;
     struct window_surface *target_surface;
-    struct ratio dpi_from;
-    struct ratio dpi_to;
+    UINT dpi_from;
+    UINT dpi_to;
 };
 
 static struct scaled_surface *get_scaled_surface( struct window_surface *window_surface )
@@ -251,14 +224,14 @@ static const struct window_surface_funcs scaled_surface_funcs =
     scaled_surface_destroy
 };
 
-static void scaled_surface_set_target( struct scaled_surface *surface, struct window_surface *target, struct ratio dpi_to )
+static void scaled_surface_set_target( struct scaled_surface *surface, struct window_surface *target, UINT dpi_to )
 {
     if (surface->target_surface) window_surface_release( surface->target_surface );
     window_surface_add_ref( (surface->target_surface = target) );
     surface->dpi_to = dpi_to;
 }
 
-static struct window_surface *scaled_surface_create( HWND hwnd, const RECT *surface_rect, struct ratio dpi_from, struct ratio dpi_to,
+static struct window_surface *scaled_surface_create( HWND hwnd, const RECT *surface_rect, UINT dpi_from, UINT dpi_to,
                                                      struct window_surface *target_surface )
 {
     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -297,11 +270,11 @@ static RECT get_surface_rect( RECT rect )
     return rect;
 }
 
-void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_rect, struct ratio monitor_dpi,
+void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_rect, UINT monitor_dpi,
                             struct window_surface **window_surface )
 {
     struct window_surface *previous, *driver_surface;
-    struct ratio dpi = get_dpi_for_window( hwnd );
+    UINT dpi = get_dpi_for_window( hwnd );
     RECT monitor_rect;
 
 
@@ -324,7 +297,7 @@ void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_
         return;
     }
 
-    if (!driver_surface || !memcmp( &dpi, &monitor_dpi, sizeof(monitor_dpi) ))
+    if (!driver_surface || dpi == monitor_dpi)
     {
         if (*window_surface) window_surface_release( *window_surface );
         *window_surface = driver_surface;
@@ -345,11 +318,11 @@ void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_
     window_surface_release( driver_surface );
 }
 
-struct window_surface *get_driver_window_surface( struct window_surface *surface, struct ratio monitor_dpi )
+struct window_surface *get_driver_window_surface( struct window_surface *surface, UINT monitor_dpi )
 {
     if (!surface || surface == &dummy_surface) return surface;
     if (surface->funcs != &scaled_surface_funcs) return surface;
-    if (memcmp( &get_scaled_surface( surface )->dpi_to, &monitor_dpi, sizeof(monitor_dpi) )) return &dummy_surface;
+    if (get_scaled_surface( surface )->dpi_to != monitor_dpi) return &dummy_surface;
     return get_scaled_surface( surface )->target_surface;
 }
 
@@ -444,23 +417,20 @@ static BOOL set_surface_shape( struct window_surface *surface, const RECT *rect,
     char shape_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
     COLORREF color_key = surface->color_key;
-    void *shape_bits, *old_shape = NULL;
+    void *shape_bits, *old_shape;
     RECT *shape_rect, tmp_rect;
     WINEREGION *data;
-    BOOL ret, is_new;
+    BOOL ret;
 
     width = color_info->bmiHeader.biWidth;
     height = abs( color_info->bmiHeader.biHeight );
     assert( !(width & 7) ); /* expect 1bpp bitmap to be aligned on bytes */
 
-    if ((is_new = !surface->shape_bitmap)) surface->shape_bitmap = NtGdiCreateBitmap( width, height, 1, 1, NULL );
+    if (!surface->shape_bitmap) surface->shape_bitmap = NtGdiCreateBitmap( width, height, 1, 1, NULL );
     if (!(shape_bits = window_surface_get_shape( surface, shape_info ))) return FALSE;
 
-    if (!is_new)
-    {
-        old_shape = malloc( shape_info->bmiHeader.biSizeImage );
-        memcpy( old_shape, shape_bits, shape_info->bmiHeader.biSizeImage );
-    }
+    old_shape = malloc( shape_info->bmiHeader.biSizeImage );
+    memcpy( old_shape, shape_bits, shape_info->bmiHeader.biSizeImage );
 
     color_stride = color_info->bmiHeader.biSizeImage / height;
     shape_stride = shape_info->bmiHeader.biSizeImage / abs( shape_info->bmiHeader.biHeight );
@@ -530,7 +500,7 @@ static BOOL set_surface_shape( struct window_surface *surface, const RECT *rect,
     }
     }
 
-    ret = is_new || memcmp( old_shape, shape_bits, shape_info->bmiHeader.biSizeImage );
+    ret = memcmp( old_shape, shape_bits, shape_info->bmiHeader.biSizeImage );
     free( old_shape );
     return ret;
 }
@@ -554,31 +524,8 @@ static BOOL update_surface_shape( struct window_surface *surface, const RECT *re
         return clear_surface_shape( surface );
 }
 
-static void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info )
-{
-    struct bitblt_coords coords = {0};
-    struct gdi_image_bits gdi_bits;
-    BITMAPOBJ *bmp;
-
-    if (surface == &dummy_surface)
-    {
-        static BITMAPINFOHEADER header = {.biSize = sizeof(header), .biWidth = 1, .biHeight = 1,
-                                          .biPlanes = 1, .biBitCount = 32, .biCompression = BI_RGB};
-        static DWORD dummy_data;
-
-        info->bmiHeader = header;
-        return &dummy_data;
-    }
-
-    if (!(bmp = GDI_GetObjPtr( surface->color_bitmap, NTGDI_OBJ_BITMAP ))) return NULL;
-    get_image_from_bitmap( bmp, info, &gdi_bits, &coords );
-    GDI_ReleaseObj( surface->color_bitmap );
-
-    return gdi_bits.ptr;
-}
-
-struct window_surface *window_surface_create( UINT size, const struct window_surface_funcs *funcs, HWND hwnd,
-                                              const RECT *rect, BITMAPINFO *info, HBITMAP bitmap )
+W32KAPI struct window_surface *window_surface_create( UINT size, const struct window_surface_funcs *funcs, HWND hwnd,
+                                                      const RECT *rect, BITMAPINFO *info, HBITMAP bitmap )
 {
     struct window_surface *surface;
 
@@ -607,12 +554,12 @@ struct window_surface *window_surface_create( UINT size, const struct window_sur
     return surface;
 }
 
-void window_surface_add_ref( struct window_surface *surface )
+W32KAPI void window_surface_add_ref( struct window_surface *surface )
 {
     InterlockedIncrement( &surface->ref );
 }
 
-void window_surface_release( struct window_surface *surface )
+W32KAPI void window_surface_release( struct window_surface *surface )
 {
     ULONG ret = InterlockedDecrement( &surface->ref );
     if (!ret)
@@ -626,21 +573,42 @@ void window_surface_release( struct window_surface *surface )
     }
 }
 
-void window_surface_lock( struct window_surface *surface )
+W32KAPI void window_surface_lock( struct window_surface *surface )
 {
     if (surface == &dummy_surface) return;
     pthread_mutex_lock( &surface->mutex );
 }
 
-void window_surface_unlock( struct window_surface *surface )
+W32KAPI void window_surface_unlock( struct window_surface *surface )
 {
     if (surface == &dummy_surface) return;
-    mark_window_surface_dirty( surface );
     pthread_mutex_unlock( &surface->mutex );
 }
 
-/* Called with the surface mutex held. */
-static void window_surface_flush_locked( struct window_surface *surface )
+void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info )
+{
+    struct bitblt_coords coords = {0};
+    struct gdi_image_bits gdi_bits;
+    BITMAPOBJ *bmp;
+
+    if (surface == &dummy_surface)
+    {
+        static BITMAPINFOHEADER header = {.biSize = sizeof(header), .biWidth = 1, .biHeight = 1,
+                                          .biPlanes = 1, .biBitCount = 32, .biCompression = BI_RGB};
+        static DWORD dummy_data;
+
+        info->bmiHeader = header;
+        return &dummy_data;
+    }
+
+    if (!(bmp = GDI_GetObjPtr( surface->color_bitmap, NTGDI_OBJ_BITMAP ))) return NULL;
+    get_image_from_bitmap( bmp, info, &gdi_bits, &coords );
+    GDI_ReleaseObj( surface->color_bitmap );
+
+    return gdi_bits.ptr;
+}
+
+W32KAPI void window_surface_flush( struct window_surface *surface )
 {
     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     char shape_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -648,6 +616,8 @@ static void window_surface_flush_locked( struct window_surface *surface )
     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
     RECT dirty = surface->rect, bounds;
     void *color_bits;
+
+    window_surface_lock( surface );
 
     /* align bounds / dirty rect to help with 1bpp shape bitmap updates */
     bounds.left = surface->bounds.left & ~7;
@@ -670,17 +640,10 @@ static void window_surface_flush_locked( struct window_surface *surface )
             reset_bounds( &surface->bounds );
     }
 
-}
-
-void window_surface_flush( struct window_surface *surface )
-{
-    window_surface_lock( surface );
-    clear_window_surface_dirty( surface );
-    window_surface_flush_locked( surface );
     window_surface_unlock( surface );
 }
 
-void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask )
+W32KAPI void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask )
 {
     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     BITMAPINFO *color_info = (BITMAPINFO *)color_buf;
@@ -709,7 +672,7 @@ void window_surface_set_layered( struct window_surface *surface, COLORREF color_
     window_surface_unlock( surface );
 }
 
-void window_surface_set_clip( struct window_surface *surface, HRGN clip_region )
+W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_region )
 {
     window_surface_lock( surface );
 
@@ -742,7 +705,7 @@ void window_surface_set_clip( struct window_surface *surface, HRGN clip_region )
     window_surface_unlock( surface );
 }
 
-void window_surface_set_shape( struct window_surface *surface, HRGN shape_region )
+W32KAPI void window_surface_set_shape( struct window_surface *surface, HRGN shape_region )
 {
     window_surface_lock( surface );
 
@@ -772,7 +735,7 @@ struct shm_window_surface
     struct window_surface header;
     HANDLE      section;
     HWND        parent;
-    DWORD       parent_pid; /* owns section; the parent HWND may be destroyed first */
+    DWORD       parent_pid;
     BITMAPINFO  info;
 };
 
@@ -987,38 +950,10 @@ void register_window_surface( struct window_surface *old, struct window_surface 
     if (old == &dummy_surface) old = NULL;
     if (new == &dummy_surface) new = NULL;
     if (old == new) return;
-
-    /* Never wait for a surface while holding surfaces_lock.  Retire the old
-       surface completely before publishing its replacement, so detached work
-       cannot reach the native driver after newer output has become eligible. */
-    if (old)
-    {
-        window_surface_lock( old );
-        pthread_mutex_lock( &surfaces_lock );
-        if (old->dirty)
-        {
-            list_remove( &old->entry );
-            old->dirty = FALSE;
-        }
-        old->registered = FALSE;
-        pthread_mutex_unlock( &surfaces_lock );
-        pthread_mutex_unlock( &old->mutex );
-    }
-
-    if (new)
-    {
-        window_surface_lock( new );
-        pthread_mutex_lock( &surfaces_lock );
-        new->registered = TRUE;
-        if (!IsRectEmpty( &new->bounds ))
-        {
-            list_add_tail( &dirty_surfaces, &new->entry );
-            new->dirty = TRUE;
-            new->dirty_generation = dirty_generation;
-        }
-        pthread_mutex_unlock( &surfaces_lock );
-        pthread_mutex_unlock( &new->mutex );
-    }
+    pthread_mutex_lock( &surfaces_lock );
+    if (old) list_remove( &old->entry );
+    if (new) list_add_tail( &window_surfaces, &new->entry );
+    pthread_mutex_unlock( &surfaces_lock );
 }
 
 /*******************************************************************
@@ -1029,57 +964,19 @@ void register_window_surface( struct window_surface *old, struct window_surface 
 void flush_window_surfaces( BOOL idle )
 {
     static DWORD last_idle;
-    UINT generation;
     DWORD now;
+    struct window_surface *surface;
 
     pthread_mutex_lock( &surfaces_lock );
     now = NtGetTickCount();
     if (idle) last_idle = now;
     /* if not idle, we only flush if there's evidence that the app never goes idle */
-    else if ((int)(now - last_idle) < 50)
-    {
-        pthread_mutex_unlock( &surfaces_lock );
-        return;
-    }
-    generation = dirty_generation++;
+    else if ((int)(now - last_idle) < 50) goto done;
+
+    LIST_FOR_EACH_ENTRY( surface, &window_surfaces, struct window_surface, entry )
+        window_surface_flush( surface );
+done:
     pthread_mutex_unlock( &surfaces_lock );
-
-    for (;;)
-    {
-        struct window_surface *surface;
-        BOOL flush = FALSE;
-
-        pthread_mutex_lock( &surfaces_lock );
-        /* Treat generations as wrapping serial numbers.  A later pass inherits
-           older work whose original flusher was delayed or abandoned. */
-        if (list_empty( &dirty_surfaces ) ||
-            (INT)(LIST_ENTRY( dirty_surfaces.next, struct window_surface, entry )->dirty_generation - generation) > 0)
-        {
-            pthread_mutex_unlock( &surfaces_lock );
-            break;
-        }
-
-        surface = LIST_ENTRY( dirty_surfaces.next, struct window_surface, entry );
-        window_surface_add_ref( surface );
-        pthread_mutex_unlock( &surfaces_lock );
-
-        /* The reference protects the surface while its mutex is acquired.  Recheck
-           registration under surface->global lock order so unregister can cancel a
-           detached candidate before it reaches the native driver. */
-        window_surface_lock( surface );
-        pthread_mutex_lock( &surfaces_lock );
-        if (surface->registered && surface->dirty && (INT)(surface->dirty_generation - generation) <= 0)
-        {
-            list_remove( &surface->entry );
-            surface->dirty = FALSE;
-            flush = TRUE;
-        }
-        pthread_mutex_unlock( &surfaces_lock );
-
-        if (flush) window_surface_flush_locked( surface );
-        window_surface_unlock( surface );
-        window_surface_release( surface );
-    }
 }
 
 /***********************************************************************
@@ -1907,7 +1804,8 @@ static HRGN send_ncpaint( HWND hwnd, HWND *child, UINT *flags )
                 if (style & WS_VSCROLL)
                     set_standard_scroll_painted( hwnd, SB_VERT, FALSE );
 
-                send_message( hwnd, WM_NCPAINT, (WPARAM)whole_rgn, 0 );
+                /* CW Hack 20969, 23427 */
+                send_notify_message( hwnd, WM_NCPAINT, (WPARAM)whole_rgn, 0, FALSE );
             }
             if (whole_rgn > (HRGN)1) NtGdiDeleteObjectApp( whole_rgn );
         }
@@ -1944,7 +1842,11 @@ static BOOL send_erase( HWND hwnd, UINT flags, HRGN client_rgn,
             {
                 /* don't erase if the clip box is empty */
                 if (type != NULLREGION)
-                    need_erase = !send_message( hwnd, WM_ERASEBKGND, (WPARAM)hdc, 0 );
+                {
+                    /* CW Hack 23394, 23427 */
+                    need_erase = !send_message_timeout( hwnd, WM_ERASEBKGND, (WPARAM)hdc, 0, SMTO_ABORTIFHUNG, 1000, FALSE );
+                    if (need_erase && RtlGetLastWin32Error() == ERROR_TIMEOUT) ERR( "timeout.\n" );
+                }
             }
             if (!hdc_ret) release_dc( hwnd, hdc, TRUE );
         }
@@ -2250,7 +2152,7 @@ BOOL WINAPI NtUserGetUpdateRect( HWND hwnd, RECT *rect, BOOL erase )
     {
         HDC hdc = NtUserGetDCEx( hwnd, 0, DCX_USESTYLE );
         DWORD layout = NtGdiSetLayout( hdc, -1, 0 );  /* map_window_points mirrors already */
-        struct ratio win_dpi = get_dpi_for_window( hwnd );
+        UINT win_dpi = get_dpi_for_window( hwnd );
         map_window_points( 0, hwnd, (POINT *)rect, 2, win_dpi );
         *rect = map_dpi_rect( *rect, win_dpi, get_thread_dpi() );
         NtGdiTransformPoints( hdc, (POINT *)rect, (POINT *)rect, 2, NtGdiDPtoLP );

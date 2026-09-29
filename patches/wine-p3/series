@@ -1,5 +1,0 @@
-# Ordered quilt for Wine P3 (upstream 11.17 @ 913e31f2).
-# P3 preparation is external; this repository has no preparation helper.
-0001-host-msync.patch
-0002-d3dmetal-bridge.patch
-0003-zzz-compatibility.patch

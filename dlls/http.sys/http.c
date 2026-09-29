@@ -21,6 +21,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "wine/http.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
@@ -684,7 +685,7 @@ static DWORD WINAPI request_thread_proc(void *arg)
 
     TRACE("Starting request thread.\n");
 
-    while (!thread_stop && !WaitForSingleObject(request_event, INFINITE) && !thread_stop)
+    while (!WaitForSingleObject(request_event, INFINITE))
     {
         EnterCriticalSection(&http_cs);
 

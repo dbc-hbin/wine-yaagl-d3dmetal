@@ -42,6 +42,7 @@
 #endif
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 
 #include "x11drv.h"
 #include "winreg.h"
@@ -82,7 +83,6 @@ int copy_default_colors = 128;
 int alloc_system_colors = 256;
 int xrender_error_base = 0;
 char *process_name = NULL;
-pthread_key_t x11drv_thread_data_key = 0;
 
 static x11drv_error_callback err_callback;   /* current callback for error */
 static Display *err_callback_display;        /* display callback is set for */
@@ -285,13 +285,16 @@ static int error_handler( Display *display, XErrorEvent *error_evt )
                error_evt->error_code, error_evt->request_code );
         return 0;
     }
+    ERR("XERROR: code %d request %d minor %d xid %08lx\n",
+        error_evt->error_code,
+        error_evt->request_code,
+        error_evt->minor_code,
+        error_evt->resourceid);
     if (TRACE_ON(synchronous))
     {
-        ERR( "X protocol error: serial=%ld, request_code=%d - breaking into debugger\n",
-             error_evt->serial, error_evt->request_code );
+        old_error_handler( display, error_evt );
         assert( 0 );
     }
-    old_error_handler( display, error_evt );
     return 0;
 }
 
@@ -427,7 +430,7 @@ static void setup_options(void)
 
     /* open the app-specific key */
 
-    appname = RtlGetCurrentPeb()->ProcessParameters->ImagePathName.Buffer;
+    appname = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
     if ((p = wcsrchr( appname, '/' ))) appname = p + 1;
     if ((p = wcsrchr( appname, '\\' ))) appname = p + 1;
     len = lstrlenW( appname );
@@ -622,7 +625,7 @@ static void init_visuals( Display *display, int screen )
 /***********************************************************************
  *           X11DRV process initialisation routine
  */
-NTSTATUS __wine_unix_lib_init(void)
+static NTSTATUS x11drv_init( void *arg )
 {
     Display *display;
     void *libx11 = dlopen( SONAME_LIBX11, RTLD_NOW|RTLD_GLOBAL );
@@ -650,7 +653,6 @@ NTSTATUS __wine_unix_lib_init(void)
     gdi_display = display;
     old_error_handler = XSetErrorHandler( error_handler );
 
-    pthread_key_create( &x11drv_thread_data_key, NULL );
     init_pixmap_formats( display );
     init_visuals( display, DefaultScreen( display ));
     screen_bpp = pixmap_formats[default_visual.depth]->bits_per_pixel;
@@ -674,8 +676,8 @@ NTSTATUS __wine_unix_lib_init(void)
 #endif
     x11drv_xinput2_load();
 
-    x11drv_init_keyboard( gdi_display );
-    x11drv_init_mouse( gdi_display );
+    XkbUseExtension( gdi_display, NULL, NULL );
+    X11DRV_InitKeyboard( gdi_display );
     if (use_xim) use_xim = xim_init( input_style );
 
     init_icm_profile();
@@ -700,7 +702,7 @@ void X11DRV_ThreadDetach(void)
         XCloseDisplay( data->display );
         free( data );
         /* clear data in case we get re-entered from user32 before the thread is truly dead */
-        pthread_setspecific( x11drv_thread_data_key, NULL );
+        NtUserGetThreadInfo()->driver_data = 0;
     }
 }
 
@@ -758,7 +760,7 @@ struct x11drv_thread_data *x11drv_init_thread_data(void)
     if (TRACE_ON(synchronous)) XSynchronize( data->display, True );
 
     set_queue_display_fd( data->display );
-    pthread_setspecific( x11drv_thread_data_key, data );
+    NtUserGetThreadInfo()->driver_data = (UINT_PTR)data;
 
     XSelectInput( data->display, DefaultRootWindow( data->display ), PropertyChangeMask );
     if (use_xim) xim_thread_attach( data );
@@ -805,3 +807,17 @@ BOOL X11DRV_SystemParametersInfo( UINT action, UINT int_param, void *ptr_param, 
     }
     return FALSE;  /* let user32 handle it */
 }
+
+const unixlib_entry_t __wine_unix_call_funcs[] =
+{
+    x11drv_init,
+};
+
+#ifdef _WIN64
+
+const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+{
+    x11drv_init,
+};
+
+#endif /* _WIN64 */

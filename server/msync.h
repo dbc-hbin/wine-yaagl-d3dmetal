@@ -19,12 +19,9 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#include "wine/msync.h"
-
 extern int do_msync(void);
 extern void msync_init_shm(void);
 extern void msync_init(void);
-extern void msync_cleanup_thread( thread_id_t tid );
 
 #ifdef __APPLE__
 
@@ -45,7 +42,7 @@ struct msync
 };
 
 extern struct msync *create_msync( int low, int high, enum msync_type type );
-extern int msync_grab_object( struct msync *msync );
+extern void msync_grab_object( struct msync *msync );
 extern void msync_destroy( struct msync *msync );
 extern void msync_set_event( struct msync *msync );
 extern void msync_reset_event( struct msync *msync );

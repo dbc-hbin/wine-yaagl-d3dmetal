@@ -51,6 +51,20 @@ static BOOL CALLBACK get_process_windows(HWND hwnd, LPARAM lp)
     struct quit_info *qi = (struct quit_info*)lp;
     DWORD pid;
 
+    /* CW Hack #26261 */
+    {
+        static const WCHAR chrome_statustraywindowW[] = {'C','h','r','o','m','e','_','S','t','a','t','u','s','T','r','a','y','W','i','n','d','o','w',0};
+        WCHAR buffer[sizeof(chrome_statustraywindowW) / sizeof(WCHAR)];
+        UNICODE_STRING name = { .Buffer = buffer, .MaximumLength = sizeof(chrome_statustraywindowW) };
+
+        if (NtUserGetClassName(hwnd, FALSE, &name) &&
+            !memcmp(chrome_statustraywindowW, buffer, sizeof(chrome_statustraywindowW)))
+        {
+            WARN("HACK: not sending session end messages to Chrome_StatusTrayWindow hwnd %p\n", hwnd);
+            return TRUE;
+        }
+    }
+
     NtUserGetWindowThread(hwnd, &pid);
     if (pid == GetCurrentProcessId())
     {
@@ -143,15 +157,9 @@ static void CALLBACK quit_callback(HWND hwnd, UINT msg, ULONG_PTR data, LRESULT 
                 if (!SendMessageCallbackW(qi->wins[i], WM_ENDSESSION, qi->result, qi->flags,
                                           quit_callback, (ULONG_PTR)qi))
                 {
-                    DWORD error = RtlGetLastWin32Error();
-                    BOOL invalid = (error == ERROR_INVALID_WINDOW_HANDLE);
-                    if (invalid)
-                        TRACE("failed to send WM_ENDSESSION to win %p because it's invalid; assuming success\n",
-                            qi->wins[i]);
-                    else
-                        WARN("failed to send WM_ENDSESSION to win %p; error 0x%08lx; assuming refusal\n",
-                            qi->wins[i], error);
-                    quit_callback(qi->wins[i], WM_ENDSESSION, (ULONG_PTR)qi, invalid);
+                    WARN("failed to send WM_ENDSESSION to win %p; error 0x%08lx\n",
+                         qi->wins[i], RtlGetLastWin32Error());
+                    quit_callback(qi->wins[i], WM_ENDSESSION, (ULONG_PTR)qi, 0);
                 }
             }
         }
@@ -341,22 +349,31 @@ static NTSTATUS WINAPI macdrv_app_icon(void *arg, ULONG size)
         icon_bits = LockResource(icon_res_data);
         if (icon_bits)
         {
-            HICON icon;
+            static const BYTE png_magic[] = { 0x89, 0x50, 0x4e, 0x47 };
 
             entry->width = width;
             entry->height = height;
+            entry->size = icon_dir->idEntries[i].dwBytesInRes;
 
-            /* dwBytesInRes from the icon_dir entry is wrong in some apps; use
-               SizeofResource instead. */
-            icon = CreateIconFromResourceEx(icon_bits, SizeofResource(NULL, res_info),
-                                            TRUE, 0x00030000, width, height, 0);
-            if (icon)
+            if (!memcmp(icon_bits, png_magic, sizeof(png_magic)))
             {
-                entry->icon = HandleToUlong(icon);
+                entry->png = (UINT_PTR)icon_bits;
+                entry->icon = 0;
                 count++;
             }
             else
-                WARN("failed to create icon %d from resource with ID %hd\n", i, icon_dir->idEntries[i].nID);
+            {
+                HICON icon = CreateIconFromResourceEx(icon_bits, icon_dir->idEntries[i].dwBytesInRes,
+                                                      TRUE, 0x00030000, width, height, 0);
+                if (icon)
+                {
+                    entry->icon = HandleToUlong(icon);
+                    entry->png = 0;
+                    count++;
+                }
+                else
+                    WARN("failed to create icon %d from resource with ID %hd\n", i, icon_dir->idEntries[i].nID);
+            }
         }
         else
             WARN("failed to lock RT_ICON resource %d with ID %hd\n", i, icon_dir->idEntries[i].nID);

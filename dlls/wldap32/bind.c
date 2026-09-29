@@ -515,7 +515,6 @@ ULONG CDECL WLDAP32_ldap_unbind_s( LDAP *ld )
 
     if (SERVER_CTRLS(ld)) ldap_value_free_len( SERVER_CTRLS(ld) );
 
-    free( ld->ld_host );
     free( ld );
     return ret;
 }

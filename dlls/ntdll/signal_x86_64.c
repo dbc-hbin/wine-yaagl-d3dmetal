@@ -29,6 +29,7 @@
 #include <setjmp.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
@@ -429,7 +430,8 @@ __ASM_GLOBAL_FUNC( KiUserCallbackDispatcher,
                    "movl 0x28(%rsp),%edx\n\t"  /* len */
                    "movl 0x2c(%rsp),%r8d\n\t"  /* id */
 #ifdef __WINE_PE_BUILD
-                   "movq %gs:0x60,%rax\n\t"     /* peb */
+                   "movq %gs:0x30,%rax\n\t"     /* NtCurrentTeb() */
+                   "movq 0x60(%rax),%rax\n\t"   /* peb */
                    "movq 0x58(%rax),%rax\n\t"   /* peb->KernelCallbackTable */
                    "call *(%rax,%r8,8)\n\t"     /* KernelCallbackTable[id] */
                    ".seh_handler " __ASM_NAME("user_callback_handler") ", @except\n\t"
@@ -775,10 +777,9 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
         }
         else  /* hack: call builtin handlers registered in the tib list */
         {
-            ULONG_PTR last_frame = new_context.Rsp;
-            if (end_frame && (ULONG_PTR)end_frame < last_frame) last_frame = (ULONG_PTR)end_frame;
-
-            while (is_valid_frame( (ULONG_PTR)teb_frame ) && (ULONG_PTR)teb_frame < last_frame)
+            while (is_valid_frame( (ULONG_PTR)teb_frame ) &&
+                   (ULONG64)teb_frame < new_context.Rsp &&
+                   (ULONG64)teb_frame < (ULONG64)end_frame)
             {
                 TRACE( "calling TEB handler %p (rec=%p, frame=%p context=%p, dispatch=%p)\n",
                        teb_frame->Handler, rec, teb_frame, dispatch.ContextRecord, &dispatch );
@@ -806,7 +807,7 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
                     break;
                 }
             }
-            if ((ULONG_PTR)teb_frame == last_frame && last_frame < new_context.Rsp) break;
+            if ((ULONG64)teb_frame == (ULONG64)end_frame && (ULONG64)end_frame < new_context.Rsp) break;
         }
 
         if (dispatch.EstablisherFrame == (ULONG64)end_frame) break;
@@ -839,7 +840,8 @@ __ASM_GLOBAL_FUNC( RtlRaiseException,
                    "movq %rax,0xf8(%rdx)\n\t"   /* context->Rip */
                    "movq %rax,0x10(%rcx)\n\t"   /* rec->ExceptionAddress */
                    "movl $1,%r8d\n\t"
-                   "movq %gs:0x60,%rax\n\t"     /* Peb */
+                   "movq %gs:(0x30),%rax\n\t"   /* Teb */
+                   "movq 0x60(%rax),%rax\n\t"   /* Peb */
                    "cmpb $0,0x02(%rax)\n\t"     /* BeingDebugged */
                    "jne 1f\n\t"
                    "call " __ASM_NAME("dispatch_exception") "\n"
@@ -885,7 +887,6 @@ ULONG WINAPI RtlWalkFrameChain( void **buffer, ULONG count, ULONG flags )
     for (i = 0; i < count; i++)
     {
         func = RtlLookupFunctionEntry( context.Rip, &base, &table );
-        if (!func) break;
         if (RtlVirtualUnwind2( UNW_FLAG_NHANDLER, base, context.Rip, func, &context, NULL,
                                &data, &frame, NULL, NULL, NULL, &handler, 0 ))
             break;
@@ -1083,7 +1084,8 @@ __ASM_GLOBAL_FUNC( DbgUiRemoteBreakin,
                    ".seh_stackalloc 0x28\n\t"
                    ".seh_endprologue\n\t"
                    ".seh_handler DbgUiRemoteBreakin_handler, @except\n\t"
-                   "mov %gs:0x60,%rax\n\t"
+                   "mov %gs:0x30,%rax\n\t"
+                   "mov 0x60(%rax),%rax\n\t"
                    "cmpb $0,2(%rax)\n\t"
                    "je 1f\n\t"
                    "call " __ASM_NAME("DbgBreakPoint") "\n"

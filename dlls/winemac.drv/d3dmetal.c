@@ -102,9 +102,9 @@ struct metal_view_surface
 static pthread_mutex_t metal_view_surfaces_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct metal_view_surface *metal_view_surfaces;
 
-/* The window array owns the original reference; an active metal view owns another.
- * Removing an entry transfers its reference to the caller, which releases it
- * after dropping the window lock (detach reacquires it). */
+/* The window array owns the original reference; an active view owns another.
+ * Removal transfers the array reference to the caller for release after the
+ * window lock is dropped (detaching a client surface reacquires that lock). */
 static BOOL remove_window_surface(struct macdrv_win_data *data, struct macdrv_client_surface *surface)
 {
     CFIndex index;
@@ -112,12 +112,9 @@ static BOOL remove_window_surface(struct macdrv_win_data *data, struct macdrv_cl
     if (!data || !data->d3dmetal_client_surfaces) return FALSE;
     index = CFArrayGetFirstIndexOfValue(data->d3dmetal_client_surfaces,
                                        CFRangeMake(0, CFArrayGetCount(data->d3dmetal_client_surfaces)), surface);
-    if (index != kCFNotFound)
-    {
-        CFArrayRemoveValueAtIndex(data->d3dmetal_client_surfaces, index);
-        return TRUE;
-    }
-    return FALSE;
+    if (index == kCFNotFound) return FALSE;
+    CFArrayRemoveValueAtIndex(data->d3dmetal_client_surfaces, index);
+    return TRUE;
 }
 
 void macdrv_retain_d3dmetal_client_surface(void *surface)
@@ -147,17 +144,14 @@ static struct d3dmetal_macdrv_win_data *my_get_win_data(HWND hwnd)
      * They do:
      * get_win_data() -> create_metal_device() -> create_metal_view() -> get_metal_layer() -> release_win_data()
      */
-    {
-        struct client_surface *base = macdrv_CreateClientSurface(hwnd, 0, FALSE);
-        if (!base) return NULL;
-        client_surface = impl_from_client_surface(base);
-    }
+    client_surface = macdrv_client_surface_create(hwnd);
+    if (!client_surface) return NULL;
 
     /* get_win_data() needs to happen after client_surface creation to avoid deadlocks */
     data = get_win_data(hwnd);
     if (!data)
     {
-        client_surface_release(&client_surface->client);
+        client_surface_release((struct client_surface *)client_surface);
         return NULL;
     }
 
@@ -165,7 +159,6 @@ static struct d3dmetal_macdrv_win_data *my_get_win_data(HWND hwnd)
 
     if (!data->d3dmetal_client_surfaces)
     {
-        /* Entries own their original client-surface references, not CF callbacks. */
         data->d3dmetal_client_surfaces = CFArrayCreateMutable(NULL, 0, NULL);
     }
     d3dm_data = calloc(1, sizeof(*d3dm_data));
@@ -209,6 +202,7 @@ static void my_release_win_data(struct d3dmetal_macdrv_win_data *data)
     BOOL active = FALSE, removed = FALSE;
 
     TRACE("release_win_data %p\n", data);
+
     if (!data) return;
 
     surface = data->padding[1];
@@ -217,8 +211,6 @@ static void my_release_win_data(struct d3dmetal_macdrv_win_data *data)
         if (entry->surface == surface) { active = TRUE; break; }
     pthread_mutex_unlock(&metal_view_surfaces_mutex);
 
-    /* No native view was made (or it was already released).  Creation failure
-     * must not strand its client view until the HWND is destroyed. */
     if (!active) removed = remove_window_surface(data->padding[0], surface);
     release_win_data(data->padding[0]);
     if (removed) client_surface_release(&surface->client);
@@ -296,7 +288,7 @@ static void my_macdrv_view_release_metal_view(macdrv_metal_view v)
 
     data = get_win_data(entry->surface->client.hwnd);
     removed = remove_window_surface(data, entry->surface);
-    release_win_data(data);
+    if (data) release_win_data(data);
     if (removed) client_surface_release(&entry->surface->client);
     client_surface_release(&entry->surface->client);
     free(entry);
@@ -496,7 +488,7 @@ static LONG_PTR WINAPI my_SetWindowLongPtrW(HWND hwnd, INT offset, LONG_PTR newv
     return NtUserSetWindowLongPtr( hwnd, offset, newval, FALSE );
 }
 
-/* This is a separate SysV export, not part of the fixed macdrv_functions_t ABI. */
+/* Separate SysV export: do not extend the fixed 192-byte D3DMetal ABI. */
 DECLSPEC_EXPORT int macdrv_query_d3dmetal_display(uintptr_t window, uintptr_t monitor_override,
                                                  struct yaagl_d3dmetal_display *out)
 {

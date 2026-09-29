@@ -1,7 +1,6 @@
 PROGRAMS = wineserver
 
 SOURCES = \
-	alpc.c \
 	async.c \
 	atom.c \
 	change.c \
@@ -16,6 +15,7 @@ SOURCES = \
 	event.c \
 	fd.c \
 	file.c \
+	msync.c \
 	handle.c \
 	hook.c \
 	inproc_sync.c \
@@ -23,7 +23,6 @@ SOURCES = \
 	mailslot.c \
 	main.c \
 	mapping.c \
-	msync.c \
 	mutex.c \
 	named_pipe.c \
 	object.c \

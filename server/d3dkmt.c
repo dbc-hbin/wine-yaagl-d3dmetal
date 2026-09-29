@@ -25,6 +25,7 @@
 #include <stdio.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
@@ -50,11 +51,27 @@ static void d3dkmt_object_destroy( struct object *obj );
 
 static const struct object_ops d3dkmt_object_ops =
 {
-    .size    = sizeof(struct d3dkmt_object),
-    .type    = &no_type,
-    .dump    = d3dkmt_object_dump,
-    .get_fd  = d3dkmt_object_get_fd,
-    .destroy = d3dkmt_object_destroy,
+    sizeof(struct d3dkmt_object),   /* size */
+    &no_type,                       /* type */
+    d3dkmt_object_dump,             /* dump */
+    no_add_queue,                   /* add_queue */
+    NULL,                           /* remove_queue */
+    NULL,                           /* signaled */
+    NULL,                           /* satisfied */
+    no_signal,                      /* signal */
+    d3dkmt_object_get_fd,           /* get_fd */
+    default_get_sync,               /* get_sync */
+    default_map_access,             /* map_access */
+    default_get_sd,                 /* get_sd */
+    default_set_sd,                 /* set_sd */
+    no_get_full_name,               /* get_full_name */
+    no_lookup_name,                 /* lookup_name */
+    no_link_name,                   /* link_name */
+    NULL,                           /* unlink_name */
+    no_open_file,                   /* open_file */
+    no_kernel_obj_list,             /* get_kernel_obj_list */
+    no_close_handle,                /* close_handle */
+    d3dkmt_object_destroy,          /* destroy */
 };
 
 static enum server_fd_type d3dkmt_get_fd_type( struct fd *fd )
@@ -64,7 +81,18 @@ static enum server_fd_type d3dkmt_get_fd_type( struct fd *fd )
 
 static const struct fd_ops d3dkmt_fd_ops =
 {
-    .get_fd_type = d3dkmt_get_fd_type,
+    default_fd_get_poll_events,   /* get_poll_events */
+    default_poll_event,           /* poll_event */
+    d3dkmt_get_fd_type,           /* get_fd_type */
+    no_fd_read,                   /* read */
+    no_fd_write,                  /* write */
+    no_fd_flush,                  /* flush */
+    no_fd_get_file_info,          /* get_file_info */
+    no_fd_get_volume_info,        /* get_volume_info */
+    no_fd_ioctl,                  /* ioctl */
+    default_fd_cancel_async,      /* cancel_async */
+    no_fd_queue_async,            /* queue_async */
+    default_fd_reselect_async     /* reselect_async */
 };
 
 struct keyed_wait
@@ -91,10 +119,27 @@ static void d3dkmt_mutex_destroy( struct object *obj );
 
 static const struct object_ops d3dkmt_mutex_ops =
 {
-    .size    = sizeof(struct d3dkmt_mutex),
-    .type    = &no_type,
-    .dump    = d3dkmt_mutex_dump,
-    .destroy = d3dkmt_mutex_destroy,
+    sizeof(struct d3dkmt_mutex),    /* size */
+    &no_type,                       /* type */
+    d3dkmt_mutex_dump,              /* dump */
+    no_add_queue,                   /* add_queue */
+    NULL,                           /* remove_queue */
+    NULL,                           /* signaled */
+    NULL,                           /* satisfied */
+    no_signal,                      /* signal */
+    no_get_fd,                      /* get_fd */
+    default_get_sync,               /* get_sync */
+    default_map_access,             /* map_access */
+    default_get_sd,                 /* get_sd */
+    default_set_sd,                 /* set_sd */
+    no_get_full_name,               /* get_full_name */
+    no_lookup_name,                 /* lookup_name */
+    no_link_name,                   /* link_name */
+    NULL,                           /* unlink_name */
+    no_open_file,                   /* open_file */
+    no_kernel_obj_list,             /* get_kernel_obj_list */
+    no_close_handle,                /* close_handle */
+    d3dkmt_mutex_destroy,           /* destroy */
 };
 
 #define DXGK_SHARED_SYNC_QUERY_STATE  0x0001
@@ -126,10 +171,27 @@ static void dxgk_shared_sync_destroy( struct object *obj );
 
 static const struct object_ops dxgk_shared_sync_ops =
 {
-    .size    = sizeof(struct dxgk_shared_sync),
-    .type    = &dxgk_shared_sync_type,
-    .dump    = dxgk_shared_sync_dump,
-    .destroy = dxgk_shared_sync_destroy,
+    sizeof(struct dxgk_shared_sync),    /* size */
+    &dxgk_shared_sync_type,             /* type */
+    dxgk_shared_sync_dump,              /* dump */
+    no_add_queue,                       /* add_queue */
+    NULL,                               /* remove_queue */
+    NULL,                               /* signaled */
+    NULL,                               /* satisfied */
+    no_signal,                          /* signal */
+    no_get_fd,                          /* get_fd */
+    default_get_sync,                   /* get_sync */
+    default_map_access,                 /* map_access */
+    default_get_sd,                     /* get_sd */
+    default_set_sd,                     /* set_sd */
+    default_get_full_name,              /* get_full_name */
+    no_lookup_name,                     /* lookup_name */
+    directory_link_name,                /* link_name */
+    default_unlink_name,                /* unlink_name */
+    no_open_file,                       /* open_file */
+    no_kernel_obj_list,                 /* get_kernel_obj_list */
+    no_close_handle,                    /* close_handle */
+    dxgk_shared_sync_destroy,           /* destroy */
 };
 
 static void dxgk_shared_sync_dump( struct object *obj, int verbose )
@@ -176,10 +238,27 @@ static void dxgk_shared_resource_destroy( struct object *obj );
 
 static const struct object_ops dxgk_shared_resource_ops =
 {
-    .size    = sizeof(struct dxgk_shared_resource),
-    .type    = &dxgk_shared_resource_type,
-    .dump    = dxgk_shared_resource_dump,
-    .destroy = dxgk_shared_resource_destroy,
+    sizeof(struct dxgk_shared_resource),    /* size */
+    &dxgk_shared_resource_type,             /* type */
+    dxgk_shared_resource_dump,              /* dump */
+    no_add_queue,                           /* add_queue */
+    NULL,                                   /* remove_queue */
+    NULL,                                   /* signaled */
+    NULL,                                   /* satisfied */
+    no_signal,                              /* signal */
+    no_get_fd,                              /* get_fd */
+    default_get_sync,                       /* get_sync */
+    default_map_access,                     /* map_access */
+    default_get_sd,                         /* get_sd */
+    default_set_sd,                         /* set_sd */
+    default_get_full_name,                  /* get_full_name */
+    no_lookup_name,                         /* lookup_name */
+    directory_link_name,                    /* link_name */
+    default_unlink_name,                    /* unlink_name */
+    no_open_file,                           /* open_file */
+    no_kernel_obj_list,                     /* get_kernel_obj_list */
+    no_close_handle,                        /* close_handle */
+    dxgk_shared_resource_destroy,           /* destroy */
 };
 
 static void dxgk_shared_resource_dump( struct object *obj, int verbose )
@@ -607,21 +686,22 @@ DECL_HANDLER(d3dkmt_object_open)
 DECL_HANDLER(d3dkmt_share_objects)
 {
     struct object *resource = NULL, *mutex = NULL, *sync = NULL;
-    struct object_params params;
+    const struct object_attributes *objattr;
+    const struct security_descriptor *sd;
+    struct unicode_str name;
+    struct object *root;
 
-    if (!get_req_object_attributes( &params )) return;
-    params.attr |= OBJ_CASE_INSENSITIVE;
+    if (!(objattr = get_req_object_attributes( &sd, &name, &root ))) return;
 
     if (req->resource)
     {
         struct dxgk_shared_resource *shared;
 
-        if (!(resource = d3dkmt_object_open( req->resource, D3DKMT_RESOURCE ))) goto done;
+        if (!(resource = d3dkmt_object_open( req->resource, D3DKMT_RESOURCE ))) return;
         if (req->mutex && !(mutex = d3dkmt_object_open( req->mutex, D3DKMT_MUTEX ))) goto done;
         if (req->sync && !(sync = d3dkmt_object_open( req->sync, D3DKMT_SYNC ))) goto done;
 
-        params.ops = &dxgk_shared_resource_ops;
-        if (!(shared = create_named_object( &params ))) goto done;
+        if (!(shared = create_named_object( root, &dxgk_shared_resource_ops, &name, objattr->attributes | OBJ_CASE_INSENSITIVE, NULL ))) goto done;
         shared->resource = grab_object( resource );
         if ((shared->mutex = mutex)) grab_object( mutex );
         if ((shared->sync = sync)) grab_object( sync );
@@ -632,17 +712,15 @@ DECL_HANDLER(d3dkmt_share_objects)
     {
         struct dxgk_shared_sync *shared;
 
-        if (!(sync = d3dkmt_object_open( req->sync, D3DKMT_SYNC ))) goto done;
+        if (!(sync = d3dkmt_object_open( req->sync, D3DKMT_SYNC ))) return;
 
-        params.ops = &dxgk_shared_sync_ops;
-        if (!(shared = create_named_object( &params ))) goto done;
+        if (!(shared = create_named_object( root, &dxgk_shared_sync_ops, &name, objattr->attributes | OBJ_CASE_INSENSITIVE, NULL ))) goto done;
         shared->sync = grab_object( sync );
         reply->handle = alloc_handle( current->process, shared, req->access, OBJ_INHERIT );
         release_object( shared );
     }
 
 done:
-    if (params.root) release_object( params.root );
     if (resource) release_object( resource );
     if (mutex) release_object( mutex );
     if (sync) release_object( sync );
@@ -657,11 +735,11 @@ DECL_HANDLER(d3dkmt_object_open_name)
     {
     case D3DKMT_SYNC:
         reply->handle = open_object( current->process, req->rootdir, req->access, &dxgk_shared_sync_ops,
-                                     name, req->attributes | OBJ_CASE_INSENSITIVE );
+                                     &name, req->attributes | OBJ_CASE_INSENSITIVE );
         break;
     case D3DKMT_RESOURCE:
         reply->handle = open_object( current->process, req->rootdir, req->access, &dxgk_shared_resource_ops,
-                                     name, req->attributes | OBJ_CASE_INSENSITIVE );
+                                     &name, req->attributes | OBJ_CASE_INSENSITIVE );
         break;
     default:
         set_error( STATUS_INVALID_PARAMETER );
@@ -675,7 +753,7 @@ DECL_HANDLER(d3dkmt_mutex_acquire)
     struct d3dkmt_mutex *mutex;
     struct object *sync;
 
-    if (!(mutex = d3dkmt_object_open( req->mutex, D3DKMT_MUTEX ))) return;
+    if (!(mutex = d3dkmt_object_open( req->mutex, D3DKMT_MUTEX ))) goto done;
 
     if (req->wait_status) set_error( req->wait_status );
     else if (mutex->abandoned) set_error( STATUS_ABANDONED );
@@ -693,7 +771,12 @@ DECL_HANDLER(d3dkmt_mutex_acquire)
 
     release_object( mutex );
 
-    if (get_error() != STATUS_PENDING && req->wait_handle) keyed_wait_release( mutex, req->key_value );
+done:
+    if (get_error() != STATUS_PENDING && req->wait_handle)
+    {
+        close_handle( current->process, req->wait_handle );
+        if (mutex) keyed_wait_release( mutex, req->key_value );
+    }
 }
 
 /* Release a global d3dkmt keyed mutex */

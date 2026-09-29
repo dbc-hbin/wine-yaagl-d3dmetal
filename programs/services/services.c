@@ -41,7 +41,11 @@ WINE_DEFAULT_DEBUG_CHANNEL(service);
 
 struct scmdatabase *active_database;
 
-DWORD service_pipe_timeout = 10000;
+/* CW HACK 20218:
+ * Quadruple service_pipe_timeout, the Rockstar Launcher service takes 20+
+ * seconds to launch under Rosetta.
+ */
+DWORD service_pipe_timeout = 40000;
 DWORD service_kill_timeout = 60000;
 static DWORD default_preshutdown_timeout = 180000;
 static DWORD autostart_delay = 120000;
@@ -520,12 +524,9 @@ BOOL validate_service_config(struct service_entry *entry)
     case SERVICE_WIN32_OWN_PROCESS | SERVICE_INTERACTIVE_PROCESS:
     case SERVICE_WIN32_SHARE_PROCESS | SERVICE_INTERACTIVE_PROCESS:
         /* These can be only run as LocalSystem */
-        if (entry->config.lpServiceStartName &&
-            wcsicmp(entry->config.lpServiceStartName, L"LocalSystem") != 0 &&
-            wcsicmp(entry->config.lpServiceStartName, L".\\LocalSystem") != 0)
+        if (entry->config.lpServiceStartName && wcsicmp(entry->config.lpServiceStartName, L"LocalSystem") != 0)
         {
-            WINE_ERR("Service %s is interactive but has the disallowed account name %s\n",
-                     wine_dbgstr_w(entry->name), wine_dbgstr_w(entry->config.lpServiceStartName));
+            WINE_ERR("Service %s is interactive but has a start name\n", wine_dbgstr_w(entry->name));
             return FALSE;
         }
         break;

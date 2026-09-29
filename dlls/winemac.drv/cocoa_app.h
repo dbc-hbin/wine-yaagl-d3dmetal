@@ -21,16 +21,9 @@
 #import <AppKit/AppKit.h>
 
 #include "macdrv_cocoa.h"
-#include "cocoa_warpconsumption.h"
 
 #define ERR(...) do { if (macdrv_err_on) LogError(__func__, __VA_ARGS__); } while (false)
 
-/* Internal notification sent on NSApp for display configuration changes. The
-   userInfo contains the two keys, NSNumbers for the effected CGDirectDisplayID
-   and the CGDisplayChangeSummaryFlags from the underlying CG callback. */
-static NSString* const WineDisplayConfigurationChangedNotification = @"WineDisplayConfigurationChanged";
-static NSString* const WineDisplayConfigurationNotificationDisplayIDKey = @"DisplayID";
-static NSString* const WineDisplayConfigurationNotificationFlagsKey = @"Flags";
 
 enum {
     WineApplicationEventWakeQuery,
@@ -72,10 +65,6 @@ enum {
     WineWindow* mouseCaptureWindow;
     BOOL forceNextMouseMoveAbsolute;
     double mouseMoveDeltaX, mouseMoveDeltaY;
-    double rawMouseMoveDeltaX, rawMouseMoveDeltaY;
-    /* Pending direct-CGWarp displacements folded into future mouse-move
-       event deltas (main thread only).  See cocoa_warpconsumption.h. */
-    struct warp_correction_state warpCorrections;
     NSUInteger unmatchedMouseDowns;
 
     NSTimeInterval lastScrollTime;
@@ -84,6 +73,8 @@ enum {
     NSMutableDictionary* originalDisplayModes;
     NSMutableDictionary* latentDisplayModes;
     BOOL displaysCapturedForFullscreen;
+    BOOL displaysTemporarilyUncapturedForDialog;
+    BOOL temporarilyIgnoreResignEventsForDialog;
 
     NSArray*    cursorFrames;
     int         cursorFrame;
@@ -99,14 +90,24 @@ enum {
 
     NSImage* applicationIcon;
 
+    /* CW Hack 22310, 24199 */
+    NSString *explicitAppUserModelID;
+    BOOL terminatingDueToExternalRequest;
+
     BOOL beenActive;
 
     NSMutableSet* windowsBeingDragged;
+
+    // CrossOver Hack 10912: Mac Edit menu
+    NSMutableArray* changedKeyEquivalents;
 }
 
 @property (nonatomic) CGEventSourceKeyboardType keyboardType;
 @property (readonly, copy, nonatomic) NSEvent* lastFlagsChanged;
 @property (readonly, nonatomic) BOOL areDisplaysCaptured;
+@property (readonly, nonatomic) BOOL displaysTemporarilyUncapturedForDialog;
+@property (readonly, nonatomic) BOOL temporarilyIgnoreResignEventsForDialog;
+@property (nonatomic, copy) NSString *explicitAppUserModelID;  /* CW Hack 22310 */
 
 @property (readonly) BOOL clippingCursor;
 @property (nonatomic) NSTimeInterval lastSetCursorPositionTime;
@@ -123,8 +124,6 @@ enum {
     - (double) ticksForEventTime:(NSTimeInterval)eventTime;
 
     - (void) windowGotFocus:(WineWindow*)window;
-    - (void) applyCursorForWindow:(WineWindow*)window;
-    - (void) reconcileCursorForCurrentMouseLocation;
 
     - (BOOL) waitUntilQueryDone:(bool*)done timeout:(NSDate*)timeout processEvents:(BOOL)processEvents;
 
@@ -142,6 +141,9 @@ enum {
 
     - (BOOL) handleEvent:(NSEvent*)anEvent;
     - (void) didSendEvent:(NSEvent*)anEvent;
+
+    // CrossOver Hack 10912: Mac Edit menu
+    - (BOOL) isEditMenuAction:(SEL)selector;
 
 @end
 

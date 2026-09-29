@@ -1441,12 +1441,12 @@ static HRESULT propertystorage_read_scalar(PROPVARIANT *prop, const struct read_
                 if (codepage == CP_UNICODE)
                 {
                     hr = buffer_read_len(buffer, *offset, prop->bstrVal, count);
-                    *offset += ALIGNED_LENGTH(count, sizeof(DWORD) - 1);
+                    offset += ALIGNED_LENGTH(count, sizeof(DWORD) - 1);
                 }
                 else
                 {
                     MultiByteToWideChar(codepage, 0, (LPCSTR)(buffer->data + *offset), count, prop->bstrVal, wcount);
-                    *offset += ALIGNED_LENGTH(wcount, sizeof(DWORD) - 1);
+                    offset += ALIGNED_LENGTH(wcount, sizeof(DWORD) - 1);
                 }
 
                 prop->bstrVal[wcount - 1] = '\0';
@@ -1637,20 +1637,16 @@ static HRESULT PropertyStorage_ReadProperty(PROPVARIANT *prop, const struct read
             {
                 for (; i > 0; --i)
                 {
-                    if (prop->vt == (VT_VECTOR | VT_VARIANT))
-                        memcpy(&elem, prop->cac.pElems + elemsize * (i - 1), elemsize);
-                    else
-                        memcpy(&elem.lVal, prop->cac.pElems + elemsize * (i - 1), elemsize);
                     switch(elem.vt)
                     {
                     case VT_LPSTR:
                     case VT_LPWSTR:
                     case VT_CF:
                     case VT_CLSID:
-                        call_IMemoryAllocator_Free(pma, elem.pwszVal);
+                        call_IMemoryAllocator_Free(pma, prop->calpwstr.pElems);
                         break;
                     case VT_BSTR:
-                        SysFreeString(elem.bstrVal);
+                        SysFreeString(prop->cabstr.pElems[i -1]);
                         break;
                     }
                 }
@@ -2344,13 +2340,6 @@ static HRESULT PropertyStorage_WritePropertyToStream(PropertyStorage_impl *This,
         hr = IStream_Write(This->stm, var->pwszVal, len * sizeof(WCHAR),
          &count);
         bytesWritten = count + sizeof(DWORD);
-        break;
-    }
-    case VT_BOOL:
-    {
-        hr = IStream_Write(This->stm, &var->boolVal, sizeof(var->boolVal),
-         &count);
-        bytesWritten = count;
         break;
     }
     case VT_FILETIME:

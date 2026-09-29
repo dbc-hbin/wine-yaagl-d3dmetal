@@ -1929,10 +1929,6 @@ GpStatus WINGDIPAPI GdipWarpPath(GpPath *path, GpMatrix* matrix,
     FIXME("(%p,%s,%p,%i,%0.2f,%0.2f,%0.2f,%0.2f,%i,%0.2f)\n", path, debugstr_matrix(matrix),
         points, count, x, y, width, height, warpmode, flatness);
 
-    if (!path || !points || count < 1) {
-        return InvalidParameter;
-    }
-
     return NotImplemented;
 }
 
@@ -2901,7 +2897,7 @@ GpStatus WINGDIPAPI GdipClearPathMarkers(GpPath* path)
 
     count = path->pathdata.Count;
 
-    for(i = 0; i < count; i++){
+    for(i = 0; i < count - 1; i++){
         path->pathdata.Types[i] &= ~PathPointTypePathMarker;
     }
 

@@ -69,16 +69,6 @@ static UINT	CBitHeight, CBitWidth;
 static void CBCalcPlacement(HEADCOMBO *combo);
 static void CBResetPos(HEADCOMBO *combo, BOOL redraw);
 
-static HEADCOMBO *get_control_state( HWND hwnd )
-{
-    return (HEADCOMBO *)NtUserGetPrivateData( hwnd, 0, sizeof(HEADCOMBO *) );
-}
-
-static HEADCOMBO *set_control_state( HWND hwnd, HEADCOMBO *state )
-{
-    return (HEADCOMBO *)NtUserSetPrivateData( hwnd, 0, sizeof(HEADCOMBO *), (LONG_PTR)state );
-}
-
 /***********************************************************************
  *           COMBO_Init
  *
@@ -126,7 +116,7 @@ static LRESULT COMBO_NCCreate(HWND hwnd, LONG style)
     if( COMBO_Init() && (lphc = calloc( 1, sizeof(HEADCOMBO) )) )
     {
         lphc->self = hwnd;
-        set_control_state( hwnd, lphc );
+        SetWindowLongPtrW( hwnd, 0, (LONG_PTR)lphc );
 
        /* some braindead apps do try to use scrollbar/border flags */
 
@@ -164,7 +154,7 @@ static LRESULT COMBO_NCDestroy( LPHEADCOMBO lphc )
        if( (CB_GETTYPE(lphc) != CBS_SIMPLE) && lphc->hWndLBox )
            NtUserDestroyWindow( lphc->hWndLBox );
 
-       set_control_state( lphc->self, NULL );
+       SetWindowLongPtrW( lphc->self, 0, 0 );
        free( lphc );
    }
    return 0;
@@ -1672,17 +1662,11 @@ static void COMBO_MouseMove( LPHEADCOMBO lphc, WPARAM wParam, LPARAM lParam )
    }
 }
 
-
-/*************************************************************************
- *           GetComboBoxInfo   (USER32.@)
- */
-BOOL WINAPI GetComboBoxInfo( HWND hwnd, COMBOBOXINFO *pcbi )
+static LRESULT COMBO_GetComboBoxInfo(const HEADCOMBO *lphc, COMBOBOXINFO *pcbi)
 {
-    HEADCOMBO *lphc = get_control_state( hwnd );
-
-    if (!lphc || !pcbi || (pcbi->cbSize < sizeof(COMBOBOXINFO)))
+    if (!pcbi || (pcbi->cbSize < sizeof(COMBOBOXINFO)))
         return FALSE;
-    TRACE("(%p, %p)\n", hwnd, pcbi);
+
     pcbi->rcItem = lphc->textRect;
     pcbi->rcButton = lphc->buttonRect;
     pcbi->stateButton = 0;
@@ -1701,13 +1685,12 @@ BOOL WINAPI GetComboBoxInfo( HWND hwnd, COMBOBOXINFO *pcbi )
  */
 LRESULT ComboWndProc_common( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, BOOL unicode )
 {
-      LPHEADCOMBO lphc = get_control_state( hwnd );
+      LPHEADCOMBO lphc = (LPHEADCOMBO)GetWindowLongPtrW( hwnd, 0 );
 
       TRACE("[%p]: msg %s wp %08Ix lp %08Ix\n",
             hwnd, SPY_GetMsgName(message, hwnd), wParam, lParam );
 
       if (!IsWindow(hwnd)) return 0;
-      if (message == WM_NCCREATE || message == WM_CREATE) NtUserSetWindowFNID( hwnd, MAKE_FNID(NTUSER_WNDPROC_COMBO) );
 
       if( lphc || message == WM_NCCREATE )
       switch(message)
@@ -2084,7 +2067,7 @@ LRESULT ComboWndProc_common( HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
 	case CB_GETEXTENDEDUI:
 		return (lphc->wState & CBF_EUI) != 0;
 	case CB_GETCOMBOBOXINFO:
-		return GetComboBoxInfo(hwnd, (COMBOBOXINFO *)lParam);
+		return COMBO_GetComboBoxInfo(lphc, (COMBOBOXINFO *)lParam);
 	case CB_LIMITTEXT:
 		if( lphc->wState & CBF_EDIT )
 			return SendMessageW(lphc->hWndEdit, EM_LIMITTEXT, wParam, lParam);
@@ -2097,4 +2080,14 @@ LRESULT ComboWndProc_common( HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
       }
       return unicode ? DefWindowProcW(hwnd, message, wParam, lParam) :
                        DefWindowProcA(hwnd, message, wParam, lParam);
+}
+
+/*************************************************************************
+ *           GetComboBoxInfo   (USER32.@)
+ */
+BOOL WINAPI GetComboBoxInfo(HWND hwndCombo,      /* [in] handle to combo box */
+			    PCOMBOBOXINFO pcbi   /* [in/out] combo box information */)
+{
+    TRACE("(%p, %p)\n", hwndCombo, pcbi);
+    return SendMessageW(hwndCombo, CB_GETCOMBOBOXINFO, 0, (LPARAM)pcbi);
 }

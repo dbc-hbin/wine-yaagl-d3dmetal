@@ -30,7 +30,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,9 +51,7 @@
 #include <os/lock.h>
 #include <AvailabilityMacros.h>
 #include <dlfcn.h>
-#include <pthread.h>
 #include <sched.h>
-#include <signal.h>
 #include <unistd.h>
 
 #include "ntstatus.h"
@@ -208,37 +206,8 @@ C_ASSERT(sizeof(struct mutex) == 16);
 typedef struct
 {
     mach_msg_header_t header;
-    unsigned int shm_idx[MAXIMUM_WAIT_OBJECTS + 2];
+    unsigned int shm_idx[MAXIMUM_WAIT_OBJECTS + 1];
 } mach_register_message_t;
-
-enum wait_state
-{
-    MSYNC_WAIT_IDLE,
-    MSYNC_WAIT_REGISTERING,
-    MSYNC_WAIT_ARMED,
-    MSYNC_WAIT_WOKEN,
-    MSYNC_WAIT_CANCELING,
-    MSYNC_WAIT_FAILED
-};
-
-#define WAIT_STATE_MASK 7u
-#define REGISTRATION_SPIN_COUNT 128
-
-static inline unsigned int wait_token( unsigned int generation, enum wait_state state )
-{
-    return generation | state;
-}
-
-static inline void spin_pause(void)
-{
-#if defined(__aarch64__)
-    __asm__ volatile("yield");
-#elif defined(__i386__) || defined(__x86_64__)
-    __asm__ volatile("pause");
-#else
-    __asm__ volatile("" ::: "memory");
-#endif
-}
 
 static mach_port_t server_port;
 
@@ -246,33 +215,36 @@ static int *shm_tid_map;
 
 static const mach_msg_bits_t msgh_bits_send = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
 
-static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, unsigned int token,
-                                const int *objs, void **objs_shm, int alert_obj, int count )
+static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, const int *objs,
+                                void **objs_shm, int alert_obj, void *alert_obj_shm, int count )
 {
     int i, is_mutex;
     mach_msg_return_t mr;
-    sigset_t old_set;
     __thread static mach_register_message_t message;
-
-    pthread_sigmask( SIG_BLOCK, &server_block_set, &old_set );
 
     message.header.msgh_remote_port = server_port;
     message.header.msgh_bits = msgh_bits_send;
     message.header.msgh_id = msgh_id;
-    message.shm_idx[0] = token;
 
     for (i = 0; i < count; i++)
     {
         struct event *obj = (struct event *)objs_shm[i];
 
         is_mutex = obj->msync_type == MSYNC_MUTEX ? 1 : 0;
-        message.shm_idx[i + 1] = objs[i] | (is_mutex << 28);
+        message.shm_idx[i] = objs[i]| (is_mutex << 28);
+        __atomic_add_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
     }
 
-    if (alert_obj) message.shm_idx[++count] = alert_obj;
+    if (alert_obj)
+    {
+        struct event *obj = (struct event *)alert_obj_shm;
+
+        message.shm_idx[count++] = alert_obj;
+        __atomic_add_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
+    }
 
     message.header.msgh_size = sizeof(mach_msg_header_t) +
-                               (count + 1) * sizeof(unsigned int);
+                               count * sizeof(unsigned int);
 
     mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
                      0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
@@ -280,26 +252,50 @@ static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, unsi
     if (mr != MACH_MSG_SUCCESS)
         ERR("Failed to send server register wait: %#x\n", mr);
 
-    pthread_sigmask( SIG_SETMASK, &old_set, NULL );
     return mr;
 }
 
-static inline mach_msg_return_t server_unregister_wait( unsigned int msgh_id, unsigned int token )
+static inline void server_remove_wait( unsigned int msgh_id, const int *objs, void **objs_shm,
+                                       int alert_obj, void *alert_obj_shm, int count )
 {
+    int i;
     mach_msg_return_t mr;
     __thread static mach_register_message_t message;
 
     message.header.msgh_remote_port = server_port;
     message.header.msgh_bits = msgh_bits_send;
     message.header.msgh_id = msgh_id;
-    message.shm_idx[0] = token;
-    message.header.msgh_size = sizeof(mach_msg_header_t) + sizeof(message.shm_idx[0]);
+
+    for (i = 0; i < count; i++)
+    {
+        struct event *obj = (struct event *)objs_shm[i];
+
+        int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
+        if (refs < 0)
+            __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
+        message.shm_idx[i] = objs[i];
+    }
+
+    if (alert_obj)
+    {
+        struct event *obj = (struct event *)alert_obj_shm;
+
+        int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
+        if (refs < 0)
+            __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
+        message.shm_idx[count++] = alert_obj;
+    }
+
+    message.shm_idx[0] |= (1 << 29);
+
+    message.header.msgh_size = sizeof(mach_msg_header_t) +
+                               count * sizeof(unsigned int);
 
     mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
-                    0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+
     if (mr != MACH_MSG_SUCCESS)
-        ERR("Failed to send server unregister wait: %#x\n", mr);
-    return mr;
+        ERR("Failed to send server remove wait: %#x\n", mr);
 }
 
 static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
@@ -317,14 +313,14 @@ static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
                 val = tid;
         }
 
+        if (__atomic_load_n( (int *)obj_shm, __ATOMIC_ACQUIRE ) != val)
+            return STATUS_PENDING;
+
         if (end)
         {
             ns_timeleft = update_timeout( *end ) * 100;
             if (!ns_timeleft) return STATUS_TIMEOUT;
         }
-
-        if (__atomic_load_n( (int *)obj_shm, __ATOMIC_ACQUIRE ) != val)
-            return STATUS_PENDING;
         ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, obj_shm, val, ns_timeleft );
     } while (ret == -EINTR || ret == -EFAULT);
 
@@ -334,136 +330,88 @@ static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
     return STATUS_SUCCESS;
 }
 
-static int wait_objects_ready( void **objs_shm, void *alert_obj_shm, int count, int tid )
+static inline int check_shm_contention( void **objs_shm, void *alert_obj_shm, int count, int tid )
 {
     int i, val;
 
-    if (alert_obj_shm && __atomic_load_n( (int *)alert_obj_shm, __ATOMIC_ACQUIRE )) return 1;
-
     for (i = 0; i < count; i++)
     {
-        val = __atomic_load_n( (int *)objs_shm[i], __ATOMIC_ACQUIRE );
+        val = __atomic_load_n((int *)objs_shm[i], __ATOMIC_SEQ_CST);
         if (((struct mutex *)objs_shm[i])->msync_type == MSYNC_MUTEX)
         {
-            if (!val || val == ~0 || val == tid) return 1;
+            if (val == 0 || val == ~0 || val == tid) return 1;
         }
-        else if (val)
-            return 1;
+        else
+        {
+            if (val != 0)  return 1;
+        }
     }
+
+    if (alert_obj_shm)
+    {
+        val = __atomic_load_n((int *)alert_obj_shm, __ATOMIC_SEQ_CST);
+        if (val != 0)  return 1;
+    }
+
     return 0;
 }
 
 static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert_obj, void *alert_obj_shm,
                                      int count, ULONGLONG *end, int tid )
 {
-    unsigned int *addr = (unsigned int *)shm_tid_map + tid;
-    unsigned int expected, generation, idle_token, registering_token, state;
-    int ret, spin;
-    ULONGLONG ns_timeleft;
+    int ret, val;
+    int *addr = shm_tid_map + tid;
+    ULONGLONG ns_timeleft = 0;
     mach_msg_return_t mr;
-    NTSTATUS status = STATUS_SUCCESS;
     unsigned int msgh_id;
     int total_count = count + (alert_obj ? 1 : 0);
 
-    state = __atomic_load_n( addr, __ATOMIC_ACQUIRE );
-    generation = state & ~WAIT_STATE_MASK;
-    idle_token = wait_token( generation, MSYNC_WAIT_IDLE );
-    registering_token = wait_token( generation, MSYNC_WAIT_REGISTERING );
-    expected = idle_token;
-    if (!__atomic_compare_exchange_n( addr, &expected, registering_token, 0,
-                                      __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ))
-    {
-        ERR("msync tid %d wait slot token mismatch %#x/%#x\n", tid, expected, idle_token);
-        return STATUS_UNSUCCESSFUL;
-    }
-
+    __atomic_store_n( addr, 2, __ATOMIC_RELEASE );
     msgh_id = (tid << 8) | total_count;
-    mr = server_register_wait( msgh_id, registering_token, objs, objs_shm,
-                               alert_obj, count );
+    mr = server_register_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+
     if (mr != MACH_MSG_SUCCESS)
+        return STATUS_PENDING;
+
+    while (__atomic_load_n( addr, __ATOMIC_ACQUIRE ) == 2)
     {
-        expected = registering_token;
-        if (!__atomic_compare_exchange_n( addr, &expected, idle_token, 0,
-                                          __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ))
-            ERR("msync tid %d register failure raced with state %d\n", tid, expected);
-        return STATUS_UNSUCCESSFUL;
+        if (check_shm_contention( objs_shm, alert_obj_shm, count, tid ))
+        {
+            int i;
+            for (i = 0; i < count; i++)
+            {
+                struct event *obj = (struct event *)objs_shm[i];
+
+                int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
+                if (refs < 0)
+                    __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
+            }
+            return STATUS_PENDING;
+        }
     }
 
-    for (spin = 0; spin < REGISTRATION_SPIN_COUNT; spin++)
+    do
     {
-        if (__atomic_load_n( addr, __ATOMIC_ACQUIRE ) != registering_token) break;
-        spin_pause();
-    }
-
-    for (;;)
-    {
-        state = __atomic_load_n( addr, __ATOMIC_ACQUIRE );
-        if (state == wait_token( generation, MSYNC_WAIT_WOKEN )) break;
-        if (state == wait_token( generation, MSYNC_WAIT_FAILED ))
-        {
-            status = STATUS_NO_MEMORY;
-            break;
-        }
-        if (state != registering_token && state != wait_token( generation, MSYNC_WAIT_ARMED ))
-        {
-            ERR("msync tid %d entered unexpected wait state %d\n", tid, state);
-            status = STATUS_UNSUCCESSFUL;
-            break;
-        }
-
-        ns_timeleft = 0;
         if (end)
         {
             ns_timeleft = update_timeout( *end ) * 100;
             if (!ns_timeleft)
             {
-                status = wait_objects_ready( objs_shm, alert_obj_shm, count, tid ) ?
-                         STATUS_SUCCESS : STATUS_TIMEOUT;
-                expected = state;
-                if (__atomic_compare_exchange_n( addr, &expected,
-                                                  wait_token( generation, MSYNC_WAIT_CANCELING ), 0,
-                                                  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ))
-                    break;
-                status = STATUS_SUCCESS;
-                continue;
+                server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+                return STATUS_TIMEOUT;
             }
         }
+        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, 1, ns_timeleft );
+        val = __atomic_load_n( addr, __ATOMIC_ACQUIRE );
+        if (!val)
+            break;
+    } while (ret == -EINTR || ret == -EFAULT);
 
-        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, state, ns_timeleft );
-        if (ret && ret != -EINTR && ret != -EFAULT && ret != -EAGAIN && ret != -ETIMEDOUT)
-        {
-            ERR("msync wait failed: %d\n", ret);
-            expected = state;
-            if (__atomic_compare_exchange_n( addr, &expected,
-                                              wait_token( generation, MSYNC_WAIT_CANCELING ), 0,
-                                              __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ))
-            {
-                status = STATUS_UNSUCCESSFUL;
-                break;
-            }
-        }
-    }
+    server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
 
-    mr = server_unregister_wait( msgh_id, registering_token );
-    if (mr != MACH_MSG_SUCCESS) return STATUS_UNSUCCESSFUL;
+    if (ret == -ETIMEDOUT) return STATUS_TIMEOUT;
 
-    for (;;)
-    {
-        state = __atomic_load_n( addr, __ATOMIC_ACQUIRE );
-        if (state == idle_token) break;
-
-        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, state, 0 );
-        if (ret && ret != -EINTR && ret != -EFAULT && ret != -EAGAIN)
-        {
-            ERR("msync cleanup acknowledgement wait failed: %d\n", ret);
-            return STATUS_UNSUCCESSFUL;
-        }
-    }
-
-    if (status == STATUS_TIMEOUT && alert_obj_shm &&
-        __atomic_load_n( (int *)alert_obj_shm, __ATOMIC_ACQUIRE ))
-        return STATUS_USER_APC;
-    return status;
+    return STATUS_SUCCESS;
 }
 
 int do_msync(void)
@@ -478,11 +426,12 @@ int do_msync(void)
 
 static const mach_vm_size_t shm_tid_size = 64 * 1024 * 1024; /* 64 MB to index 24 bit tids */
 static void **shm_addrs;
+static int shm_addrs_size;  /* length of the allocated shm_addrs array */
+static long pagesize;
 
 typedef struct
 {
     mach_msg_header_t header;
-    unsigned int wire_version;
     int entry;
 } mach_map_message_t;
 
@@ -505,7 +454,6 @@ static void *request_shm_from_server( int entry, int tid )
 
     TRACE( "requesting shm entry %d from server\n", entry );
 
-    receive_message.descriptor.name = MACH_PORT_NULL;
     kr = mach_port_allocate( mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply_port );
 
     if (kr != KERN_SUCCESS)
@@ -519,7 +467,7 @@ static void *request_shm_from_server( int entry, int tid )
     if (kr != KERN_SUCCESS)
     {
         ERR( "Failed to insert right into reply port: %s\n", mach_error_string( kr ) );
-        mach_port_destroy( mach_task_self(), reply_port );
+        mach_port_deallocate( mach_task_self(), reply_port );
         return NULL;
     }
 
@@ -528,10 +476,6 @@ static void *request_shm_from_server( int entry, int tid )
     send_message.header.msgh_size = sizeof(send_message);
     send_message.header.msgh_remote_port = server_port;
     send_message.header.msgh_local_port = reply_port;
-    send_message.wire_version = MSYNC_SHM_WIRE_VERSION;
-    if (getenv("WINE_MSYNC_TEST_TRACE") && getenv("WINE_MSYNC_TEST_TRACE")[0] == '1' &&
-        !getenv("WINE_MSYNC_TEST_TRACE")[1] && getenv("WINE_MSYNC_TEST_WIRE_VERSION"))
-        send_message.wire_version = strtoul( getenv("WINE_MSYNC_TEST_WIRE_VERSION"), NULL, 0 );
     send_message.entry = entry;
 
     mr = mach_msg_overwrite( &send_message.header, MACH_SEND_MSG | MACH_RCV_MSG,
@@ -542,9 +486,9 @@ static void *request_shm_from_server( int entry, int tid )
     {
         ERR( "Failed to send/receive shm map request: %#x\n", mr );
     }
-    else if (receive_message.descriptor.name != MACH_PORT_NULL)
+    else
     {
-        mach_vm_size_t size = tid ? shm_tid_size : MSYNC_SHM_PAGE_SIZE;
+        mach_vm_size_t size = tid ? shm_tid_size : pagesize;
 
         TRACE( "mapping shm entry %u with size %llu\n", receive_message.descriptor.name, size );
 
@@ -558,12 +502,9 @@ static void *request_shm_from_server( int entry, int tid )
             map_address = 0;
         }
     }
-    else
-        ERR( "Server returned no memory entry for shm page %d\n", entry );
 
-    mach_port_destroy( mach_task_self(), reply_port );
-    if (receive_message.descriptor.name != MACH_PORT_NULL)
-        mach_port_deallocate( mach_task_self(), receive_message.descriptor.name );
+    mach_port_deallocate( mach_task_self(), reply_port );
+    mach_port_deallocate( mach_task_self(), receive_message.descriptor.name );
     return (void *)map_address;
 }
 
@@ -571,32 +512,35 @@ static os_unfair_lock shm_addrs_lock = OS_UNFAIR_LOCK_INIT;
 
 static void *get_shm_slow( unsigned int idx )
 {
-    unsigned int entry = idx / MSYNC_SHM_OBJECTS_PER_PAGE;
-    unsigned int offset = (idx % MSYNC_SHM_OBJECTS_PER_PAGE) * MSYNC_SHM_OBJECT_SIZE;
+    int entry  = (idx * 16) / pagesize;
+    int offset = (idx * 16) % pagesize;
     void *ret;
 
     os_unfair_lock_lock( &shm_addrs_lock );
 
-    if (entry >= MSYNC_SHM_MAX_PAGES)
+    if (entry >= shm_addrs_size)
     {
-        ERR("Invalid msync shm index %u.\n", idx);
-        abort();
+        int new_size = max(shm_addrs_size * 2, entry + 1);
+
+        if (!(shm_addrs = realloc( shm_addrs, new_size * sizeof(shm_addrs[0]) )))
+            ERR("Failed to grow shm_addrs array to size %d.\n", shm_addrs_size);
+        memset( shm_addrs + shm_addrs_size, 0, (new_size - shm_addrs_size) * sizeof(shm_addrs[0]) );
+        shm_addrs_size = new_size;
     }
 
-    if (!__atomic_load_n( &shm_addrs[entry], __ATOMIC_ACQUIRE ))
+    if (!shm_addrs[entry])
     {
         void *addr = request_shm_from_server( entry, 0 );
         if (!addr)
-        {
-            ERR("Failed to map page %u (offset %#x).\n", entry, entry * MSYNC_SHM_PAGE_SIZE);
-            abort();
-        }
+            ERR("Failed to map page %d (offset %#lx).\n", entry, entry * pagesize);
 
-        TRACE("Mapping page %u at %p.\n", entry, addr);
-        __atomic_store_n( &shm_addrs[entry], addr, __ATOMIC_RELEASE );
+        TRACE("Mapping page %d at %p.\n", entry, addr);
+
+        if (__sync_val_compare_and_swap( &shm_addrs[entry], 0, addr ))
+            mach_vm_deallocate( mach_task_self(), (mach_vm_address_t)addr, pagesize ); /* someone beat us to it */
     }
 
-    ret = (void *)((unsigned long)__atomic_load_n( &shm_addrs[entry], __ATOMIC_ACQUIRE ) + offset);
+    ret = (void *)((unsigned long)shm_addrs[entry] + offset);
 
     os_unfair_lock_unlock( &shm_addrs_lock );
 
@@ -605,16 +549,13 @@ static void *get_shm_slow( unsigned int idx )
 
 static inline void *get_shm( const unsigned int idx )
 {
-    unsigned int entry = idx / MSYNC_SHM_OBJECTS_PER_PAGE;
-    unsigned int offset = (idx % MSYNC_SHM_OBJECTS_PER_PAGE) * MSYNC_SHM_OBJECT_SIZE;
+    int entry = idx >> (vm_kernel_page_shift - 4);
+    int offset = (idx << 4) & vm_kernel_page_mask;
 
-    void *addr;
-
-    if (entry >= MSYNC_SHM_MAX_PAGES ||
-        !(addr = __atomic_load_n( &shm_addrs[entry], __ATOMIC_ACQUIRE )))
+    if (entry >= shm_addrs_size || !shm_addrs[entry])
         return get_shm_slow( idx );
 
-    return (void *)((unsigned long)addr + offset);
+    return (void *)((unsigned long)shm_addrs[entry] + offset);
 }
 
 void msync_close( int obj )
@@ -625,7 +566,7 @@ void msync_close( int obj )
     TRACE( "obj=%d.\n", obj );
 
     send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
-    send_header.msgh_id = (obj & MSYNC_SHM_INDEX_MASK) | MSYNC_SHM_CLOSE_FLAG;
+    send_header.msgh_id = obj | (1 << 28);
     send_header.msgh_size = sizeof(send_header);
     send_header.msgh_remote_port = server_port;
 
@@ -641,7 +582,7 @@ void msync_init(void)
     struct stat st;
     mach_port_t bootstrap_port;
     void *dlhandle = dlopen( NULL, RTLD_NOW );
-    char message_port_name[64];
+    char message_port_name[28];
 
     if (!do_msync())
     {
@@ -667,14 +608,15 @@ void msync_init(void)
     if (stat( config_dir, &st ) == -1)
         ERR("Cannot stat %s\n", config_dir);
 
-    snprintf( message_port_name, sizeof(message_port_name), "wine-%" PRIxMAX "-msync-v%u",
-              (uintmax_t)st.st_ino, MSYNC_SHM_WIRE_VERSION );
+    if (st.st_ino != (unsigned long)st.st_ino)
+        snprintf( message_port_name, 28, "wine-%lx%08lx-msync", (unsigned long)((unsigned long long)st.st_ino >> 32), (unsigned long)st.st_ino );
+    else
+        snprintf( message_port_name, 28, "wine-%lx-msync", (unsigned long)st.st_ino );
 
-    if (!(shm_addrs = calloc( MSYNC_SHM_MAX_PAGES, sizeof(shm_addrs[0]) )))
-    {
-        ERR("Failed to allocate msync shm page table.\n");
-        exit(1);
-    }
+    pagesize = (long)vm_kernel_page_size;
+
+    shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
+    shm_addrs_size = 128;
 
     /* Bootstrap mach wineserver communication */
 
@@ -997,8 +939,7 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
             else
                 ret = msync_wait_multiple( objs, objs_shm, alert_obj, alert_obj_shm, count, timeout ? &end : NULL, current_tid );
 
-            if (ret == STATUS_USER_APC) goto userapc;
-            if (ret != STATUS_SUCCESS && ret != STATUS_PENDING) return ret;
+            if (ret == STATUS_TIMEOUT) return STATUS_TIMEOUT;
         } /* while (1) */
     }
     else
@@ -1008,9 +949,10 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
          *
          * The idea is basically just to wait in sequence on every object in the
          * set. Then when we're done, try to grab them all in a tight loop. If
-         * that fails, restore only resources acquired in this attempt,
-         * preserving existing mutex ownership and abandoned state. Wake
-         * waiters for anything we restore, then start over.
+         * that fails, release any resources we've grabbed (and yes, we can
+         * reliably do this—it's just mutexes and semaphores that we have to
+         * put back, and in both cases we just put back 1), and if any of that
+         * fails we start over.
          *
          * What makes this inherently bad is that we might temporarily grab a
          * resource incorrectly. Hopefully it'll be quick (and hey, it won't
@@ -1024,17 +966,12 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
          * waiting for an instant while we put things back. */
 
         NTSTATUS status = STATUS_SUCCESS;
-        unsigned char acquired[MAXIMUM_WAIT_OBJECTS];
-        BOOL attempted = FALSE;
 
         while (1)
         {
             BOOL abandoned;
 
 tryagain:
-            if (alert_obj && __atomic_load_n( alert_obj_shm, __ATOMIC_SEQ_CST )) goto userapc;
-            if (attempted && timeout && !update_timeout( end )) return STATUS_TIMEOUT;
-            attempted = TRUE;
             abandoned = FALSE;
 
             /* First step: try to wait on each object in sequence. */
@@ -1044,13 +981,11 @@ tryagain:
                 if (((struct mutex *)objs_shm[i])->msync_type == MSYNC_MUTEX)
                 {
                     struct mutex *mutex = (struct mutex *)objs_shm[i];
-                    int owner;
 
                     if (mutex->tid == current_tid)
                         continue;
 
-                    while ((owner = __atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST )) &&
-                           owner != ~0 && owner != current_tid)
+                    while (__atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST ))
                     {
                         status = do_single_wait( objs[i], objs_shm[i], alert_obj, alert_obj_shm, timeout ? &end : NULL, current_tid );
                         if (status != STATUS_PENDING)
@@ -1070,8 +1005,8 @@ tryagain:
                     }
                 }
 
+                if (status == STATUS_TIMEOUT) return STATUS_TIMEOUT;
                 if (status == STATUS_USER_APC) goto userapc;
-                if (status != STATUS_SUCCESS && status != STATUS_PENDING) return status;
             }
 
             /* If we got here and we haven't timed out, that means all of the
@@ -1106,15 +1041,11 @@ tryagain:
                     struct mutex *mutex = (struct mutex *)objs_shm[i];
                     int tid = __atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST );
                     if (tid == current_tid)
-                    {
-                        acquired[i] = 0;
                         break;
-                    }
                     if (tid && tid != ~0)
                         goto tooslow;
                     if (__sync_val_compare_and_swap( &mutex->tid, tid, current_tid ) != tid)
                         goto tooslow;
-                    acquired[i] = tid == ~0 ? 2 : 1;
                     if (tid == ~0)
                         abandoned = TRUE;
                     break;
@@ -1132,7 +1063,6 @@ tryagain:
                     }
                     if (!current)
                         goto tooslow;
-                    acquired[i] = 1;
                     break;
                 }
                 case MSYNC_AUTO_EVENT:
@@ -1141,12 +1071,11 @@ tryagain:
                     struct event *event = (struct event *)objs_shm[i];
                     if (!__sync_val_compare_and_swap( &event->signaled, 1, 0 ))
                         goto tooslow;
-                    acquired[i] = 1;
                     break;
                 }
                 default:
-                    /* A manual-reset event isn't consumed by this wait. */
-                    acquired[i] = 0;
+                    /* If a manual-reset event changed between there and
+                     * here, it's shouldn't be a problem. */
                     break;
                 }
             }
@@ -1169,21 +1098,21 @@ tryagain:
 tooslow:
             for (--i; i >= 0; i--)
             {
-                if (!acquired[i]) continue;
                 switch (((struct event *)objs_shm[i])->msync_type)
                 {
                 case MSYNC_MUTEX:
                 {
                     struct mutex *mutex = (struct mutex *)objs_shm[i];
-                    __atomic_store_n( &mutex->tid, acquired[i] == 2 ? ~0 : 0, __ATOMIC_SEQ_CST );
-                    signal_all( (void *)mutex, objs[i] );
+                    /* HACK: This won't do the right thing with abandoned
+                     * mutexes, but fixing it is probably more trouble than
+                     * it's worth. */
+                    __atomic_store_n( &mutex->tid, 0, __ATOMIC_SEQ_CST );
                     break;
                 }
                 case MSYNC_SEMAPHORE:
                 {
                     struct semaphore *semaphore = (struct semaphore *)objs_shm[i];
                     __sync_fetch_and_add( &semaphore->count, 1 );
-                    signal_all( (void *)semaphore, objs[i] );
                     break;
                 }
                 case MSYNC_AUTO_EVENT:
@@ -1191,7 +1120,6 @@ tooslow:
                 {
                     struct event *event = (struct event *)objs_shm[i];
                     __atomic_store_n( &event->signaled, 1, __ATOMIC_SEQ_CST );
-                    signal_all( (void *)event, objs[i] );
                     break;
                 }
                 default:

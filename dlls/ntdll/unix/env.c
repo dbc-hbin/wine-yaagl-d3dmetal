@@ -51,6 +51,7 @@
 #endif
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
 #include "winbase.h"
@@ -63,12 +64,12 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(environ);
 
-DWORD pid = 0;
 PEB *peb = NULL;
 WOW_PEB *wow_peb = NULL;
 USHORT *uctable = NULL, *lctable = NULL;
 SIZE_T startup_info_size = 0;
 BOOL is_prefix_bootstrap = FALSE;
+BOOL wow64_using_32bit_prefix = FALSE;
 
 static const WCHAR bootstrapW[] = {'W','I','N','E','B','O','O','T','S','T','R','A','P','M','O','D','E'};
 
@@ -154,7 +155,7 @@ static NTSTATUS open_nls_data_file( const char *path, const WCHAR *sysdir, HANDL
     OBJECT_ATTRIBUTES attr;
     UNICODE_STRING valueW;
     WCHAR buffer[64];
-    const char *p;
+    char *p;
 
     wcscpy( buffer, system_dir );
     p = strrchr( path, '/' ) + 1;
@@ -162,11 +163,11 @@ static NTSTATUS open_nls_data_file( const char *path, const WCHAR *sysdir, HANDL
     init_unicode_string( &valueW, buffer );
     InitializeObjectAttributes( &attr, &valueW, 0, 0, NULL );
 
-    status = open_unix_file( file, path, GENERIC_READ | SYNCHRONIZE, &attr, 0, FILE_SHARE_READ,
+    status = open_unix_file( file, path, GENERIC_READ, &attr, 0, FILE_SHARE_READ,
                              FILE_OPEN, FILE_SYNCHRONOUS_IO_ALERT, NULL, 0 );
     if (status != STATUS_NO_SUCH_FILE) return status;
 
-    return NtOpenFile( file, GENERIC_READ | SYNCHRONIZE, &attr, &io, FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_ALERT );
+    return NtOpenFile( file, GENERIC_READ, &attr, &io, FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_ALERT );
 }
 
 static NTSTATUS get_nls_section_name( UINT type, UINT id, WCHAR name[32] )
@@ -355,7 +356,6 @@ static BOOL is_ignored_env_var( const char *var )
             STARTS_WITH( var, "SDL_AUDIO_DRIVER=" ) ||
             STARTS_WITH( var, "SDL_VIDEODRIVER=" ) ||
             STARTS_WITH( var, "SDL_VIDEO_DRIVER=" ) ||
-            STARTS_WITH( var, "WAYLAND_DISPLAY=" ) ||
             STARTS_WITH( var, "VK_" ));
 }
 
@@ -485,7 +485,7 @@ const WCHAR *ntdll_get_data_dir(void)
  */
 static void set_process_name( const char *name )
 {
-    const char *p;
+    char *p;
 
 #ifdef HAVE_SETPROCTITLE
     setproctitle("-%s", name );
@@ -840,7 +840,7 @@ void init_environment(void)
 /* check if a WINE_HOST_ prefixed variable already exists in the environment */
 static BOOL host_var_exists( const char *name )
 {
-    const char *end = strchr( name, '=' );
+    char *end = strchr( name, '=' );
 
     if (!end) return FALSE;
     for (char **e = environ; *e; e++)
@@ -1058,6 +1058,9 @@ static void add_dynamic_environment( WCHAR **env, SIZE_T *pos, SIZE_T *size )
     append_envA( env, pos, size, "WINEUSERLOCALE", user_locale );
     append_envA( env, pos, size, "SystemDrive", "C:" );
     append_envA( env, pos, size, "SystemRoot", "C:\\windows" );
+
+    /* CW HACK 20810: Set this environment variable so PE code can look for it. */
+    if (wow64_using_32bit_prefix) append_envA( env, pos, size, "WINEWOW6432BPREFIXMODE", "1" );
 }
 
 
@@ -1547,8 +1550,7 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
         's','y','s','t','e','m','3','2','\\','w','i','n','e','b','o','o','t','.','e','x','e','"',
         ' ','-','-','i','n','i','t',0};
     RTL_USER_PROCESS_PARAMETERS params = { sizeof(params), sizeof(params) };
-    ULONG_PTR attr_buffer[offsetof(PS_ATTRIBUTE_LIST,Attributes[2]) / sizeof(ULONG_PTR)];
-    PS_ATTRIBUTE_LIST *ps_attr = (PS_ATTRIBUTE_LIST *)attr_buffer;
+    PS_ATTRIBUTE_LIST ps_attr;
     PS_CREATE_INFO create_info;
     HANDLE process, thread, handles[2];
     UNICODE_STRING nameW;
@@ -1578,19 +1580,17 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
     init_unicode_string( &params.WindowTitle, appnameW + 4 );
     init_unicode_string( &nameW, appnameW );
 
-    ps_attr->TotalLength = sizeof(attr_buffer);
-    ps_attr->Attributes[0].Attribute    = PS_ATTRIBUTE_IMAGE_NAME;
-    ps_attr->Attributes[0].Size         = sizeof(appnameW) - sizeof(WCHAR);
-    ps_attr->Attributes[0].ValuePtr     = (WCHAR *)appnameW;
-    ps_attr->Attributes[0].ReturnLength = NULL;
-    ps_attr->Attributes[1].Attribute    = PS_ATTRIBUTE_MACHINE_TYPE;
-    ps_attr->Attributes[1].Value        = native_machine;
+    ps_attr.TotalLength = sizeof(ps_attr);
+    ps_attr.Attributes[0].Attribute    = PS_ATTRIBUTE_IMAGE_NAME;
+    ps_attr.Attributes[0].Size         = sizeof(appnameW) - sizeof(WCHAR);
+    ps_attr.Attributes[0].ValuePtr     = (WCHAR *)appnameW;
+    ps_attr.Attributes[0].ReturnLength = NULL;
 
     wine_server_fd_to_handle( 2, GENERIC_WRITE | SYNCHRONIZE, OBJ_INHERIT, &params.hStdError );
 
     status = NtCreateUserProcess( &process, &thread, PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS,
                                   NULL, NULL, 0, THREAD_CREATE_FLAGS_CREATE_SUSPENDED, &params,
-                                  &create_info, ps_attr );
+                                  &create_info, &ps_attr );
     NtClose( params.hStdError );
 
     if (status)
@@ -1710,7 +1710,7 @@ static ULONG get_dword_option( HANDLE key, const WCHAR *name, ULONG defval )
 /*************************************************************************
  *		load_global_options
  */
-static void load_global_options( const UNICODE_STRING *image, BOOL debugged )
+static void load_global_options( const UNICODE_STRING *image )
 {
     static const WCHAR optionsW[] = {'\\','R','e','g','i','s','t','r','y','\\',
         'M','a','c','h','i','n','e','\\','S','o','f','t','w','a','r','e','\\',
@@ -1744,12 +1744,6 @@ static void load_global_options( const UNICODE_STRING *image, BOOL debugged )
         peb->HeapDeCommitFreeBlockThreshold = get_dword_option( key, heapdecommitblockW, 0x1000 );
         NtClose( key );
     }
-
-    if (debugged) peb->NtGlobalFlag |= FLG_HEAP_ENABLE_TAIL_CHECK |
-                                       FLG_HEAP_ENABLE_FREE_CHECK |
-                                       FLG_HEAP_VALIDATE_PARAMETERS;
-    else peb->ProcessParameters->Flags |= PROCESS_PARAMS_IMAGE_KEY_MISSING;
-
     init_unicode_string( &nameW, optionsW );
     if (!NtOpenKey( &key, KEY_QUERY_VALUE, &attr ))
     {
@@ -1760,7 +1754,6 @@ static void load_global_options( const UNICODE_STRING *image, BOOL debugged )
         if (!NtOpenKey( &key, KEY_QUERY_VALUE, &attr ))
         {
             peb->NtGlobalFlag = get_dword_option( key, globalflagW, peb->NtGlobalFlag );
-            peb->ProcessParameters->Flags &= ~PROCESS_PARAMS_IMAGE_KEY_MISSING;
             NtClose( key );
         }
         NtClose( attr.RootDirectory );
@@ -1835,7 +1828,7 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
 /*************************************************************************
  *		init_peb
  */
-static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module, BOOL debugged )
+static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
 {
     peb->ImageBaseAddress           = module;
     peb->ProcessParameters          = params;
@@ -1850,16 +1843,15 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module, BOOL de
 #ifdef _WIN64
     if (!is_machine_64bit( main_image_info.Machine ))
     {
-        struct thread_data *data = get_thread_data();
-        data->teb->WowTebOffset = teb_offset;
-        data->teb->Tib.ExceptionList = (void *)((char *)data->teb + teb_offset);
+        NtCurrentTeb()->WowTebOffset = teb_offset;
+        NtCurrentTeb()->Tib.ExceptionList = (void *)((char *)NtCurrentTeb() + teb_offset);
         wow_peb = (PEB32 *)((char *)peb + page_size);
-        set_thread_id( data );
+        set_thread_id( NtCurrentTeb(), GetCurrentProcessId(), GetCurrentThreadId() );
     }
 #endif
 
     virtual_set_large_address_space();
-    load_global_options( &params->ImagePathName, debugged );
+    load_global_options( &params->ImagePathName );
 
     if (wow_peb)
     {
@@ -1902,9 +1894,8 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     WCHAR *curdir = get_initial_directory();
     UNICODE_STRING nt_name;
     NTSTATUS status;
-    TEB64 *teb64 = get_teb64( NtCurrentTeb() );
 
-    if (teb64) teb64->TlsSlots[WOW64_TLS_FILESYSREDIR] = TRUE;
+    if (NtCurrentTeb64()) NtCurrentTeb64()->TlsSlots[WOW64_TLS_FILESYSREDIR] = TRUE;
 
     /* store the initial PATH value */
     path = get_env_var( env, env_pos, pathW, 4 );
@@ -1959,7 +1950,7 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     else
     {
         rebuild_argv();
-        if (teb64) teb64->TlsSlots[WOW64_TLS_FILESYSREDIR] = FALSE;
+        if (NtCurrentTeb64()) NtCurrentTeb64()->TlsSlots[WOW64_TLS_FILESYSREDIR] = FALSE;
     }
 
     main_wargv = build_wargv( get_dos_path( nt_name.Buffer ));
@@ -1982,7 +1973,7 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     params->Size            = size;
     params->Flags           = PROCESS_PARAMS_FLAG_NORMALIZED;
     params->wShowWindow     = 1; /* SW_SHOWNORMAL */
-    params->ProcessGroupId  = pid;
+    params->ProcessGroupId  = GetCurrentProcessId();
 
     params->CurrentDirectory.DosPath.Buffer = (WCHAR *)(params + 1);
     wcscpy( params->CurrentDirectory.DosPath.Buffer, get_dos_path( curdir ));
@@ -2021,12 +2012,11 @@ void init_startup_info(void)
     struct startup_info_data *info;
     UNICODE_STRING nt_name;
     USHORT machine;
-    BOOL debugged;
 
     if (!startup_info_size)
     {
         params = build_initial_params( &module );
-        init_peb( params, module, FALSE );
+        init_peb( params, module );
         return;
     }
 
@@ -2037,7 +2027,6 @@ void init_startup_info(void)
         wine_server_set_reply( req, info, startup_info_size );
         status = wine_server_call( req );
         machine = reply->machine;
-        debugged = reply->debugged;
         info_size = reply->info_size;
         env_size = (wine_server_reply_size( reply ) - info_size) / sizeof(WCHAR);
     }
@@ -2126,7 +2115,7 @@ void init_startup_info(void)
     rebuild_argv();
     main_wargv = build_wargv( params->ImagePathName.Buffer );
     free( nt_name.Buffer );
-    init_peb( params, module, debugged );
+    init_peb( params, module );
 }
 
 
@@ -2417,9 +2406,8 @@ void WINAPI RtlInitUnicodeString( UNICODE_STRING *str, const WCHAR *data )
  */
 ULONG WINAPI RtlNtStatusToDosError( NTSTATUS status )
 {
-    TEB *teb = NtCurrentTeb();
+    NtCurrentTeb()->LastStatusValue = status;
 
-    if (teb) teb->LastStatusValue = status;
     if (!status || (status & 0x20000000)) return status;
     if ((status & 0xf0000000) == 0xd0000000) status &= ~0x10000000;
 
@@ -2436,16 +2424,11 @@ ULONG WINAPI RtlNtStatusToDosError( NTSTATUS status )
 DWORD WINAPI RtlGetLastWin32Error(void)
 {
     TEB *teb = NtCurrentTeb();
-
-    if (teb)
-    {
 #ifdef _WIN64
-        WOW_TEB *wow_teb = get_wow_teb( teb );
-        if (wow_teb) return wow_teb->LastErrorValue;
+    WOW_TEB *wow_teb = get_wow_teb( teb );
+    if (wow_teb) return wow_teb->LastErrorValue;
 #endif
-        return teb->LastErrorValue;
-    }
-    else return 0;
+    return teb->LastErrorValue;
 }
 
 /**********************************************************************
@@ -2454,37 +2437,9 @@ DWORD WINAPI RtlGetLastWin32Error(void)
 void WINAPI RtlSetLastWin32Error( DWORD err )
 {
     TEB *teb = NtCurrentTeb();
-
-    if (teb)
-    {
 #ifdef _WIN64
-        WOW_TEB *wow_teb = get_wow_teb( teb );
-        if (wow_teb) wow_teb->LastErrorValue = err;
+    WOW_TEB *wow_teb = get_wow_teb( teb );
+    if (wow_teb) wow_teb->LastErrorValue = err;
 #endif
-        teb->LastErrorValue = err;
-    }
-}
-
-/**********************************************************************
- *      RtlGetCurrentPeb  (ntdll.so)
- */
-PEB * WINAPI RtlGetCurrentPeb(void)
-{
-    return peb;
-}
-
-/**********************************************************************
- *      PsGetCurrentProcessId  (ntdll.so)
- */
-HANDLE WINAPI PsGetCurrentProcessId(void)
-{
-    return ULongToHandle( pid );
-}
-
-/**********************************************************************
- *      PsGetCurrentThreadId  (ntdll.so)
- */
-HANDLE WINAPI PsGetCurrentThreadId(void)
-{
-    return ULongToHandle( get_thread_data()->tid );
+    teb->LastErrorValue = err;
 }

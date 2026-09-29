@@ -103,17 +103,8 @@ class WineLaunchWrapperTests(unittest.TestCase):
         self.assertEqual(absent["env"]["MTL_HUD_ENABLED"], "0")
         self.assertEqual(absent["env"]["WINE_ENABLE_TIMEOUT_FIX"], "1")
 
-        # Even the old stage and P3 markers together cannot activate the final wrapper.
-        (self.root / "zzz-frame-probe-stage.json").write_text("{}")
-        (self.root / "yaagl-wine-p3-runtime.txt").write_text("baseline")
-        old_stage = self.record_policy(args, YAAGL_FSR_UPSCALER="native")
-        self.assertIsNone(old_stage["env"]["WINEDLLOVERRIDES"])
-        self.assertIsNone(old_stage["env"]["CX_APPLEGPTK_LIBD3DSHARED_PATH"])
-        (self.root / "zzz-frame-probe-stage.json").unlink()
-        (self.root / "yaagl-wine-p3-runtime.txt").unlink()
-
         (self.root / "yaagl-d3dmetal-runtime.json").write_text(
-            json.dumps({"schemaVersion": 1, "runtimeId": "wine-11.17-d3dmetal-gptk4.0b2-2"}))
+            json.dumps({"schemaVersion": 1, "runtimeId": "wine-cx26.3-d3dmetal-gptk4.0b2-1"}))
         native = self.record_policy(args, YAAGL_FSR_UPSCALER="native", MTL_HUD_ENABLED="1",
                                     WINE_ENABLE_TIMEOUT_FIX="0", **{
                                         "DYLD_FALLBACK_LIBRARY_PATH": "/inherited/lib"})

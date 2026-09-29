@@ -610,12 +610,15 @@ GpStatus WINGDIPAPI GdipGetFontHeightGivenDPI(GDIPCONST GpFont *font, REAL dpi, 
 static INT CALLBACK is_font_installed_proc(const LOGFONTW *elf,
                             const TEXTMETRICW *ntm, DWORD type, LPARAM lParam)
 {
+    const ENUMLOGFONTW *elfW = (const ENUMLOGFONTW *)elf;
     LOGFONTW *lf = (LOGFONTW *)lParam;
 
     if (type & RASTER_FONTTYPE)
         return 1;
 
     *lf = *elf;
+    /* replace substituted font name by a real one */
+    lstrcpynW(lf->lfFaceName, elfW->elfFullName, LF_FACESIZE);
     return 0;
 }
 
@@ -675,48 +678,6 @@ static BOOL get_font_metrics(HDC hdc, struct font_metrics *fm)
     return TRUE;
 }
 
-static GpStatus find_font_family(GpFontCollection *collection, const WCHAR *name,
-                                 GpFontFamily **family)
-{
-    int i;
-    GpStatus status;
-
-    for (i = 0; i < collection->count; i++)
-    {
-        if (!wcsicmp(name, collection->FontFamilies[i]->FamilyName))
-        {
-            status = GdipCloneFontFamily(collection->FontFamilies[i], family);
-            TRACE("<-- %p\n", *family);
-            return status;
-        }
-    }
-    return FontFamilyNotFound;
-}
-
-static BOOL get_font_family_name(HDC hdc, WCHAR *name, INT name_len)
-{
-    OUTLINETEXTMETRICW *otm;
-    UINT size;
-
-    size = GetOutlineTextMetricsW(hdc, 0, NULL);
-    if (!size) return FALSE;
-
-    otm = malloc(size);
-    if (!otm) return FALSE;
-
-    if (GetOutlineTextMetricsW(hdc, size, otm) && otm->otmpFamilyName &&
-        (ULONG_PTR)otm->otmpFamilyName < size)
-    {
-        lstrcpynW(name, (const WCHAR *)((const char *)otm + (ULONG_PTR)otm->otmpFamilyName),
-                  name_len);
-        free(otm);
-        return TRUE;
-    }
-
-    free(otm);
-    return FALSE;
-}
-
 /*******************************************************************************
  * GdipCreateFontFamilyFromName [GDIPLUS.@]
  *
@@ -744,6 +705,7 @@ GpStatus WINGDIPAPI GdipCreateFontFamilyFromName(GDIPCONST WCHAR *name,
     HDC hdc;
     LOGFONTW lf;
     GpStatus status;
+    int i;
 
     TRACE("%s, %p %p\n", debugstr_w(name), collection, family);
 
@@ -762,29 +724,13 @@ GpStatus WINGDIPAPI GdipCreateFontFamilyFromName(GDIPCONST WCHAR *name,
 
     if (!EnumFontFamiliesW(hdc, name, is_font_installed_proc, (LPARAM)&lf))
     {
-        status = find_font_family(collection, lf.lfFaceName, family);
-
-        if (status == FontFamilyNotFound)
+        for (i = 0; i < collection->count; i++)
         {
-            HFONT hfont, old_font;
-            WCHAR facename[LF_FACESIZE];
-
-            hfont = CreateFontIndirectW(&lf);
-            if (hfont)
+            if (!wcsicmp(lf.lfFaceName, collection->FontFamilies[i]->FamilyName))
             {
-                old_font = SelectObject(hdc, hfont);
-
-                /* lfFaceName may still be the requested name after font
-                 * substitution; use GetTextFaceW() to get the real face name,
-                 * then OUTLINETEXTMETRIC as a fallback. */
-                GetTextFaceW(hdc, LF_FACESIZE, facename);
-                status = find_font_family(collection, facename, family);
-                if (status == FontFamilyNotFound &&
-                    get_font_family_name(hdc, facename, LF_FACESIZE))
-                    status = find_font_family(collection, facename, family);
-
-                SelectObject(hdc, old_font);
-                DeleteObject(hfont);
+                status = GdipCloneFontFamily(collection->FontFamilies[i], family);
+                TRACE("<-- %p\n", *family);
+                break;
             }
         }
     }

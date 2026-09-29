@@ -177,5 +177,12 @@ static inline int ascii_strcasecmp( const char *s1, const char *s2 )
     return ascii_strncasecmp( s1, s2, -1 );
 }
 
-NTSTATUS icmp_get_reply( void *args );
+NTSTATUS icmp_cancel_listen( void *args );
+NTSTATUS icmp_close( void *args );
+NTSTATUS icmp_listen( void *args );
 NTSTATUS icmp_send_echo( void *args );
+
+#ifdef _WIN64
+NTSTATUS wow64_icmp_listen( void *args );
+NTSTATUS wow64_icmp_send_echo( void *args );
+#endif /* _WIN64 */

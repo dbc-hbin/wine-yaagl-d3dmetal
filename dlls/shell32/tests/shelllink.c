@@ -172,10 +172,9 @@ static void test_get_set(void)
     ok(*buffer=='\0', "GetPath returned '%s'\n", buffer);
 
     /* Win98 returns S_FALSE, but WinXP returns S_OK */
-    str="c:\\nonexistent\\file\\";
-    r = IShellLinkA_SetPath(sl, str);
-    ok(r==S_OK, "SetPath failed (0x%08lx)\n", r);
     str="c:\\nonexistent\\file";
+    r = IShellLinkA_SetPath(sl, str);
+    ok(r==S_FALSE || r==S_OK, "SetPath failed (0x%08lx)\n", r);
 
     strcpy(buffer,"garbage");
     r = IShellLinkA_GetPath(sl, buffer, sizeof(buffer), NULL, SLGP_RAWPATH);

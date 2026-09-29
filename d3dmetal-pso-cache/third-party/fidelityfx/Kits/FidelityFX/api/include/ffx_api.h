@@ -26,7 +26,12 @@
 extern "C" {
 #endif  // #if defined(__cplusplus)
 
+/* Wine exports PE entry points through the module .spec, not __declspec. */
+#if defined(__WINESRC__)
+#define FFX_API_ENTRY
+#else
 #define FFX_API_ENTRY __declspec(dllexport)
+#endif
 
 #include <stdint.h>
 

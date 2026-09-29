@@ -692,8 +692,6 @@ void METAFILE_Free(GpMetafile *metafile)
     DeleteEnhMetaFile(CloseEnhMetaFile(metafile->record_dc));
     if (!metafile->preserve_hemf)
         DeleteEnhMetaFile(metafile->hemf);
-    if (!metafile->preserve_hwmf)
-        DeleteMetaFile(metafile->hwmf);
     if (metafile->record_graphics)
     {
         WARN("metafile closed while recording\n");
@@ -1711,8 +1709,8 @@ GpStatus METAFILE_GraphicsDeleted(GpMetafile* metafile)
 
                 af_min->X = fmin(af_min->X, gdi_bounds_rc.left);
                 af_min->Y = fmin(af_min->Y, gdi_bounds_rc.top);
-                af_max->X = fmax(af_max->X, gdi_bounds_rc.right + 1);
-                af_max->Y = fmax(af_max->Y, gdi_bounds_rc.bottom + 1);
+                af_max->X = fmax(af_max->X, gdi_bounds_rc.right);
+                af_max->Y = fmax(af_max->Y, gdi_bounds_rc.bottom);
             }
 
             bounds_rc.left = floorf(metafile->auto_frame_min.X * x_scale);
@@ -2008,7 +2006,6 @@ static GpStatus metafile_deserialize_image(const BYTE *record_data, UINT data_si
 static GpStatus metafile_deserialize_path(const BYTE *record_data, UINT data_size, GpPath **path)
 {
     EmfPlusPath *data = (EmfPlusPath *)record_data;
-    GpStatus status;
     BYTE *types;
     UINT size;
     DWORD i;
@@ -2051,9 +2048,8 @@ static GpStatus metafile_deserialize_path(const BYTE *record_data, UINT data_siz
             }
 
             types = (BYTE *)(points + i);
-            status = GdipCreatePath2(temp, types, data->PathPointCount, FillModeAlternate, path);
+            GdipCreatePath2(temp, types, data->PathPointCount, FillModeAlternate, path);
             free(temp);
-            return status;
         }
         else
         {
@@ -2066,6 +2062,8 @@ static GpStatus metafile_deserialize_path(const BYTE *record_data, UINT data_siz
     {
         return GdipCreatePath(FillModeAlternate, path);
     }
+
+    return Ok;
 }
 
 static GpStatus metafile_read_region_node(struct memory_buffer *mbuf, GpRegion *region, region_element *node, UINT *count)
@@ -3218,7 +3216,6 @@ GpStatus WINGDIPAPI GdipPlayMetafileRecord(GDIPCONST GpMetafile *metafile,
         {
             EmfPlusDrawImage *draw = (EmfPlusDrawImage *)header;
             BYTE image = flags & 0xff;
-            GpImageAttributes *attributes;
             GpPointF points[3];
 
             if (image >= EmfPlusObjectTableSize || real_metafile->objtable[image].type != ObjectTypeImage)
@@ -3230,9 +3227,7 @@ GpStatus WINGDIPAPI GdipPlayMetafileRecord(GDIPCONST GpMetafile *metafile,
 
             if (draw->ImageAttributesID >= EmfPlusObjectTableSize ||
                     real_metafile->objtable[draw->ImageAttributesID].type != ObjectTypeImageAttributes)
-                attributes = NULL;
-            else
-                attributes = real_metafile->objtable[draw->ImageAttributesID].u.image_attributes;
+                return InvalidParameter;
 
             if (flags & 0x4000) /* C */
             {
@@ -3240,8 +3235,8 @@ GpStatus WINGDIPAPI GdipPlayMetafileRecord(GDIPCONST GpMetafile *metafile,
                 points[0].Y = draw->RectData.rect.Y;
                 points[1].X = points[0].X + draw->RectData.rect.Width;
                 points[1].Y = points[0].Y;
-                points[2].X = points[0].X;
-                points[2].Y = points[0].Y + draw->RectData.rect.Height;
+                points[2].X = points[1].X;
+                points[2].Y = points[1].Y + draw->RectData.rect.Height;
             }
             else
             {
@@ -3249,13 +3244,13 @@ GpStatus WINGDIPAPI GdipPlayMetafileRecord(GDIPCONST GpMetafile *metafile,
                 points[0].Y = draw->RectData.rectF.Y;
                 points[1].X = points[0].X + draw->RectData.rectF.Width;
                 points[1].Y = points[0].Y;
-                points[2].X = points[0].X;
-                points[2].Y = points[0].Y + draw->RectData.rectF.Height;
+                points[2].X = points[1].X;
+                points[2].Y = points[1].Y + draw->RectData.rectF.Height;
             }
 
             return GdipDrawImagePointsRect(real_metafile->playback_graphics, real_metafile->objtable[image].u.image,
                 points, 3, draw->SrcRect.X, draw->SrcRect.Y, draw->SrcRect.Width, draw->SrcRect.Height, draw->SrcUnit,
-                attributes, NULL, NULL);
+                real_metafile->objtable[draw->ImageAttributesID].u.image_attributes, NULL, NULL);
         }
         case EmfPlusRecordTypeDrawImagePoints:
         {
@@ -3263,7 +3258,6 @@ GpStatus WINGDIPAPI GdipPlayMetafileRecord(GDIPCONST GpMetafile *metafile,
             static const UINT fixed_part_size = FIELD_OFFSET(EmfPlusDrawImagePoints, PointData) -
                 FIELD_OFFSET(EmfPlusDrawImagePoints, ImageAttributesID);
             BYTE image = flags & 0xff;
-            GpImageAttributes* attributes;
             GpPointF points[3];
             unsigned int i;
             UINT size;
@@ -3277,9 +3271,7 @@ GpStatus WINGDIPAPI GdipPlayMetafileRecord(GDIPCONST GpMetafile *metafile,
 
             if (draw->ImageAttributesID >= EmfPlusObjectTableSize ||
                     real_metafile->objtable[draw->ImageAttributesID].type != ObjectTypeImageAttributes)
-                attributes = NULL;
-            else
-                attributes = real_metafile->objtable[draw->ImageAttributesID].u.image_attributes;
+                return InvalidParameter;
 
             if (draw->count != 3)
                 return InvalidParameter;
@@ -3320,7 +3312,7 @@ GpStatus WINGDIPAPI GdipPlayMetafileRecord(GDIPCONST GpMetafile *metafile,
 
             return GdipDrawImagePointsRect(real_metafile->playback_graphics, real_metafile->objtable[image].u.image,
                 points, 3, draw->SrcRect.X, draw->SrcRect.Y, draw->SrcRect.Width, draw->SrcRect.Height, draw->SrcUnit,
-                attributes, NULL, NULL);
+                real_metafile->objtable[draw->ImageAttributesID].u.image_attributes, NULL, NULL);
         }
         case EmfPlusRecordTypeFillPath:
         {
@@ -4323,9 +4315,6 @@ GpStatus WINGDIPAPI GdipCreateMetafileFromWmf(HMETAFILE hwmf, BOOL delete,
 
     if (retval == Ok)
     {
-        (*metafile)->hwmf = hwmf;
-        (*metafile)->preserve_hwmf = !delete;
-
         if (placeable)
         {
             (*metafile)->image.xres = (REAL)placeable->Inch;
@@ -4341,12 +4330,11 @@ GpStatus WINGDIPAPI GdipCreateMetafileFromWmf(HMETAFILE hwmf, BOOL delete,
         else
             (*metafile)->metafile_type = MetafileTypeWmf;
         (*metafile)->image.format = ImageFormatWMF;
+
+        if (delete) DeleteMetaFile(hwmf);
     }
     else
-    {
         DeleteEnhMetaFile(hemf);
-    }
-
     return retval;
 }
 
@@ -5051,7 +5039,7 @@ static GpStatus METAFILE_AddPenObject(GpMetafile *metafile, GpPen *pen, DWORD *i
     }
     if (data_flags & PenDataNonCenter)
     {
-        *(DWORD*)(pen_data->OptionalData + i) = pen->align;
+        *(REAL*)(pen_data->OptionalData + i) = pen->align;
         i += sizeof(DWORD);
     }
     if (data_flags & PenDataCustomStartCap)

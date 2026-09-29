@@ -498,7 +498,6 @@ static const struct wined3d_gpu_description gpu_description_table[] =
     {HW_VENDOR_NVIDIA,     CARD_NVIDIA_GEFORCE_RTX3090TI,  "NVIDIA GeForce RTX 3090 Ti",       DRIVER_NVIDIA_KEPLER,  24576},
     {HW_VENDOR_NVIDIA,     CARD_NVIDIA_TESLA_T4,           "NVIDIA Tesla T4",                  DRIVER_NVIDIA_KEPLER,  16384},
     {HW_VENDOR_NVIDIA,     CARD_NVIDIA_AMPERE_A10,         "NVIDIA Ampere A10",                DRIVER_NVIDIA_KEPLER,  24576},
-    {HW_VENDOR_NVIDIA,     CARD_NVIDIA_AMPERE_A10G,        "NVIDIA A10G",                      DRIVER_NVIDIA_KEPLER,  24564},
     {HW_VENDOR_NVIDIA,     CARD_NVIDIA_GEFORCE_RTX4060,    "NVIDIA GeForce RTX 4060",          DRIVER_NVIDIA_KEPLER,  8192},
     {HW_VENDOR_NVIDIA,     CARD_NVIDIA_GEFORCE_RTX4060M,   "NVIDIA GeForce RTX 4060M",         DRIVER_NVIDIA_KEPLER,  8192},
     {HW_VENDOR_NVIDIA,     CARD_NVIDIA_GEFORCE_RTX4060TI8G, "NVIDIA GeForce RTX 4060 Ti 8GB",  DRIVER_NVIDIA_KEPLER,  8192},
@@ -572,7 +571,6 @@ static const struct wined3d_gpu_description gpu_description_table[] =
     {HW_VENDOR_AMD,        CARD_AMD_RADEON_RX_NAVI_10,     "Radeon RX 5700 / 5700 XT",         DRIVER_AMD_RX,           8192},
     {HW_VENDOR_AMD,        CARD_AMD_RADEON_RX_NAVI_14,     "Radeon RX 5500M",                  DRIVER_AMD_RX,           4096},
     {HW_VENDOR_AMD,        CARD_AMD_RADEON_RX_NAVI_21,     "Radeon RX 6800/6800 XT / 6900 XT", DRIVER_AMD_RX,          16384},
-    {HW_VENDOR_AMD,        CARD_AMD_RADEON_680M,           "AMD Radeon(TM) Graphics",          DRIVER_AMD_RX,           8192},
     {HW_VENDOR_AMD,        CARD_AMD_RADEON_RX_NAVI_44,     "AMD Radeon RX 9060 XT",            DRIVER_AMD_RX,           16384},
     {HW_VENDOR_AMD,        CARD_AMD_RADEON_PRO_V620,       "Radeon Pro V620",                  DRIVER_AMD_RX,          32768},
     {HW_VENDOR_AMD,        CARD_AMD_RADEON_PRO_V620_VF,    "Radeon Pro V620 VF",               DRIVER_AMD_RX,          32768},
@@ -659,8 +657,7 @@ static const struct wined3d_gpu_description gpu_description_table[] =
     {HW_VENDOR_INTEL,      CARD_INTEL_IPP580_1,            "Intel(R) Iris(TM) Pro Graphics P580",                       DRIVER_INTEL_HD4000,  2048},
     {HW_VENDOR_INTEL,      CARD_INTEL_IPP580_2,            "Intel(R) Iris(TM) Pro Graphics P580",                       DRIVER_INTEL_HD4000,  2048},
     {HW_VENDOR_INTEL,      CARD_INTEL_UHD617,              "Intel(R) UHD Graphics 617",                                 DRIVER_INTEL_HD4000,  2048},
-    {HW_VENDOR_INTEL,      CARD_INTEL_UHD620_1,            "Intel(R) UHD Graphics 620",                                 DRIVER_INTEL_HD4000,  3072},
-    {HW_VENDOR_INTEL,      CARD_INTEL_UHD620_2,            "Intel(R) UHD Graphics 620",                                 DRIVER_INTEL_HD4000,  3072},
+    {HW_VENDOR_INTEL,      CARD_INTEL_UHD620,              "Intel(R) UHD Graphics 620",                                 DRIVER_INTEL_HD4000,  3072},
     {HW_VENDOR_INTEL,      CARD_INTEL_HD615,               "Intel(R) HD Graphics 615",                                  DRIVER_INTEL_HD4000,  2048},
     {HW_VENDOR_INTEL,      CARD_INTEL_HD620,               "Intel(R) HD Graphics 620",                                  DRIVER_INTEL_HD4000,  3072},
     {HW_VENDOR_INTEL,      CARD_INTEL_HD630_1,             "Intel(R) HD Graphics 630",                                  DRIVER_INTEL_HD4000,  3072},
@@ -1813,6 +1810,42 @@ HRESULT CDECL wined3d_adapter_get_identifier(const struct wined3d_adapter *adapt
     identifier->shared_system_memory = min(~(SIZE_T)0, adapter->driver_info.sysmem_bytes);
 
     wined3d_mutex_unlock();
+
+    {
+        WCHAR name[MAX_PATH], *module_exe;
+        if (GetModuleFileNameW(NULL, name, sizeof(name)))
+        {
+            module_exe = wcsrchr(name, '\\');
+            module_exe = module_exe ? module_exe + 1 : name;
+
+            /* CW HACK 19356 */
+            if (!lstrcmpW(module_exe, L"GTAIV.exe"))
+            {
+                /* GTA IV hangs on launch trying to init nvapi if it sees an NVIDIA GPU */
+                if (identifier->vendor_id == HW_VENDOR_NVIDIA)
+                {
+                    identifier->vendor_id = HW_VENDOR_AMD;
+                    identifier->device_id = CARD_AMD_RADEON_RX_480;
+                }
+
+                /* GTA IV ends up using its "Intel integrated" codepath for determining
+                 * VRAM size (since nvapi/atiadlxx fail), but this requires that
+                 * DedicatedVideoMemory is a very small dummy value, and SharedSystemMemory
+                 * is the actual VRAM size.
+                 * Swap the memory values around so this works.
+                 */
+                identifier->shared_system_memory = identifier->video_memory;
+                identifier->video_memory = 32 * 1024 * 1024;
+            }
+
+            /* CW HACK 19355: GTA 5 crashes on launch trying to init nvapi if it sees an NVIDIA GPU */
+            if (!lstrcmpW(module_exe, L"GTA5.exe") && (identifier->vendor_id == HW_VENDOR_NVIDIA))
+            {
+                    identifier->vendor_id = HW_VENDOR_AMD;
+                    identifier->device_id = CARD_AMD_RADEON_RX_480;
+            }
+        }
+    }
 
     return WINED3D_OK;
 }
@@ -3484,13 +3517,25 @@ done:
 
 static struct wined3d_adapter *wined3d_adapter_create(unsigned int ordinal, DWORD wined3d_creation_flags)
 {
+    struct wined3d_adapter *adapter = NULL;
+
     if (wined3d_creation_flags & WINED3D_NO3D)
         return wined3d_adapter_no3d_create(ordinal, wined3d_creation_flags);
 
     if (wined3d_settings.renderer == WINED3D_RENDERER_VULKAN)
         return wined3d_adapter_vk_create(ordinal, wined3d_creation_flags);
 
-    return wined3d_adapter_gl_create(ordinal, wined3d_creation_flags);
+    if (wined3d_settings.renderer == WINED3D_RENDERER_OPENGL)
+        return wined3d_adapter_gl_create(ordinal, wined3d_creation_flags);
+
+    /* CW HACK 18311: Use the Vulkan renderer on macOS. */
+    if ((adapter = wined3d_adapter_vk_create(ordinal, wined3d_creation_flags)))
+        ERR_(winediag)("Using the Vulkan renderer for d3d10/11 applications.\n");
+
+    if (!adapter)
+        adapter = wined3d_adapter_gl_create(ordinal, wined3d_creation_flags);
+
+    return adapter;
 }
 
 static void STDMETHODCALLTYPE wined3d_null_wined3d_object_destroyed(void *parent) {}

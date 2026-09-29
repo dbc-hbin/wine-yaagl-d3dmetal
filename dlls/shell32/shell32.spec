@@ -362,7 +362,6 @@
 @ stdcall SHEmptyRecycleBinA(long str long)
 @ stdcall SHEmptyRecycleBinW(long wstr long)
 @ stdcall SHEnumerateUnreadMailAccountsW(ptr long ptr long)
-@ stdcall SHEvaluateSystemCommandTemplate(wstr ptr ptr ptr)
 @ stdcall SHExtractIconsW(wstr long long long ptr ptr long long) user32.PrivateExtractIconsW
 @ stdcall SHFileOperation(ptr) SHFileOperationA
 @ stdcall SHFileOperationA(ptr)
@@ -493,3 +492,5 @@
 @ stdcall -private StrStrIW(wstr wstr) shlwapi.StrStrIW
 @ stdcall -private StrStrW(wstr wstr) shlwapi.StrStrW
 @ stdcall WOWShellExecute(long str str str str long ptr)
+
+@ stdcall wine_update_symbolic_links(long long wstr long)

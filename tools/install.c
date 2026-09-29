@@ -35,6 +35,7 @@
 static bool backup;
 static bool create_symlink;
 static bool directories;
+static bool preserve_timestamps;
 static bool strip;
 static bool verbose;
 static const char *group;
@@ -318,7 +319,8 @@ static void option_callback( int optc, char *optarg )
     case 'o':
         user = xstrdup( optarg );
         break;
-    case 'p': /* ignored */
+    case 'p':
+        preserve_timestamps = true;
         break;
     case 's':
         strip = true;

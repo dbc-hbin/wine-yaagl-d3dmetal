@@ -21,6 +21,7 @@
 #include <stdarg.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winnt.h"
@@ -115,7 +116,6 @@ static NTSTATUS mem_extended_parameters_32to64( MEM_EXTENDED_PARAMETER **ret_par
 
     if (req32)
     {
-        if (req32->LowestStartingAddress > highest_user_address) return STATUS_INVALID_PARAMETER;
         if (req32->HighestEndingAddress > highest_user_address) return STATUS_INVALID_PARAMETER;
         req->LowestStartingAddress = ULongToPtr( req32->LowestStartingAddress );
         req->HighestEndingAddress  = ULongToPtr( req32->HighestEndingAddress );
@@ -154,8 +154,6 @@ NTSTATUS WINAPI wow64_NtAllocateVirtualMemory( UINT *args )
     NTSTATUS status;
 
     if (!addr && (type & MEM_COMMIT)) type |= MEM_RESERVE;
-    if (*addr32 > highest_user_address) return STATUS_CONFLICTING_ADDRESSES;
-    if (*addr32 + size > highest_user_address + 1) return STATUS_CONFLICTING_ADDRESSES;
 
     if (!is_current) send_cross_process_notification( process, CrossProcessPreVirtualAlloc,
                                                       addr, size, 3, type, protect, 0 );
@@ -198,8 +196,6 @@ NTSTATUS WINAPI wow64_NtAllocateVirtualMemoryEx( UINT *args )
 
     if (!addr) type |= MEM_RESERVE;
 
-    if (*addr32 > highest_user_address) return STATUS_CONFLICTING_ADDRESSES;
-    if (*addr32 + size > highest_user_address + 1) return STATUS_CONFLICTING_ADDRESSES;
     if ((status = mem_extended_parameters_32to64( &params64, params32, &count, set_limit ))) return status;
 
     if (!is_current) send_cross_process_notification( process, CrossProcessPreVirtualAlloc,
@@ -290,15 +286,14 @@ NTSTATUS WINAPI wow64_NtFlushVirtualMemory( UINT *args )
     HANDLE process = get_handle( &args );
     ULONG *addr32 = get_ptr( &args );
     ULONG *size32 = get_ptr( &args );
-    IO_STATUS_BLOCK32 *io32 = get_ptr( &args );
-    IO_STATUS_BLOCK io;
+    ULONG unknown = get_ulong( &args );
 
     void *addr;
     SIZE_T size;
     NTSTATUS status;
 
     status = NtFlushVirtualMemory( process, (const void **)addr_32to64( &addr, addr32 ),
-                                   size_32to64( &size, size32 ), iosb_32to64( &io, io32 ) );
+                                   size_32to64( &size, size32 ), unknown );
     if (!status)
     {
         put_addr( addr32, addr );
@@ -480,11 +475,6 @@ NTSTATUS WINAPI wow64_NtMapViewOfSection( UINT *args )
     NTSTATUS status;
     void *prev = NtCurrentTeb()->Tib.ArbitraryUserPointer;
 
-    if (addr32)
-    {
-        if (*addr32 > highest_user_address) return STATUS_INVALID_PARAMETER;
-        if (size32 && *addr32 + (SIZE_T)*size32 > highest_user_address + 1) return STATUS_CONFLICTING_ADDRESSES;
-    }
     NtCurrentTeb()->Tib.ArbitraryUserPointer = ULongToPtr( NtCurrentTeb32()->Tib.ArbitraryUserPointer );
     status = NtMapViewOfSection( handle, process, addr_32to64( &addr, addr32 ), get_zero_bits( zero_bits ),
                                  commit, offset, size_32to64( &size, size32 ), inherit, alloc, protect );
@@ -522,11 +512,6 @@ NTSTATUS WINAPI wow64_NtMapViewOfSectionEx( UINT *args )
     BOOL set_limit = (!*addr32 && is_current);
     void *prev = NtCurrentTeb()->Tib.ArbitraryUserPointer;
 
-    if (addr32)
-    {
-        if (*addr32 > highest_user_address) return STATUS_INVALID_PARAMETER;
-        if (size32 && *addr32 + (SIZE_T)*size32 > highest_user_address + 1) return STATUS_CONFLICTING_ADDRESSES;
-    }
     if ((status = mem_extended_parameters_32to64( &params64, params32, &count, set_limit ))) return status;
 
     NtCurrentTeb()->Tib.ArbitraryUserPointer = ULongToPtr( NtCurrentTeb32()->Tib.ArbitraryUserPointer );
@@ -706,24 +691,11 @@ NTSTATUS WINAPI wow64_NtQueryVirtualMemory( UINT *args )
         break;
     }
 
-    case MemoryWineLoadUnixLibWow64:
-    case MemoryWineLoadUnixLibByNameWow64:
+    case MemoryWineUnixWow64Funcs:
         return STATUS_INVALID_INFO_CLASS;
 
-    case MemoryWineLoadUnixLib:
-        status = NtQueryVirtualMemory( handle, addr, MemoryWineLoadUnixLibWow64, ptr, len, &res_len );
-        break;
-    case MemoryWineLoadUnixLibByName:
-    {
-        UNICODE_STRING32 *str32 = addr;
-        UNICODE_STRING str;
-
-        status = NtQueryVirtualMemory( handle, unicode_str_32to64( &str, str32 ),
-                                       MemoryWineLoadUnixLibByNameWow64, ptr, len, &res_len );
-        break;
-    }
-    case MemoryWineUnloadUnixLib:
-        status = NtQueryVirtualMemory( handle, addr, class, ptr, len, &res_len );
+    case MemoryWineUnixFuncs:
+        status = NtQueryVirtualMemory( handle, addr, MemoryWineUnixWow64Funcs, ptr, len, &res_len );
         break;
 
     default:
@@ -805,13 +777,23 @@ NTSTATUS WINAPI wow64_NtSetInformationVirtualMemory( UINT *args )
 NTSTATUS WINAPI wow64_NtSetLdtEntries( UINT *args )
 {
     ULONG sel1 = get_ulong( &args );
-    ULONG entry1_low = get_ulong( &args );
-    ULONG entry1_high = get_ulong( &args );
+    ULONG64 entry1 = get_ulong64( &args );
     ULONG sel2 = get_ulong( &args );
-    ULONG entry2_low = get_ulong( &args );
-    ULONG entry2_high = get_ulong( &args );
+    ULONG64 entry2 = get_ulong64( &args );
 
-    return NtSetLdtEntries( sel1, entry1_low, entry1_high, sel2, entry2_low, entry2_high );
+    /* CW Hack 26470 & 26456: Rosetta hangs if you try to set a 16-bit LDT */
+    {
+        char buffer[64];
+        NTSTATUS status = NtQuerySystemInformation( SystemProcessorBrandString, buffer, sizeof(buffer), NULL );
+
+        if (!status && strstr( buffer, "VirtualApple" ))
+        {
+            ERR("HACK: not calling NtSetLdtEntries()\n");
+            return STATUS_NOT_IMPLEMENTED;
+        }
+    }
+
+    return NtSetLdtEntries( sel1, *(LDT_ENTRY *)&entry1, sel2, *(LDT_ENTRY *)&entry2 );
 }
 
 

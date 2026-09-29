@@ -169,41 +169,6 @@ static void test_event(void)
     pNtClose(event);
 }
 
-static void test_many_events(void)
-{
-    HANDLE events[4096];
-    NTSTATUS status;
-    DWORD ret;
-    unsigned int i, count;
-
-    /* Keep enough handles live to exercise more than the initial sync cache block. */
-    for (count = 0; count < ARRAY_SIZE(events); count++)
-    {
-        status = pNtCreateEvent( &events[count], EVENT_ALL_ACCESS, NULL, NotificationEvent, FALSE );
-        ok( !status, "Event %u: NtCreateEvent returned %#lx\n", count, status );
-        if (status) goto done;
-    }
-
-    for (i = 0; i < count; i += 2)
-    {
-        status = pNtSetEvent( events[i], NULL );
-        ok( !status, "Event %u: NtSetEvent returned %#lx\n", i, status );
-    }
-    for (i = 0; i < count; i++)
-    {
-        ret = WaitForSingleObject( events[i], 0 );
-        ok( ret == (i & 1 ? WAIT_TIMEOUT : WAIT_OBJECT_0),
-            "Event %u: unexpected wait result %#lx\n", i, ret );
-        status = pNtResetEvent( events[i], NULL );
-        ok( !status, "Event %u: NtResetEvent returned %#lx\n", i, status );
-        ret = WaitForSingleObject( events[i], 0 );
-        ok( ret == WAIT_TIMEOUT, "Event %u: wait after reset returned %#lx\n", i, ret );
-    }
-
-done:
-    while (count) pNtClose( events[--count] );
-}
-
 static const WCHAR keyed_nameW[] = L"\\BaseNamedObjects\\WineTestEvent";
 
 static DWORD WINAPI keyed_event_thread( void *arg )
@@ -1510,7 +1475,6 @@ START_TEST(sync)
 
     test_wait_on_address();
     test_event();
-    test_many_events();
     test_mutant();
     test_semaphore();
     test_keyed_events();

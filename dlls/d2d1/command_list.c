@@ -41,7 +41,6 @@ enum d2d_command_type
     D2D_COMMAND_DRAW_RECTANGLE,
     D2D_COMMAND_DRAW_BITMAP,
     D2D_COMMAND_DRAW_IMAGE,
-    D2D_COMMAND_DRAW_SPRITE_BATCH,
     D2D_COMMAND_FILL_MESH,
     D2D_COMMAND_FILL_OPACITY_MASK,
     D2D_COMMAND_FILL_GEOMETRY,
@@ -117,6 +116,7 @@ struct d2d_command_push_layer
 {
     struct d2d_command c;
     D2D1_LAYER_PARAMETERS1 params;
+    ID2D1Layer *layer;
 };
 
 struct d2d_command_draw_line
@@ -206,17 +206,6 @@ struct d2d_command_draw_image
     D2D1_COMPOSITE_MODE composite_mode;
     D2D1_POINT_2F *target_offset;
     D2D1_RECT_F *image_rect;
-};
-
-struct d2d_command_draw_sprite_batch
-{
-    struct d2d_command c;
-    ID2D1SpriteBatch *sprite_batch;
-    ID2D1Bitmap *bitmap;
-    UINT32 start_index;
-    UINT32 sprite_count;
-    D2D1_BITMAP_INTERPOLATION_MODE interpolation_mode;
-    D2D1_SPRITE_OPTIONS sprite_options;
 };
 
 static inline struct d2d_command_list *impl_from_ID2D1CommandList(ID2D1CommandList *iface)
@@ -425,24 +414,6 @@ static HRESULT STDMETHODCALLTYPE d2d_command_list_Stream(ID2D1CommandList *iface
                         c->interpolation_mode, c->composite_mode);
                 break;
             }
-            case D2D_COMMAND_DRAW_SPRITE_BATCH:
-            {
-                const struct d2d_command_draw_sprite_batch *c = data;
-                ID2D1CommandSink3 *sink3;
-
-                if (SUCCEEDED(ID2D1CommandSink_QueryInterface(sink, &IID_ID2D1CommandSink3, (void **)&sink3)))
-                {
-                    hr = ID2D1CommandSink3_DrawSpriteBatch(sink3, c->sprite_batch, c->start_index,
-                            c->sprite_count, c->bitmap, c->interpolation_mode, c->sprite_options);
-                    ID2D1CommandSink3_Release(sink3);
-                }
-                else
-                {
-                    FIXME("DrawSpriteBatch() fallback is not implemented.\n");
-                    hr = E_NOTIMPL;
-                }
-                break;
-            }
             case D2D_COMMAND_FILL_MESH:
             {
                 const struct d2d_command_fill_mesh *c = data;
@@ -476,7 +447,7 @@ static HRESULT STDMETHODCALLTYPE d2d_command_list_Stream(ID2D1CommandList *iface
             case D2D_COMMAND_PUSH_LAYER:
             {
                 const struct d2d_command_push_layer *c = data;
-                hr = ID2D1CommandSink_PushLayer(sink, &c->params, NULL);
+                hr = ID2D1CommandSink_PushLayer(sink, &c->params, c->layer);
                 break;
             }
             case D2D_COMMAND_POP_CLIP:
@@ -551,10 +522,7 @@ static void * d2d_command_list_require_space(struct d2d_command_list *command_li
     struct d2d_command *command;
 
     if (!d2d_array_reserve(&command_list->data, &command_list->capacity, command_list->size + size, 1))
-    {
-        command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
         return NULL;
-    }
 
     command = (struct d2d_command *)((char *)command_list->data + command_list->size);
     command->size = size;
@@ -580,7 +548,7 @@ static void d2d_command_list_reference_object(struct d2d_command_list *command_l
     IUnknown_AddRef(obj);
 }
 
-static bool d2d_command_list_create_brush(struct d2d_command_list *command_list,
+static HRESULT d2d_command_list_create_brush(struct d2d_command_list *command_list,
         const struct d2d_device_context *ctx, ID2D1Brush *orig_brush, ID2D1Brush **ret)
 {
     ID2D1DeviceContext *context = (ID2D1DeviceContext *)&ctx->ID2D1DeviceContext6_iface;
@@ -634,21 +602,16 @@ static bool d2d_command_list_create_brush(struct d2d_command_list *command_list,
             break;
         default:
             FIXME("Unsupported brush type %u.\n", brush->type);
-            return false;
+            return E_UNEXPECTED;
     }
 
-    if (hr == S_OK)
+    if (SUCCEEDED(hr))
     {
         d2d_command_list_reference_object(command_list, *ret);
         ID2D1Brush_Release(*ret);
     }
-    else
-    {
-        command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
-        WARN("Failed to create a brush, hr %#lx.\n", hr);
-    }
 
-    return hr == S_OK;
+    return hr;
 }
 
 void d2d_command_list_set_antialias_mode(struct d2d_command_list *command_list,
@@ -656,11 +619,9 @@ void d2d_command_list_set_antialias_mode(struct d2d_command_list *command_list,
 {
     struct d2d_command_set_antialias_mode *command;
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_SET_ANTIALIAS_MODE;
-        command->mode = mode;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_SET_ANTIALIAS_MODE;
+    command->mode = mode;
 }
 
 void d2d_command_list_set_primitive_blend(struct d2d_command_list *command_list,
@@ -668,22 +629,18 @@ void d2d_command_list_set_primitive_blend(struct d2d_command_list *command_list,
 {
     struct d2d_command_set_primitive_blend *command;
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_SET_PRIMITIVE_BLEND;
-        command->primitive_blend = primitive_blend;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_SET_PRIMITIVE_BLEND;
+    command->primitive_blend = primitive_blend;
 }
 
 void d2d_command_list_set_unit_mode(struct d2d_command_list *command_list, D2D1_UNIT_MODE mode)
 {
     struct d2d_command_set_unit_mode *command;
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_SET_UNIT_MODE;
-        command->mode = mode;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_SET_UNIT_MODE;
+    command->mode = mode;
 }
 
 void d2d_command_list_set_text_antialias_mode(struct d2d_command_list *command_list,
@@ -691,23 +648,19 @@ void d2d_command_list_set_text_antialias_mode(struct d2d_command_list *command_l
 {
     struct d2d_command_set_text_antialias_mode *command;
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_SET_TEXT_ANTIALIAS_MODE;
-        command->mode = mode;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_SET_TEXT_ANTIALIAS_MODE;
+    command->mode = mode;
 }
 
 void d2d_command_list_set_tags(struct d2d_command_list *command_list, D2D1_TAG tag1, D2D1_TAG tag2)
 {
     struct d2d_command_set_tags *command;
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_SET_TAGS;
-        command->tag1 = tag1;
-        command->tag2 = tag2;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_SET_TAGS;
+    command->tag1 = tag1;
+    command->tag2 = tag2;
 }
 
 void d2d_command_list_set_transform(struct d2d_command_list *command_list,
@@ -715,11 +668,9 @@ void d2d_command_list_set_transform(struct d2d_command_list *command_list,
 {
     struct d2d_command_set_transform *command;
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_SET_TRANSFORM;
-        command->transform = *transform;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_SET_TRANSFORM;
+    command->transform = *transform;
 }
 
 void d2d_command_list_begin_draw(struct d2d_command_list *command_list,
@@ -747,62 +698,59 @@ void d2d_command_list_push_clip(struct d2d_command_list *command_list, const D2D
 {
     struct d2d_command_push_clip *command;
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_PUSH_CLIP;
-        command->rect = *rect;
-        command->mode = mode;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_PUSH_CLIP;
+    command->rect = *rect;
+    command->mode = mode;
 }
 
 void d2d_command_list_pop_clip(struct d2d_command_list *command_list)
 {
     struct d2d_command *command;
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-        command->op = D2D_COMMAND_POP_CLIP;
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->op = D2D_COMMAND_POP_CLIP;
 }
 
 void d2d_command_list_push_layer(struct d2d_command_list *command_list, const struct d2d_device_context *context,
-        const D2D1_LAYER_PARAMETERS1 *params)
+        const D2D1_LAYER_PARAMETERS1 *params, ID2D1Layer *layer)
 {
     struct d2d_command_push_layer *command;
     ID2D1Brush *opacity_brush = NULL;
 
-    if (params->opacityBrush && !d2d_command_list_create_brush(command_list, context,
-            params->opacityBrush, &opacity_brush))
+    if (params->opacityBrush && FAILED(d2d_command_list_create_brush(command_list, context,
+            params->opacityBrush, &opacity_brush)))
     {
+        command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
         return;
     }
 
+    d2d_command_list_reference_object(command_list, layer);
     d2d_command_list_reference_object(command_list, params->geometricMask);
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_PUSH_LAYER;
-        command->params = *params;
-        command->params.opacityBrush = opacity_brush;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_PUSH_LAYER;
+    command->params = *params;
+    command->params.opacityBrush = opacity_brush;
+    command->layer = layer;
 }
 
 void d2d_command_list_pop_layer(struct d2d_command_list *command_list)
 {
     struct d2d_command *command;
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-        command->op = D2D_COMMAND_POP_LAYER;
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->op = D2D_COMMAND_POP_LAYER;
 }
 
 void d2d_command_list_clear(struct d2d_command_list *command_list, const D2D1_COLOR_F *color)
 {
     struct d2d_command_clear *command;
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_CLEAR;
-        if (color) command->color = *color;
-        else memset(&command->color, 0, sizeof(command->color));
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_CLEAR;
+    if (color) command->color = *color;
+    else memset(&command->color, 0, sizeof(command->color));
 }
 
 void d2d_command_list_draw_line(struct d2d_command_list *command_list,
@@ -812,20 +760,21 @@ void d2d_command_list_draw_line(struct d2d_command_list *command_list,
     struct d2d_command_draw_line *command;
     ID2D1Brush *brush;
 
-    if (!d2d_command_list_create_brush(command_list, context, orig_brush, &brush))
+    if (FAILED(d2d_command_list_create_brush(command_list, context, orig_brush, &brush)))
+    {
+        command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
         return;
+    }
 
     d2d_command_list_reference_object(command_list, stroke_style);
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_DRAW_LINE;
-        command->p0 = p0;
-        command->p1 = p1;
-        command->brush = brush;
-        command->stroke_width = stroke_width;
-        command->stroke_style = stroke_style;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_DRAW_LINE;
+    command->p0 = p0;
+    command->p1 = p1;
+    command->brush = brush;
+    command->stroke_width = stroke_width;
+    command->stroke_style = stroke_style;
 }
 
 void d2d_command_list_draw_geometry(struct d2d_command_list *command_list,
@@ -835,20 +784,21 @@ void d2d_command_list_draw_geometry(struct d2d_command_list *command_list,
     struct d2d_command_draw_geometry *command;
     ID2D1Brush *brush;
 
-    if (!d2d_command_list_create_brush(command_list, context, orig_brush, &brush))
+    if (FAILED(d2d_command_list_create_brush(command_list, context, orig_brush, &brush)))
+    {
+        command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
         return;
+    }
 
     d2d_command_list_reference_object(command_list, geometry);
     d2d_command_list_reference_object(command_list, stroke_style);
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_DRAW_GEOMETRY;
-        command->geometry = geometry;
-        command->brush = brush;
-        command->stroke_width = stroke_width;
-        command->stroke_style = stroke_style;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_DRAW_GEOMETRY;
+    command->geometry = geometry;
+    command->brush = brush;
+    command->stroke_width = stroke_width;
+    command->stroke_style = stroke_style;
 }
 
 void d2d_command_list_draw_rectangle(struct d2d_command_list *command_list, const struct d2d_device_context *context,
@@ -857,19 +807,20 @@ void d2d_command_list_draw_rectangle(struct d2d_command_list *command_list, cons
     struct d2d_command_draw_rectangle *command;
     ID2D1Brush *brush;
 
-    if (!d2d_command_list_create_brush(command_list, context, orig_brush, &brush))
+    if (FAILED(d2d_command_list_create_brush(command_list, context, orig_brush, &brush)))
+    {
+        command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
         return;
+    }
 
     d2d_command_list_reference_object(command_list, stroke_style);
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_DRAW_RECTANGLE;
-        command->rect = *rect;
-        command->brush = brush;
-        command->stroke_width = stroke_width;
-        command->stroke_style = stroke_style;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_DRAW_RECTANGLE;
+    command->rect = *rect;
+    command->brush = brush;
+    command->stroke_width = stroke_width;
+    command->stroke_style = stroke_style;
 }
 
 void d2d_command_list_fill_geometry(struct d2d_command_list *command_list,
@@ -879,24 +830,27 @@ void d2d_command_list_fill_geometry(struct d2d_command_list *command_list,
     ID2D1Brush *brush, *opacity_brush = NULL;
     struct d2d_command_fill_geometry *command;
 
-    if (!d2d_command_list_create_brush(command_list, context, orig_brush, &brush))
-        return;
-
-    if (orig_opacity_brush && !d2d_command_list_create_brush(command_list, context,
-            orig_opacity_brush, &opacity_brush))
+    if (FAILED(d2d_command_list_create_brush(command_list, context, orig_brush, &brush)))
     {
+        command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
+        return;
+    }
+
+    if (orig_opacity_brush && FAILED(d2d_command_list_create_brush(command_list, context,
+            orig_opacity_brush, &opacity_brush)))
+    {
+        command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
+        ID2D1Brush_Release(brush);
         return;
     }
 
     d2d_command_list_reference_object(command_list, geometry);
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_FILL_GEOMETRY;
-        command->geometry = geometry;
-        command->brush = brush;
-        command->opacity_brush = opacity_brush;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_FILL_GEOMETRY;
+    command->geometry = geometry;
+    command->brush = brush;
+    command->opacity_brush = opacity_brush;
 }
 
 void d2d_command_list_fill_rectangle(struct d2d_command_list *command_list,
@@ -905,15 +859,16 @@ void d2d_command_list_fill_rectangle(struct d2d_command_list *command_list,
     struct d2d_command_fill_rectangle *command;
     ID2D1Brush *brush;
 
-    if (!d2d_command_list_create_brush(command_list, context, orig_brush, &brush))
-        return;
-
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
+    if (FAILED(d2d_command_list_create_brush(command_list, context, orig_brush, &brush)))
     {
-        command->c.op = D2D_COMMAND_FILL_RECTANGLE;
-        command->rect = *rect;
-        command->brush = brush;
+        command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
+        return;
     }
+
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_FILL_RECTANGLE;
+    command->rect = *rect;
+    command->brush = brush;
 }
 
 static void d2d_command_list_set_text_rendering_params_internal(struct d2d_command_list *command_list,
@@ -936,11 +891,9 @@ static void d2d_command_list_set_text_rendering_params_internal(struct d2d_comma
     else
         command_list->flags |= D2D_COMMAND_LIST_HAS_NULL_TEXT_RENDERING_PARAMS;
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_SET_TEXT_RENDERING_PARAMS;
-        command->params = params;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_SET_TEXT_RENDERING_PARAMS;
+    command->params = params;
 }
 
 void d2d_command_list_set_text_rendering_params(struct d2d_command_list *command_list,
@@ -970,15 +923,18 @@ void d2d_command_list_draw_glyph_run(struct d2d_command_list *command_list,
         DWRITE_MEASURING_MODE measuring_mode)
 {
     struct d2d_command_draw_glyph_run *command;
-    size_t size, locale_name_size = 0;
     DWRITE_GLYPH_RUN_DESCRIPTION *d;
     DWRITE_GLYPH_RUN *r;
     UINT32 glyph_count;
     ID2D1Brush *brush;
+    size_t size;
     BYTE *data;
 
-    if (!d2d_command_list_create_brush(command_list, context, orig_brush, &brush))
+    if (FAILED(d2d_command_list_create_brush(command_list, context, orig_brush, &brush)))
+    {
+        command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
         return;
+    }
 
     /* Set rendering parameters automatically. Explicitly set null parameters are not recorded,
        either separately or as a part of a restored state block. Forcing parameters update on
@@ -997,11 +953,7 @@ void d2d_command_list_draw_glyph_run(struct d2d_command_list *command_list,
     if (run_desc)
     {
         size += sizeof(*run_desc);
-        if (run_desc->localeName)
-        {
-            locale_name_size = (wcslen(run_desc->localeName) + 1) * sizeof(*run_desc->localeName);
-            size += locale_name_size;
-        }
+        if (run_desc->localeName) size += (wcslen(run_desc->localeName) + 1) * sizeof(*run_desc->localeName);
         if (run_desc->string) size += run_desc->stringLength * sizeof(*run_desc->string);
         if (run_desc->clusterMap) size += run_desc->stringLength * sizeof(*run_desc->clusterMap);
         size += sizeof(run_desc->stringLength);
@@ -1010,8 +962,7 @@ void d2d_command_list_draw_glyph_run(struct d2d_command_list *command_list,
 
     d2d_command_list_reference_object(command_list, run->fontFace);
 
-    if (!(command = d2d_command_list_require_space(command_list, size)))
-        return;
+    command = d2d_command_list_require_space(command_list, size);
     command->c.op = D2D_COMMAND_DRAW_GLYPH_RUN;
     r = &command->run;
 
@@ -1034,7 +985,7 @@ void d2d_command_list_draw_glyph_run(struct d2d_command_list *command_list,
         memset(d, 0, sizeof(*d));
         data += sizeof(*d);
 
-        d2d_command_list_write_field(&data, &d->localeName, run_desc->localeName, locale_name_size);
+        d2d_command_list_write_field(&data, &d->localeName, run_desc->localeName, (wcslen(run_desc->localeName) + 1) * sizeof(*run_desc->localeName));
         d2d_command_list_write_field(&data, &d->string, run_desc->string, run_desc->stringLength * sizeof(*run_desc->string));
         d->stringLength = run_desc->stringLength;
         d2d_command_list_write_field(&data, &d->clusterMap, run_desc->clusterMap, run_desc->stringLength * sizeof(*run_desc->clusterMap));
@@ -1061,20 +1012,17 @@ void d2d_command_list_draw_bitmap(struct d2d_command_list *command_list, ID2D1Bi
 
     d2d_command_list_reference_object(command_list, bitmap);
 
-    if ((command = d2d_command_list_require_space(command_list, size)))
-    {
-        command->c.op = D2D_COMMAND_DRAW_BITMAP;
-        command->bitmap = bitmap;
-        command->opacity = opacity;
-        command->interpolation_mode = interpolation_mode;
+    command = d2d_command_list_require_space(command_list, size);
+    command->c.op = D2D_COMMAND_DRAW_BITMAP;
+    command->bitmap = bitmap;
+    command->opacity = opacity;
+    command->interpolation_mode = interpolation_mode;
 
-        data = (BYTE *)(command + 1);
+    data = (BYTE *)(command + 1);
 
-        d2d_command_list_write_field(&data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
-        d2d_command_list_write_field(&data, &command->src_rect, src_rect, sizeof(*src_rect));
-        d2d_command_list_write_field(&data, &command->perspective_transform, perspective_transform,
-                sizeof(*perspective_transform));
-    }
+    d2d_command_list_write_field(&data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
+    d2d_command_list_write_field(&data, &command->src_rect, src_rect, sizeof(*src_rect));
+    d2d_command_list_write_field(&data, &command->perspective_transform, perspective_transform, sizeof(*perspective_transform));
 }
 
 void d2d_command_list_draw_image(struct d2d_command_list *command_list, ID2D1Image *image,
@@ -1091,42 +1039,16 @@ void d2d_command_list_draw_image(struct d2d_command_list *command_list, ID2D1Ima
 
     d2d_command_list_reference_object(command_list, image);
 
-    if ((command = d2d_command_list_require_space(command_list, size)))
-    {
-        command->c.op = D2D_COMMAND_DRAW_IMAGE;
-        command->image = image;
-        command->interpolation_mode = interpolation_mode;
-        command->composite_mode = composite_mode;
+    command = d2d_command_list_require_space(command_list, size);
+    command->c.op = D2D_COMMAND_DRAW_IMAGE;
+    command->image = image;
+    command->interpolation_mode = interpolation_mode;
+    command->composite_mode = composite_mode;
 
-        data = (BYTE *)(command + 1);
+    data = (BYTE *)(command + 1);
 
-        d2d_command_list_write_field(&data, &command->target_offset, target_offset, sizeof(*target_offset));
-        d2d_command_list_write_field(&data, &command->image_rect, image_rect, sizeof(*image_rect));
-    }
-}
-
-void d2d_command_list_draw_sprite_batch(struct d2d_command_list *command_list, ID2D1SpriteBatch *sprite_batch,
-    UINT32 start_index, UINT32 sprite_count, ID2D1Bitmap *bitmap, D2D1_BITMAP_INTERPOLATION_MODE interpolation_mode,
-    D2D1_SPRITE_OPTIONS sprite_options)
-{
-    struct d2d_command_draw_sprite_batch *command;
-    size_t size;
-
-    size = sizeof(*command);
-
-    d2d_command_list_reference_object(command_list, sprite_batch);
-    d2d_command_list_reference_object(command_list, bitmap);
-
-    if ((command = d2d_command_list_require_space(command_list, size)))
-    {
-        command->c.op = D2D_COMMAND_DRAW_SPRITE_BATCH;
-        command->sprite_batch = sprite_batch;
-        command->bitmap = bitmap;
-        command->start_index = start_index;
-        command->sprite_count = sprite_count;
-        command->interpolation_mode = interpolation_mode;
-        command->sprite_options = sprite_options;
-    }
+    d2d_command_list_write_field(&data, &command->target_offset, target_offset, sizeof(*target_offset));
+    d2d_command_list_write_field(&data, &command->image_rect, image_rect, sizeof(*image_rect));
 }
 
 void d2d_command_list_fill_mesh(struct d2d_command_list *command_list, const struct d2d_device_context *context,
@@ -1135,17 +1057,18 @@ void d2d_command_list_fill_mesh(struct d2d_command_list *command_list, const str
     struct d2d_command_fill_mesh *command;
     ID2D1Brush *brush;
 
-    if (!d2d_command_list_create_brush(command_list, context, orig_brush, &brush))
+    if (FAILED(d2d_command_list_create_brush(command_list, context, orig_brush, &brush)))
+    {
+        command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
         return;
+    }
 
     d2d_command_list_reference_object(command_list, mesh);
 
-    if ((command = d2d_command_list_require_space(command_list, sizeof(*command))))
-    {
-        command->c.op = D2D_COMMAND_FILL_MESH;
-        command->mesh = mesh;
-        command->brush = brush;
-    }
+    command = d2d_command_list_require_space(command_list, sizeof(*command));
+    command->c.op = D2D_COMMAND_FILL_MESH;
+    command->mesh = mesh;
+    command->brush = brush;
 }
 
 void d2d_command_list_fill_opacity_mask(struct d2d_command_list *command_list, const struct d2d_device_context *context,
@@ -1156,8 +1079,11 @@ void d2d_command_list_fill_opacity_mask(struct d2d_command_list *command_list, c
     size_t size;
     BYTE *data;
 
-    if (!d2d_command_list_create_brush(command_list, context, orig_brush, &brush))
+    if (FAILED(d2d_command_list_create_brush(command_list, context, orig_brush, &brush)))
+    {
+        command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
         return;
+    }
 
     size = sizeof(*command);
     if (dst_rect) size += sizeof(*dst_rect);
@@ -1165,15 +1091,13 @@ void d2d_command_list_fill_opacity_mask(struct d2d_command_list *command_list, c
 
     d2d_command_list_reference_object(command_list, bitmap);
 
-    if ((command = d2d_command_list_require_space(command_list, size)))
-    {
-        command->c.op = D2D_COMMAND_FILL_OPACITY_MASK;
-        command->bitmap = bitmap;
-        command->brush = brush;
+    command = d2d_command_list_require_space(command_list, size);
+    command->c.op = D2D_COMMAND_FILL_OPACITY_MASK;
+    command->bitmap = bitmap;
+    command->brush = brush;
 
-        data = (BYTE *)(command + 1);
+    data = (BYTE *)(command + 1);
 
-        d2d_command_list_write_field(&data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
-        d2d_command_list_write_field(&data, &command->src_rect, src_rect, sizeof(*src_rect));
-    }
+    d2d_command_list_write_field(&data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
+    d2d_command_list_write_field(&data, &command->src_rect, src_rect, sizeof(*src_rect));
 }

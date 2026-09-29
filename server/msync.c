@@ -25,7 +25,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -145,243 +144,135 @@ static inline mach_msg_return_t mach_msg2( mach_msg_header_t *data, uint64_t opt
 
 static mach_port_name_t receive_port;
 
-enum wait_state
+struct tid_node
 {
-    MSYNC_WAIT_IDLE,
-    MSYNC_WAIT_REGISTERING,
-    MSYNC_WAIT_ARMED,
-    MSYNC_WAIT_WOKEN,
-    MSYNC_WAIT_CANCELING,
-    MSYNC_WAIT_FAILED
+    struct tid_node *next;
+    int tid;
 };
 
-#define WAIT_STATE_MASK 7u
-#define WAIT_GENERATION_STEP 8u
-#define MSYNC_MAP_MESSAGE_WIRE_SIZE 32u
-#define MSYNC_CLEANUP_MESSAGE_ID ((mach_msg_id_t)0x7ffffffe)
+#define MAX_POOL_NODES 0x80000
 
-static inline unsigned int wait_token_state( unsigned int token )
+struct node_memory_pool
 {
-    return token & WAIT_STATE_MASK;
+    struct tid_node *nodes;
+    struct tid_node **free_nodes;
+    unsigned int count;
+};
+
+static struct node_memory_pool *pool;
+
+static void pool_init(void)
+{
+    unsigned int i;
+    pool = malloc( sizeof(struct node_memory_pool) );
+    pool->nodes = malloc( MAX_POOL_NODES * sizeof(struct tid_node) );
+    pool->free_nodes = malloc( MAX_POOL_NODES * sizeof(struct tid_node *) );
+    pool->count = MAX_POOL_NODES;
+
+    for (i = 0; i < MAX_POOL_NODES; i++)
+        pool->free_nodes[i] = &pool->nodes[i];
 }
 
-static inline unsigned int wait_token_with_state( unsigned int token, enum wait_state state )
+static inline struct tid_node *pool_alloc(void)
 {
-    return (token & ~WAIT_STATE_MASK) | state;
+    if (pool->count == 0)
+    {
+        fprintf( stderr, "msync: warn: node memory pool exhausted\n" );
+        return malloc( sizeof(struct tid_node) );
+    }
+    return pool->free_nodes[--pool->count];
 }
 
-struct wait_registration;
-
-struct wait_node
+static inline void pool_free( struct tid_node *node )
 {
-    struct wait_node *next;
-    struct wait_node **prev;
-    struct wait_registration *registration;
-    unsigned int shm_idx;
+    if (node < pool->nodes || node >= pool->nodes + MAX_POOL_NODES)
+    {
+        free(node);
+        return;
+    }
+    pool->free_nodes[pool->count++] = node;
+}
+
+struct tid_list
+{
+    struct tid_node *head;
 };
 
-struct wait_registration
-{
-    struct wait_registration *free_next;
-    struct wait_registration *hash_next;
-    unsigned int tid;
-    unsigned int token;
-    unsigned int node_count;
-    unsigned int capacity;
-    struct wait_node nodes[];
-};
-
-struct wait_list
-{
-    struct wait_node *head;
-};
-
-#define MAX_REGISTRATION_NODES 0x80000
-#define REGISTRATION_HASH_SIZE 16384
-
-static struct wait_registration *free_registrations[MAXIMUM_WAIT_OBJECTS + 2];
-static struct wait_registration *registration_hash[REGISTRATION_HASH_SIZE];
-static unsigned int allocated_registration_nodes;
-static struct wait_list *wait_lists;
-static size_t wait_lists_size;
+static struct tid_list *tid_map;
+static size_t tid_map_size;
 static int *shm_tid_map;
 static const mach_vm_size_t shm_tid_size = 64 * 1024 * 1024; /* 64 MB to index 24 bit tids */
 
-static inline unsigned int registration_hash_idx( unsigned int tid )
+/* This function should only be called from get_tid_list() */
+static void grow_tid_map( unsigned int shm_idx )
 {
-    return (tid * 2654435761u) & (REGISTRATION_HASH_SIZE - 1);
+    size_t new_size = max(tid_map_size ? tid_map_size * 2 : 256, shm_idx + 1);
+    struct tid_list *new_tid_map;
+
+    new_tid_map = realloc( tid_map, new_size * sizeof(struct tid_list) );
+    assert( new_tid_map );
+    memset( new_tid_map + tid_map_size, 0, (new_size - tid_map_size) * sizeof(struct tid_list) );
+    tid_map = new_tid_map;
+    tid_map_size = new_size;
 }
 
-static struct wait_registration *find_registration( unsigned int tid )
+/* This function is not thread-safe and should only be called from the message thread! */
+static inline struct tid_list *get_tid_list( unsigned int shm_idx )
 {
-    struct wait_registration *registration;
-
-    for (registration = registration_hash[registration_hash_idx( tid )]; registration;
-         registration = registration->hash_next)
-        if (registration->tid == tid) return registration;
-
-    return NULL;
+    if( shm_idx >= tid_map_size ) grow_tid_map( shm_idx );
+    return tid_map + shm_idx;
 }
 
-static void insert_registration( struct wait_registration *registration )
+static inline void add_tid( unsigned int shm_idx, int tid )
 {
-    unsigned int idx = registration_hash_idx( registration->tid );
+    struct tid_node *new_node;
+    struct tid_list *list = get_tid_list( shm_idx );
 
-    registration->hash_next = registration_hash[idx];
-    registration_hash[idx] = registration;
+    new_node = pool_alloc();
+    new_node->tid = tid;
+
+    new_node->next = list->head;
+    list->head = new_node;
 }
 
-static void remove_registration( struct wait_registration *registration )
+static inline void remove_tid( unsigned int shm_idx, int tid )
 {
-    struct wait_registration **cursor = registration_hash + registration_hash_idx( registration->tid );
+    struct tid_node *current, *prev = NULL;
+    struct tid_list *list = get_tid_list( shm_idx );
 
-    while (*cursor && *cursor != registration) cursor = &(*cursor)->hash_next;
-    if (*cursor) *cursor = registration->hash_next;
-}
-
-static int reclaim_cached_registration(void)
-{
-    struct wait_registration *registration;
-    unsigned int capacity;
-
-    for (capacity = 1; capacity < ARRAY_SIZE(free_registrations); capacity++)
+    current = list->head;
+    while (current != NULL)
     {
-        if (!(registration = free_registrations[capacity])) continue;
-        free_registrations[capacity] = registration->free_next;
-        allocated_registration_nodes -= registration->capacity;
-        free( registration );
-        return 1;
+        if (current->tid == tid)
+        {
+            if (prev == NULL)
+                list->head = current->next;
+            else
+                prev->next = current->next;
+            pool_free(current);
+            break;
+        }
+        prev = current;
+        current = current->next;
     }
-    return 0;
 }
 
-static struct wait_registration *alloc_registration( unsigned int count )
-{
-    struct wait_registration *registration;
-
-    if ((registration = free_registrations[count]))
-    {
-        free_registrations[count] = registration->free_next;
-        return registration;
-    }
-
-    while (count > MAX_REGISTRATION_NODES - allocated_registration_nodes)
-    {
-        if (reclaim_cached_registration()) continue;
-        fprintf( stderr, "msync: error: wait registration node pool exhausted\n" );
-        return NULL;
-    }
-
-    if (!(registration = malloc( sizeof(*registration) + count * sizeof(registration->nodes[0]) )))
-    {
-        fprintf( stderr, "msync: error: failed to allocate wait registration\n" );
-        return NULL;
-    }
-    registration->capacity = count;
-    allocated_registration_nodes += count;
-    return registration;
-}
-
-static void free_registration( struct wait_registration *registration )
-{
-    registration->free_next = free_registrations[registration->capacity];
-    free_registrations[registration->capacity] = registration;
-}
-
-static int grow_wait_lists( unsigned int shm_idx )
-{
-    size_t new_size = max(wait_lists_size ? wait_lists_size * 2 : 256, (size_t)shm_idx + 1);
-    struct wait_list *new_wait_lists;
-    size_t i;
-
-    if (new_size < wait_lists_size ||
-        !(new_wait_lists = realloc( wait_lists, new_size * sizeof(*new_wait_lists) )))
-    {
-        fprintf( stderr, "msync: error: failed to grow wait list array to %zu entries\n", new_size );
-        return 0;
-    }
-
-    memset( new_wait_lists + wait_lists_size, 0,
-            (new_size - wait_lists_size) * sizeof(*new_wait_lists) );
-    for (i = 0; i < wait_lists_size; i++)
-        if (new_wait_lists[i].head) new_wait_lists[i].head->prev = &new_wait_lists[i].head;
-    wait_lists = new_wait_lists;
-    wait_lists_size = new_size;
-    return 1;
-}
-
-static inline struct wait_list *get_wait_list( unsigned int shm_idx, int create )
-{
-    if (shm_idx >= wait_lists_size)
-    {
-        if (!create || !grow_wait_lists( shm_idx )) return NULL;
-    }
-    return wait_lists + shm_idx;
-}
-
-static void unlink_wait_node( struct wait_node *node )
-{
-    if (!node->prev) return;
-
-    *node->prev = node->next;
-    if (node->next) node->next->prev = node->prev;
-    node->next = NULL;
-    node->prev = NULL;
-}
-
-static void detach_registration( struct wait_registration *registration )
-{
-    unsigned int i;
-
-    for (i = 0; i < registration->node_count; i++)
-        unlink_wait_node( registration->nodes + i );
-}
-
-static int link_wait_node( struct wait_registration *registration, unsigned int shm_idx )
-{
-    struct wait_node *node = registration->nodes + registration->node_count;
-    struct wait_list *list = get_wait_list( shm_idx, 1 );
-
-    if (!list) return 0;
-
-    node->registration = registration;
-    node->prev = &list->head;
-    node->next = list->head;
-    if (node->next) node->next->prev = &node->next;
-    list->head = node;
-    registration->node_count++;
-    return 1;
-}
-
+static long pagesize;
 static void *get_shm( unsigned int idx );
 
 typedef struct
 {
     mach_msg_header_t header;
-    unsigned int shm_idx[MAXIMUM_WAIT_OBJECTS + 2];
+    unsigned int shm_idx[MAXIMUM_WAIT_OBJECTS + 1];
     mach_msg_trailer_t trailer;
 } mach_register_message_t;
 
 typedef struct
 {
     mach_msg_header_t header;
-    unsigned int wire_version;
     int entry;
     mach_msg_trailer_t trailer;
 } mach_map_message_t;
-
-typedef struct
-{
-    mach_msg_header_t header;
-    unsigned int tid;
-    mach_msg_trailer_t trailer;
-} mach_cleanup_message_t;
-
-typedef struct
-{
-    mach_msg_header_t header;
-    mach_msg_trailer_t trailer;
-} mach_cleanup_reply_t;
 
 typedef struct
 {
@@ -390,7 +281,8 @@ typedef struct
     mach_msg_port_descriptor_t descriptor;
 } mach_map_message_reply_t;
 
-static void *shm_addrs[MSYNC_SHM_MAX_PAGES];
+static void **shm_addrs;
+static int shm_addrs_size;  /* length of the allocated shm_addrs array */
 
 static void send_shm_to_client( mach_map_message_t *message )
 {
@@ -401,35 +293,24 @@ static void send_shm_to_client( mach_map_message_t *message )
     mach_vm_size_t entry_size = 0;
     mach_port_t entry_port = MACH_PORT_NULL;
 
-    if (message->header.msgh_size != MSYNC_MAP_MESSAGE_WIRE_SIZE)
-        fprintf( stderr, "msync: error: client sent malformed shared mapping request of %u bytes (expected %u)\n",
-                 message->header.msgh_size, MSYNC_MAP_MESSAGE_WIRE_SIZE );
-    else if (message->wire_version != MSYNC_SHM_WIRE_VERSION)
-        fprintf( stderr, "msync: error: client requested incompatible shared layout %u (expected %u)\n",
-                 message->wire_version, MSYNC_SHM_WIRE_VERSION );
-    else if (message->header.msgh_id)
+    if (message->header.msgh_id)
     {
         offset = (memory_object_offset_t)shm_tid_map;
         entry_size = shm_tid_size;
     }
-    else if (message->entry >= 0 && message->entry < MSYNC_SHM_MAX_PAGES &&
-             __atomic_load_n( &shm_addrs[message->entry], __ATOMIC_ACQUIRE ))
+    else if (message->entry < shm_addrs_size)
     {
         offset = (memory_object_offset_t)shm_addrs[message->entry];
-        entry_size = MSYNC_SHM_PAGE_SIZE;
+        entry_size = pagesize;
     }
     else
-        fprintf( stderr, "msync: error: client requested invalid shm entry %d\n", message->entry );
+        fprintf( stderr, "msync: error: client requested out-of-bounds shm entry %d\n", message->entry );
 
-    if (entry_size)
-    {
-        kr = mach_make_memory_entry_64( mach_task_self(), &entry_size, offset, VM_PROT_DEFAULT,
-                                        &entry_port, MACH_PORT_NULL );
+    kr = mach_make_memory_entry_64( mach_task_self(), &entry_size, offset, VM_PROT_DEFAULT,
+                                    &entry_port, MACH_PORT_NULL );
 
-        if (kr != KERN_SUCCESS)
-            fprintf( stderr, "msync: error: mach_make_memory_entry_64 failed with %d: %s\n",
-                     kr, mach_error_string( kr ) );
-    }
+    if (kr != KERN_SUCCESS)
+        fprintf( stderr, "msync: error: mach_make_memory_entry_64 failed with %d: %s\n", kr, mach_error_string( kr ) );
 
     reply.header.msgh_bits = MACH_MSGH_BITS_SET( MACH_MSG_TYPE_COPY_SEND, 0, 0, MACH_MSGH_BITS_COMPLEX );
     reply.header.msgh_id = message->header.msgh_id;
@@ -450,68 +331,36 @@ static void send_shm_to_client( mach_map_message_t *message )
     mach_port_deallocate( mach_task_self(), entry_port );
 }
 
-static inline void wake_wait_state( unsigned int tid )
+static inline void unregister_wait( mach_register_message_t *message, unsigned int tid, unsigned int count )
 {
-    __ulock_wake( UL_COMPARE_AND_WAIT_SHARED, shm_tid_map + tid, 0 );
+    int i;
+
+    for (i = 0; i < count; i++)
+        remove_tid( message->shm_idx[i], tid );
 }
 
-static int publish_wait_state( unsigned int tid, int from, int to )
+static inline void wake_tid( int tid )
 {
-    int expected = from;
+    int *shm = shm_tid_map + tid;
 
-    if (!__atomic_compare_exchange_n( shm_tid_map + tid, &expected, to, 0,
-                                      __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ))
-        return 0;
-
-    wake_wait_state( tid );
-    return 1;
-}
-
-static void retire_registration( struct wait_registration *registration );
-
-static void complete_registration( struct wait_registration *registration,
-                                   enum wait_state from, enum wait_state to )
-{
-    detach_registration( registration );
-    publish_wait_state( registration->tid, wait_token_with_state( registration->token, from ),
-                        wait_token_with_state( registration->token, to ) );
-}
-
-static void acknowledge_unregister( unsigned int tid, unsigned int token )
-{
-    struct wait_registration *registration = find_registration( tid );
-    unsigned int state = __atomic_load_n( shm_tid_map + tid, __ATOMIC_ACQUIRE );
-
-    if ((state & ~WAIT_STATE_MASK) != (token & ~WAIT_STATE_MASK)) return;
-    if (wait_token_state( state ) != MSYNC_WAIT_WOKEN && wait_token_state( state ) != MSYNC_WAIT_CANCELING &&
-        wait_token_state( state ) != MSYNC_WAIT_FAILED)
-    {
-        fprintf( stderr, "msync: error: unregister for tid %u in state %#x\n", tid, state );
-        return;
-    }
-
-    if (registration)
-    {
-        if (registration->token != token) return;
-        detach_registration( registration );
-        retire_registration( registration );
-        remove_registration( registration );
-        free_registration( registration );
-    }
-
-    if (!publish_wait_state( tid, state, wait_token_with_state( token, MSYNC_WAIT_IDLE ) ))
-        fprintf( stderr, "msync: error: unregister state changed for tid %u\n", tid );
+    __atomic_store_n( shm, 0, __ATOMIC_RELEASE );
+    __ulock_wake( UL_COMPARE_AND_WAIT_SHARED, (void *)shm, 0 );
 }
 
 static inline void signal_all_internal( unsigned int shm_idx )
 {
-    struct wait_list *list = get_wait_list( shm_idx, 0 );
+    struct tid_node *current, *temp;
+    struct tid_list *list = get_tid_list( shm_idx );
 
-    while (list && list->head)
+    current = list->head;
+    list->head = NULL;
+
+    while (current)
     {
-        struct wait_registration *registration = list->head->registration;
-
-        complete_registration( registration, MSYNC_WAIT_ARMED, MSYNC_WAIT_WOKEN );
+        wake_tid( current->tid );
+        temp = current;
+        current = current->next;
+        pool_free(temp);
     }
 }
 
@@ -525,87 +374,34 @@ struct msync_shm
     int multiple_waiters;
 };
 
-static pthread_mutex_t shm_index_mutex = PTHREAD_MUTEX_INITIALIZER;
-static unsigned int free_shm_idx = UINT32_MAX;
-static unsigned int next_unused_shm_idx = 2;
-
-static int retain_shm_ref( unsigned int shm_idx )
-{
-    struct msync_shm *obj = get_shm( shm_idx );
-    unsigned short refs = __atomic_load_n( &obj->refcount, __ATOMIC_RELAXED );
-
-    do
-    {
-        if (!refs || refs == USHRT_MAX) return 0;
-    } while (!__atomic_compare_exchange_n( &obj->refcount, &refs, refs + 1, 1,
-                                           __ATOMIC_SEQ_CST, __ATOMIC_RELAXED ));
-    __atomic_add_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST );
-    return 1;
-}
-
-static void release_shm_ref( unsigned int shm_idx )
-{
-    struct msync_shm *obj = get_shm( shm_idx );
-    unsigned short refs;
-
-    pthread_mutex_lock( &shm_index_mutex );
-    refs = __atomic_load_n( &obj->refcount, __ATOMIC_SEQ_CST );
-    if (!refs)
-        fprintf( stderr, "msync: error: refcount underflow for shm idx %u\n", shm_idx );
-    else if (!__atomic_sub_fetch( &obj->refcount, 1, __ATOMIC_SEQ_CST ))
-    {
-        obj->msync_type = 0;
-        obj->low = free_shm_idx;
-        free_shm_idx = shm_idx;
-    }
-    pthread_mutex_unlock( &shm_index_mutex );
-}
-
-static void retire_registration( struct wait_registration *registration )
-{
-    unsigned int i;
-
-    for (i = 0; i < registration->capacity; i++)
-    {
-        struct msync_shm *obj = get_shm( registration->nodes[i].shm_idx );
-        int waiters = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST );
-        if (waiters < 0)
-            fprintf( stderr, "msync: error: waiter count underflow for shm idx %u\n",
-                     registration->nodes[i].shm_idx );
-        release_shm_ref( registration->nodes[i].shm_idx );
-    }
-}
-
-static void retire_message_refs( mach_register_message_t *message, unsigned int count )
-{
-    unsigned int i;
-
-    for (i = 0; i < count; i++)
-    {
-        struct msync_shm *obj;
-        unsigned int shm_idx = message->shm_idx[i + 1] & MSYNC_SHM_INDEX_MASK;
-        int waiters;
-
-        obj = get_shm( shm_idx );
-        waiters = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST );
-        if (waiters < 0)
-            fprintf( stderr, "msync: error: waiter count underflow for shm idx %u\n", shm_idx );
-        release_shm_ref( shm_idx );
-    }
-}
+static unsigned int last_allocated_idx = 1;
+static unsigned int last_destroyed_idx = UINT32_MAX;
 
 static inline void destroy_all_internal( unsigned int shm_idx )
 {
-    release_shm_ref( shm_idx );
+    struct msync_shm *obj = get_shm( shm_idx );
+    unsigned short refcount = __atomic_load_n( &obj->refcount, __ATOMIC_SEQ_CST );
+
+    if (!refcount)
+    {
+        fprintf( stderr, "msync: error: destroy_all on already destroyed shm idx %u with refcount %d\n", shm_idx, refcount );
+        return;
+    }
+
+    refcount = __atomic_sub_fetch( &obj->refcount, 1, __ATOMIC_SEQ_CST );
+
+    if (!refcount) last_destroyed_idx = shm_idx;
 }
 
-/* Client registration and unregister messages are ordered on the Mach port. Shared
- * state publication still uses release/acquire ordering for weakly ordered CPUs. */
+/*
+ * thread-safe sequentially consistent guarantees relative to register/unregister
+ * client-side are made by the mach messaging queue
+ */
 static inline mach_msg_return_t destroy_all( unsigned int shm_idx )
 {
     static mach_msg_header_t send_header;
     send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
-    send_header.msgh_id = (shm_idx & MSYNC_SHM_INDEX_MASK) | MSYNC_SHM_CLOSE_FLAG;
+    send_header.msgh_id = shm_idx | (1 << 28);
     send_header.msgh_size = sizeof(send_header);
     send_header.msgh_remote_port = receive_port;
 
@@ -650,119 +446,11 @@ static inline unsigned int check_bit( const unsigned int bit, unsigned int *shm_
     return bit_val;
 }
 
-static void register_wait( mach_register_message_t *message, unsigned int tid, unsigned int count )
-{
-    struct wait_registration *registration;
-    unsigned int i, token = message->shm_idx[0];
-    unsigned int state;
-
-    state = __atomic_load_n( shm_tid_map + tid, __ATOMIC_ACQUIRE );
-    if (state != token || wait_token_state( token ) != MSYNC_WAIT_REGISTERING)
-        return;
-
-    if (find_registration( tid ))
-    {
-        fprintf( stderr, "msync: error: duplicate registration for tid %u\n", tid );
-        publish_wait_state( tid, token, wait_token_with_state( token, MSYNC_WAIT_FAILED ) );
-        return;
-    }
-
-    if (!(registration = alloc_registration( count )))
-    {
-        publish_wait_state( tid, token, wait_token_with_state( token, MSYNC_WAIT_FAILED ) );
-        return;
-    }
-
-    for (i = 0; i < count; i++)
-    {
-        unsigned int shm_idx = message->shm_idx[i + 1] & MSYNC_SHM_INDEX_MASK;
-
-        if (retain_shm_ref( shm_idx )) continue;
-        retire_message_refs( message, i );
-        free_registration( registration );
-        publish_wait_state( tid, token, wait_token_with_state( token, MSYNC_WAIT_FAILED ) );
-        return;
-    }
-
-    registration->tid = tid;
-    registration->token = message->shm_idx[0];
-    registration->node_count = 0;
-    for (i = 0; i < count; i++)
-        registration->nodes[i].shm_idx = message->shm_idx[i + 1] & MSYNC_SHM_INDEX_MASK;
-    insert_registration( registration );
-
-    for (i = 0; i < count; i++)
-    {
-        struct msync_shm *obj;
-        unsigned int shm_idx = message->shm_idx[i + 1];
-        unsigned int is_mutex = check_bit( 28, &shm_idx );
-        int val;
-
-        obj = get_shm( shm_idx );
-        val = __atomic_load_n( &obj->low, __ATOMIC_ACQUIRE );
-        if ((is_mutex && (val == 0 || val == ~0 || val == tid)) || (!is_mutex && val != 0))
-        {
-            complete_registration( registration, MSYNC_WAIT_REGISTERING, MSYNC_WAIT_WOKEN );
-            return;
-        }
-
-        if (!link_wait_node( registration, shm_idx ))
-        {
-            complete_registration( registration, MSYNC_WAIT_REGISTERING, MSYNC_WAIT_FAILED );
-            return;
-        }
-    }
-
-    if (publish_wait_state( tid, token, wait_token_with_state( token, MSYNC_WAIT_ARMED ) ))
-    {
-        if (getenv("WINE_MSYNC_TEST_TRACE") && getenv("WINE_MSYNC_TEST_TRACE")[0] == '1' &&
-            !getenv("WINE_MSYNC_TEST_TRACE")[1])
-            fprintf( stderr, "msync: MSYNC_WAIT_ARMED tid %u count %u\n", tid, count );
-    }
-    else
-        detach_registration( registration );
-}
-
-static void cleanup_thread_registration( mach_cleanup_message_t *message )
-{
-    struct wait_registration *registration = find_registration( message->tid );
-    mach_msg_header_t reply = {0};
-    unsigned int state, next;
-    mach_msg_return_t mr;
-
-    if (registration)
-    {
-        detach_registration( registration );
-        retire_registration( registration );
-        remove_registration( registration );
-        free_registration( registration );
-    }
-
-    state = __atomic_load_n( shm_tid_map + message->tid, __ATOMIC_ACQUIRE );
-    for (;;)
-    {
-        next = ((state & ~WAIT_STATE_MASK) + WAIT_GENERATION_STEP) | MSYNC_WAIT_IDLE;
-        if (__atomic_compare_exchange_n( shm_tid_map + message->tid, &state, next, 0,
-                                         __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ))
-            break;
-    }
-    wake_wait_state( message->tid );
-
-    reply.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
-    reply.msgh_size = sizeof(reply);
-    reply.msgh_remote_port = message->header.msgh_remote_port;
-    reply.msgh_id = MSYNC_CLEANUP_MESSAGE_ID;
-    mr = mach_msg2( &reply, MACH_SEND_MSG, reply.msgh_size, 0,
-                    MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
-    if (mr != MACH_MSG_SUCCESS)
-        fprintf( stderr, "msync: error: failed to acknowledge tid %u cleanup: %#x\n",
-                 message->tid, mr );
-    mach_port_deallocate( mach_task_self(), message->header.msgh_remote_port );
-}
-
 static void *mach_message_pump( void *args )
 {
-    unsigned int tid, count, body_count;
+    int i, val;
+    unsigned int tid, count, is_mutex;
+    struct msync_shm *obj;
     mach_msg_return_t mr;
     mach_register_message_t receive_message = { 0 };
     sigset_t set;
@@ -785,48 +473,52 @@ static void *mach_message_pump( void *args )
          */
         if (receive_message.header.msgh_remote_port != MACH_PORT_NULL)
         {
-            if (receive_message.header.msgh_id == MSYNC_CLEANUP_MESSAGE_ID)
-                cleanup_thread_registration( (mach_cleanup_message_t *)&receive_message );
-            else
-                send_shm_to_client( (mach_map_message_t *)&receive_message );
+            send_shm_to_client( (mach_map_message_t *)&receive_message );
             continue;
         }
 
-        /* Header-only messages carry a 28-bit shared index and a signal or close flag. */
+        /*
+         * A message with no body is a signal_all or destroy_all operation where the shm_idx
+         * is the msgh_id and the type of operation is decided by the 29th bit.
+         * (The shared memory index is only a 28-bit integer at max)
+         * See signal_all( unsigned int shm_idx ) and destroy_all( unsigned int shm_idx )above.
+         */
         if (receive_message.header.msgh_size == sizeof(mach_msg_header_t))
         {
-            unsigned int message_id = receive_message.header.msgh_id;
-            unsigned int shm_idx = message_id & MSYNC_SHM_INDEX_MASK;
-
-            if (message_id & MSYNC_SHM_CLOSE_FLAG)
-                destroy_all_internal( shm_idx );
+            if (check_bit( 28, (unsigned int *)&receive_message.header.msgh_id ))
+                destroy_all_internal( receive_message.header.msgh_id );
             else
-                signal_all_internal( shm_idx );
+                signal_all_internal( receive_message.header.msgh_id );
             continue;
         }
 
-        /* Finally, registration and ordered unregister messages. */
+        /*
+         * Finally server_register_wait and server_unregister_wait
+         */
         decode_msgh_id( receive_message.header.msgh_id, &tid, &count );
-        body_count = (receive_message.header.msgh_size - sizeof(mach_msg_header_t)) /
-                     sizeof(receive_message.shm_idx[0]);
-
-        if (body_count == 1)
+        for (i = 0; i < count; i++)
         {
-            acknowledge_unregister( tid, receive_message.shm_idx[0] );
-            continue;
+            if (i == 0 && check_bit( 29, receive_message.shm_idx + i ))
+            {
+                unregister_wait( &receive_message, tid, count );
+                break;
+            }
+            is_mutex = check_bit( 28, receive_message.shm_idx + i );
+            obj = get_shm( receive_message.shm_idx[i] );
+            val = __atomic_load_n( &obj->low, __ATOMIC_SEQ_CST );
+            if ((is_mutex && (val == 0 || val == ~0 || val == tid)) || (!is_mutex && val != 0))
+            {
+                if (i > 1) unregister_wait( &receive_message, tid, i );
+                wake_tid( tid );
+                break;
+            }
+            add_tid( receive_message.shm_idx[i], tid );
+            if (i == count - 1)
+            {
+                /* The client can stop spinning and safely start waiting now */
+                __atomic_store_n( shm_tid_map + tid, 1, __ATOMIC_RELEASE );
+            }
         }
-
-        if (!count || count > MAXIMUM_WAIT_OBJECTS + 1 || count + 1 != body_count)
-        {
-            fprintf( stderr, "msync: error: invalid wait registration size %u/%u for tid %u\n",
-                     count, body_count, tid );
-            if (body_count)
-                publish_wait_state( tid, receive_message.shm_idx[0],
-                                    wait_token_with_state( receive_message.shm_idx[0], MSYNC_WAIT_FAILED ) );
-            continue;
-        }
-
-        register_wait( &receive_message, tid, count );
     }
 
     return NULL;
@@ -886,6 +578,11 @@ void msync_init_shm(void)
 
     if (!do_msync()) return;
 
+    pagesize = (long)vm_kernel_page_size;
+
+    shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
+    shm_addrs_size = 128;
+
     kr = mach_vm_map( mach_task_self(), (mach_vm_address_t *)&shm_tid_map, shm_tid_size, 0, VM_FLAGS_ANYWHERE,
                       MACH_PORT_NULL, 0, FALSE, VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_SHARE );
 
@@ -896,43 +593,6 @@ void msync_init_shm(void)
     }
 }
 
-void msync_cleanup_thread( thread_id_t tid )
-{
-    mach_cleanup_message_t message = {0};
-    mach_cleanup_reply_t reply = {0};
-    mach_port_t reply_port = MACH_PORT_NULL;
-    mach_msg_return_t mr;
-    kern_return_t kr;
-
-    if (!do_msync() || !tid) return;
-
-    if ((kr = mach_port_allocate( mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply_port )) != KERN_SUCCESS)
-        fatal_error( "could not allocate msync cleanup reply port: %s\n", mach_error_string( kr ) );
-    if ((kr = mach_port_insert_right( mach_task_self(), reply_port, reply_port,
-                                      MACH_MSG_TYPE_MAKE_SEND )) != KERN_SUCCESS)
-    {
-        mach_port_destroy( mach_task_self(), reply_port );
-        fatal_error( "could not insert msync cleanup reply right: %s\n", mach_error_string( kr ) );
-    }
-
-    message.header.msgh_bits = MACH_MSGH_BITS_SET( MACH_MSG_TYPE_COPY_SEND,
-                                                   MACH_MSG_TYPE_COPY_SEND, 0, 0 );
-    message.header.msgh_size = sizeof(message) - sizeof(message.trailer);
-    message.header.msgh_remote_port = receive_port;
-    message.header.msgh_local_port = reply_port;
-    message.header.msgh_id = MSYNC_CLEANUP_MESSAGE_ID;
-    message.tid = tid;
-
-    mr = mach_msg_overwrite( &message.header, MACH_SEND_MSG | MACH_RCV_MSG,
-                             message.header.msgh_size, sizeof(reply), reply_port,
-                             MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, &reply.header, 0 );
-    kr = mach_port_destroy( mach_task_self(), reply_port );
-    if (mr != MACH_MSG_SUCCESS)
-        fatal_error( "msync thread cleanup failed for tid %u: %#x\n", tid, mr );
-    if (kr != KERN_SUCCESS)
-        fatal_error( "could not destroy msync cleanup reply port: %s\n", mach_error_string( kr ) );
-}
-
 void msync_init(void)
 {
     struct stat st;
@@ -940,15 +600,17 @@ void msync_init(void)
     mach_port_limits_t limits;
     void *dlhandle = dlopen( NULL, RTLD_NOW );
     pthread_t message_thread;
-    char message_port_name[64];
+    char message_port_name[28];
 
     if (!do_msync()) return;
 
     if (fstat( config_dir_fd, &st ) == -1)
         fatal_error( "cannot stat config dir\n" );
 
-    snprintf( message_port_name, sizeof(message_port_name), "wine-%" PRIxMAX "-msync-v%u",
-              (uintmax_t)st.st_ino, MSYNC_SHM_WIRE_VERSION );
+    if (st.st_ino != (unsigned long)st.st_ino)
+        snprintf( message_port_name, 28, "wine-%lx%08lx-msync", (unsigned long)((unsigned long long)st.st_ino >> 32), (unsigned long)st.st_ino );
+    else
+        snprintf( message_port_name, 28, "wine-%lx-msync", (unsigned long)st.st_ino );
 
     /* Bootstrap mach server message pump */
 
@@ -972,6 +634,8 @@ void msync_init(void)
     MACH_CHECK_ERROR(task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bootstrap_port), "task_get_special_port");
 
     MACH_CHECK_ERROR(bootstrap_register2(bootstrap_port, message_port_name, receive_port, 0), "bootstrap_register2");
+
+    pool_init();
 
     if (pthread_create( &message_thread, NULL, mach_message_pump, NULL ))
     {
@@ -1002,74 +666,65 @@ void msync_destroy( struct msync *msync )
 
 static void *get_shm( unsigned int idx )
 {
-    unsigned int entry = idx / MSYNC_SHM_OBJECTS_PER_PAGE;
-    unsigned int offset = (idx % MSYNC_SHM_OBJECTS_PER_PAGE) * MSYNC_SHM_OBJECT_SIZE;
+    int entry  = (idx * 16) / pagesize;
+    int offset = (idx * 16) % pagesize;
 
-    void *page;
-
-    if (entry >= MSYNC_SHM_MAX_PAGES)
-        fatal_error( "invalid msync shm index %u\n", idx );
-
-    if (!(page = __atomic_load_n( &shm_addrs[entry], __ATOMIC_ACQUIRE )))
+    if (entry >= shm_addrs_size)
     {
-        kern_return_t kr;
-        mach_vm_address_t address = 0;
+        int new_size = max(shm_addrs_size * 2, entry + 1);
 
-        kr = mach_vm_map( mach_task_self(), &address, MSYNC_SHM_PAGE_SIZE, 0, VM_FLAGS_ANYWHERE,
-                          MACH_PORT_NULL, 0, FALSE, VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_SHARE );
-        if (kr != KERN_SUCCESS)
-            fatal_error( "could not map msync shm page %u for index %u: %d: %s\n",
-                         entry, idx, kr, mach_error_string( kr ) );
-        memset( (void *)address, 0, MSYNC_SHM_PAGE_SIZE );
+        if (!(shm_addrs = realloc( shm_addrs, new_size * sizeof(shm_addrs[0]) )))
+            fprintf( stderr, "msync: couldn't expand shm_addrs array to size %d\n", entry + 1 );
 
-        if (debug_level)
-            fprintf( stderr, "msync: Mapping page %u at %llu.\n", entry, address );
+        memset( shm_addrs + shm_addrs_size, 0, (new_size - shm_addrs_size) * sizeof(shm_addrs[0]) );
 
-        page = NULL;
-        if (!__atomic_compare_exchange_n( &shm_addrs[entry], &page, (void *)address, 0,
-                                          __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ))
-            mach_vm_deallocate( mach_task_self(), address, MSYNC_SHM_PAGE_SIZE );
-        else
-            page = (void *)address;
+        shm_addrs_size = new_size;
     }
 
-    return (void *)((unsigned long)page + offset);
+    if (!shm_addrs[entry])
+    {
+        kern_return_t kr;
+        mach_vm_address_t address;
+
+        kr = mach_vm_map( mach_task_self(), (mach_vm_address_t *)&address, (mach_vm_size_t)pagesize, 0, VM_FLAGS_ANYWHERE,
+                          MACH_PORT_NULL, 0, FALSE, VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_SHARE );
+        MACH_CHECK_ERROR( kr, "mach_vm_map" );
+        memset( (void *)address, 0, pagesize );
+
+        if (debug_level)
+            fprintf( stderr, "msync: Mapping page %d at %llu.\n", entry, address );
+
+        if (__sync_val_compare_and_swap( &shm_addrs[entry], 0, (void *)address ))
+            mach_vm_deallocate( mach_task_self(), address, pagesize ); /* someone beat us to it */
+    }
+
+    return (void *)((unsigned long)shm_addrs[entry] + offset);
 }
 
 static unsigned int msync_alloc_shm( int low, int high, enum msync_type type )
 {
     unsigned int shm_idx;
     struct msync_shm *shm;
-    int allocated_new = 0;
 
-    pthread_mutex_lock( &shm_index_mutex );
-    if (free_shm_idx != UINT32_MAX)
+    shm_idx = min( last_destroyed_idx, last_allocated_idx + 1 );
+
+    for(;;)
     {
-        shm_idx = free_shm_idx;
         shm = get_shm( shm_idx );
-        free_shm_idx = shm->low;
-    }
-    else
-    {
-        if (next_unused_shm_idx >= MSYNC_SHM_INDEX_COUNT)
-            fatal_error( "msync shared object index space exhausted\n" );
-        shm_idx = next_unused_shm_idx++;
-        shm = get_shm( shm_idx );
-        allocated_new = 1;
+        if (!__atomic_load_n( &shm->refcount, __ATOMIC_SEQ_CST ))
+            break;
+
+        shm_idx++;
     }
 
-    assert( shm && !__atomic_load_n( &shm->refcount, __ATOMIC_SEQ_CST ) );
+    last_allocated_idx = shm_idx;
+
+    assert(shm);
     shm->low = low;
     shm->high = high;
     shm->msync_type = type;
     shm->multiple_waiters = 0;
-    __atomic_store_n( &shm->refcount, 1, __ATOMIC_RELEASE );
-    if (allocated_new && !(shm_idx % MSYNC_SHM_OBJECTS_PER_PAGE) &&
-        getenv("WINE_MSYNC_TEST_TRACE") && getenv("WINE_MSYNC_TEST_TRACE")[0] == '1' &&
-        !getenv("WINE_MSYNC_TEST_TRACE")[1])
-        fprintf( stderr, "msync: MSYNC_SHM_HIGH_WATER index %u page %u\n", shm_idx,
-                 shm_idx / MSYNC_SHM_OBJECTS_PER_PAGE );
-    pthread_mutex_unlock( &shm_index_mutex );
+    __atomic_store_n( &shm->refcount, 1, __ATOMIC_SEQ_CST );
 
     return shm_idx;
 }
@@ -1141,19 +796,11 @@ void msync_abandon_mutexes( thread_id_t tid )
     }
 }
 
-int msync_grab_object( struct msync *msync )
+void msync_grab_object( struct msync *msync )
 {
     struct msync_shm *obj = get_shm( msync->shm_idx );
-    unsigned short refs = __atomic_load_n( &obj->refcount, __ATOMIC_RELAXED );
 
-    do
-    {
-        if (!refs)
-            fatal_error( "cannot grab destroyed msync object %u\n", msync->shm_idx );
-        if (refs == USHRT_MAX) return 0;
-    } while (!__atomic_compare_exchange_n( &obj->refcount, &refs, refs + 1, 1,
-                                           __ATOMIC_SEQ_CST, __ATOMIC_RELAXED ));
-    return 1;
+    __atomic_fetch_add( &obj->refcount, 1, __ATOMIC_SEQ_CST );
 }
 
 #else /* __APPLE__ */
@@ -1168,10 +815,6 @@ void msync_init_shm(void)
 }
 
 void msync_init(void)
-{
-}
-
-void msync_cleanup_thread( thread_id_t tid )
 {
 }
 

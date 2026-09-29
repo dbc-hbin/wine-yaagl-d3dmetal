@@ -86,6 +86,7 @@
 #include <pthread.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winternl.h"
@@ -105,13 +106,13 @@ static IOHIDManagerRef hid_manager;
 static CFRunLoopRef run_loop;
 static struct list event_queue = LIST_INIT(event_queue);
 static struct list device_list = LIST_INIT(device_list);
+static const struct bus_options *options;
 
 struct iohid_device
 {
     struct unix_device unix_device;
     IOHIDDeviceRef device;
-    BOOL started;
-    BOOL open;
+    uint8_t *buffer;
 };
 
 static inline struct iohid_device *impl_from_unix_device(struct unix_device *iface)
@@ -148,11 +149,8 @@ static void handle_IOHIDDeviceIOHIDReportCallback(void *context,
         IOReturn result, void *sender, IOHIDReportType type,
         uint32_t reportID, uint8_t *report, CFIndex report_length)
 {
-    struct iohid_device *impl = find_device_from_iohid(sender);
-
-    if (impl && __atomic_load_n(&impl->started, __ATOMIC_ACQUIRE)
-            && report_length > 0 && report_length <= 0xffff)
-        bus_event_queue_input_report(&event_queue, &impl->unix_device, report, report_length);
+    struct unix_device *iface = (struct unix_device *)context;
+    bus_event_queue_input_report(&event_queue, iface, report, report_length);
 }
 
 static void iohid_device_destroy(struct unix_device *iface)
@@ -161,9 +159,15 @@ static void iohid_device_destroy(struct unix_device *iface)
 
 static NTSTATUS iohid_device_start(struct unix_device *iface)
 {
+    DWORD length;
     struct iohid_device *impl = impl_from_unix_device(iface);
+    CFNumberRef num;
 
-    __atomic_store_n(&impl->started, TRUE, __ATOMIC_RELEASE);
+    num = IOHIDDeviceGetProperty(impl->device, CFSTR(kIOHIDMaxInputReportSizeKey));
+    length = CFNumberToDWORD(num);
+    impl->buffer = malloc(length);
+
+    IOHIDDeviceRegisterInputReportCallback(impl->device, impl->buffer, length, handle_IOHIDDeviceIOHIDReportCallback, iface);
     return STATUS_SUCCESS;
 }
 
@@ -171,14 +175,10 @@ static void iohid_device_stop(struct unix_device *iface)
 {
     struct iohid_device *impl = impl_from_unix_device(iface);
 
+    IOHIDDeviceRegisterInputReportCallback(impl->device, NULL, 0, NULL, NULL);
+
     pthread_mutex_lock(&iohid_cs);
-    __atomic_store_n(&impl->started, FALSE, __ATOMIC_RELEASE);
     list_remove(&impl->unix_device.entry);
-    if (impl->open)
-    {
-        IOHIDDeviceClose(impl->device, 0);
-        impl->open = FALSE;
-    }
     pthread_mutex_unlock(&iohid_cs);
 }
 
@@ -271,7 +271,7 @@ static void handle_DeviceMatchingCallback(void *context, IOReturn result, void *
 {
     struct device_desc desc =
     {
-        .input = -1, .bus_id = -1, .is_hidraw = TRUE,
+        .input = -1, .is_hidraw = TRUE,
         .serialnumber = {'0','0','0','0',0},
     };
     struct iohid_device *impl;
@@ -311,6 +311,8 @@ static void handle_DeviceMatchingCallback(void *context, IOReturn result, void *
         ERR("Failed to open HID device %p (vid %04x, pid %04x)\n", IOHIDDevice, desc.vid, desc.pid);
         return;
     }
+    IOHIDDeviceScheduleWithRunLoop(IOHIDDevice, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+
     str = IOHIDDeviceGetProperty(IOHIDDevice, CFSTR(kIOHIDManufacturerKey));
     if (str) CFStringToWSTR(str, desc.manufacturer, ARRAY_SIZE(desc.manufacturer));
     str = IOHIDDeviceGetProperty(IOHIDDevice, CFSTR(kIOHIDProductKey));
@@ -327,21 +329,12 @@ static void handle_DeviceMatchingCallback(void *context, IOReturn result, void *
 
     TRACE("dev %p, desc %s.\n", IOHIDDevice, debugstr_device_desc(&desc));
 
-    if (!(impl = raw_device_create(&iohid_device_vtbl, sizeof(struct iohid_device))))
-    {
-        IOHIDDeviceClose(IOHIDDevice, 0);
-        return;
-    }
+    if (!(impl = raw_device_create(&iohid_device_vtbl, sizeof(struct iohid_device)))) return;
     list_add_tail(&device_list, &impl->unix_device.entry);
     impl->device = IOHIDDevice;
-    impl->open = TRUE;
+    impl->buffer = NULL;
 
-    if (!bus_event_queue_device_created(&event_queue, &impl->unix_device, &desc))
-    {
-        list_remove(&impl->unix_device.entry);
-        IOHIDDeviceClose(IOHIDDevice, 0);
-        free(impl);
-    }
+    bus_event_queue_device_created(&event_queue, &impl->unix_device, &desc);
 }
 
 static void handle_RemovalCallback(void *context, IOReturn result, void *sender, IOHIDDeviceRef IOHIDDevice)
@@ -349,24 +342,22 @@ static void handle_RemovalCallback(void *context, IOReturn result, void *sender,
     struct iohid_device *impl;
 
     TRACE("OS/X IOHID Device Removed %p\n", IOHIDDevice);
+    IOHIDDeviceRegisterInputReportCallback(IOHIDDevice, NULL, 0, NULL, NULL);
+    /* Note: Yes, we leak the buffer. But according to research there is no
+             safe way to deallocate that buffer. */
+    IOHIDDeviceUnscheduleFromRunLoop(IOHIDDevice, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+    IOHIDDeviceClose(IOHIDDevice, 0);
 
     impl = find_device_from_iohid(IOHIDDevice);
-    if (impl)
-    {
-        __atomic_store_n(&impl->started, FALSE, __ATOMIC_RELEASE);
-        if (impl->open)
-        {
-            IOHIDDeviceClose(IOHIDDevice, 0);
-            impl->open = FALSE;
-        }
-        bus_event_queue_device_removed(&event_queue, &impl->unix_device);
-    }
+    if (impl) bus_event_queue_device_removed(&event_queue, &impl->unix_device);
     else WARN("failed to find device for iohid device %p\n", IOHIDDevice);
 }
 
 NTSTATUS iohid_bus_init(void *args)
 {
     TRACE("args %p\n", args);
+
+    options = args;
 
     if (!(hid_manager = IOHIDManagerCreate(kCFAllocatorDefault, 0L)))
     {
@@ -379,7 +370,6 @@ NTSTATUS iohid_bus_init(void *args)
     IOHIDManagerSetDeviceMatching(hid_manager, NULL);
     IOHIDManagerRegisterDeviceMatchingCallback(hid_manager, handle_DeviceMatchingCallback, NULL);
     IOHIDManagerRegisterDeviceRemovalCallback(hid_manager, handle_RemovalCallback, NULL);
-    IOHIDManagerRegisterInputReportCallback(hid_manager, handle_IOHIDDeviceIOHIDReportCallback, NULL);
     IOHIDManagerScheduleWithRunLoop(hid_manager, run_loop, kCFRunLoopDefaultMode);
     return STATUS_SUCCESS;
 }
@@ -404,7 +394,6 @@ NTSTATUS iohid_bus_wait(void *args)
     bus_event_queue_destroy(&event_queue);
     IOHIDManagerRegisterDeviceMatchingCallback(hid_manager, NULL, NULL);
     IOHIDManagerRegisterDeviceRemovalCallback(hid_manager, NULL, NULL);
-    IOHIDManagerRegisterInputReportCallback(hid_manager, NULL, NULL);
     CFRelease(hid_manager);
     return STATUS_SUCCESS;
 }

@@ -85,7 +85,7 @@ static void get_device_state( DWORD index, struct device_state *state )
 static DWORD WINAPI input_thread_proc( void *param )
 {
     HANDLE thread_stop = param;
-    DWORD i, x, y;
+    DWORD i;
 
     while (WaitForSingleObject( thread_stop, 20 ) == WAIT_TIMEOUT)
     {
@@ -100,10 +100,10 @@ static DWORD WINAPI input_thread_proc( void *param )
 
             if (state.rumble)
             {
-                x = max( abs( state.state.Gamepad.sThumbLX ), abs( state.state.Gamepad.sThumbLY ) );
-                y = max( abs( state.state.Gamepad.sThumbRX ), abs( state.state.Gamepad.sThumbRY ) );
-                vibration.wLeftMotorSpeed  = min( 0xffff, 2 * x );
-                vibration.wRightMotorSpeed = min( 0xffff, 2 * y );
+                vibration.wLeftMotorSpeed = 2 * max( abs( state.state.Gamepad.sThumbLX ),
+                                                     abs( state.state.Gamepad.sThumbLY ) ) - 1;
+                vibration.wRightMotorSpeed = 2 * max( abs( state.state.Gamepad.sThumbRX ),
+                                                      abs( state.state.Gamepad.sThumbRY ) ) - 1;
             }
 
             XInputSetState( i, &vibration );

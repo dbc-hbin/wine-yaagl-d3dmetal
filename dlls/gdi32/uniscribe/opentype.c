@@ -2091,14 +2091,8 @@ static BOOL GPOS_apply_MarkToMark(const OT_LookupTable *look, const SCRIPT_ANALY
             if (mark_index != -1)
             {
                 int mark2_index;
-                unsigned int prev_glyph_index = glyph_index - write_dir;
-                if (prev_glyph_index >= glyph_count)
-                {
-                    TRACE("Mark looking outside range\n");
-                    return FALSE;
-                }
                 offset = GET_BE_WORD(mmpf1->Mark2Coverage);
-                mark2_index = GSUB_is_glyph_covered((const BYTE*)mmpf1+offset, glyphs[prev_glyph_index]);
+                mark2_index = GSUB_is_glyph_covered((const BYTE*)mmpf1+offset, glyphs[glyph_index - write_dir]);
                 if (mark2_index != -1)
                 {
                     const GPOS_MarkArray *ma;
@@ -2110,7 +2104,7 @@ static BOOL GPOS_apply_MarkToMark(const OT_LookupTable *look, const SCRIPT_ANALY
                     int mark2record_size;
                     POINT mark2_pt;
                     POINT mark_pt;
-                    TRACE("Mark %x(%i) and Mark2 %x(%i)\n",glyphs[glyph_index], mark_index, glyphs[prev_glyph_index], mark2_index);
+                    TRACE("Mark %x(%i) and Mark2 %x(%i)\n",glyphs[glyph_index], mark_index, glyphs[glyph_index - write_dir], mark2_index);
                     offset = GET_BE_WORD(mmpf1->Mark1Array);
                     ma = (const GPOS_MarkArray*)((const BYTE*)mmpf1 + offset);
                     if (mark_index > GET_BE_WORD(ma->MarkCount))
@@ -2212,12 +2206,8 @@ static unsigned int GPOS_apply_ContextPos(const ScriptCache *script_cache, const
 
                     for (l = 0; l < g_count-1; l++)
                     {
-                        g = glyph_index + (write_dir * (l+1));
-                        if (g < glyph_count)
-                        {
-                            int g_class = OT_get_glyph_class(glyph_class_table, glyphs[g]);
-                            if (g_class != GET_BE_WORD(pr->Class[l])) break;
-                        }
+                        int g_class = OT_get_glyph_class(glyph_class_table, glyphs[glyph_index + (write_dir * (l+1))]);
+                        if (g_class != GET_BE_WORD(pr->Class[l])) break;
                     }
 
                     if (l < g_count-1)
@@ -2329,12 +2319,9 @@ static unsigned int GPOS_apply_ChainContextPos(const ScriptCache *script_cache, 
 
             for (k = 0; k < backtrack_count; ++k)
             {
-                unsigned int prev_glyph_index;
                 offset = GET_BE_WORD(backtrack->Coverage[k]);
-                prev_glyph_index = glyph_index + (dirBacktrack * (k + 1));
-                if (prev_glyph_index >= glyph_count)
-                    continue;
-                if (GSUB_is_glyph_covered((const BYTE *)backtrack + offset, glyphs[prev_glyph_index]) == -1)
+                if (GSUB_is_glyph_covered((const BYTE *)backtrack + offset,
+                        glyphs[glyph_index + (dirBacktrack * (k + 1))]) == -1)
                     break;
             }
             if (k != backtrack_count)
@@ -2343,12 +2330,9 @@ static unsigned int GPOS_apply_ChainContextPos(const ScriptCache *script_cache, 
 
             for (k = 0; k < input_count; ++k)
             {
-                unsigned int next_glyph_index = glyph_index + (write_dir * k);
-                if (next_glyph_index >= glyph_count)
-                    continue;
                 offset = GET_BE_WORD(input->Coverage[k]);
                 if (GSUB_is_glyph_covered((const BYTE *)backtrack + offset,
-                        glyphs[next_glyph_index]) == -1)
+                        glyphs[glyph_index + (write_dir * k)]) == -1)
                     break;
             }
             if (k != input_count)
@@ -2357,12 +2341,9 @@ static unsigned int GPOS_apply_ChainContextPos(const ScriptCache *script_cache, 
 
             for (k = 0; k < lookahead_count; ++k)
             {
-                unsigned int next_glyph_index = glyph_index + (dirLookahead * (input_count + k));
-                if (next_glyph_index >= glyph_count)
-                    continue;
                 offset = GET_BE_WORD(lookahead->Coverage[k]);
                 if (GSUB_is_glyph_covered((const BYTE *)backtrack + offset,
-                        glyphs[next_glyph_index]) == -1)
+                        glyphs[glyph_index + (dirLookahead * (input_count + k))]) == -1)
                     break;
             }
             if (k != lookahead_count)
@@ -2465,12 +2446,6 @@ static unsigned int GPOS_apply_lookup(const ScriptCache *script_cache, const OUT
             int index_offset;
             int write_dir = (analysis->fRTL && !analysis->fLogicalOrder) ? -1 : 1;
             int offset_sign = (analysis->fRTL && analysis->fLogicalOrder) ? -1 : 1;
-            unsigned int next_glyph_index = glyph_index + write_dir;
-            if (next_glyph_index >= glyph_count)
-            {
-                WARN("Skipping invalid glyph index %u, write dir %d.\n", glyph_index, write_dir);
-                break;
-            }
 
             index_offset = GPOS_apply_PairAdjustment(look, analysis, glyphs,
                     glyph_index, glyph_count, ppem, adjust, advance);
@@ -2488,13 +2463,13 @@ static unsigned int GPOS_apply_lookup(const ScriptCache *script_cache, const OUT
             if (adjust[1].x || adjust[1].y)
             {
                 GPOS_convert_design_units_to_device(lpotm, lplogfont, adjust[1].x, adjust[1].y, &devX, &devY);
-                pGoffset[next_glyph_index].du += round(devX) * offset_sign;
-                pGoffset[next_glyph_index].dv += round(devY);
+                pGoffset[glyph_index + write_dir].du += round(devX) * offset_sign;
+                pGoffset[glyph_index + write_dir].dv += round(devY);
             }
             if (advance[1].x || advance[1].y)
             {
                 GPOS_convert_design_units_to_device(lpotm, lplogfont, advance[1].x, advance[1].y, &devX, &devY);
-                piAdvance[next_glyph_index] += round(devX);
+                piAdvance[glyph_index + write_dir] += round(devX);
             }
             return index_offset;
         }
@@ -2504,19 +2479,13 @@ static unsigned int GPOS_apply_lookup(const ScriptCache *script_cache, const OUT
             POINT desU = {0,0};
             double devX, devY;
             int write_dir = (analysis->fRTL && !analysis->fLogicalOrder) ? -1 : 1;
-            unsigned int next_glyph_index = glyph_index + write_dir;
-            if (next_glyph_index >= glyph_count)
-            {
-                WARN("Skipping invalid glyph index %u, write dir %d.\n", glyph_index, write_dir);
-                break;
-            }
 
             GPOS_apply_CursiveAttachment(look, analysis, glyphs, glyph_index, glyph_count, ppem, &desU);
             if (desU.x || desU.y)
             {
                 GPOS_convert_design_units_to_device(lpotm, lplogfont, desU.x, desU.y, &devX, &devY);
                 /* Windows does not appear to apply X offsets here */
-                pGoffset[glyph_index].dv = round(devY) + pGoffset[next_glyph_index].dv;
+                pGoffset[glyph_index].dv = round(devY) + pGoffset[glyph_index+write_dir].dv;
             }
             break;
         }
@@ -2560,19 +2529,12 @@ static unsigned int GPOS_apply_lookup(const ScriptCache *script_cache, const OUT
             double devX, devY;
             POINT desU = {0,0};
             int write_dir = (analysis->fRTL && !analysis->fLogicalOrder) ? -1 : 1;
-            unsigned int prev_glyph_index = glyph_index - write_dir;
-            if (prev_glyph_index >= glyph_count)
-            {
-                WARN("Skipping invalid glyph index %u, write dir %d.\n", glyph_index, write_dir);
-                break;
-            }
-
             if (GPOS_apply_MarkToMark(look, analysis, glyphs, glyph_index, glyph_count, ppem, &desU))
             {
                 GPOS_convert_design_units_to_device(lpotm, lplogfont, desU.x, desU.y, &devX, &devY);
                 if (analysis->fRTL && analysis->fLogicalOrder) devX *= -1;
-                pGoffset[glyph_index].du = round(devX) + pGoffset[prev_glyph_index].du;
-                pGoffset[glyph_index].dv = round(devY) + pGoffset[prev_glyph_index].dv;
+                pGoffset[glyph_index].du = round(devX) + pGoffset[glyph_index - write_dir].du;
+                pGoffset[glyph_index].dv = round(devY) + pGoffset[glyph_index - write_dir].dv;
             }
             break;
         }

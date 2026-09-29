@@ -35,6 +35,19 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(msidb);
 
+
+/*
+ * Code to delete rows from a table.
+ *
+ * We delete rows by blanking them out rather than trying to remove the row.
+ * This appears to be what the native MSI does (or tries to do). For the query:
+ *
+ * delete from Property
+ *
+ * some non-zero entries are left in the table by native MSI.  I'm not sure if
+ * that's a bug in the way I'm running the query, or a just a bug.
+ */
+
 struct delete_view
 {
     MSIVIEW        view;
@@ -63,7 +76,7 @@ static UINT DELETE_fetch_stream( struct tagMSIVIEW *view, UINT row, UINT col, IS
 static UINT DELETE_execute( struct tagMSIVIEW *view, MSIRECORD *record )
 {
     struct delete_view *dv = (struct delete_view *)view;
-    UINT r, i, rows, cols;
+    UINT r, i, rows = 0, cols = 0;
 
     TRACE("%p %p\n", dv, record);
 
@@ -78,10 +91,11 @@ static UINT DELETE_execute( struct tagMSIVIEW *view, MSIRECORD *record )
     if( r != ERROR_SUCCESS )
         return r;
 
-    TRACE("deleting %u rows\n", rows);
+    TRACE("deleting %d rows\n", rows);
 
-    for (i = 0; i < rows; i++)
-        dv->table->ops->delete_row( dv->table, 0 );
+    /* blank out all the rows that match */
+    for ( i=0; i<rows; i++ )
+        dv->table->ops->delete_row( dv->table, i );
 
     return ERROR_SUCCESS;
 }

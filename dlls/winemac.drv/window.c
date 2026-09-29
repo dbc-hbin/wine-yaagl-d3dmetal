@@ -46,6 +46,31 @@ static CFMutableDictionaryRef win_datas;
 static unsigned int activate_on_focus_time;
 
 
+/* CrossOver Hack #16933 */
+static BOOL is_main_quicken_window(HWND hwnd)
+{
+    static const WCHAR qw_exeW[] = {'q','w','.','e','x','e',0};
+    static const WCHAR qframeW[] = {'Q','F','R','A','M','E',0};
+    static int is_qw_exe = -1;
+    WCHAR class[32];
+    UNICODE_STRING name = { .Buffer = class, .MaximumLength = sizeof(class) };
+
+    if (is_qw_exe == -1)
+    {
+        WCHAR *name = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
+        WCHAR *module_exe = wcsrchr(name, '\\');
+        module_exe = module_exe ? module_exe + 1 : name;
+
+        is_qw_exe = !wcsicmp(module_exe, qw_exeW);
+    }
+
+    if (!is_qw_exe || !NtUserGetClassName(hwnd, FALSE, &name))
+        return FALSE;
+
+    return !wcscmp(class, qframeW);
+}
+
+
 /* per-monitor DPI aware NtUserSetWindowPos call */
 static BOOL set_window_pos(HWND hwnd, HWND after, INT x, INT y, INT cx, INT cy, UINT flags)
 {
@@ -94,6 +119,13 @@ static struct macdrv_window_features get_cocoa_window_features(struct macdrv_win
 
     if (ex_style & WS_EX_NOACTIVATE) wf.prevents_app_activation = TRUE;
     if (EqualRect(&data->rects.window, &data->rects.visible)) return wf;
+
+    /* CrossOver Hack #16933 */
+    if (is_main_quicken_window(data->hwnd))
+    {
+        wf.resizable = TRUE;
+        return wf;
+    }
 
     return get_window_features_for_style(style, ex_style, data->shaped);
 }
@@ -506,12 +538,12 @@ done:
 /**********************************************************************
  *              detach_cocoa_window
  *
- * Detach the Mac window while holding win_data_mutex.  Destroy it after
- * releasing the mutex, since discarded events may release client surfaces.
+ * Detach the Mac window under the window-data lock; destroy it after unlocking.
  */
 static macdrv_window detach_cocoa_window(struct macdrv_win_data *data)
 {
     macdrv_window window = data->cocoa_window;
+    if (!window) return NULL;
 
     TRACE("win %p Cocoa win %p\n", data->hwnd, data->cocoa_window);
 
@@ -519,7 +551,6 @@ static macdrv_window detach_cocoa_window(struct macdrv_win_data *data)
     data->on_screen = FALSE;
     return window;
 }
-
 
 /***********************************************************************
  *              macdrv_create_win_data
@@ -798,8 +829,46 @@ static void set_app_icon(void)
     CFArrayRef images = create_app_icon_images();
     if (images)
     {
-        macdrv_set_application_icon(images);
+        macdrv_set_application_icon(images, NULL);
         CFRelease(images);
+    }
+    else /* CrossOver Hack 13440: Find an icon from the CrossOver app bundle */
+    {
+        const char *cx_root;
+        if ((cx_root = getenv("CX_ROOT")) && cx_root[0])
+        {
+            CFURLRef url, temp;
+            url = CFURLCreateFromFileSystemRepresentation(NULL, (UInt8*)cx_root, strlen(cx_root), TRUE);
+            if (url)
+            {
+                temp = CFURLCreateCopyDeletingLastPathComponent(NULL, url);
+                CFRelease(url);
+                url = temp;
+            }
+            if (url)
+            {
+                temp = CFURLCreateCopyDeletingLastPathComponent(NULL, url);
+                CFRelease(url);
+                url = temp;
+            }
+            if (url)
+            {
+                temp = CFURLCreateCopyAppendingPathComponent(NULL, url, CFSTR("Resources"), TRUE);
+                CFRelease(url);
+                url = temp;
+            }
+            if (url)
+            {
+                temp = CFURLCreateCopyAppendingPathComponent(NULL, url, CFSTR("exeIcon.icns"), FALSE);
+                CFRelease(url);
+                url = temp;
+            }
+            if (url)
+            {
+                macdrv_set_application_icon(NULL, url);
+                CFRelease(url);
+            }
+        }
     }
 }
 
@@ -826,7 +895,7 @@ static BOOL set_capture_window_for_move(HWND hwnd)
 
     if (ret)
     {
-        macdrv_SetCapture(NtUserGetAncestor(hwnd, GA_ROOT), GUI_INMOVESIZE, NtUserGetAncestor(previous, GA_ROOT));
+        macdrv_SetCapture(hwnd, GUI_INMOVESIZE);
 
         if (previous && previous != hwnd)
             send_message(previous, WM_CAPTURECHANGED, 0, (LPARAM)hwnd);
@@ -860,7 +929,7 @@ static LRESULT move_window(HWND hwnd, WPARAM wparam)
     POINT capturePoint;
     LONG style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     BOOL moved = FALSE;
-    DWORD dwPoint = NtUserGetMessagePos();
+    DWORD dwPoint = NtUserGetThreadInfo()->message_pos;
     INT captionHeight;
     HMONITOR mon = 0;
     MONITORINFO info;
@@ -1077,7 +1146,8 @@ static void macdrv_client_surface_destroy(struct client_surface *client)
 
     TRACE("%s\n", debugstr_client_surface(client));
 
-    if (surface->metal_swapchain) macdrv_destroy_swapchain(surface->metal_swapchain);
+    if (surface->metal_view) macdrv_view_release_metal_view(surface->metal_view);
+    if (surface->metal_device) macdrv_release_metal_device(surface->metal_device);
 }
 
 static void macdrv_client_surface_detach(struct client_surface *client)
@@ -1104,13 +1174,18 @@ static void macdrv_client_surface_detach(struct client_surface *client)
 static void macdrv_client_surface_update(struct client_surface *client)
 {
     struct macdrv_client_surface *surface = impl_from_client_surface(client);
-    HWND hwnd = client->hwnd, toplevel = client->toplevel;
+    HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     struct macdrv_win_data *data;
+    RECT rect;
 
     TRACE("%s\n", debugstr_client_surface(client));
 
+    NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+    NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&rect, 2, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
+
     if (!(data = get_win_data(toplevel))) return;
-    macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(client->monitor_rect));
+    OffsetRect(&rect, data->rects.client.left - data->rects.visible.left, data->rects.client.top - data->rects.visible.top);
+    macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(rect));
     macdrv_set_view_superview(surface->cocoa_view, toplevel == hwnd ? NULL : data->client_view, data->cocoa_window, NULL, NULL);
     release_win_data(data);
 }
@@ -1140,61 +1215,29 @@ static const struct client_surface_funcs macdrv_client_surface_funcs =
     .present = macdrv_client_surface_present,
 };
 
-struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client)
+struct macdrv_client_surface *macdrv_client_surface_create(HWND hwnd)
 {
-    assert(client->funcs == &macdrv_client_surface_funcs);
-    return CONTAINING_RECORD(client, struct macdrv_client_surface, client);
-}
-
-struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format, BOOL raw)
-{
+    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     struct macdrv_client_surface *surface;
+    RECT rect;
 
-    if (!(surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd, pixel_format, raw)))
-        return NULL;
-    if (!(surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect))))
+    NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+    NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&rect, 2, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
+
+    surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd);
+    if (!surface) return NULL;
+    surface->cocoa_view = macdrv_create_view(cgrect_from_rect(rect));
+    if (!surface->cocoa_view)
     {
         client_surface_release(&surface->client);
         return NULL;
     }
     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
 
-    if (surface)
-    {
-        macdrv_client_surface_update(&surface->client);
-        macdrv_client_surface_present(&surface->client, 0);
-    }
+    macdrv_client_surface_update(&surface->client);
+    macdrv_client_surface_present(&surface->client, 0);
 
-    return &surface->client;
-}
-
-BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface)
-{
-    HWND hwnd = surface->client.hwnd;
-    struct macdrv_win_data *data;
-
-    if (surface->metal_swapchain) return TRUE;
-
-    if ((data = get_win_data(hwnd)))
-    {
-        release_win_data(data);
-        surface->metal_swapchain = macdrv_create_view_swapchain(surface->cocoa_view);
-    }
-    else
-    {
-        RECT rect;
-
-        if (NtUserGetAncestor(hwnd, GA_ROOT) != hwnd)
-        {
-            FIXME("Cross-process child window Metal swapchains are not implemented\n");
-            return FALSE;
-        }
-
-        if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI))) return FALSE;
-        surface->metal_swapchain = macdrv_create_offscreen_swapchain(hwnd, cgrect_from_rect(rect));
-    }
-
-    return surface->metal_swapchain != NULL;
+    return surface;
 }
 
 /**********************************************************************
@@ -1202,7 +1245,6 @@ BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface 
  */
 void macdrv_SetDesktopWindow(HWND hwnd)
 {
-    static pthread_once_t app_icon_once = PTHREAD_ONCE_INIT;
     unsigned int width, height;
 
     TRACE("%p\n", hwnd);
@@ -1237,7 +1279,21 @@ void macdrv_SetDesktopWindow(HWND hwnd)
         SERVER_END_REQ;
     }
 
-    pthread_once(&app_icon_once, set_app_icon);
+    /* CW Hack #26536 */
+    {
+        static const WCHAR helldivers2_exeW[] = {'\\','h','e','l','l','d','i','v','e','r','s','2','.','e','x','e',0};
+        WCHAR *path = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
+        size_t suffix_len = ARRAY_SIZE(helldivers2_exeW) - 1, path_len = wcslen(path);
+        if (path_len > suffix_len && !wcsicmp(path + path_len - suffix_len, helldivers2_exeW))
+        {
+            static pthread_once_t app_icon_once = PTHREAD_ONCE_INIT;
+            ERR("HACK: only doing set_app_icon once for Helldivers 2\n");
+            pthread_once(&app_icon_once, set_app_icon);
+            return;
+        }
+    }
+
+    set_app_icon();
 }
 
 #define WM_WINE_NOTIFY_ACTIVITY WM_USER
@@ -1276,6 +1332,7 @@ void macdrv_DestroyWindow(HWND hwnd)
 
     if (!(data = get_win_data(hwnd))) return;
 
+    if (hwnd == get_capture()) macdrv_SetCapture(0, 0);
     if (data->drag_event) NtSetEvent(data->drag_event, NULL);
 
     window = detach_cocoa_window(data);
@@ -1284,8 +1341,8 @@ void macdrv_DestroyWindow(HWND hwnd)
     release_win_data(data);
     if (window) macdrv_destroy_cocoa_window(window);
 
-    /* The array holds the original client-surface references without CF callbacks.
-     * Release them only after dropping the window lock: detach may reacquire it. */
+    /* Array slots own client-surface references, without CF callbacks.  Release
+     * them outside the window lock because detachment may reacquire it. */
     if (data->d3dmetal_client_surfaces)
     {
         CFIndex i, count = CFArrayGetCount(data->d3dmetal_client_surfaces);
@@ -1574,38 +1631,10 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         activate_on_following_focus();
         TRACE("WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS time %u\n", activate_on_focus_time);
         return 0;
-    case WM_MACDRV_CREATE_REMOTE_LAYER:
-        if ((data = get_win_data(hwnd)))
-        {
-            TRACE("WM_MACDRV_CREATE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
-            if (data->cocoa_window) macdrv_window_create_ca_layer_host_view(data->cocoa_window, (unsigned int)lp);
-            release_win_data(data);
-        }
-        return 0;
-    case WM_MACDRV_RELEASE_REMOTE_LAYER:
-        if ((data = get_win_data(hwnd)))
-        {
-            TRACE("WM_MACDRV_RELEASE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
-            if (data->cocoa_window) macdrv_window_release_ca_layer_host_view(data->cocoa_window, (unsigned int)lp);
-            release_win_data(data);
-        }
-        return 0;
     }
 
     FIXME("unrecognized window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (unsigned long)wp, lp);
     return 0;
-}
-
-
-void macdrv_create_remote_layer(void* hwnd_ptr, unsigned int context_id)
-{
-    NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_CREATE_REMOTE_LAYER, 0, context_id);
-}
-
-
-void macdrv_release_remote_layer(void* hwnd_ptr, unsigned int context_id)
-{
-    NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_RELEASE_REMOTE_LAYER, 0, context_id);
 }
 
 
@@ -1635,6 +1664,9 @@ BOOL macdrv_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const stru
 BOOL macdrv_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask)
 {
     struct macdrv_window_features wf = get_window_features_for_style(style, ex_style, FALSE);
+
+    /* CW HACK 16933: No Cocoa window decorations for the Quicken main window. */
+    if (is_main_quicken_window(hwnd)) return FALSE;
 
     *style_mask = ex_style = 0;
     if (wf.title_bar)
@@ -1927,28 +1959,6 @@ void macdrv_window_did_minimize(HWND hwnd)
 
 
 /***********************************************************************
- *              macdrv_window_native_cursor_sync
- *
- * Synchronize server ownership after Cocoa has completed a native visibility
- * transition, or AppKit has identified the authoritative tracking window.
- */
-void macdrv_window_native_cursor_sync(macdrv_window candidate)
-{
-    struct macdrv_native_cursor_context context;
-
-    if (!macdrv_get_native_cursor_context(&context, candidate)) return;
-
-    SERVER_START_REQ(set_cursor)
-    {
-        req->flags = SET_CURSOR_OWNER;
-        req->win = wine_server_user_handle(context.window);
-        wine_server_call(req);
-    }
-    SERVER_END_REQ;
-}
-
-
-/***********************************************************************
  *              macdrv_window_did_unminimize
  *
  * Handler for WINDOW_DID_UNMINIMIZE events.
@@ -1970,7 +1980,6 @@ void macdrv_window_did_unminimize(HWND hwnd)
     {
         TRACE("restoring win %p/%p\n", hwnd, data->cocoa_window);
         release_win_data(data);
-        NtUserSetActiveWindow(hwnd);
         send_message(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
         return;
     }

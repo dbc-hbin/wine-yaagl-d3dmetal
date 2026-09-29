@@ -874,7 +874,7 @@
 @ stdcall -syscall NtUserCreatePopupMenu()
 @ stub -syscall NtUserCreateSyntheticPointerDevice2
 @ stub -syscall NtUserCreateSystemThreads
-@ stdcall -syscall NtUserCreateWindowEx(long ptr ptr ptr long long long long long ptr ptr ptr ptr long ptr ptr long)
+@ stdcall -syscall NtUserCreateWindowEx(long ptr ptr ptr long long long long long long long long ptr long long ptr long)
 @ stub -syscall NtUserCreateWindowGroup
 @ stdcall -syscall NtUserCreateWindowStation(ptr long long long long long long)
 @ stub -syscall NtUserCsDdeUninitialize
@@ -1051,7 +1051,7 @@
 @ stub -syscall NtUserGetMenuIndex
 @ stdcall -syscall NtUserGetMenuItemRect(long long long ptr)
 @ stdcall -syscall NtUserGetMessage(ptr long long long)
-@ stdcall -syscall NtUserGetMessagePos()
+@ stub -syscall NtUserGetMessagePos
 @ stub -syscall NtUserGetMinuserIdForBaseWindow
 @ stub -syscall NtUserGetModernAppWindow
 @ stdcall -syscall NtUserGetMouseMovePointsEx(long ptr ptr long long)
@@ -1066,13 +1066,13 @@
 @ stub -syscall NtUserGetPointerDeviceInputSpace
 @ stub -syscall NtUserGetPointerDeviceOrientation
 @ stub -syscall NtUserGetPointerDeviceProperties
-@ stdcall -syscall NtUserGetPointerDeviceRects(long ptr ptr)
+@ stub -syscall NtUserGetPointerDeviceRects
 @ stub -syscall NtUserGetPointerDevices
 @ stub -syscall NtUserGetPointerFrameTimes
 @ stdcall -syscall NtUserGetPointerInfoList(long long long long long ptr ptr ptr)
 @ stub -syscall NtUserGetPointerInputTransform
 @ stub -syscall NtUserGetPointerProprietaryId
-@ stdcall -syscall NtUserGetPointerType(long ptr)
+@ stub -syscall NtUserGetPointerType
 @ stub -syscall NtUserGetPrecisionTouchPadConfiguration
 @ stdcall -syscall NtUserGetPriorityClipboardFormat(ptr long)
 @ stdcall -syscall NtUserGetProcessDefaultLayout(ptr)
@@ -1150,7 +1150,7 @@
 @ stub -syscall NtUserInitializeInputDeviceInjection
 @ stub -syscall NtUserInitializePointerDeviceInjection
 @ stub -syscall NtUserInitializePointerDeviceInjectionEx
-@ stdcall -syscall NtUserInitializeTouchInjection(long long)
+@ stub -syscall NtUserInitializeTouchInjection
 @ stub -syscall NtUserInjectDeviceInput
 @ stub -syscall NtUserInjectGenericHidInput
 @ stub -syscall NtUserInjectGesture
@@ -1388,7 +1388,7 @@
 @ stdcall -syscall NtUserSetMenuContextHelpId(long long)
 @ stdcall -syscall NtUserSetMenuDefaultItem(long long long)
 @ stub -syscall NtUserSetMenuFlagRtoL
-@ stdcall -syscall NtUserSetMessageExtraInfo(long)
+@ stub -syscall NtUserSetMessageExtraInfo
 @ stub -syscall NtUserSetMirrorRendering
 @ stub -syscall NtUserSetModernAppWindow
 @ stub -syscall NtUserSetMonitorWorkArea
@@ -1540,3 +1540,8 @@
 @ stub -syscall NtValidateCompositionSurfaceHandle
 @ stub -syscall NtVisualCaptureBits
 # extern gDispatchTableValues
+
+# shutil
+# CW Hack 22310
+@ stdcall -syscall __wine_get_current_process_explicit_app_user_model_id(ptr long)
+@ stdcall -syscall __wine_set_current_process_explicit_app_user_model_id(wstr)

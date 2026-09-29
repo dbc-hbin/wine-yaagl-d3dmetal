@@ -156,6 +156,9 @@ void DDRAW_Convert_DDSCAPS_1_To_2(const DDSCAPS *pIn, DDSCAPS2 *pOut);
 void DDRAW_Convert_DDDEVICEIDENTIFIER_2_To_1(const DDDEVICEIDENTIFIER2 *pIn, DDDEVICEIDENTIFIER *pOut);
 struct wined3d_vertex_declaration *ddraw_find_decl(struct ddraw *ddraw, DWORD fvf);
 
+/* hack for WA/WWP/Diablo */
+extern int use_desktop_hack;
+
 #define DDRAW_SURFACE_LOCATION_DEFAULT 0x00000001
 #define DDRAW_SURFACE_LOCATION_DRAW    0x00000002
 
@@ -191,7 +194,6 @@ struct ddraw_surface
     struct ddraw_surface *next_attached;
     struct ddraw_surface *first_attached;
     IUnknown                *attached_iface;
-    DWORD attach_saved_caps;
 
     /* Complex surfaces are organized in a tree, although the tree is degenerated to a list in most cases.
      * In mipmap and primary surfaces each level has only one attachment, which is the next surface level.
@@ -200,8 +202,10 @@ struct ddraw_surface
      */
 #define MAX_COMPLEX_ATTACHED 6
     struct ddraw_surface *complex_array[MAX_COMPLEX_ATTACHED];
-    unsigned int is_implicit : 1;
-    unsigned int is_flip_chain_start : 1;
+    /* You can't traverse the tree upwards. Only a flag for Surface::Release because it's needed there,
+     * but no pointer to prevent temptations to traverse it in the wrong direction.
+     */
+    unsigned int is_root : 1;
     unsigned int is_lost : 1;
     unsigned int sysmem_fallback : 1;
 
@@ -487,12 +491,14 @@ struct d3d_material
 
     /* IDirect3DMaterial2 fields */
     struct ddraw *ddraw;
+    struct d3d_device *active_device;
+
     D3DMATERIAL mat;
     DWORD Handle;
 };
 
 /* Helper functions */
-void material_activate(struct d3d_device *device, struct d3d_material *material);
+void material_activate(struct d3d_material *material);
 struct d3d_material *d3d_material_create(struct ddraw *ddraw);
 
 enum ddraw_viewport_version

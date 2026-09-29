@@ -387,11 +387,10 @@ static void WINAPI query_symbol_file_callback( TP_CALLBACK_INSTANCE *instance, v
     IoCompleteRequest( irp, IO_NO_INCREMENT );
 }
 
-/* NT APC called from Unix side to add/remove devices */
-static void CALLBACK device_op( ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3 )
+static void device_op( void )
 {
     struct device_info info;
-    struct dequeue_device_op_params params = { arg1, &info };
+    struct dequeue_device_op_params params = { &info };
 
     if (MOUNTMGR_CALL( dequeue_device_op, &params )) return;
 
@@ -554,22 +553,15 @@ static NTSTATUS WINAPI mountmgr_ioctl( DEVICE_OBJECT *device, IRP *irp )
 
 static DWORD WINAPI device_op_thread( void *arg )
 {
-    for (;;) SleepEx( INFINITE, TRUE );  /* wait for APCs */
+    for (;;) device_op();
     return 0;
 }
 
 static DWORD WINAPI run_loop_thread( void *arg )
 {
-    struct run_loop_params params = {.op_thread = arg, .op_apc = device_op};
-    return MOUNTMGR_CALL( run_loop, &params );
+    return MOUNTMGR_CALL( run_loop, NULL );
 }
 
-static NTSTATUS WINAPI mountmgr_create( DEVICE_OBJECT *device, IRP *irp )
-{
-    irp->IoStatus.Status = STATUS_SUCCESS;
-    IoCompleteRequest( irp, IO_NO_INCREMENT );
-    return STATUS_SUCCESS;
-}
 
 /* main entry point for the mount point manager driver */
 NTSTATUS WINAPI DriverEntry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
@@ -592,7 +584,6 @@ NTSTATUS WINAPI DriverEntry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
     status = __wine_init_unix_call();
     if (status) return status;
 
-    driver->MajorFunction[IRP_MJ_CREATE] = mountmgr_create;
     driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = mountmgr_ioctl;
 
     if (!(status = IoCreateDevice( driver, 0, &device_mount_point_manager, 0, 0, FALSE, &device )))
@@ -610,7 +601,7 @@ NTSTATUS WINAPI DriverEntry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
                           KEY_ALL_ACCESS, NULL, &devicemap_key, NULL ))
         RegCloseKey( devicemap_key );
 
-    status = IoCreateDriver( &driver_harddisk, disk_driver_entry );
+    status = IoCreateDriver( &driver_harddisk, harddisk_driver_entry );
 
     thread = CreateThread( NULL, 0, device_op_thread, NULL, 0, NULL );
     CloseHandle( CreateThread( NULL, 0, run_loop_thread, thread, 0, NULL ));

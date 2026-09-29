@@ -33,7 +33,6 @@ const sourcePaths = [
   "d3dmetal-pso-cache/third-party/fidelityfx/Kits/FidelityFX/api/include/ffx_api_types.h",
   "d3dmetal-pso-cache/third-party/fidelityfx/Kits/FidelityFX/api/include/dx12/ffx_api_dx12.h",
   "d3dmetal-pso-cache/third-party/fidelityfx/Kits/FidelityFX/upscalers/include/ffx_upscale.h",
-  "d3dmetal-pso-cache/persistent-cache.hpp", "d3dmetal-pso-cache/persistent-cache.mm",
   "d3dmetal-pso-cache/rt-key.hpp", "d3dmetal-pso-cache/rt-key.mm",
   "d3dmetal-pso-cache/stage-cache.hpp", "d3dmetal-pso-cache/stage-cache.mm",
   "d3dmetal-pso-cache/bridge.mm", "d3dmetal-pso-cache/layout.json",
@@ -138,7 +137,7 @@ const compileArgs = [
   "-mmacosx-version-min=14.0", "-O2", "-Wall", "-Wextra", "-Werror",
   "-dynamiclib", "-pthread", "-framework", "Foundation", "-framework", "Metal", "-framework", "QuartzCore", "-framework", "MetalFX",
   "-I", sourceDirectory, "-I", outputDirectory,
-  ...["cache.mm", "function-cache.mm", "function-hooks.mm", "key.mm", "metalfx-backend.mm", "d3dmetal-transport.mm", "d3dmetal-transport-legacy.mm", "ngx-hooks.mm", "display-routing.mm", "fsr-contract.cpp", "fsr-translator.mm", "fsr-framegeneration.mm", "persistent-cache.mm", "rt-key.mm", "stage-cache.mm", "bridge.mm"].map((file) => resolve(sourceDirectory, file)),
+  ...["cache.mm", "function-cache.mm", "function-hooks.mm", "key.mm", "metalfx-backend.mm", "d3dmetal-transport.mm", "d3dmetal-transport-legacy.mm", "ngx-hooks.mm", "display-routing.mm", "fsr-contract.cpp", "fsr-translator.mm", "fsr-framegeneration.mm", "rt-key.mm", "stage-cache.mm", "bridge.mm"].map((file) => resolve(sourceDirectory, file)),
   "-Wl,-install_name,@rpath/libYaaglNativePsoCache.dylib", "-o", modulePath,
 ];
 const compiled = spawnSync(compiler, compileArgs, { cwd: root, stdio: "inherit" });

@@ -36,20 +36,20 @@ static inline struct ID3DXBufferImpl *impl_from_ID3DXBuffer(ID3DXBuffer *iface)
     return CONTAINING_RECORD(iface, struct ID3DXBufferImpl, ID3DXBuffer_iface);
 }
 
-static HRESULT WINAPI ID3DXBufferImpl_QueryInterface(ID3DXBuffer *iface, REFIID riid, void **out)
+static HRESULT WINAPI ID3DXBufferImpl_QueryInterface(ID3DXBuffer *iface, REFIID riid, void **ppobj)
 {
-    TRACE("iface %p, riid %s, object %p\n", iface, debugstr_guid(riid), out);
+    TRACE("iface %p, riid %s, object %p\n", iface, debugstr_guid(riid), ppobj);
 
-    if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_ID3DXBuffer))
+    if (IsEqualGUID(riid, &IID_IUnknown)
+      || IsEqualGUID(riid, &IID_ID3DXBuffer))
     {
         IUnknown_AddRef(iface);
-        *out = iface;
+        *ppobj = iface;
         return D3D_OK;
     }
 
     WARN("%s not implemented, returning E_NOINTERFACE\n", debugstr_guid(riid));
 
-    *out = NULL;
     return E_NOINTERFACE;
 }
 

@@ -189,107 +189,6 @@ DECLARE_CRITICAL_SECTION(cs_socket_list);
 static SOCKET *socket_list;
 static unsigned int socket_list_size;
 
-static inline const char *debugstr_sockdomain(int domain)
-{
-    const char *stropt = NULL;
-
-#define DEBUG_SOCKDOM(x) case (x): stropt = #x; break
-
-    switch(domain)
-    {
-        DEBUG_SOCKDOM(AF_12844);
-        DEBUG_SOCKDOM(AF_APPLETALK);
-        DEBUG_SOCKDOM(AF_ATM);
-        DEBUG_SOCKDOM(AF_BAN);
-        DEBUG_SOCKDOM(AF_BTH);
-        DEBUG_SOCKDOM(AF_CCITT);
-        DEBUG_SOCKDOM(AF_CHAOS);
-        DEBUG_SOCKDOM(AF_CLUSTER);
-        DEBUG_SOCKDOM(AF_DATAKIT);
-        DEBUG_SOCKDOM(AF_DECnet);
-        DEBUG_SOCKDOM(AF_DLI);
-        DEBUG_SOCKDOM(AF_ECMA);
-        DEBUG_SOCKDOM(AF_FIREFOX);
-        DEBUG_SOCKDOM(AF_HYLINK);
-        DEBUG_SOCKDOM(AF_HYPERV);
-        DEBUG_SOCKDOM(AF_ICLFXBM);
-        DEBUG_SOCKDOM(AF_IMPLINK);
-        DEBUG_SOCKDOM(AF_INET);
-        DEBUG_SOCKDOM(AF_INET6);
-        DEBUG_SOCKDOM(AF_IPX);
-        DEBUG_SOCKDOM(AF_IRDA);
-        DEBUG_SOCKDOM(AF_ISO);
-        DEBUG_SOCKDOM(AF_LAT);
-        DEBUG_SOCKDOM(AF_LINK);
-        DEBUG_SOCKDOM(AF_MAX);
-        DEBUG_SOCKDOM(AF_NETBIOS);
-        DEBUG_SOCKDOM(AF_NETDES);
-        /* duplicated cases */
-        /* DEBUG_SOCKDOM(AF_NS);*/
-        /* DEBUG_SOCKDOM(AF_OSI); */
-        DEBUG_SOCKDOM(AF_PUP);
-        DEBUG_SOCKDOM(AF_SNA);
-        DEBUG_SOCKDOM(AF_TCNMESSAGE);
-        DEBUG_SOCKDOM(AF_TCNPROCESS);
-        DEBUG_SOCKDOM(AF_UNIX);
-        DEBUG_SOCKDOM(AF_UNKNOWN1);
-        DEBUG_SOCKDOM(AF_UNSPEC);
-        DEBUG_SOCKDOM(AF_VOICEVIEW);
-        default: stropt = wine_dbg_sprintf("0x%x", domain);
-    }
-
-#undef DEBUG_SOCKDOM
-
-    return stropt;
-}
-
-static inline const char *debugstr_socktype(int type)
-{
-    const char *stropt = NULL;
-
-#define DEBUG_SOCKTYPE(x) case (x): stropt = #x; break
-
-    switch(type)
-    {
-        DEBUG_SOCKTYPE(SOCK_DGRAM);
-        DEBUG_SOCKTYPE(SOCK_RAW);
-        DEBUG_SOCKTYPE(SOCK_RDM);
-        DEBUG_SOCKTYPE(SOCK_SEQPACKET);
-        DEBUG_SOCKTYPE(SOCK_STREAM);
-        default: stropt = wine_dbg_sprintf("0x%x", type);
-    }
-
-#undef DEBUG_SOCKTYPE
-
-    return stropt;
-}
-
-static inline const char *debugstr_sockprotocol(int protocol)
-{
-    const char *stropt = NULL;
-
-#define DEBUG_SOCKPROTO(x) case (x): stropt = #x; break
-
-    switch(protocol)
-    {
-        DEBUG_SOCKPROTO(IPPROTO_GGP);
-        DEBUG_SOCKPROTO(IPPROTO_ICMP);
-        DEBUG_SOCKPROTO(IPPROTO_IDP);
-        DEBUG_SOCKPROTO(IPPROTO_IGMP);
-        DEBUG_SOCKPROTO(IPPROTO_IP);
-        DEBUG_SOCKPROTO(IPPROTO_MAX);
-        DEBUG_SOCKPROTO(IPPROTO_ND);
-        DEBUG_SOCKPROTO(IPPROTO_RAW);
-        DEBUG_SOCKPROTO(IPPROTO_TCP);
-        DEBUG_SOCKPROTO(IPPROTO_UDP);
-        default: stropt = wine_dbg_sprintf("0x%x", protocol);
-    }
-
-#undef DEBUG_SOCKPROTO
-
-    return stropt;
-}
-
 const char *debugstr_sockaddr( const struct sockaddr *a )
 {
     if (!a) return "(nil)";
@@ -886,8 +785,8 @@ static BOOL ws_protocol_info(SOCKET s, int unicode, WSAPROTOCOL_INFOW *buffer, i
             return TRUE;
         }
     }
-    FIXME( "Could not fill protocol information for family %s, type %s, protocol %s.\n",
-            debugstr_sockdomain(params.family), debugstr_socktype(params.type), debugstr_sockprotocol(params.protocol) );
+    FIXME( "Could not fill protocol information for family %d, type %d, protocol %d.\n",
+            params.family, params.type, params.protocol );
     return TRUE;
 }
 
@@ -1353,7 +1252,7 @@ int WINAPI closesocket( SOCKET s )
         return -1;
     }
 
-    if (!socket_list_remove( s ) && !is_valid_socket( s ))
+    if (!socket_list_remove( s ))
     {
         SetLastError( WSAENOTSOCK );
         return -1;
@@ -2928,28 +2827,6 @@ static int add_fd_to_set( SOCKET fd, struct fd_set *set )
     return 1;
 }
 
-struct socket_index_entry
-{
-    SOCKET socket;
-    ULONG value;
-    BOOL used;
-};
-
-static struct socket_index_entry *socket_index_find( struct socket_index_entry *index, ULONG count, SOCKET socket )
-{
-    ULONG slot = ((ULONG_PTR)socket >> 2) % count;
-    ULONG i;
-
-    for (i = 0; i < count; ++i)
-    {
-        struct socket_index_entry *entry = &index[(slot + i) % count];
-
-        if (!entry->used || entry->socket == socket)
-            return entry;
-    }
-    return NULL;
-}
-
 
 /***********************************************************************
  *      select   (ws2_32.18)
@@ -2961,11 +2838,10 @@ int WINAPI select( int count, fd_set *read_ptr, fd_set *write_ptr,
     static const int write_flags = AFD_POLL_WRITE;
     static const int except_flags = AFD_POLL_OOB | AFD_POLL_CONNECT_ERR;
 
-    struct socket_index_entry *read_index;
+    struct fd_set *read_input = NULL;
     struct afd_poll_params *params;
     unsigned int poll_count = 0;
-    SIZE_T allocation_size;
-    ULONG params_size, i;
+    ULONG params_size, i, j;
     SOCKET poll_socket = 0;
     IO_STATUS_BLOCK io;
     HANDLE sync_event;
@@ -2974,21 +2850,11 @@ int WINAPI select( int count, fd_set *read_ptr, fd_set *write_ptr,
 
     TRACE( "read %p, write %p, except %p, timeout %p\n", read_ptr, write_ptr, except_ptr, timeout );
 
-    if (read_ptr)
-    {
-        if (read_ptr->fd_count > MAXDWORD - poll_count) goto count_too_large;
-        poll_count += read_ptr->fd_count;
-    }
-    if (write_ptr)
-    {
-        if (write_ptr->fd_count > MAXDWORD - poll_count) goto count_too_large;
-        poll_count += write_ptr->fd_count;
-    }
-    if (except_ptr)
-    {
-        if (except_ptr->fd_count > MAXDWORD - poll_count) goto count_too_large;
-        poll_count += except_ptr->fd_count;
-    }
+    if (!(sync_event = get_sync_event())) return -1;
+
+    if (read_ptr) poll_count += read_ptr->fd_count;
+    if (write_ptr) poll_count += write_ptr->fd_count;
+    if (except_ptr) poll_count += except_ptr->fd_count;
 
     if (!poll_count)
     {
@@ -2996,21 +2862,12 @@ int WINAPI select( int count, fd_set *read_ptr, fd_set *write_ptr,
         return -1;
     }
 
-    if (poll_count > (MAXDWORD - offsetof( struct afd_poll_params, sockets )) /
-                     sizeof(params->sockets[0]))
-        goto count_too_large;
     params_size = offsetof( struct afd_poll_params, sockets[poll_count] );
-    if (poll_count > (~(SIZE_T)0 - params_size) / sizeof(*read_index))
-        goto count_too_large;
-    allocation_size = params_size + (SIZE_T)poll_count * sizeof(*read_index);
-
-    if (!(sync_event = get_sync_event())) return -1;
-    if (!(params = calloc( allocation_size, 1 )))
+    if (!(params = calloc( params_size, 1 )))
     {
         SetLastError( WSAENOBUFS );
         return -1;
     }
-    read_index = (struct socket_index_entry *)&params->sockets[poll_count];
 
     if (timeout)
         params->timeout = (LONGLONG)timeout->tv_sec * -10000000 + (LONGLONG)timeout->tv_usec * -10;
@@ -3019,12 +2876,18 @@ int WINAPI select( int count, fd_set *read_ptr, fd_set *write_ptr,
 
     if (read_ptr)
     {
+        unsigned int read_size = offsetof( struct fd_set, fd_array[read_ptr->fd_count] );
+
+        if (!(read_input = malloc( read_size )))
+        {
+            free( params );
+            SetLastError( WSAENOBUFS );
+            return -1;
+        }
+        memcpy( read_input, read_ptr, read_size );
+
         for (i = 0; i < read_ptr->fd_count; ++i)
         {
-            struct socket_index_entry *entry = socket_index_find( read_index, poll_count, read_ptr->fd_array[i] );
-
-            entry->used = TRUE;
-            entry->socket = read_ptr->fd_array[i];
             params->sockets[params->count].socket = read_ptr->fd_array[i];
             params->sockets[params->count].flags = read_flags;
             ++params->count;
@@ -3058,11 +2921,11 @@ int WINAPI select( int count, fd_set *read_ptr, fd_set *write_ptr,
 
     status = NtDeviceIoControlFile( (HANDLE)poll_socket, sync_event, NULL, NULL, &io,
                                     IOCTL_AFD_POLL, params, params_size, params, params_size );
-    if (status == STATUS_NOT_SUPPORTED) status = STATUS_INVALID_HANDLE;
     if (status == STATUS_PENDING)
     {
         if (wait_event_alertable( sync_event ) == WAIT_FAILED)
         {
+            free( read_input );
             free( params );
             return -1;
         }
@@ -3081,12 +2944,16 @@ int WINAPI select( int count, fd_set *read_ptr, fd_set *write_ptr,
             unsigned int flags = params->sockets[i].flags;
             SOCKET s = params->sockets[i].socket;
 
-            struct socket_index_entry *entry = socket_index_find( read_index, poll_count, s );
-
-            if (entry && entry->used && entry->socket == s && (flags & (read_flags | AFD_POLL_CLOSE)))
+            if (read_input)
             {
-                ret_count += add_fd_to_set( s, read_ptr );
-                flags &= ~AFD_POLL_CLOSE;
+                for (j = 0; j < read_input->fd_count; ++j)
+                {
+                    if (read_input->fd_array[j] == s && (flags & (read_flags | AFD_POLL_CLOSE)))
+                    {
+                        ret_count += add_fd_to_set( s, read_ptr );
+                        flags &= ~AFD_POLL_CLOSE;
+                    }
+                }
             }
 
             if (flags & AFD_POLL_CLOSE)
@@ -3103,15 +2970,12 @@ int WINAPI select( int count, fd_set *read_ptr, fd_set *write_ptr,
         }
     }
 
+    free( read_input );
     free( params );
 
     SetLastError( NtStatusToWSAError( status ) );
     TRACE( "status %#lx.\n", status );
     return status ? -1 : ret_count;
-
-count_too_large:
-    SetLastError( WSAENOBUFS );
-    return -1;
 }
 
 
@@ -3146,10 +3010,7 @@ static unsigned int afd_poll_flag_to_win32( unsigned int flags )
  */
 int WINAPI WSAPoll( WSAPOLLFD *fds, ULONG count, int timeout )
 {
-    struct socket_index_entry *result_index;
     struct afd_poll_params *params;
-    ULONG *result_links;
-    SIZE_T allocation_size, index_size;
     ULONG params_size, i, j;
     SOCKET poll_socket = 0;
     IO_STATUS_BLOCK io;
@@ -3168,25 +3029,14 @@ int WINAPI WSAPoll( WSAPOLLFD *fds, ULONG count, int timeout )
         return SOCKET_ERROR;
     }
 
-    if (count > (MAXDWORD - offsetof( struct afd_poll_params, sockets )) /
-                sizeof(params->sockets[0]))
-        goto count_too_large;
-    params_size = offsetof( struct afd_poll_params, sockets[count] );
-    if (count > ~(SIZE_T)0 / (sizeof(*result_index) + sizeof(*result_links)))
-        goto count_too_large;
-    index_size = (SIZE_T)count * (sizeof(*result_index) + sizeof(*result_links));
-    if (index_size > ~(SIZE_T)0 - params_size)
-        goto count_too_large;
-    allocation_size = params_size + index_size;
-
     if (!(sync_event = get_sync_event())) return -1;
-    if (!(params = calloc( allocation_size, 1 )))
+
+    params_size = offsetof( struct afd_poll_params, sockets[count] );
+    if (!(params = calloc( params_size, 1 )))
     {
         SetLastError(WSAENOBUFS);
         return SOCKET_ERROR;
     }
-    result_index = (struct socket_index_entry *)&params->sockets[count];
-    result_links = (ULONG *)(result_index + count);
 
     params->timeout = (timeout >= 0 ? (LONGLONG)timeout * -10000 : TIMEOUT_INFINITE);
 
@@ -3235,49 +3085,33 @@ int WINAPI WSAPoll( WSAPOLLFD *fds, ULONG count, int timeout )
     }
     if (!status)
     {
-        for (j = 0; j < params->count; ++j)
-        {
-            struct socket_index_entry *entry = socket_index_find( result_index, count,
-                                                                  params->sockets[j].socket );
-
-            if (!entry->used)
-            {
-                entry->used = TRUE;
-                entry->socket = params->sockets[j].socket;
-                entry->value = ~0u;
-            }
-            result_links[j] = entry->value;
-            entry->value = j;
-        }
-
         for (i = 0; i < count; ++i)
         {
-            struct socket_index_entry *entry;
-
-            if (fds[i].revents == POLLNVAL) continue;
-            entry = socket_index_find( result_index, count, fds[i].fd );
-            if (!entry || !entry->used || entry->socket != fds[i].fd) continue;
-
-            for (j = entry->value; j != ~0u; j = result_links[j])
+            for (j = 0; j < params->count; ++j)
             {
-                unsigned int revents = 0;
+                if (fds[i].fd == params->sockets[j].socket)
+                {
+                    unsigned int revents = 0;
 
-                if (params->sockets[j].flags & (AFD_POLL_ACCEPT | AFD_POLL_READ))
-                    revents |= POLLRDNORM;
-                if (params->sockets[j].flags & AFD_POLL_OOB)
-                    revents |= POLLRDBAND;
-                if (params->sockets[j].flags & AFD_POLL_WRITE)
-                    revents |= POLLWRNORM;
-                if (params->sockets[j].flags & (AFD_POLL_RESET | AFD_POLL_HUP))
-                    revents |= POLLHUP;
-                if (params->sockets[j].flags & (AFD_POLL_RESET | AFD_POLL_CONNECT_ERR))
-                    revents |= POLLERR;
-                if (params->sockets[j].flags & AFD_POLL_CLOSE)
-                    revents |= POLLNVAL;
+                    if (params->sockets[j].flags & (AFD_POLL_ACCEPT | AFD_POLL_READ))
+                        revents |= POLLRDNORM;
+                    if (params->sockets[j].flags & AFD_POLL_OOB)
+                        revents |= POLLRDBAND;
+                    if (params->sockets[j].flags & AFD_POLL_WRITE)
+                        revents |= POLLWRNORM;
+                    if (params->sockets[j].flags & (AFD_POLL_RESET | AFD_POLL_HUP))
+                        revents |= POLLHUP;
+                    if (params->sockets[j].flags & (AFD_POLL_RESET | AFD_POLL_CONNECT_ERR))
+                        revents |= POLLERR;
+                    if (params->sockets[j].flags & AFD_POLL_CLOSE)
+                        revents |= POLLNVAL;
 
-                fds[i].revents |= revents & (fds[i].events | POLLHUP | POLLERR | POLLNVAL);
+                    fds[i].revents = revents & (fds[i].events | POLLHUP | POLLERR | POLLNVAL);
+
+                    if (fds[i].revents)
+                        ++ret_count;
+                }
             }
-            if (fds[i].revents) ++ret_count;
         }
     }
     if (status == STATUS_TIMEOUT) status = STATUS_SUCCESS;
@@ -3287,10 +3121,6 @@ int WINAPI WSAPoll( WSAPOLLFD *fds, ULONG count, int timeout )
     SetLastError( NtStatusToWSAError( status ) );
     TRACE( "status %#lx.\n", status );
     return status ? -1 : ret_count;
-
-count_too_large:
-    SetLastError( WSAENOBUFS );
-    return SOCKET_ERROR;
 }
 
 
@@ -3871,7 +3701,7 @@ int WINAPI shutdown( SOCKET s, int how )
  */
 SOCKET WINAPI socket( int af, int type, int protocol )
 {
-    TRACE("af=%s type=%s protocol=%s\n", debugstr_sockdomain(af), debugstr_socktype(type), debugstr_sockprotocol(protocol));
+    TRACE("af=%d type=%d protocol=%d\n", af, type, protocol);
 
     return WSASocketW( af, type, protocol, NULL, 0,
                        get_per_thread_data()->opentype ? 0 : WSA_FLAG_OVERLAPPED );
@@ -4049,7 +3879,6 @@ int WINAPI WSAAsyncSelect( SOCKET s, HWND window, UINT message, LONG mask )
     return status ? -1 : 0;
 }
 
-
 static BOOL is_need_timeout_fix(void)
 {
     static volatile char cache = -1;
@@ -4060,7 +3889,6 @@ static BOOL is_need_timeout_fix(void)
         const WCHAR *p, *name = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
         const char *env = getenv("WINE_ENABLE_TIMEOUT_FIX");
 
-        /* Missing image path: treat as non-target and cache negative. */
         if (!name)
         {
             cache = 0;
@@ -4072,7 +3900,8 @@ static BOOL is_need_timeout_fix(void)
         if ((p = wcsrchr(name, '\\')))
             name = p + 1;
         ret = (env && atoi(env)) &&
-              (!wcsicmp(name, L"GenshinImpact.exe") || !wcsicmp(name, L"YuanShen.exe") || !wcsicmp(name, L"ZenlessZoneZero.exe"));
+              (!wcsicmp(name, L"GenshinImpact.exe") || !wcsicmp(name, L"YuanShen.exe") ||
+               !wcsicmp(name, L"ZenlessZoneZero.exe"));
         cache = ret;
     }
     return ret;
@@ -4080,55 +3909,46 @@ static BOOL is_need_timeout_fix(void)
 
 static void fix_curl_timeout(void)
 {
-    static LONG successful_scans;
+    static _Atomic DWORD count = 0;
     static const BYTE timeout_buf[] = {0x60, 0xea, 0x00, 0x00, 0x60, 0xea, 0x00, 0x00};
     static const SIZE_T timeout_off = 0x2f8;
+    PROCESS_HEAP_ENTRY entry;
     HANDLE heap;
     BYTE *data;
-    PROCESS_HEAP_ENTRY entry;
-    LONG count;
 
-    if (InterlockedCompareExchange(&successful_scans, 0, 0) >= 2 || !is_need_timeout_fix())
+    if (count >= 2 || !is_need_timeout_fix())
         return;
 
     heap = GetProcessHeap();
     if (!HeapLock(heap))
         return;
 
-    do {
-        count = InterlockedCompareExchange(&successful_scans, 0, 0);
-        if (count >= 2) {
-            HeapUnlock(heap);
-            return;
-        }
-    } while(InterlockedCompareExchange(&successful_scans, count + 1, count) != count);
-
-    TRACE("HACK: WSACreateEvent fixing curl timeout :xdd:\n");
+    /* Reserve a scan only after HeapLock succeeds; serialized heap walkers stay bounded. */
+    if (count >= 2)
+    {
+        HeapUnlock(heap);
+        return;
+    }
+    count++;
+    TRACE("HACK: WSACreateEvent scanning for curl timeout.\n");
 
     entry.lpData = NULL;
     entry.wFlags = PROCESS_HEAP_REGION;
-
     while (HeapWalk(heap, &entry))
     {
-        if (entry.cbData < 4)
+        if (entry.cbData < 4 || !(entry.wFlags & PROCESS_HEAP_ENTRY_BUSY))
             continue;
-        if (!(entry.wFlags & PROCESS_HEAP_ENTRY_BUSY))
-            continue;
-
-        data = entry.lpData;
-        if (!data)
+        if (!(data = entry.lpData))
             continue;
         if (data[0] == 0xAD && data[1] == 0xDB && data[2] == 0xDE && data[3] == 0xC0)
         {
-            /* Same undocumented game heap layout as dwproton/gi-timeout; require full write span. */
+            /* The game heap layout is undocumented; require the complete write span. */
             if (entry.cbData < timeout_off + sizeof(timeout_buf))
                 continue;
             memcpy(data + timeout_off, timeout_buf, sizeof(timeout_buf));
-            /* Bytes are 0x0000ea60 (=60000ms); upstream TRACE text saying 5000ms was incorrect. */
-            TRACE("HACK: WSACreateEvent adjusted curl timeout to 60000ms in memory at %p\n", data + timeout_off);
+            TRACE("HACK: WSACreateEvent adjusted curl timeout to 60000ms at %p\n", data + timeout_off);
         }
     }
-
     HeapUnlock(heap);
 }
 
@@ -4206,8 +4026,8 @@ SOCKET WINAPI WSASocketW(int af, int type, int protocol,
       g, dwFlags except WSA_FLAG_OVERLAPPED) are ignored.
    */
 
-    TRACE( "family %s, type %s, protocol %s, info %p, group %u, flags %#lx\n",
-           debugstr_sockdomain(af), debugstr_socktype(type), debugstr_sockprotocol(protocol), lpProtocolInfo, g, flags );
+    TRACE( "family %d, type %d, protocol %d, info %p, group %u, flags %#lx\n",
+           af, type, protocol, lpProtocolInfo, g, flags );
 
     if (!num_startup)
     {

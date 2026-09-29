@@ -29,6 +29,7 @@
 #include <sys/types.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winver.h"
@@ -775,6 +776,27 @@ DWORD WINAPI GetFileVersionInfoSizeExW( DWORD flags, LPCWSTR filename, LPDWORD r
     if ((hModule = LoadLibraryExW( filename, 0, LOAD_LIBRARY_AS_IMAGE_RESOURCE )))
     {
         HRSRC hRsrc = NULL;
+
+        {
+            /* CW Hack 25427 */
+            static const char builtin_signature[] = "Wine builtin DLL";
+            WCHAR env_val[2];
+            HMODULE mod = (HMODULE)((ULONG_PTR)hModule & ~(ULONG_PTR)3);
+            char *signature = (char *)((IMAGE_DOS_HEADER *)mod + 1);
+            IMAGE_NT_HEADERS *nt;
+
+            if (GetEnvironmentVariableW( L"CX_HIDE_BUILTIN_VERSION_RESOURCES", env_val, ARRAY_SIZE(env_val) ) > 0
+                && env_val[0] == '1'
+                && (nt = RtlImageNtHeader( mod )) && (char *)nt - signature >= sizeof(builtin_signature)
+                && !memcmp( signature, builtin_signature, sizeof(builtin_signature) ))
+            {
+                ERR("HACK: not exposing version info.\n");
+                FreeLibrary( hModule );
+                SetLastError( ERROR_RESOURCE_NAME_NOT_FOUND );
+                return 0;
+            }
+        }
+
         if (!(flags & FILE_VER_GET_LOCALISED))
         {
             LANGID english = MAKELANGID( LANG_ENGLISH, SUBLANG_DEFAULT );
@@ -1676,17 +1698,6 @@ static UINT32 processor_arch_from_string(const WCHAR *str, unsigned int len)
     return ~0u;
 }
 
-static const WCHAR *processor_arch_from_code(UINT32 code)
-{
-    unsigned int i;
-
-    for (i = 0; i < ARRAY_SIZE(arch_names); ++i)
-        if (arch_names[i].code == code)
-            return arch_names[i].name;
-
-    return NULL;
-}
-
 /***********************************************************************
  *         PackageIdFromFullName   (kernelbase.@)
  */
@@ -1772,86 +1783,6 @@ LONG WINAPI PackageIdFromFullName(const WCHAR *full_name, UINT32 flags, UINT32 *
         return ERROR_INVALID_PARAMETER;
     memcpy(id->publisherId, publisher_id, sizeof(*id->publisherId) * len);
     id->publisherId[len] = 0;
-
-    return ERROR_SUCCESS;
-}
-
-/***********************************************************************
- *         PackageFullNameFromId   (kernelbase.@)
- */
-LONG WINAPI PackageFullNameFromId(const PACKAGE_ID *id, UINT32 *length, WCHAR *buffer)
-{
-    WCHAR full_name[PACKAGE_FULL_NAME_MAX_LENGTH + 1];
-    WCHAR version[PACKAGE_VERSION_MAX_LENGTH + 1];
-    const WCHAR *arch;
-    size_t len;
-
-    TRACE("id %p, length %p, buffer %p\n", id, length, buffer);
-
-    if (!id || !length)
-        return ERROR_INVALID_PARAMETER;
-
-    len = id->name ? wcslen(id->name) : 0;
-    if (len < PACKAGE_NAME_MIN_LENGTH || len > PACKAGE_NAME_MAX_LENGTH)
-        return ERROR_INVALID_PARAMETER;
-
-    *full_name = 0;
-    wcscpy(full_name, id->name);
-    wcscat(full_name, L"_");
-
-    swprintf(version, ARRAYSIZE(version), L"%u.%u.%u.%u", id->version.Major, id->version.Minor,
-            id->version.Build, id->version.Revision);
-    wcscat(full_name, version);
-    wcscat(full_name, L"_");
-
-    arch = processor_arch_from_code(id->processorArchitecture);
-    if (!arch)
-    {
-        WARN("Unrecognized architecture id %u.\n", id->processorArchitecture);
-        return ERROR_INVALID_PARAMETER;
-    }
-
-    wcscat(full_name, arch);
-    wcscat(full_name, L"_");
-
-    if (id->resourceId)
-    {
-        len = wcslen(id->resourceId);
-
-        if (len > PACKAGE_RESOURCEID_MAX_LENGTH)
-            return ERROR_INVALID_PARAMETER;
-
-        wcscat(full_name, id->resourceId);
-        wcscat(full_name, L"_");
-    }
-
-    if (id->publisherId)
-    {
-        len = wcslen(id->publisherId);
-
-        if (len != PACKAGE_PUBLISHERID_MAX_LENGTH)
-            return ERROR_INVALID_PARAMETER;
-
-        wcscat(full_name, id->publisherId);
-    }
-    else
-    {
-        if (!id->publisher)
-            return ERROR_INVALID_PARAMETER;
-
-        FIXME("Publisher ID generation is not implemented.\n");
-
-        wcscat(full_name, L"123456789abcd");
-    }
-
-    len = wcslen(full_name);
-    *length = len + 1;
-
-    if (!buffer || *length <= len)
-        return ERROR_INSUFFICIENT_BUFFER;
-
-    wcscpy(buffer, full_name);
-    *length = len + 1;
 
     return ERROR_SUCCESS;
 }

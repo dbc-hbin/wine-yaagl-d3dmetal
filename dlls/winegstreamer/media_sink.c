@@ -91,12 +91,10 @@ struct media_sink
 
     IMFByteStream *bytestream;
     IMFMediaEventQueue *event_queue;
-    IMFPresentationClock *clock;
 
     struct list stream_sinks;
 
     wg_muxer_t muxer;
-    HRESULT status;
 };
 
 static struct stream_sink *impl_from_IMFStreamSink(IMFStreamSink *iface)
@@ -345,13 +343,6 @@ static HRESULT WINAPI stream_sink_ProcessSample(IMFStreamSink *iface, IMFSample 
         return MF_E_INVALIDREQUEST;
     }
 
-    if (FAILED(media_sink->status))
-    {
-        hr = media_sink->status;
-        LeaveCriticalSection(&media_sink->cs);
-        return hr;
-    }
-
     if (FAILED(hr = (async_command_create(ASYNC_PROCESS, &command))))
     {
         LeaveCriticalSection(&media_sink->cs);
@@ -578,21 +569,6 @@ static HRESULT media_sink_queue_stream_event(struct media_sink *media_sink, Medi
     return S_OK;
 }
 
-static HRESULT media_sink_latch_error(struct media_sink *media_sink, HRESULT hr)
-{
-    struct stream_sink *stream_sink;
-
-    if (SUCCEEDED(media_sink->status))
-    {
-        media_sink->status = hr;
-        IMFMediaEventQueue_QueueEventParamVar(media_sink->event_queue, MEError, &GUID_NULL, hr, NULL);
-        LIST_FOR_EACH_ENTRY(stream_sink, &media_sink->stream_sinks, struct stream_sink, entry)
-            IMFMediaEventQueue_QueueEventParamVar(stream_sink->event_queue, MEError, &GUID_NULL, hr, NULL);
-    }
-
-    return media_sink->status;
-}
-
 static HRESULT media_sink_write_stream(struct media_sink *media_sink)
 {
     BYTE buffer[1024];
@@ -603,19 +579,11 @@ static HRESULT media_sink_write_stream(struct media_sink *media_sink)
 
     while (SUCCEEDED(hr = wg_muxer_read_data(media_sink->muxer, buffer, &size, &offset)))
     {
-        ULONG total = 0;
-
         if (offset != UINT64_MAX && FAILED(hr = IMFByteStream_SetCurrentPosition(media_sink->bytestream, offset)))
             return hr;
 
-        while (total < size)
-        {
-            if (FAILED(hr = IMFByteStream_Write(media_sink->bytestream, buffer + total, size - total, &written)))
-                return hr;
-            if (!written || written > size - total)
-                return E_FAIL;
-            total += written;
-        }
+        if (FAILED(hr = IMFByteStream_Write(media_sink->bytestream, buffer, size, &written)))
+            return hr;
 
         size = sizeof(buffer);
     }
@@ -658,14 +626,8 @@ static HRESULT media_sink_process(struct media_sink *media_sink, IMFSample *samp
 
     TRACE("media_sink %p, sample %p, stream_id %u.\n", media_sink, sample, stream_id);
 
-    if (FAILED(media_sink->status))
-        return media_sink->status;
-
     if (FAILED(hr = media_sink_write_stream(media_sink)))
-    {
         WARN("Failed to write output samples to stream, hr %#lx.\n", hr);
-        return media_sink_latch_error(media_sink, hr);
-    }
 
     if (FAILED(hr = wg_sample_create_mf(sample, &wg_sample)))
         return hr;
@@ -725,33 +687,15 @@ static HRESULT media_sink_finalize(struct media_sink *media_sink, IMFAsyncResult
 
     media_sink->state = STATE_FINALIZED;
 
-    if (FAILED(media_sink->status))
-        hr = media_sink->status;
-    else if (FAILED(hr = wg_muxer_finalize(media_sink->muxer)))
-        hr = media_sink_latch_error(media_sink, hr);
-    else if (FAILED(hr = media_sink_write_stream(media_sink)))
-        hr = media_sink_latch_error(media_sink, hr);
+    hr = wg_muxer_finalize(media_sink->muxer);
+
+    if (SUCCEEDED(hr))
+        hr = media_sink_write_stream(media_sink);
 
     IMFAsyncResult_SetStatus(result, hr);
     MFInvokeCallback(result);
 
     return hr;
-}
-
-static void media_sink_set_presentation_clock(struct media_sink *media_sink, IMFPresentationClock *clock)
-{
-    if (media_sink->clock)
-    {
-        IMFPresentationClock_RemoveClockStateSink(media_sink->clock, &media_sink->IMFClockStateSink_iface);
-        IMFPresentationClock_Release(media_sink->clock);
-    }
-
-    media_sink->clock = clock;
-    if (media_sink->clock)
-    {
-        IMFPresentationClock_AddRef(media_sink->clock);
-        IMFPresentationClock_AddClockStateSink(media_sink->clock, &media_sink->IMFClockStateSink_iface);
-    }
 }
 
 static HRESULT WINAPI media_sink_QueryInterface(IMFFinalizableMediaSink *iface, REFIID riid, void **obj)
@@ -947,45 +891,16 @@ static HRESULT WINAPI media_sink_GetStreamSinkById(IMFFinalizableMediaSink *ifac
 
 static HRESULT WINAPI media_sink_SetPresentationClock(IMFFinalizableMediaSink *iface, IMFPresentationClock *clock)
 {
-    struct media_sink *media_sink = impl_from_IMFFinalizableMediaSink(iface);
-    HRESULT hr = S_OK;
+    FIXME("iface %p, clock %p stub!\n", iface, clock);
 
-    TRACE("iface %p, clock %p.\n", iface, clock);
-
-    EnterCriticalSection(&media_sink->cs);
-
-    if (media_sink->state == STATE_SHUTDOWN)
-        hr = MF_E_SHUTDOWN;
-    else
-        media_sink_set_presentation_clock(media_sink, clock);
-
-    LeaveCriticalSection(&media_sink->cs);
-
-    return hr;
+    return E_NOTIMPL;
 }
 
 static HRESULT WINAPI media_sink_GetPresentationClock(IMFFinalizableMediaSink *iface, IMFPresentationClock **clock)
 {
-    struct media_sink *media_sink = impl_from_IMFFinalizableMediaSink(iface);
-    HRESULT hr = S_OK;
+    FIXME("iface %p, clock %p stub!\n", iface, clock);
 
-    TRACE("iface %p, clock %p.\n", iface, clock);
-
-    if (!clock)
-        return E_POINTER;
-
-    EnterCriticalSection(&media_sink->cs);
-
-    if (media_sink->state == STATE_SHUTDOWN)
-        hr = MF_E_SHUTDOWN;
-    else if (media_sink->clock)
-        IMFPresentationClock_AddRef((*clock = media_sink->clock));
-    else
-        hr = MF_E_NO_CLOCK;
-
-    LeaveCriticalSection(&media_sink->cs);
-
-    return hr;
+    return E_NOTIMPL;
 }
 
 static HRESULT WINAPI media_sink_Shutdown(IMFFinalizableMediaSink *iface)
@@ -1002,8 +917,6 @@ static HRESULT WINAPI media_sink_Shutdown(IMFFinalizableMediaSink *iface)
         LeaveCriticalSection(&media_sink->cs);
         return MF_E_SHUTDOWN;
     }
-
-    media_sink_set_presentation_clock(media_sink, NULL);
 
     LIST_FOR_EACH_ENTRY_SAFE(stream_sink, next, &media_sink->stream_sinks, struct stream_sink, entry)
     {

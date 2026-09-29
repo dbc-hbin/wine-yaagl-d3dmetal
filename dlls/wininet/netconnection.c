@@ -286,26 +286,58 @@ static void set_socket_blocking(netconn_t *conn, BOOL is_blocking)
     conn->is_blocking = is_blocking;
 }
 
-static DWORD create_netconn_socket(server_t *server, object_header_t *hdr, DWORD_PTR callback_context,
-                                   netconn_t *netconn, DWORD timeout)
+static DWORD create_netconn_socket(server_t *server, netconn_t *netconn, DWORD timeout)
 {
+    int result;
     ULONG flag;
+    DWORD res;
 
     init_winsock();
 
-    assert(server->addr);
-    if ((netconn->socket = create_connect_socket(server->addr, AF_UNSPEC, timeout, hdr, callback_context)) == -1)
+    assert(server->addr_len);
+    result = netconn->socket = socket(server->addr.ss_family, SOCK_STREAM, 0);
+    if(result != -1) {
+        set_socket_blocking(netconn, FALSE);
+        result = connect(netconn->socket, (struct sockaddr*)&server->addr, server->addr_len);
+        if(result == -1)
+        {
+            res = WSAGetLastError();
+            if (res == WSAEINPROGRESS || res == WSAEWOULDBLOCK) {
+                FD_SET set;
+                int res;
+                socklen_t len = sizeof(res);
+                TIMEVAL timeout_timeval = {0, timeout*1000};
+
+                FD_ZERO(&set);
+                FD_SET(netconn->socket, &set);
+                res = select(netconn->socket+1, NULL, &set, NULL, &timeout_timeval);
+                if(!res || res == SOCKET_ERROR) {
+                    closesocket(netconn->socket);
+                    netconn->socket = -1;
+                    return ERROR_INTERNET_CANNOT_CONNECT;
+                }
+                if (!getsockopt(netconn->socket, SOL_SOCKET, SO_ERROR, (void *)&res, &len) && !res)
+                    result = 0;
+            }
+        }
+        if(result == -1)
+        {
+            closesocket(netconn->socket);
+            netconn->socket = -1;
+        }
+    }
+    if(result == -1)
         return ERROR_INTERNET_CANNOT_CONNECT;
 
     flag = 1;
-    if(setsockopt(netconn->socket, IPPROTO_TCP, TCP_NODELAY, (void*)&flag, sizeof(flag)) < 0)
+    result = setsockopt(netconn->socket, IPPROTO_TCP, TCP_NODELAY, (void*)&flag, sizeof(flag));
+    if(result < 0)
         WARN("setsockopt(TCP_NODELAY) failed\n");
 
     return ERROR_SUCCESS;
 }
 
-DWORD create_netconn(server_t *server, object_header_t *hdr, DWORD security_flags,
-                     BOOL mask_errors, DWORD timeout, netconn_t **ret)
+DWORD create_netconn(server_t *server, DWORD security_flags, BOOL mask_errors, DWORD timeout, netconn_t **ret)
 {
     netconn_t *netconn;
     int result;
@@ -320,7 +352,7 @@ DWORD create_netconn(server_t *server, object_header_t *hdr, DWORD security_flag
     list_init(&netconn->pool_entry);
     SecInvalidateHandle(&netconn->ssl_ctx);
 
-    result = create_netconn_socket(server, hdr, hdr->dwContext, netconn, timeout);
+    result = create_netconn_socket(server, netconn, timeout);
     if (result != ERROR_SUCCESS) {
         free(netconn);
         return result;
@@ -412,7 +444,6 @@ static DWORD netcon_secure_connect_setup(netconn_t *connection, BOOL compat_mode
     const CERT_CONTEXT *cert;
     SECURITY_STATUS status;
     DWORD res = ERROR_SUCCESS;
-    BOOL context_complete = FALSE;
 
     const DWORD isc_req_flags = ISC_REQ_ALLOCATE_MEMORY|ISC_REQ_USE_SESSION_KEY|ISC_REQ_CONFIDENTIALITY
         |ISC_REQ_SEQUENCE_DETECT|ISC_REQ_REPLAY_DETECT|ISC_REQ_MANUAL_CRED_VALIDATION;
@@ -430,7 +461,6 @@ static DWORD netcon_secure_connect_setup(netconn_t *connection, BOOL compat_mode
     if(!read_buf)
         return ERROR_OUTOFMEMORY;
 
-    SecInvalidateHandle(&ctx);
     status = InitializeSecurityContextW(cred, NULL, connection->server->name, isc_req_flags, 0, 0, NULL, 0,
             &ctx, &out_desc, &attrs, NULL);
 
@@ -497,7 +527,9 @@ static DWORD netcon_secure_connect_setup(netconn_t *connection, BOOL compat_mode
         TRACE("InitializeSecurityContext ret %08lx\n", status);
 
         if(status == SEC_E_OK) {
-            context_complete = TRUE;
+            if(SecIsValidHandle(&connection->ssl_ctx))
+                DeleteSecurityContext(&connection->ssl_ctx);
+            connection->ssl_ctx = ctx;
 
             if(in_bufs[1].BufferType == SECBUFFER_EXTRA)
                 FIXME("SECBUFFER_EXTRA not supported\n");
@@ -531,16 +563,6 @@ static DWORD netcon_secure_connect_setup(netconn_t *connection, BOOL compat_mode
     }
 
     free(read_buf);
-    if(out_buf.pvBuffer)
-        FreeContextBuffer(out_buf.pvBuffer);
-
-    if(context_complete) {
-        if(SecIsValidHandle(&connection->ssl_ctx))
-            DeleteSecurityContext(&connection->ssl_ctx);
-        connection->ssl_ctx = ctx;
-    }else if(SecIsValidHandle(&ctx)) {
-        DeleteSecurityContext(&ctx);
-    }
 
     if(status != SEC_E_OK || res != ERROR_SUCCESS) {
         WARN("Failed to establish SSL connection: %08lx (%lu)\n", status, res);
@@ -596,7 +618,7 @@ DWORD NETCON_secure_connect(netconn_t *connection, server_t *server)
     if (res == ERROR_INTERNET_SECURITY_CHANNEL_ERROR && have_compat_cred_handle)
     {
         closesocket(connection->socket);
-        res = create_netconn_socket(connection->server, NULL, 0, connection, 500);
+        res = create_netconn_socket(connection->server, connection, 500);
         if (res != ERROR_SUCCESS)
             return res;
         res = netcon_secure_connect_setup(connection, TRUE);

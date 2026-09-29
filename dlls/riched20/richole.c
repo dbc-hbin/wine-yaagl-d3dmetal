@@ -3678,7 +3678,6 @@ static HRESULT WINAPI TextPara_GetAlignment(ITextPara *iface, LONG *value)
 {
     ITextParaImpl *This = impl_from_ITextPara(iface);
     FIXME("(%p)->(%p)\n", This, value);
-    if (value) *value = 0;
     return E_NOTIMPL;
 }
 

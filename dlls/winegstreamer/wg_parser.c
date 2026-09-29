@@ -36,6 +36,7 @@
 #include <gst/tag/tag.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "winternl.h"
 #include "dshow.h"
 
@@ -68,7 +69,6 @@ struct wg_parser
     GstPad *my_src;
 
     guint64 file_size, start_offset, next_offset, stop_offset;
-    GstClockTime base_pts;
     guint64 next_pull_offset;
     gchar *uri;
 
@@ -77,7 +77,7 @@ struct wg_parser
     pthread_mutex_t mutex;
 
     pthread_cond_t init_cond;
-    bool output_compressed, pts_rebased;
+    bool output_compressed;
     bool no_more_pads, has_duration, error;
     bool err_on, warn_on;
 
@@ -97,7 +97,7 @@ struct wg_parser
 
     struct input_cache_chunk input_cache_chunks[4];
 };
-static const unsigned int input_cache_chunk_size = 256 << 10;
+static const unsigned int input_cache_chunk_size = 512 << 10;
 
 struct wg_parser_stream
 {
@@ -115,7 +115,7 @@ struct wg_parser_stream
     GstBuffer *buffer;
     GstMapInfo map_info;
 
-    bool flushing, eos, enabled, has_tags, has_buffer, has_initial_gap, no_more_pads, get_buffer_called;
+    bool flushing, eos, enabled, has_tags, has_buffer, no_more_pads;
 
     uint64_t duration;
     gchar *tags[WG_PARSER_TAG_COUNT];
@@ -230,14 +230,11 @@ static NTSTATUS wg_parser_stream_get_current_format(void *args)
 {
     const struct wg_parser_stream_get_current_format_params *params = args;
     struct wg_parser_stream *stream = get_stream(params->stream);
-    struct wg_parser *parser = stream->parser;
 
-    pthread_mutex_lock(&parser->mutex);
     if (stream->current_caps)
         wg_format_from_caps(params->format, stream->current_caps);
     else
         memset(params->format, 0, sizeof(*params->format));
-    pthread_mutex_unlock(&parser->mutex);
 
     return S_OK;
 }
@@ -246,16 +243,13 @@ static NTSTATUS wg_parser_stream_get_codec_format(void *args)
 {
     struct wg_parser_stream_get_codec_format_params *params = args;
     struct wg_parser_stream *stream = get_stream(params->stream);
-    struct wg_parser *parser = stream->parser;
 
-    pthread_mutex_lock(&parser->mutex);
     if (caps_is_compressed(stream->codec_caps))
         wg_format_from_caps(params->format, stream->codec_caps);
     else if (stream->current_caps)
         wg_format_from_caps(params->format, stream->current_caps);
     else
         memset(params->format, 0, sizeof(*params->format));
-    pthread_mutex_unlock(&parser->mutex);
 
     return S_OK;
 }
@@ -267,21 +261,12 @@ static NTSTATUS wg_parser_stream_enable(void *args)
     const struct wg_format *format = params->format;
     struct wg_parser *parser = stream->parser;
 
-    GstCaps *caps, *old_caps;
-
-    if (!(caps = wg_format_to_caps(format)))
-        return E_OUTOFMEMORY;
-
     pthread_mutex_lock(&parser->mutex);
 
-    old_caps = stream->desired_caps;
-    stream->desired_caps = caps;
+    stream->desired_caps = wg_format_to_caps(format);
     stream->enabled = true;
 
     pthread_mutex_unlock(&parser->mutex);
-
-    if (old_caps)
-        gst_caps_unref(old_caps);
 
     if (format->major_type == WG_MAJOR_TYPE_VIDEO)
     {
@@ -382,17 +367,8 @@ static NTSTATUS wg_parser_stream_get_buffer(void *args)
      * that this will need modification to wg_parser_stream_notify_qos() as
      * well. */
 
-    /* Because mpegpsdemux reports a non-zero PTS for the earliest buffer among
-     * all streams, we rebase the PTS by subtracting base_pts so that our
-     * stream starts at zero for the MPEG-I Splitter in quartz. */
-
     if ((wg_buffer->has_pts = GST_BUFFER_PTS_IS_VALID(buffer)))
-    {
-        if (parser->pts_rebased && GST_CLOCK_TIME_IS_VALID(parser->base_pts))
-            wg_buffer->pts = (GST_BUFFER_PTS(buffer) - parser->base_pts) / 100;
-        else
-            wg_buffer->pts = GST_BUFFER_PTS(buffer) / 100;
-    }
+        wg_buffer->pts = GST_BUFFER_PTS(buffer) / 100;
     if ((wg_buffer->has_duration = GST_BUFFER_DURATION_IS_VALID(buffer)))
         wg_buffer->duration = GST_BUFFER_DURATION(buffer) / 100;
     wg_buffer->discontinuity = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DISCONT);
@@ -400,8 +376,6 @@ static NTSTATUS wg_parser_stream_get_buffer(void *args)
     wg_buffer->delta = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
     wg_buffer->size = gst_buffer_get_size(buffer);
     wg_buffer->stream = stream->number;
-
-    stream->get_buffer_called = true;
 
     pthread_mutex_unlock(&parser->mutex);
     return S_OK;
@@ -417,7 +391,7 @@ static NTSTATUS wg_parser_stream_copy_buffer(void *args)
 
     pthread_mutex_lock(&parser->mutex);
 
-    if (!stream->buffer || !stream->get_buffer_called)
+    if (!stream->buffer)
     {
         pthread_mutex_unlock(&parser->mutex);
         return VFW_E_WRONG_STATE;
@@ -444,8 +418,6 @@ static NTSTATUS wg_parser_stream_release_buffer(void *args)
         gst_buffer_unref(stream->buffer);
         stream->buffer = NULL;
     }
-
-    stream->get_buffer_called = false;
 
     pthread_mutex_unlock(&parser->mutex);
     pthread_cond_signal(&stream->event_empty_cond);
@@ -689,8 +661,6 @@ static gboolean sink_event_cb(GstPad *pad, GstObject *parent, GstEvent *event)
                 stream->buffer = NULL;
             }
 
-            stream->get_buffer_called = false;
-
             pthread_mutex_unlock(&parser->mutex);
             break;
 
@@ -714,28 +684,15 @@ static gboolean sink_event_cb(GstPad *pad, GstObject *parent, GstEvent *event)
 
         case GST_EVENT_CAPS:
         {
-            GstCaps *caps, *old_caps;
+            GstCaps *caps;
 
             gst_event_parse_caps(event, &caps);
-            caps = gst_caps_ref(caps);
             pthread_mutex_lock(&parser->mutex);
-            old_caps = stream->current_caps;
-            stream->current_caps = caps;
+            stream->current_caps = gst_caps_ref(caps);
             pthread_mutex_unlock(&parser->mutex);
-            if (old_caps)
-                gst_caps_unref(old_caps);
             pthread_cond_signal(&parser->init_cond);
             break;
         }
-
-        case GST_EVENT_GAP:
-            if (stream->has_buffer || stream->has_initial_gap)
-                break;
-            pthread_mutex_lock(&parser->mutex);
-            stream->has_initial_gap = true;
-            pthread_mutex_unlock(&parser->mutex);
-            pthread_cond_signal(&parser->init_cond);
-            break;
 
         case GST_EVENT_TAG:
             pthread_mutex_lock(&parser->mutex);
@@ -763,17 +720,6 @@ static GstFlowReturn sink_chain_cb(GstPad *pad, GstObject *parent, GstBuffer *bu
     if (!stream->has_buffer)
     {
         stream->has_buffer = true;
-
-        /* Keep the earliest PTS for adjusting. */
-        if (!stream->has_initial_gap &&
-            GST_BUFFER_PTS_IS_VALID(buffer) &&
-            (GST_BUFFER_PTS(buffer) < parser->base_pts))
-        {
-            parser->base_pts = GST_BUFFER_PTS(buffer);
-            GST_LOG("Updated base PTS to %" GST_TIME_FORMAT ".",
-                    GST_TIME_ARGS(parser->base_pts));
-        }
-
         pthread_cond_signal(&parser->init_cond);
     }
 
@@ -948,14 +894,6 @@ static void free_stream(struct wg_parser_stream *stream)
         if (stream->tags[i])
             g_free(stream->tags[i]);
     }
-
-    if (stream->codec_caps)
-        gst_caps_unref(stream->codec_caps);
-    if (stream->current_caps)
-        gst_caps_unref(stream->current_caps);
-    if (stream->desired_caps)
-        gst_caps_unref(stream->desired_caps);
-
     free(stream);
 }
 
@@ -972,20 +910,16 @@ static bool stream_create_post_processing_elements(GstPad *pad, struct wg_parser
 
     if (!strcmp(name, "video/x-raw"))
     {
-        /* decodebin doesn't provide framerate for raw video. This causes the
-         * the deinterlace element to reject the caps. So we need to go through
-         * videoconvert first (as it fixates the framerate) */
+        /* DirectShow can express interlaced video, but downstream filters can't
+         * necessarily consume it. In particular, the video renderer can't. */
+        if (!(element = create_element("deinterlace", "good"))
+                || !append_element(parser->container, element, &first, &last))
+            return false;
 
         /* decodebin considers many YUV formats to be "raw", but some quartz
          * filters can't handle those. Also, videoflip can't handle all "raw"
          * formats either. Add a videoconvert to swap color spaces. */
         if (!(element = create_element("videoconvert", "base"))
-                || !append_element(parser->container, element, &first, &last))
-            return false;
-
-        /* DirectShow can express interlaced video, but downstream filters can't
-         * necessarily consume it. In particular, the video renderer can't. */
-        if (!(element = create_element("deinterlace", "good"))
                 || !append_element(parser->container, element, &first, &last))
             return false;
 
@@ -1310,6 +1244,9 @@ static GstFlowReturn src_getrange_cb(GstPad *pad, GstObject *parent,
         GST_LOG("Returning empty buffer.");
         return GST_FLOW_OK;
     }
+
+    if (size >= input_cache_chunk_size || sizeof(void*) == 4)
+        return issue_read_request(parser, offset, size, buffer);
 
     if (offset >= parser->file_size)
         return GST_FLOW_EOS;
@@ -1735,8 +1672,8 @@ static NTSTATUS wg_parser_connect(void *args)
         struct wg_parser_stream *stream = parser->streams[i];
         gint64 duration;
 
-        /* Make sure the stream has a buffer or an initial gap. */
-        while (!parser->error && !stream->has_buffer && !stream->has_initial_gap)
+        /* If we received a buffer, waiting for tags or caps does not make sense anymore. */
+        while ((!stream->current_caps || !stream->has_tags) && !parser->error && !stream->has_buffer)
             pthread_cond_wait(&parser->init_cond, &parser->mutex);
 
         /* GStreamer doesn't actually provide any guarantees about when duration
@@ -1934,11 +1871,9 @@ static NTSTATUS wg_parser_create(void *args)
     pthread_cond_init(&parser->init_cond, NULL);
     pthread_cond_init(&parser->read_cond, NULL);
     pthread_cond_init(&parser->read_done_cond, NULL);
-    parser->output_compressed = params->flags & WG_PARSER_CREATE_FLAG_OUTPUT_COMPRESSED;
-    parser->pts_rebased = params->flags & WG_PARSER_CREATE_FLAG_PTS_REBASED;
+    parser->output_compressed = params->output_compressed;
     parser->err_on = params->err_on;
     parser->warn_on = params->warn_on;
-    parser->base_pts = GST_CLOCK_TIME_NONE;
     GST_DEBUG("Created winegstreamer parser %p.", parser);
     params->parser = (wg_parser_t)(ULONG_PTR)parser;
     return S_OK;

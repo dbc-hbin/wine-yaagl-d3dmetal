@@ -25,6 +25,7 @@
 #include <stdio.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "winternl.h"
 
 #include "file.h"
@@ -68,11 +69,27 @@ static void inproc_sync_destroy( struct object *obj );
 
 static const struct object_ops inproc_sync_ops =
 {
-    .size    = sizeof(struct inproc_sync),
-    .type    = &no_type,
-    .dump    = inproc_sync_dump,
-    .signal  = inproc_sync_signal,
-    .destroy = inproc_sync_destroy,
+    sizeof(struct inproc_sync), /* size */
+    &no_type,                   /* type */
+    inproc_sync_dump,           /* dump */
+    no_add_queue,               /* add_queue */
+    NULL,                       /* remove_queue */
+    NULL,                       /* signaled */
+    NULL,                       /* satisfied */
+    inproc_sync_signal,         /* signal */
+    no_get_fd,                  /* get_fd */
+    default_get_sync,           /* get_sync */
+    default_map_access,         /* map_access */
+    default_get_sd,             /* get_sd */
+    default_set_sd,             /* set_sd */
+    default_get_full_name,      /* get_full_name */
+    no_lookup_name,             /* lookup_name */
+    directory_link_name,        /* link_name */
+    default_unlink_name,        /* unlink_name */
+    no_open_file,               /* open_file */
+    no_kernel_obj_list,         /* get_kernel_obj_list */
+    no_close_handle,            /* close_handle */
+    inproc_sync_destroy,        /* destroy */
 };
 
 int get_inproc_sync_fd( struct inproc_sync *sync )
@@ -224,7 +241,6 @@ static int get_obj_inproc_sync( struct object *obj, int *type )
     return fd;
 }
 
-
 #elif defined(__APPLE__)
 
 #include <fcntl.h>
@@ -250,11 +266,27 @@ static void inproc_sync_destroy( struct object *obj );
 
 static const struct object_ops inproc_sync_ops =
 {
-    .size    = sizeof(struct inproc_sync),
-    .type    = &no_type,
-    .dump    = inproc_sync_dump,
-    .signal  = inproc_sync_signal,
-    .destroy = inproc_sync_destroy,
+    sizeof(struct inproc_sync), /* size */
+    &no_type,                   /* type */
+    inproc_sync_dump,           /* dump */
+    no_add_queue,               /* add_queue */
+    NULL,                       /* remove_queue */
+    NULL,                       /* signaled */
+    NULL,                       /* satisfied */
+    inproc_sync_signal,         /* signal */
+    no_get_fd,                  /* get_fd */
+    default_get_sync,           /* get_sync */
+    default_map_access,         /* map_access */
+    default_get_sd,             /* get_sd */
+    default_set_sd,             /* set_sd */
+    default_get_full_name,      /* get_full_name */
+    no_lookup_name,             /* lookup_name */
+    directory_link_name,        /* link_name */
+    default_unlink_name,        /* unlink_name */
+    no_open_file,               /* open_file */
+    no_kernel_obj_list,         /* get_kernel_obj_list */
+    no_close_handle,            /* close_handle */
+    inproc_sync_destroy,        /* destroy */
 };
 
 int get_inproc_sync_fd( struct inproc_sync *sync )
@@ -357,8 +389,8 @@ static int inproc_sync_signal( struct object *obj, unsigned int access, int sign
     struct inproc_sync *sync = (struct inproc_sync *)obj;
     assert( obj->ops == &inproc_sync_ops );
 
-    assert( sync->type == INPROC_SYNC_INTERNAL || sync->type == INPROC_SYNC_EVENT );
-    assert( signal == 0 || signal == 1 );
+    assert( sync->type == INPROC_SYNC_INTERNAL || sync->type == INPROC_SYNC_EVENT ); /* never called for mutex / semaphore */
+    assert( signal == 0 || signal == 1 ); /* never called from signal_object */
 
     if (signal) signal_inproc_sync( sync );
     else reset_inproc_sync( sync );
@@ -387,14 +419,9 @@ static int get_obj_inproc_sync( struct object *obj, int *type )
     if (sync->ops == &inproc_sync_ops)
     {
         struct inproc_sync *inproc = (struct inproc_sync *)sync;
-
-        if (!msync_grab_object( inproc->msync ))
-            set_error( STATUS_NO_MEMORY );
-        else
-        {
-            *type = inproc->type;
-            shm_idx = (int)inproc->msync->shm_idx;
-        }
+        msync_grab_object( inproc->msync );
+        *type = inproc->type;
+        shm_idx = (int)inproc->msync->shm_idx;
     }
 
     release_object( sync );
@@ -461,10 +488,7 @@ DECL_HANDLER(get_inproc_sync_fd)
 
     reply->access = get_handle_access( current->process, req->handle );
 
-    if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0)
-    {
-        if (!get_error()) set_error( STATUS_NOT_IMPLEMENTED );
-    }
+    if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0) set_error( STATUS_NOT_IMPLEMENTED );
     else
     {
         if (do_msync()) reply->shm_idx = (unsigned int)fd;

@@ -1471,30 +1471,13 @@ static void free_stream_buffers(struct wm_reader *reader)
     }
 }
 
-static void release_stream_allocators(struct wm_reader *reader)
-{
-    unsigned int i;
-
-    for (i = 0; i < reader->stream_count; ++i)
-    {
-        struct wm_stream *stream = &reader->streams[i];
-
-        if (stream->output_allocator)
-            IWMReaderAllocatorEx_Release(stream->output_allocator);
-        stream->output_allocator = NULL;
-        if (stream->stream_allocator)
-            IWMReaderAllocatorEx_Release(stream->stream_allocator);
-        stream->stream_allocator = NULL;
-    }
-}
-
 static HRESULT init_stream(struct wm_reader *reader)
 {
     wg_parser_t wg_parser;
     HRESULT hr;
     WORD i;
 
-    if (!(wg_parser = wg_parser_create(WG_PARSER_CREATE_FLAG_NONE)))
+    if (!(wg_parser = wg_parser_create(FALSE)))
         return E_OUTOFMEMORY;
 
     reader->wg_parser = wg_parser;
@@ -1559,8 +1542,7 @@ static HRESULT init_stream(struct wm_reader *reader)
             if (stream->format.u.video.height > 0)
                 stream->format.u.video.height = -stream->format.u.video.height;
         }
-        if (FAILED(hr = wg_parser_stream_enable(stream->wg_stream, &stream->format)))
-            goto out_disconnect_parser;
+        wg_parser_stream_enable(stream->wg_stream, &stream->format);
     }
 
     /* We probably discarded events because streams weren't enabled yet.
@@ -1622,7 +1604,7 @@ static HRESULT reinit_stream(struct wm_reader *reader, bool read_compressed)
     wg_parser_destroy(reader->wg_parser);
     reader->wg_parser = 0;
 
-    if (!(wg_parser = wg_parser_create(read_compressed ? WG_PARSER_CREATE_FLAG_OUTPUT_COMPRESSED : WG_PARSER_CREATE_FLAG_NONE)))
+    if (!(wg_parser = wg_parser_create(read_compressed)))
         return E_OUTOFMEMORY;
 
     reader->wg_parser = wg_parser;
@@ -1655,10 +1637,8 @@ static HRESULT reinit_stream(struct wm_reader *reader, bool read_compressed)
         stream->wg_stream = wg_parser_get_stream(reader->wg_parser, i);
         stream->reader = reader;
         wg_parser_stream_get_current_format(stream->wg_stream, &format);
-        if (stream->selection == WMT_ON
-                && FAILED(hr = wg_parser_stream_enable(stream->wg_stream,
-                read_compressed ? &format : &stream->format)))
-            goto out_disconnect_parser;
+        if (stream->selection == WMT_ON)
+            wg_parser_stream_enable(stream->wg_stream, read_compressed ? &format : &stream->format);
     }
 
     /* We probably discarded events because streams weren't enabled yet.
@@ -1668,14 +1648,10 @@ static HRESULT reinit_stream(struct wm_reader *reader, bool read_compressed)
     if (WaitForSingleObject(reader->read_sem, INFINITE) != WAIT_OBJECT_0)
     {
         ERR("Failed to wait for read semaphore.\n");
-        hr = HRESULT_FROM_WIN32(GetLastError());
-        goto out_disconnect_parser;
+        goto out_shutdown_thread;
     }
 
     return S_OK;
-
-out_disconnect_parser:
-    wg_parser_disconnect(reader->wg_parser);
 
 out_shutdown_thread:
     EnterCriticalSection(&reader->shutdown_cs);
@@ -1692,7 +1668,6 @@ out_destroy_parser:
         reader->read_sem = NULL;
     }
     free_stream_buffers(reader);
-    release_stream_allocators(reader);
     wg_parser_destroy(reader->wg_parser);
     reader->wg_parser = 0;
 
@@ -1921,7 +1896,6 @@ static ULONG WINAPI unknown_inner_Release(IUnknown *iface)
         reader->shutdown_cs.DebugInfo->Spare[0] = 0;
         DeleteCriticalSection(&reader->shutdown_cs);
 
-        free(reader->streams);
         free(reader);
     }
 
@@ -1975,7 +1949,6 @@ static HRESULT WINAPI reader_Close(IWMSyncReader2 *iface)
     ReleaseSemaphore(reader->read_sem, 1, NULL);
 
     free_stream_buffers(reader);
-    release_stream_allocators(reader);
 
     wg_parser_disconnect(reader->wg_parser);
 
@@ -2486,9 +2459,8 @@ static HRESULT WINAPI reader_SetOutputProps(IWMSyncReader2 *iface, DWORD output,
         goto out;
     }
 
-    if (FAILED(hr = wg_parser_stream_enable(stream->wg_stream, &format)))
-        goto out;
     stream->format = format;
+    wg_parser_stream_enable(stream->wg_stream, &format);
 
     /* Re-decode any buffers that might have been generated with the old format.
      *
@@ -2579,7 +2551,6 @@ static HRESULT WINAPI reader_SetReadStreamSamples(IWMSyncReader2 *iface, WORD st
 {
     struct wm_reader *reader = impl_from_IWMSyncReader2(iface);
     struct wm_stream *stream;
-    HRESULT hr;
 
     TRACE("reader %p, stream_index %u, compressed %d.\n", reader, stream_number, compressed);
 
@@ -2591,11 +2562,11 @@ static HRESULT WINAPI reader_SetReadStreamSamples(IWMSyncReader2 *iface, WORD st
         return E_INVALIDARG;
     }
 
-    if (SUCCEEDED(hr = reinit_stream(reader, compressed)))
-        stream->read_compressed = compressed;
+    stream->read_compressed = compressed;
+    reinit_stream(reader, compressed);
 
     LeaveCriticalSection(&reader->cs);
-    return hr;
+    return S_OK;
 }
 
 static HRESULT WINAPI reader_SetStreamsSelected(IWMSyncReader2 *iface,
@@ -2603,7 +2574,6 @@ static HRESULT WINAPI reader_SetStreamsSelected(IWMSyncReader2 *iface,
 {
     struct wm_reader *reader = impl_from_IWMSyncReader2(iface);
     struct wm_stream *stream;
-    HRESULT hr = S_OK;
     WORD i;
 
     TRACE("reader %p, count %u, stream_numbers %p, selections %p.\n",
@@ -2630,6 +2600,7 @@ static HRESULT WINAPI reader_SetStreamsSelected(IWMSyncReader2 *iface,
     for (i = 0; i < count; ++i)
     {
         stream = wm_reader_get_stream_by_stream_number(reader, stream_numbers[i]);
+        stream->selection = selections[i];
         if (selections[i] == WMT_OFF)
         {
             TRACE("Disabling stream %u.\n", stream_numbers[i]);
@@ -2645,22 +2616,19 @@ static HRESULT WINAPI reader_SetStreamsSelected(IWMSyncReader2 *iface,
             {
                 struct wg_format format;
                 wg_parser_stream_get_current_format(stream->wg_stream, &format);
-                hr = wg_parser_stream_enable(stream->wg_stream, &format);
+                wg_parser_stream_enable(stream->wg_stream, &format);
             }
             else
             {
-                hr = wg_parser_stream_enable(stream->wg_stream, &stream->format);
+                wg_parser_stream_enable(stream->wg_stream, &stream->format);
             }
-            if (FAILED(hr))
-                break;
         }
-        stream->selection = selections[i];
     }
 
     LeaveCriticalSection(&reader->cs);
     if (WaitForSingleObject(reader->read_sem, INFINITE) != WAIT_OBJECT_0)
         ERR("Failed to wait for read thread to pause.\n");
-    return hr;
+    return S_OK;
 }
 
 static HRESULT WINAPI reader_SetRangeByTimecode(IWMSyncReader2 *iface, WORD stream_num,

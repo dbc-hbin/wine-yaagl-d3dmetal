@@ -1,0 +1,460 @@
+--- a/configure.ac
++++ b/configure.ac
+@@ -2485,6 +2485,8 @@
+ WINE_CONFIG_MAKEFILE(dlls/amsi)
+ WINE_CONFIG_MAKEFILE(dlls/amstream)
+ WINE_CONFIG_MAKEFILE(dlls/amstream/tests)
++WINE_CONFIG_MAKEFILE(dlls/amd_fidelityfx_upscaler_dx12)
++WINE_CONFIG_MAKEFILE(dlls/amd_fidelityfx_framegeneration_dx12)
+ WINE_CONFIG_MAKEFILE(dlls/apisetschema)
+ WINE_CONFIG_MAKEFILE(dlls/apphelp)
+ WINE_CONFIG_MAKEFILE(dlls/apphelp/tests)
+--- a/configure
++++ b/configure
+@@ -987,6 +987,8 @@
+ enable_advpack
+ enable_amsi
+ enable_amstream
++enable_amd_fidelityfx_upscaler_dx12
++enable_amd_fidelityfx_framegeneration_dx12
+ enable_apisetschema
+ enable_apphelp
+ enable_appwiz_cpl
+@@ -22488,6 +22490,8 @@
+ wine_fn_config_makefile dlls/amsi enable_amsi
+ wine_fn_config_makefile dlls/amstream enable_amstream
+ wine_fn_config_makefile dlls/amstream/tests enable_tests
++wine_fn_config_makefile dlls/amd_fidelityfx_upscaler_dx12 enable_amd_fidelityfx_upscaler_dx12
++wine_fn_config_makefile dlls/amd_fidelityfx_framegeneration_dx12 enable_amd_fidelityfx_framegeneration_dx12
+ wine_fn_config_makefile dlls/apisetschema enable_apisetschema
+ wine_fn_config_makefile dlls/apphelp enable_apphelp
+ wine_fn_config_makefile dlls/apphelp/tests enable_tests
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -735,6 +735,7 @@
+     struct window_surface header;
+     HANDLE      section;
+     HWND        parent;
++    DWORD       parent_pid;
+     BITMAPINFO  info;
+ };
+ 
+@@ -775,13 +776,11 @@
+     unsigned int status;
+     CLIENT_ID cid;
+     HANDLE h2;
+-    DWORD pid;
+ 
+     TRACE( "freeing %p\n", surface );
+     if (surface->section)
+     {
+-        get_window_thread( surface->parent, &pid );
+-        cid.UniqueProcess = ULongToHandle(pid);
++        cid.UniqueProcess = ULongToHandle(surface->parent_pid);
+         cid.UniqueThread  = 0;
+         status = NtOpenProcess( &parent_process, PROCESS_DUP_HANDLE, &attr, &cid );
+         if (status)
+@@ -821,7 +820,7 @@
+     HANDLE mapping;
+     unsigned int status;
+     HBITMAP bitmap;
+-    DWORD pid;
++    DWORD pid = 0;
+     RECT r;
+ 
+     TRACE( "hwnd %p parent %p\n", window, parent );
+@@ -868,6 +867,12 @@
+     }
+ 
+     surface = (struct shm_window_surface *)window_surface_create( sizeof(*surface), &shm_surface_funcs, window, &r, &info, bitmap );
++    if (!surface)
++    {
++        NtGdiDeleteObjectApp( bitmap );
++        NtClose( mapping );
++        return NULL;
++    }
+     surface->info = info;
+ 
+     TRACE( "crating surface %p for visible_rect %s of window %p\n", surface,
+@@ -887,6 +892,7 @@
+         return NULL;
+     }
+ 
++    surface->parent_pid = pid;
+     status = NtDuplicateObject( GetCurrentProcess(), mapping, parent_process,
+                                 &surface->section, FILE_MAP_READ, FALSE, 0 );
+     NtClose( parent_process );
+--- a/dlls/winemac.drv/d3dmetal.c
++++ b/dlls/winemac.drv/d3dmetal.c
+@@ -29,6 +29,7 @@
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+ #include "macdrv.h"
++#include "../../include/yaagl_d3dmetal_display.h"
+ #include "shellapi.h"
+ #include "wine/server.h"
+ 
+@@ -90,8 +91,42 @@
+ C_ASSERT(sizeof(struct d3dmetal_macdrv_win_data) == 120);
+ 
+ void OnMainThread(dispatch_block_t block);
+-static void cf_client_surface_release(CFAllocatorRef allocator, const void *client_surface);
+ 
++struct metal_view_surface
++{
++    macdrv_metal_view view;
++    struct macdrv_client_surface *surface;
++    struct metal_view_surface *next;
++};
++
++static pthread_mutex_t metal_view_surfaces_mutex = PTHREAD_MUTEX_INITIALIZER;
++static struct metal_view_surface *metal_view_surfaces;
++
++/* The window array owns the original reference; an active view owns another.
++ * Removal transfers the array reference to the caller for release after the
++ * window lock is dropped (detaching a client surface reacquires that lock). */
++static BOOL remove_window_surface(struct macdrv_win_data *data, struct macdrv_client_surface *surface)
++{
++    CFIndex index;
++
++    if (!data || !data->d3dmetal_client_surfaces) return FALSE;
++    index = CFArrayGetFirstIndexOfValue(data->d3dmetal_client_surfaces,
++                                       CFRangeMake(0, CFArrayGetCount(data->d3dmetal_client_surfaces)), surface);
++    if (index == kCFNotFound) return FALSE;
++    CFArrayRemoveValueAtIndex(data->d3dmetal_client_surfaces, index);
++    return TRUE;
++}
++
++void macdrv_retain_d3dmetal_client_surface(void *surface)
++{
++    client_surface_add_ref(surface);
++}
++
++void macdrv_release_d3dmetal_client_surface(void *surface)
++{
++    client_surface_release(surface);
++}
++
+ static void my_macdrv_init_display_devices(BOOL p1)
+ {
+     TRACE("macdrv_init_display_devices %d - no-op\n", p1);
+@@ -110,6 +145,7 @@
+      * get_win_data() -> create_metal_device() -> create_metal_view() -> get_metal_layer() -> release_win_data()
+      */
+     client_surface = macdrv_client_surface_create(hwnd);
++    if (!client_surface) return NULL;
+ 
+     /* get_win_data() needs to happen after client_surface creation to avoid deadlocks */
+     data = get_win_data(hwnd);
+@@ -123,13 +159,18 @@
+ 
+     if (!data->d3dmetal_client_surfaces)
+     {
+-        static const CFArrayCallBacks callbacks = { .release = cf_client_surface_release };
+-        data->d3dmetal_client_surfaces = CFArrayCreateMutable(NULL, 0, &callbacks);
++        data->d3dmetal_client_surfaces = CFArrayCreateMutable(NULL, 0, NULL);
+     }
++    d3dm_data = calloc(1, sizeof(*d3dm_data));
++    if (!data->d3dmetal_client_surfaces || !d3dm_data)
++    {
++        release_win_data(data);
++        client_surface_release(&client_surface->client);
++        free(d3dm_data);
++        return NULL;
++    }
+     CFArrayAppendValue(data->d3dmetal_client_surfaces, client_surface);
+ 
+-    d3dm_data = calloc(1, sizeof(*d3dm_data));
+-
+     d3dm_data->hwnd = data->hwnd;
+     d3dm_data->cocoa_window = data->cocoa_window;
+     /* cocoa_view is no longer present in macdrv_win_data. D3DMetal doesn't use it. */
+@@ -149,18 +190,30 @@
+     /* swap_interval is no longer present in macdrv_win_data. Assume D3DMetal doesn't use it. */
+     /* surface/unminimized_surface are no longer present in macdrv_win_data. Assume D3DMetal doesn't use it. */
+     d3dm_data->padding[0] = data;
++    d3dm_data->padding[1] = client_surface;
+ 
+     return d3dm_data;
+ }
+ 
+ static void my_release_win_data(struct d3dmetal_macdrv_win_data *data)
+ {
++    struct macdrv_client_surface *surface;
++    struct metal_view_surface *entry;
++    BOOL active = FALSE, removed = FALSE;
++
+     TRACE("release_win_data %p\n", data);
+ 
+-    if (!data)
+-        return;
++    if (!data) return;
+ 
++    surface = data->padding[1];
++    pthread_mutex_lock(&metal_view_surfaces_mutex);
++    for (entry = metal_view_surfaces; entry; entry = entry->next)
++        if (entry->surface == surface) { active = TRUE; break; }
++    pthread_mutex_unlock(&metal_view_surfaces_mutex);
++
++    if (!active) removed = remove_window_surface(data->padding[0], surface);
+     release_win_data(data->padding[0]);
++    if (removed) client_surface_release(&surface->client);
+     free(data);
+ }
+ 
+@@ -184,8 +237,27 @@
+ 
+ static macdrv_metal_view my_macdrv_view_create_metal_view(macdrv_view v, macdrv_metal_device d)
+ {
++    struct metal_view_surface *entry;
++    struct client_surface *surface;
++    macdrv_metal_view view;
++
+     TRACE("macdrv_view_create_metal_view %p %p\n", v, d);
+-    return macdrv_view_create_metal_view(v, d);
++    if (!(view = macdrv_view_create_metal_view(v, d))) return NULL;
++    surface = macdrv_get_view_d3dmetal_client_surface(v);
++    if (!surface) return view;
++    if (!(entry = malloc(sizeof(*entry))))
++    {
++        macdrv_view_release_metal_view(view);
++        return NULL;
++    }
++    entry->view = view;
++    entry->surface = impl_from_client_surface(surface);
++    client_surface_add_ref(surface);
++    pthread_mutex_lock(&metal_view_surfaces_mutex);
++    entry->next = metal_view_surfaces;
++    metal_view_surfaces = entry;
++    pthread_mutex_unlock(&metal_view_surfaces_mutex);
++    return view;
+ }
+ 
+ static macdrv_metal_layer my_macdrv_view_get_metal_layer(macdrv_metal_view v)
+@@ -196,8 +268,30 @@
+ 
+ static void my_macdrv_view_release_metal_view(macdrv_metal_view v)
+ {
++    struct metal_view_surface **cursor, *entry = NULL;
++    struct macdrv_win_data *data;
++    BOOL removed;
++
+     TRACE("macdrv_view_release_metal_view %p\n", v);
+-    return macdrv_view_release_metal_view(v);
++    pthread_mutex_lock(&metal_view_surfaces_mutex);
++    for (cursor = &metal_view_surfaces; *cursor; cursor = &(*cursor)->next)
++        if ((*cursor)->view == v)
++        {
++            entry = *cursor;
++            *cursor = entry->next;
++            break;
++        }
++    pthread_mutex_unlock(&metal_view_surfaces_mutex);
++
++    macdrv_view_release_metal_view(v);
++    if (!entry) return;
++
++    data = get_win_data(entry->surface->client.hwnd);
++    removed = remove_window_surface(data, entry->surface);
++    if (data) release_win_data(data);
++    if (removed) client_surface_release(&entry->surface->client);
++    client_surface_release(&entry->surface->client);
++    free(entry);
+ }
+ 
+ static void my_OnMainThread(dispatch_block_t b)
+@@ -394,6 +488,33 @@
+     return NtUserSetWindowLongPtr( hwnd, offset, newval, FALSE );
+ }
+ 
++/* Separate SysV export: do not extend the fixed 192-byte D3DMetal ABI. */
++DECLSPEC_EXPORT int macdrv_query_d3dmetal_display(uintptr_t window, uintptr_t monitor_override,
++                                                 struct yaagl_d3dmetal_display *out)
++{
++    MONITORINFOEXW info = {.cbSize = sizeof(info)};
++    DEVMODEW mode = {.dmSize = sizeof(mode)};
++    UNICODE_STRING device;
++    HMONITOR monitor;
++
++    if (!out) return 0;
++    monitor = monitor_override ? (HMONITOR)monitor_override :
++              NtUserMonitorFromWindow((HWND)window, MONITOR_DEFAULTTONEAREST);
++    if (!monitor || !NtUserGetMonitorInfo(monitor, (MONITORINFO *)&info)) return 0;
++
++    RtlInitUnicodeString(&device, info.szDevice);
++    if (!NtUserEnumDisplaySettings(&device, ENUM_CURRENT_SETTINGS, &mode, 0) ||
++        !(mode.dmFields & DM_DISPLAYFREQUENCY) || !mode.dmDisplayFrequency) return 0;
++
++    out->monitor = (uintptr_t)monitor;
++    out->refresh_rate = mode.dmDisplayFrequency;
++    out->left = info.rcMonitor.left;
++    out->top = info.rcMonitor.top;
++    out->right = info.rcMonitor.right;
++    out->bottom = info.rcMonitor.bottom;
++    return 1;
++}
++
+ DECLSPEC_EXPORT struct macdrv_functions_t macdrv_functions =
+ {
+     &my_macdrv_init_display_devices,
+@@ -427,11 +548,6 @@
+     TRACE("client_surface %p\n", event->client_surface_presented.client_surface);
+ 
+     client_surface_present(event->client_surface_presented.client_surface);
+-}
+-
+-static void cf_client_surface_release(CFAllocatorRef allocator, const void *client_surface)
+-{
+-    client_surface_release((struct client_surface *)client_surface);
+ }
+ 
+ #endif
+--- a/dlls/winemac.drv/d3dmetal_objc.m
++++ b/dlls/winemac.drv/d3dmetal_objc.m
+@@ -58,6 +58,7 @@
+                 {
+                     macdrv_event* event;
+                     event = macdrv_create_event(CLIENT_SURFACE_PRESENTED, (WineWindow*)view.window);
++                    macdrv_retain_d3dmetal_client_surface(client_surface);
+                     event->client_surface_presented.client_surface = client_surface;
+ 
+                     WineEventQueue *queue = [(WineWindow*)view.window queue];
+--- a/dlls/winemac.drv/cocoa_event.m
++++ b/dlls/winemac.drv/cocoa_event.m
+@@ -666,6 +666,11 @@
+     {
+         switch (event->type)
+         {
++            case CLIENT_SURFACE_PRESENTED:
++#if defined(__x86_64__)
++                macdrv_release_d3dmetal_client_surface(event->client_surface_presented.client_surface);
++#endif
++                break;
+             case IM_SET_TEXT:
+                 if (event->im_set_text.text)
+                     CFRelease(event->im_set_text.text);
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -611,6 +611,8 @@
+ 
+ /* CW HACK 22435 */
+ extern void macdrv_client_surface_presented(const macdrv_event *event);
++extern void macdrv_retain_d3dmetal_client_surface(void *surface);
++extern void macdrv_release_d3dmetal_client_surface(void *surface);
+ extern void *macdrv_get_view_d3dmetal_client_surface(macdrv_view v);
+ void macdrv_set_view_d3dmetal_client_surface(macdrv_view v, void *client_surface);
+ 
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -536,22 +536,22 @@
+ 
+ 
+ /**********************************************************************
+- *              destroy_cocoa_window
++ *              detach_cocoa_window
+  *
+- * Destroy the whole Mac window for a given window.
++ * Detach the Mac window under the window-data lock; destroy it after unlocking.
+  */
+-static void destroy_cocoa_window(struct macdrv_win_data *data)
++static macdrv_window detach_cocoa_window(struct macdrv_win_data *data)
+ {
+-    if (!data->cocoa_window) return;
++    macdrv_window window = data->cocoa_window;
++    if (!window) return NULL;
+ 
+     TRACE("win %p Cocoa win %p\n", data->hwnd, data->cocoa_window);
+ 
+-    macdrv_destroy_cocoa_window(data->cocoa_window);
+     data->cocoa_window = 0;
+     data->on_screen = FALSE;
++    return window;
+ }
+ 
+-
+ /***********************************************************************
+  *              macdrv_create_win_data
+  *
+@@ -1225,15 +1225,18 @@
+     NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&rect, 2, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
+ 
+     surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd);
++    if (!surface) return NULL;
+     surface->cocoa_view = macdrv_create_view(cgrect_from_rect(rect));
+-    macdrv_set_view_hidden(surface->cocoa_view, TRUE);
+-
+-    if (surface)
++    if (!surface->cocoa_view)
+     {
+-        macdrv_client_surface_update(&surface->client);
+-        macdrv_client_surface_present(&surface->client, 0);
++        client_surface_release(&surface->client);
++        return NULL;
+     }
++    macdrv_set_view_hidden(surface->cocoa_view, TRUE);
+ 
++    macdrv_client_surface_update(&surface->client);
++    macdrv_client_surface_present(&surface->client, 0);
++
+     return surface;
+ }
+ 
+@@ -1323,6 +1326,7 @@
+ void macdrv_DestroyWindow(HWND hwnd)
+ {
+     struct macdrv_win_data *data;
++    macdrv_window window;
+ 
+     TRACE("%p\n", hwnd);
+ 
+@@ -1331,13 +1335,21 @@
+     if (hwnd == get_capture()) macdrv_SetCapture(0, 0);
+     if (data->drag_event) NtSetEvent(data->drag_event, NULL);
+ 
+-    destroy_cocoa_window(data);
++    window = detach_cocoa_window(data);
+ 
+-    /* CW HACK 22435 */
+-    if (data->d3dmetal_client_surfaces) CFRelease(data->d3dmetal_client_surfaces);
+-
+     CFDictionaryRemoveValue(win_datas, hwnd);
+     release_win_data(data);
++    if (window) macdrv_destroy_cocoa_window(window);
++
++    /* Array slots own client-surface references, without CF callbacks.  Release
++     * them outside the window lock because detachment may reacquire it. */
++    if (data->d3dmetal_client_surfaces)
++    {
++        CFIndex i, count = CFArrayGetCount(data->d3dmetal_client_surfaces);
++        for (i = 0; i < count; i++)
++            client_surface_release((struct client_surface *)CFArrayGetValueAtIndex(data->d3dmetal_client_surfaces, i));
++        CFRelease(data->d3dmetal_client_surfaces);
++    }
+     free(data);
+ }
+ 
+@@ -1394,6 +1406,7 @@
+ void macdrv_SetParent(HWND hwnd, HWND parent, HWND old_parent)
+ {
+     struct macdrv_win_data *data;
++    macdrv_window window = NULL;
+ 
+     TRACE("%p, %p, %p\n", hwnd, parent, old_parent);
+ 
+@@ -1405,7 +1418,7 @@
+         if (old_parent == NtUserGetDesktopWindow())
+         {
+             /* destroy the old Mac window */
+-            destroy_cocoa_window(data);
++            window = detach_cocoa_window(data);
+         }
+     }
+     else  /* new top level window */
+@@ -1413,6 +1426,7 @@
+         create_cocoa_window(data);
+     }
+     release_win_data(data);
++    if (window) macdrv_destroy_cocoa_window(window);
+ }
+ 
+ 

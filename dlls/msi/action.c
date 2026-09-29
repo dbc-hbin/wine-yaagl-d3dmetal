@@ -230,7 +230,6 @@ UINT msi_parse_command_line( MSIPACKAGE *package, LPCWSTR szCommandLine,
         while (ptr[len - 1] == ' ') len--;
 
         prop = malloc( (len + 1) * sizeof(WCHAR) );
-        if (!prop) return ERROR_OUTOFMEMORY;
         memcpy( prop, ptr, len * sizeof(WCHAR) );
         prop[len] = 0;
         if (!preserve_case) wcsupr( prop );
@@ -240,11 +239,6 @@ UINT msi_parse_command_line( MSIPACKAGE *package, LPCWSTR szCommandLine,
 
         num_quotes = 0;
         val = malloc( (wcslen( ptr2 ) + 1) * sizeof(WCHAR) );
-        if (!val)
-        {
-            free( prop );
-            return ERROR_OUTOFMEMORY;
-        }
         len = parse_prop( ptr2, val, &num_quotes );
         if (num_quotes % 2)
         {
@@ -7824,6 +7818,34 @@ UINT ACTION_PerformAction(MSIPACKAGE *package, const WCHAR *action)
     UINT rc;
 
     TRACE("Performing action (%s)\n", debugstr_w(action));
+
+    /* CrossOver Hack #12413 for Quicken 2015 Premier. Don't install the PDF driver */
+    {
+        static const WCHAR pdf[] = {'I','n','s','t','a','l','l','P','D','F','D','r','i','v','e','r',0};
+        if (!wcsicmp(action, pdf))
+        {
+            FIXME("HACK: Skipping installation of pdf driver\n");
+            return ERROR_SUCCESS;
+        }
+    }
+    /* CrossOver Hack #16064 for Office 2010 installer. Sleep 5 seconds to avoid generating duplicate keys */
+    {
+        static const WCHAR arpwrite[] = {'A','r','p','W','r','i','t','e',0};
+        if (!wcscmp(action, arpwrite))
+        {
+            FIXME("HACK: Seeping 5 seconds\n");
+            Sleep(5000);
+        }
+    }
+    /* CrossOver Hack #18329 for Office 365. Always install osppc.dll. */
+    {
+        static const WCHAR setusespp[] = L"SetUSE_SPP_OVER_OSPP";
+        if (!wcsicmp(action, setusespp))
+        {
+            FIXME("HACK: Skipping SetUSE_SPP_OVER_OSPP action.\n");
+            return ERROR_SUCCESS;
+        }
+    }
 
     package->action_progress_increment = 0;
     rc = ACTION_HandleStandardAction(package, action);

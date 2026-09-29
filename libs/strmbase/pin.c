@@ -1148,14 +1148,10 @@ static HRESULT WINAPI MemInputPin_ReceiveMultiple(IMemInputPin * iface, IMediaSa
 static HRESULT WINAPI MemInputPin_ReceiveCanBlock(IMemInputPin * iface)
 {
     struct strmbase_sink *pin = impl_from_IMemInputPin(iface);
-    HRESULT hr = S_OK;
 
     TRACE("pin %p %s:%s.\n", pin, debugstr_w(pin->pin.filter->name), debugstr_w(pin->pin.name));
 
-    if (pin->pFuncsTable->sink_receive_can_block)
-        hr = pin->pFuncsTable->sink_receive_can_block(pin);
-
-    return hr;
+    return S_OK;
 }
 
 static const IMemInputPinVtbl MemInputPin_Vtbl =

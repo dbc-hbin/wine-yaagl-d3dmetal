@@ -30,6 +30,7 @@
 #include <IOKit/pwr_mgt/IOPMLib.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "macdrv.h"
 #include "shellapi.h"
 #include "wine/server.h"
@@ -45,6 +46,8 @@ int topmost_float_inactive = TOPMOST_FLOAT_INACTIVE_NONFULLSCREEN;
 bool capture_displays_for_fullscreen = false;
 BOOL allow_vsync = TRUE;
 BOOL allow_set_gamma = TRUE;
+/* CrossOver Hack 10912: Mac Edit menu */
+int mac_edit_menu = MAC_EDIT_MENU_BY_KEY;
 bool left_option_is_alt = false;
 bool right_option_is_alt = false;
 bool left_command_is_ctrl = false;
@@ -58,7 +61,6 @@ int gl_surface_mode = GL_SURFACE_IN_FRONT_OPAQUE;
 bool retina_enabled = false;
 bool enable_app_nap = false;
 
-pthread_key_t macdrv_thread_data_key = 0;
 UINT64 app_icon_callback = 0;
 UINT64 app_quit_request_callback = 0;
 UINT64 regcreateopenkeyexa_callback = 0;
@@ -291,7 +293,7 @@ static void setup_options(void)
 
     /* open the app-specific key */
 
-    appname = RtlGetCurrentPeb()->ProcessParameters->ImagePathName.Buffer;
+    appname = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
     if ((p = wcsrchr(appname, '/'))) appname = p + 1;
     if ((p = wcsrchr(appname, '\\'))) appname = p + 1;
     len = lstrlenW(appname);
@@ -330,6 +332,18 @@ static void setup_options(void)
     if (!get_config_key(hkey, appkey, "AllowSetGamma", buffer, sizeof(buffer)))
         allow_set_gamma = IS_OPTION_TRUE(buffer[0]);
 
+    /* CrossOver Hack 10912: Mac Edit menu */
+    if (!get_config_key(hkey, appkey, "EditMenu", buffer, sizeof(buffer)))
+    {
+        static const WCHAR messageW[] = {'m','e','s','s','a','g','e',0};
+        static const WCHAR keyW[] = {'k','e','y',0};
+        if (!wcscmp(buffer, messageW))
+            mac_edit_menu = MAC_EDIT_MENU_BY_MESSAGE;
+        else if (!wcscmp(buffer, keyW))
+            mac_edit_menu = MAC_EDIT_MENU_BY_KEY;
+        else
+            mac_edit_menu = MAC_EDIT_MENU_DISABLED;
+    }
     if (!get_config_key(hkey, appkey, "LeftOptionIsAlt", buffer, sizeof(buffer)))
         left_option_is_alt = IS_OPTION_TRUE(buffer[0]);
     if (!get_config_key(hkey, appkey, "RightOptionIsAlt", buffer, sizeof(buffer)))
@@ -442,8 +456,6 @@ static NTSTATUS macdrv_init(void *arg)
     if (status != noErr || !(attributes & sessionHasGraphicAccess))
         return STATUS_UNSUCCESSFUL;
 
-    pthread_key_create( &macdrv_thread_data_key, NULL );
-
     init_win_context();
     setup_options();
     load_strings(params->strings);
@@ -474,7 +486,7 @@ void macdrv_ThreadDetach(void)
             CFRelease(data->keyboard_layout_uchr);
         free(data);
         /* clear data in case we get re-entered from user32 before the thread is truly dead */
-        pthread_setspecific( macdrv_thread_data_key, NULL );
+        NtUserGetThreadInfo()->driver_data = 0;
     }
 }
 
@@ -537,7 +549,7 @@ struct macdrv_thread_data *macdrv_init_thread_data(void)
     macdrv_compute_keyboard_layout(data);
 
     set_queue_display_fd(macdrv_get_event_queue_fd(data->queue));
-    pthread_setspecific( macdrv_thread_data_key, data );
+    NtUserGetThreadInfo()->driver_data = (UINT_PTR)data;
 
     NtUserActivateKeyboardLayout(data->active_keyboard_layout, 0);
     return data;
@@ -602,6 +614,25 @@ BOOL macdrv_SystemParametersInfo( UINT action, UINT int_param, void *ptr_param, 
     return FALSE;
 }
 
+/* CW Hack 22310 */
+NTSTATUS macdrv_SetCurrentProcessExplicitAppUserModelID(const WCHAR *aumid)
+{
+    if (!macdrv_set_current_process_explicit_app_user_model_id(aumid, lstrlenW(aumid)))
+        return STATUS_INVALID_PARAMETER;
+
+    return 0;
+}
+
+/* CW Hack 22310 */
+NTSTATUS macdrv_GetCurrentProcessExplicitAppUserModelID(WCHAR *buffer, INT size)
+{
+    if (!buffer) return STATUS_INVALID_PARAMETER;
+
+    if (!macdrv_get_current_process_explicit_app_user_model_id(buffer, size))
+        return STATUS_BUFFER_TOO_SMALL;
+
+    return 0;
+}
 
 static NTSTATUS macdrv_quit_result(void *arg)
 {

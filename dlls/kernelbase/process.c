@@ -22,12 +22,12 @@
 #include <string.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winnls.h"
 #include "wincontypes.h"
 #include "winternl.h"
-#include "processsnapshot.h"
 
 #include "kernelbase.h"
 #include "wine/debug.h"
@@ -88,8 +88,6 @@ static WCHAR *get_file_name( WCHAR *cmdline, WCHAR *buffer, DWORD buflen )
     if (cmdline[0] == '"' && (p = wcschr( cmdline + 1, '"' )))
     {
         int len = p - cmdline - 1;
-        /* trim spaces in quotes */
-        while (len && cmdline[len] == L' ') len--;
         /* extract the quoted portion as file name */
         if (!(name = RtlAllocateHeap( GetProcessHeap(), 0, (len + 1) * sizeof(WCHAR) ))) return NULL;
         memcpy( name, cmdline + 1, len * sizeof(WCHAR) );
@@ -521,6 +519,10 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
     ULONG nt_flags = 0;
     USHORT machine = 0;
     NTSTATUS status;
+    /* CW Hack 24938 */
+    BOOL epic_launcher_hack = FALSE;
+    WCHAR winsta0_defaultW[] = L"winsta0\\Default";
+    WCHAR *orig_lpDesktop = NULL;
 
     /* Process the AppName and/or CmdLine to get module name and path */
 
@@ -541,6 +543,28 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
     {
         if (!(tidy_cmdline = get_file_name( cmd_line, name, ARRAY_SIZE(name) ))) return FALSE;
         app_name = name;
+    }
+
+    /* CW Hack 24938 */
+    if (cmd_line && wcsstr(cmd_line, L"EpicGamesLauncher.exe"))
+    {
+        FIXME("HACK: moving EpicGamesLauncher.exe to the default winstation\n");
+        epic_launcher_hack = TRUE;
+        orig_lpDesktop = startup_info->lpDesktop;
+        startup_info->lpDesktop = winsta0_defaultW;
+    }
+
+    /* CW Hack 24920, 24557 */
+    {
+        char sgi[64];
+
+        if (cmd_line && !wcsncmp( cmd_line, L"powershell", 10 )
+            && GetEnvironmentVariableA( "SteamGameId", sgi, sizeof(sgi) ) < sizeof(sgi) && !strcmp( sgi, "2767030" ))
+        {
+            FIXME("HACK: not starting powershell.exe.\n");
+            SetLastError( ERROR_FILE_NOT_FOUND );
+            return FALSE;
+        }
     }
 
     /* Warn if unsupported features are used */
@@ -685,6 +709,9 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
     }
 
  done:
+    /* CW Hack 24938 */
+    if (epic_launcher_hack) startup_info->lpDesktop = orig_lpDesktop;
+
     RtlDestroyProcessParameters( params );
     if (tidy_cmdline != cmd_line) HeapFree( GetProcessHeap(), 0, tidy_cmdline );
     return set_ntstatus( status );
@@ -824,38 +851,6 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetHandleInformation( HANDLE handle, DWORD *flags 
         if (info.ProtectFromClose) *flags |= HANDLE_FLAG_PROTECT_FROM_CLOSE;
     }
     return TRUE;
-}
-
-
-/***********************************************************************
- *           GetMachineTypeAttributes   (kernelbase.@)
- */
-HRESULT WINAPI GetMachineTypeAttributes( USHORT machine, MACHINE_ATTRIBUTES *attr )
-{
-    SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION machines[8];
-    HANDLE process = NULL;
-    NTSTATUS status;
-
-    status = NtQuerySystemInformationEx( SystemSupportedProcessorArchitectures2, &process, sizeof(process),
-                                         machines, sizeof(machines), NULL );
-    if (status) return HRESULT_FROM_NT(status);
-
-    *attr = 0;
-
-    for (unsigned int i = 0; machines[i].Machine; i++)
-    {
-        if (machines[i].Machine == machine)
-        {
-            if (machines[i].KernelMode)
-                *attr |= KernelEnabled;
-            if (machines[i].UserMode)
-                *attr |= UserEnabled;
-            if (machines[i].WoW64Container)
-                *attr |= Wow64Container;
-        }
-    }
-
-    return S_OK;
 }
 
 
@@ -1054,7 +1049,18 @@ BOOL WINAPI DECLSPEC_HOTPATCH IsProcessorFeaturePresent ( DWORD feature )
  */
 BOOL WINAPI DECLSPEC_HOTPATCH IsWow64Process2( HANDLE process, USHORT *machine, USHORT *native_machine )
 {
-    return set_ntstatus( RtlWow64GetProcessMachines( process, machine, native_machine ));
+    /* CX HACK 20810: in Wow64 with a 32-bit-only bottle, pretend we aren't in Wow64 */
+    UNICODE_STRING val_str, name_str = RTL_CONSTANT_STRING( L"WINEWOW6432BPREFIXMODE" );
+    val_str.MaximumLength = 0;
+
+    if (RtlQueryEnvironmentVariable_U( NULL, &name_str, &val_str ) != STATUS_VARIABLE_NOT_FOUND)
+    {
+        *machine = IMAGE_FILE_MACHINE_UNKNOWN;
+        if (native_machine) *native_machine = IMAGE_FILE_MACHINE_I386;
+        return STATUS_SUCCESS;
+    }
+    else
+        return set_ntstatus( RtlWow64GetProcessMachines( process, machine, native_machine ));
 }
 
 
@@ -1066,8 +1072,20 @@ BOOL WINAPI DECLSPEC_HOTPATCH IsWow64Process( HANDLE process, PBOOL wow64 )
     ULONG_PTR pbi;
     NTSTATUS status;
 
-    status = NtQueryInformationProcess( process, ProcessWow64Information, &pbi, sizeof(pbi), NULL );
-    if (!status) *wow64 = !!pbi;
+    /* CX HACK 20810: in Wow64 with a 32-bit-only bottle, pretend we aren't in Wow64 */
+    UNICODE_STRING val_str, name_str = RTL_CONSTANT_STRING( L"WINEWOW6432BPREFIXMODE" );
+    val_str.MaximumLength = 0;
+
+    if (RtlQueryEnvironmentVariable_U( NULL, &name_str, &val_str ) != STATUS_VARIABLE_NOT_FOUND)
+    {
+        status = STATUS_SUCCESS;
+        if (!status) *wow64 = FALSE;
+    }
+    else
+    {
+        status = NtQueryInformationProcess( process, ProcessWow64Information, &pbi, sizeof(pbi), NULL );
+        if (!status) *wow64 = !!pbi;
+    }
     return set_ntstatus( status );
 }
 
@@ -1091,7 +1109,7 @@ BOOL WINAPI GetProcessInformation( HANDLE process, PROCESS_INFORMATION_CLASS inf
                 return FALSE;
             }
 
-            status = NtQuerySystemInformationEx( SystemSupportedProcessorArchitectures2, &process, sizeof(process),
+            status = NtQuerySystemInformationEx( SystemSupportedProcessorArchitectures, &process, sizeof(process),
                     machines, sizeof(machines), NULL );
             if (status) return set_ntstatus( status );
 
@@ -1316,7 +1334,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH SetProcessWorkingSetSizeEx( HANDLE process, SIZE_T
 /******************************************************************************
  *           TerminateProcess   (kernelbase.@)
  */
-BOOL WINAPI DECLSPEC_HOTPATCH TerminateProcess( HANDLE handle, UINT exit_code )
+BOOL WINAPI DECLSPEC_HOTPATCH TerminateProcess( HANDLE handle, DWORD exit_code )
 {
     if (!handle)
     {
@@ -1750,6 +1768,50 @@ BOOL WINAPI DECLSPEC_HOTPATCH SetEnvironmentVariableA( LPCSTR name, LPCSTR value
 }
 
 
+/* CW HACK 19252: Create the vk_swiftshader_icd.json file for Ubisoft Connect */
+static BOOL is_ubisoft(void)
+{
+    WCHAR name[MAX_PATH], *module_exe;
+    if (GetModuleFileNameW( NULL, name, ARRAYSIZE(name) ))
+    {
+        module_exe = wcsrchr( name, '\\' );
+        module_exe = module_exe ? module_exe + 1 : name;
+        if (!wcsicmp( module_exe, L"upc.exe" ) ||
+            !wcsicmp( module_exe, L"UplayWebCore.exe" ))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void write_ubisoft_vulkan_json( LPCWSTR value )
+{
+    static const char vk_swiftshader_icd_json[] =
+        "{\"file_format_version\": \"1.0.0\", \"ICD\": {\"library_path\": \".\\\\vk_swiftshader.dll\", \"api_version\": \"1.0.5\"}}";
+    HANDLE h;
+
+    /* VK_ICD_FILENAMES is a semicolon-separated list, but we're expecting
+     * just one path. Bail out if there's more than one.
+     */
+    if (wcschr( value, ';' ))
+        return;
+
+    /* Only write vk_swiftshader_icd.json */
+    if (!wcsstr( value, L"vk_swiftshader_icd.json" ))
+        return;
+
+    /* Create and write the file if it doesn't exist.
+     * This is potentially racy, but upc.exe does this call before launching any helpers.
+     */
+    h = CreateFileW( value, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL );
+    if (!h)
+        return;
+
+    WriteFile( h, vk_swiftshader_icd_json, sizeof(vk_swiftshader_icd_json) - 1, NULL, NULL );
+    CloseHandle( h );
+    TRACE( "Created %s for Ubisoft Connect\n", debugstr_w(value) );
+}
+
+
 /***********************************************************************
  *           SetEnvironmentVariableW   (kernelbase.@)
  */
@@ -1765,6 +1827,12 @@ BOOL WINAPI DECLSPEC_HOTPATCH SetEnvironmentVariableW( LPCWSTR name, LPCWSTR val
         SetLastError( ERROR_ENVVAR_NOT_FOUND );
         return FALSE;
     }
+
+    /* CW HACK 19252: Create the vk_swiftshader_icd.json file if Ubisoft Connect tries
+     * to use it and it doesn't exist.
+     */
+    if (!wcscmp( name, L"VK_ICD_FILENAMES" ) && value && is_ubisoft())
+        write_ubisoft_vulkan_json( value );
 
     RtlInitUnicodeString( &us_name, name );
     if (value)
@@ -1907,31 +1975,4 @@ void WINAPI DECLSPEC_HOTPATCH DeleteProcThreadAttributeList( struct _PROC_THREAD
 BOOL WINAPI DECLSPEC_HOTPATCH CompareObjectHandles( HANDLE first, HANDLE second )
 {
     return set_ntstatus( NtCompareObjects( first, second ));
-}
-
-/***********************************************************************
- *           PssQuerySnapshot   (kernelbase.@)
- */
-DWORD WINAPI PssQuerySnapshot( HPSS handle, PSS_QUERY_INFORMATION_CLASS class, void *buffer, DWORD len )
-{
-    FIXME( "(%p %u %p %lu)\n", handle ,class, buffer, len );
-    return ERROR_NOT_FOUND;
-}
-
-/***********************************************************************
- *           PssFreeSnapshot   (kernelbase.@)
- */
-DWORD WINAPI PssFreeSnapshot( HANDLE hprocess, HPSS handle )
-{
-    FIXME( "(%p %p)\n", hprocess , handle );
-    return ERROR_SUCCESS;
-}
-
-/***********************************************************************
- *           PssCaptureSnapshot   (kernelbase.@)
- */
-DWORD WINAPI PssCaptureSnapshot( HANDLE hprocess, PSS_CAPTURE_FLAGS flags, DWORD ctx_flags, HPSS *handle )
-{
-    FIXME( "(%p %u %lu %p)\n", hprocess , flags, ctx_flags, handle );
-    return ERROR_NOT_FOUND;
 }

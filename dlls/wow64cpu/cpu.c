@@ -21,6 +21,7 @@
 #include <stdarg.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winnt.h"
 #include "winternl.h"
@@ -361,7 +362,6 @@ __ASM_GLOBAL_FUNC( BTCpuSimulate,
                    "movl ss32_sel(%rip),%eax\n\t"
                    "movl %eax,0xc8(%r13)\n\t"   /* context->SegSs */
                    "jmp syscall_32to64_return\n" )
-
 
 /**********************************************************************
  *           BTCpuProcessInit  (wow64cpu.@)

@@ -68,11 +68,6 @@ static BOOL unicodeOutput = FALSE;
 static HANDLE console_input;
 BOOL echo_mode = TRUE;
 
-/* Output handling */
-static DWORD orig_console_mode;
-static DWORD internal_console_mode = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT
-                                     | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-
 /* Variables pertaining to paging */
 static BOOL paged_mode;
 static const WCHAR *pagedMessage = NULL;
@@ -1803,8 +1798,6 @@ static RETURN_CODE spawn_external_full_path(const WCHAR *file, WCHAR *full_cmdli
         console = SHGetFileInfoW(exe_path, 0, &psfi, sizeof(psfi), SHGFI_EXETYPE);
 
     init_msvcrt_io_block(&si);
-    if (console && !HIWORD(console))
-        SetConsoleMode( GetStdHandle(STD_OUTPUT_HANDLE), orig_console_mode );
     ret = CreateProcessW(file, full_cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
     free(si.lpReserved2);
 
@@ -2819,7 +2812,7 @@ static BOOL node_builder_parse(struct node_builder *builder, unsigned precedence
     CMD_FOR_CONTROL *for_ctrl = NULL;
     union token_parameter pmt;
     enum builder_token tkn;
-    BOOL done = FALSE, do_echo = TRUE;
+    BOOL done, do_echo = TRUE;
 
 #define ERROR_IF(x) if (x) {bogus_line = __LINE__; goto error_handling;}
     do
@@ -3014,7 +3007,6 @@ static BOOL node_builder_parse(struct node_builder *builder, unsigned precedence
                 } while (tkn != TKN_CLOSEPAR);
                 ERROR_IF(!node_builder_expect_token(builder, TKN_DO));
                 ERROR_IF(!node_builder_parse(builder, 0, &do_block));
-                if (!for_ctrl->set) for_control_append_set(for_ctrl, L"");
                 left = node_create_for(for_ctrl, do_block, do_echo);
                 for_ctrl = NULL;
             }
@@ -4357,12 +4349,8 @@ static RETURN_CODE for_control_execute_set(CMD_FOR_CONTROL *for_ctrl, const WCHA
         if (wcspbrk(element, L"?*"))
         {
             WIN32_FIND_DATAW fd;
-            HANDLE hff;
-            size_t insert_pos;
-
-            if (*buffer == L'"') WCMD_strip_quotes(buffer);
-            hff = FindFirstFileW(buffer, &fd);
-            insert_pos = wcsrchr(buffer, L'\\') ? wcsrchr(buffer, L'\\') + 1 - buffer : 0;
+            HANDLE hff = FindFirstFileW(buffer, &fd);
+            size_t insert_pos = (wcsrchr(buffer, L'\\') ? wcsrchr(buffer, L'\\') + 1 - buffer : 0);
 
             if (hff == INVALID_HANDLE_VALUE)
             {
@@ -4435,8 +4423,13 @@ static RETURN_CODE for_control_execute_numbers(CMD_FOR_CONTROL *for_ctrl, CMD_NO
     int numbers[3] = {0, 0, 0}, var;
     int i;
 
-    wcscpy(set, for_ctrl->set);
-    handleExpansion(set, TRUE);
+    if (for_ctrl->set)
+    {
+        wcscpy(set, for_ctrl->set);
+        handleExpansion(set, TRUE);
+    }
+    else
+        set[0] = L'\0';
 
     /* Note: native doesn't check the actual number of parameters, and set
      * them by default to 0.
@@ -4469,7 +4462,7 @@ static RETURN_CODE for_control_execute(CMD_FOR_CONTROL *for_ctrl, CMD_NODE *node
 {
     RETURN_CODE return_code;
 
-    if (!for_ctrl->set[0] && for_ctrl->operator != CMD_FOR_NUMBERS) return NO_ERROR;
+    if (!for_ctrl->set && for_ctrl->operator != CMD_FOR_NUMBERS) return NO_ERROR;
 
     WCMD_save_for_loop_context(FALSE);
 
@@ -4696,7 +4689,6 @@ static RETURN_CODE node_execute_with_echo(CMD_NODE *node, BOOL with_echo)
 
 RETURN_CODE node_execute(CMD_NODE *node)
 {
-    SetConsoleMode( GetStdHandle(STD_OUTPUT_HANDLE), internal_console_mode );
     return node_execute_with_echo(node, echo_mode && WCMD_is_in_context(NULL));
 }
 
@@ -4857,7 +4849,7 @@ static void parse_command_line_parameters(struct cmd_parameters *parameters)
         /* opt_s left unflagged if the command starts with and contains exactly
          * one quoted string (exactly two quote characters). The quoted string
          * must be an executable name that has whitespace and must not have the
-         * following characters: &<>@^|
+         * following characters: &<>()@^|
          */
 
         /* 1. Confirm there is at least one quote */
@@ -4875,7 +4867,7 @@ static void parse_command_line_parameters(struct cmd_parameters *parameters)
             opt_s = TRUE;
             for (p = q1; p != q2; p++)
             {
-                if (wcschr(L"&<>@^'", *p))
+                if (wcschr(L"&<>()@^'", *p))
                 {
                     opt_s = TRUE;
                     break;
@@ -4949,7 +4941,6 @@ static void WCMD_setup(void)
     /* init for loop context */
     forloopcontext = NULL;
     WCMD_save_for_loop_context(TRUE);
-    GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &orig_console_mode);
 }
 
 /*****************************************************************************

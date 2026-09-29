@@ -28,6 +28,7 @@
 #include <stdlib.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "waylanddrv.h"
 #include "wine/debug.h"
 
@@ -38,24 +39,34 @@ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
 
-static VkResult wayland_vulkan_surface_create(struct client_surface *client, const struct vulkan_instance *instance, VkSurfaceKHR *handle)
+static VkResult wayland_vulkan_surface_create(HWND hwnd, const struct vulkan_instance *instance, VkSurfaceKHR *handle,
+                                              struct client_surface **client)
 {
     VkResult res;
     VkWaylandSurfaceCreateInfoKHR create_info_host;
-    struct wayland_client_surface *surface = impl_from_client_surface(client);
-    HWND hwnd = client->hwnd;
+    struct wayland_client_surface *surface;
 
-    TRACE("%s %p %p\n", debugstr_client_surface(client), instance, handle);
+    TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
 
+    if (!(surface = wayland_client_surface_create(hwnd))) return VK_ERROR_OUT_OF_HOST_MEMORY;
     create_info_host.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
     create_info_host.pNext = NULL;
     create_info_host.flags = 0; /* reserved */
     create_info_host.display = process_wayland.wl_display;
     create_info_host.surface = surface->wl_surface;
-    if ((res = instance->p_vkCreateWaylandSurfaceKHR(instance->host.instance, &create_info_host, NULL /* allocator */, handle))) return res;
-    set_client_surface(hwnd, surface);
 
-    TRACE("Created surface=0x%s\n", wine_dbgstr_longlong(*handle));
+    res = instance->p_vkCreateWaylandSurfaceKHR(instance->host.instance, &create_info_host, NULL /* allocator */, handle);
+    if (res != VK_SUCCESS)
+    {
+        ERR("Failed to create vulkan wayland surface, res=%d\n", res);
+        client_surface_release(&surface->client);
+        return res;
+    }
+
+    set_client_surface(hwnd, surface);
+    *client = &surface->client;
+
+    TRACE("Created surface=0x%s, client=%p\n", wine_dbgstr_longlong(*handle), *client);
     return VK_SUCCESS;
 }
 
