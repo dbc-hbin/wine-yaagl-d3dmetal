@@ -39,8 +39,8 @@ Yaagl 기본 CrossOver 배포판은 호환 처리의 참고 기준이지 이 빌
 
 ```sh
 scripts/build-wine-crossover.sh fetch
-scripts/build-wine-crossover.sh preflight
 node scripts/build-d3dmetal-autopatch.mjs build/cx26.3/autopatch
+scripts/build-wine-crossover.sh preflight
 scripts/build-wine-crossover.sh all
 ```
 

@@ -39,8 +39,8 @@ The full build requires at least 20 GiB free at startup; packaging requires at l
 
 ```sh
 scripts/build-wine-crossover.sh fetch
-scripts/build-wine-crossover.sh preflight
 node scripts/build-d3dmetal-autopatch.mjs build/cx26.3/autopatch
+scripts/build-wine-crossover.sh preflight
 scripts/build-wine-crossover.sh all
 ```
 
