@@ -45,6 +45,7 @@ scripts/build-wine-crossover.sh all
 ```
 
 단계별 실행은 `prepare`, `configure`, `build`, `install`, `package`를 사용합니다.
+ARM64 서버 구성은 별도 셸에서 실행하여 해당 컴파일러와 검색 경로가 PE 빌드 도구 환경을 덮어쓰지 않게 합니다.
 기존 구성 트리나 패키지 출력은 덮어쓰지 않습니다. 중단된 작업은 원인을 해결한 뒤 해당 단계부터 실행합니다.
 빌드에만 필요한 SDK 검색 경로는 아카이브를 봉인하기 전에 Mach-O 파일에서 제거합니다.
 

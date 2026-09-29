@@ -80,7 +80,7 @@ configure_x64() {
         --without-udev --without-usb --without-v4l2 --without-wayland --without-x \
         --disable-winebth_sys)
 }
-configure_arm64() {
+configure_arm64() (
     [ ! -e "$armbuild/config.status" ] || { echo "refusing existing ARM configure tree: $armbuild" >&2; exit 1; }
     /bin/mkdir -p "$armbuild"
     export PATH='/opt/homebrew/opt/bison/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'
@@ -94,7 +94,7 @@ configure_arm64() {
         --without-ffmpeg --without-gnutls --without-cups --without-freetype \
         --without-fontconfig --without-gettext --without-sdl --without-opencl \
         --without-pcsclite --without-pcap --without-inotify)
-}
+)
 configured() {
     python3 "$repo/scripts/package-wine-crossover.py" verify-prepared "$repo" "$root"
     [ -f "$build/config.status" ] && [ -f "$armbuild/config.status" ] || {

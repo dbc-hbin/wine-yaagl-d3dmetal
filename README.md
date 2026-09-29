@@ -45,6 +45,7 @@ scripts/build-wine-crossover.sh all
 ```
 
 Individual actions are `prepare`, `configure`, `build`, `install`, and `package`.
+ARM64 server configuration runs in an isolated shell so its compiler and search paths cannot replace the PE build toolchain.
 Existing configure trees and package outputs are not overwritten. Resolve the cause of an interrupted step before resuming that step.
 Build-only SDK search paths are removed from staged Mach-O files before the archive is sealed.
 
