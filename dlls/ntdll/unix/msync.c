@@ -215,8 +215,8 @@ static int *shm_tid_map;
 
 static const mach_msg_bits_t msgh_bits_send = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
 
-static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, const int *objs,
-                                void **objs_shm, int alert_obj, void *alert_obj_shm, int count )
+static inline void server_register_wait( unsigned int msgh_id, const int *objs,
+                                         void **objs_shm, int alert_obj, void *alert_obj_shm, int count )
 {
     int i, is_mutex;
     mach_msg_return_t mr;
@@ -250,9 +250,10 @@ static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, cons
                      0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
 
     if (mr != MACH_MSG_SUCCESS)
-        ERR("Failed to send server register wait: %#x\n", mr);
-
-    return mr;
+    {
+        ERR("Failed to send server register wait: %#x (%s)\n", mr, mach_error_string( mr ));
+        abort_thread(1);
+    }
 }
 
 static inline void server_remove_wait( unsigned int msgh_id, const int *objs, void **objs_shm,
@@ -295,7 +296,10 @@ static inline void server_remove_wait( unsigned int msgh_id, const int *objs, vo
                      0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
 
     if (mr != MACH_MSG_SUCCESS)
-        ERR("Failed to send server remove wait: %#x\n", mr);
+    {
+        ERR("Failed to send server remove wait: %#x (%s)\n", mr, mach_error_string( mr ));
+        abort_thread(1);
+    }
 }
 
 static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
@@ -362,16 +366,12 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
     int ret, val;
     int *addr = shm_tid_map + tid;
     ULONGLONG ns_timeleft = 0;
-    mach_msg_return_t mr;
     unsigned int msgh_id;
     int total_count = count + (alert_obj ? 1 : 0);
 
     __atomic_store_n( addr, 2, __ATOMIC_RELEASE );
     msgh_id = (tid << 8) | total_count;
-    mr = server_register_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
-
-    if (mr != MACH_MSG_SUCCESS)
-        return STATUS_PENDING;
+    server_register_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
 
     while (__atomic_load_n( addr, __ATOMIC_ACQUIRE ) == 2)
     {

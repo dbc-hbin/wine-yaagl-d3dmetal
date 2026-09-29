@@ -684,11 +684,12 @@ static void *get_shm( unsigned int idx )
     if (!shm_addrs[entry])
     {
         kern_return_t kr;
-        mach_vm_address_t address;
+        mach_vm_address_t address = 0;
 
         kr = mach_vm_map( mach_task_self(), (mach_vm_address_t *)&address, (mach_vm_size_t)pagesize, 0, VM_FLAGS_ANYWHERE,
                           MACH_PORT_NULL, 0, FALSE, VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_SHARE );
-        MACH_CHECK_ERROR( kr, "mach_vm_map" );
+        if (kr != KERN_SUCCESS)
+            fatal_error( "msync: could not map shared memory: %d (%s)\n", kr, mach_error_string( kr ) );
         memset( (void *)address, 0, pagesize );
 
         if (debug_level)

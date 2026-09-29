@@ -15,7 +15,8 @@ import tarfile
 ARCHIVE_SHA = 'ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872'
 ARCHIVE_NAME = 'crossover-sources-26.3.0.tar.gz'
 PATCHES = ('0001-yaagl-compat.patch', '0002-arm64-server.patch',
-           '0003-d3dmetal-display.patch', '0004-macos-vulkan-loader.patch')
+           '0003-d3dmetal-display.patch', '0004-macos-vulkan-loader.patch',
+           '0005-msync-failures.patch')
 OVERLAY = (
     'include/yaagl_d3dmetal_display.h', 'include/yaagl_fsr_bridge.h',
     'include/yaagl_fsr_fg_bridge.h',

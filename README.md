@@ -10,7 +10,7 @@ The Wine loader and Unix modules are x86_64, Windows modules are i386/x86_64, an
 ## Selected features
 
 - Yaagl MF video and Timeout compatibility, preserving work-queue release, bounded heap access, and explicit Timeout OFF.
-- ARM64 wineserver, retaining CX's MSync implementation and server protocol.
+- ARM64 wineserver, retaining CX's MSync algorithm and server protocol. MSync shared-page addresses are initialized before mapping, and mapping failures stop before accessing the failed address. Failed wait-registration/removal sends terminate the affected Wine thread instead of returning into an endless retry/log loop; normal contention, timeouts, and spin behavior are unchanged.
 - FSR API translation to MetalFX SR/FG with native FG fallback.
   Valid MetalFX/automatic-provider FFX memory-usage queries (V1/V2) return success with both byte counts set to zero, matching D3DMetal DLSS compatibility behavior. Zero means unreported usage, not a measured footprint; native FG/swapchain queries retain their native results. No allocation tracking or query-time GPU allocation is added.
 - GPTK 4.0b2 FP64 codec, stage-lock, native PSO/function/RT caches, and required display/resource lifetime handling.
@@ -23,7 +23,7 @@ Cursor changes remain a separate future A/B candidate, not part of this build.
 ## Source and input boundaries
 
 `scripts/build-wine-crossover.sh` verifies the pinned official `crossover-sources-26.3.0.tar.gz` and prepares `build/cx26.3/source-root/sources/wine`.
-Three selected feature patches, one macOS Vulkan loader build-compatibility patch, and explicitly enumerated new FSR sources are applied. The compatibility patch names the existing dynamic loader probe; it does not add Vulkan payload or claim Vulkan support.
+Three selected feature patches, one macOS Vulkan loader build-compatibility patch, one MSync failure-handling patch, and explicitly enumerated new FSR sources are applied. The Vulkan compatibility patch names the existing dynamic loader probe; it does not add Vulkan payload or claim Vulkan support.
 The repository root contains that CX 26.3 / Wine 11.0 source with the selected patches and new FSR modules already applied.
 The build reconstructs a separate verified source tree from the pinned archive and the same patches; it does not inherit an older Wine core or build tree.
 
@@ -72,6 +72,7 @@ node --test scripts/prepare-d3dmetal-runtime.test.mjs scripts/metalir-fp64-codec
 python3 scripts/test-resource-map.py
 python3 scripts/test-fg-normalization.py
 python3 scripts/test-fsr-memory-query.py
+python3 scripts/test-msync-failures.py
 python3 scripts/test-wine-launch-wrapper.py
 ```
 
