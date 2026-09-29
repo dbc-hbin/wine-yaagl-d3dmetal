@@ -52,6 +52,8 @@ common() {
     export PKG_CONFIG="$pkgconfig"
     export PKG_CONFIG_PATH="$macports/lib/pkgconfig:$macports/share/pkgconfig:$gst/lib/pkgconfig"
     export PKG_CONFIG_LIBDIR="$PKG_CONFIG_PATH"
+    # Wine build tools run before staged Mach-O dependencies are relocated;
+    # SIP strips DYLD_LIBRARY_PATH when launching /usr/bin/make.
     unset PKG_CONFIG_SYSROOT_DIR || :
     export GSTREAMER_CFLAGS="$($pkgconfig --cflags gstreamer-1.0 gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-tag-1.0)"
     export GSTREAMER_LIBS="$($pkgconfig --libs gstreamer-1.0 gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-tag-1.0)"
@@ -65,8 +67,8 @@ configure_x64() {
     export CC='/usr/bin/clang -arch x86_64' CXX='/usr/bin/clang++ -arch x86_64'
     export CFLAGS='-O2 -g0 -mmacosx-version-min=26.0' CROSSCFLAGS='-O2 -g0'
     export CXXFLAGS="$CFLAGS" CPPFLAGS="-I$macports/include"
-    export LDFLAGS="-Wl,-headerpad_max_install_names -L$macports/lib -L$gst/lib -mmacosx-version-min=26.0"
-    export CROSSLDFLAGS='-Wl,--no-insert-timestamp'
+    export LDFLAGS="-Wl,-headerpad_max_install_names -Wl,-rpath,$macports/lib -Wl,-rpath,$gst/lib -L$macports/lib -L$gst/lib -mmacosx-version-min=26.0"
+
     (cd "$build" && /usr/bin/arch -x86_64 "$source/configure" \
         --prefix="$prefix" --disable-tests --enable-win64 --enable-archs=i386,x86_64 \
         --with-mingw="$mingw/bin/clang" --with-coreaudio --with-cups --with-freetype \
@@ -105,7 +107,7 @@ case ${1:-all} in
     preflight) /bin/mkdir -p "$root"; verify_archive; common; python3 "$repo/scripts/package-wine-crossover.py" check-inputs "$repo" "$root" ;;
     configure) /bin/mkdir -p "$root"; minimum_space 2097152; prepare; common; configure_x64; configure_arm64 ;;
     build) minimum_space 20971520; configured; common; /usr/bin/arch -x86_64 /usr/bin/make -C "$build" -j "$jobs"; /usr/bin/make -C "$armbuild" -j "$jobs" server/wineserver ;;
-    install) configured; [ -f "$armbuild/server/wineserver" ] || { echo 'ARM64 server missing' >&2; exit 1; }; [ ! -e "$prefix" ] || { echo "refusing existing host: $prefix" >&2; exit 1; }; /usr/bin/arch -x86_64 /usr/bin/make -C "$build" install; /bin/cp "$armbuild/server/wineserver" "$prefix/bin/wineserver"; /usr/bin/lipo -verify_arch arm64 "$prefix/bin/wineserver" ;;
+    install) configured; [ -f "$armbuild/server/wineserver" ] || { echo 'ARM64 server missing' >&2; exit 1; }; [ ! -e "$prefix" ] || { echo "refusing existing host: $prefix" >&2; exit 1; }; common; /usr/bin/arch -x86_64 /usr/bin/make -C "$build" install; /bin/cp "$armbuild/server/wineserver" "$prefix/bin/wineserver"; /usr/bin/lipo -verify_arch arm64 "$prefix/bin/wineserver" ;;
     package) python3 "$repo/scripts/package-wine-crossover.py" package "$repo" "$root" ;;
     all) /bin/mkdir -p "$root"; minimum_space 20971520; prepare; common; configure_x64; configure_arm64; /usr/bin/arch -x86_64 /usr/bin/make -C "$build" -j "$jobs"; /usr/bin/make -C "$armbuild" -j "$jobs" server/wineserver; [ ! -e "$prefix" ] || { echo "refusing existing host: $prefix" >&2; exit 1; }; /usr/bin/arch -x86_64 /usr/bin/make -C "$build" install; /bin/cp "$armbuild/server/wineserver" "$prefix/bin/wineserver"; /usr/bin/lipo -verify_arch arm64 "$prefix/bin/wineserver"; python3 "$repo/scripts/package-wine-crossover.py" package "$repo" "$root" ;;
     *) echo "usage: $0 {fetch|prepare|preflight|configure|build|install|package|all}" >&2; exit 2 ;;

@@ -3,6 +3,7 @@
 [한국어](README.ko.md)
 
 A clean CrossOver 26.3 / Wine 11.0 build path for Yaagl.
+Display name: **Wine 11.0 D3DMetal (CX 26.3, GPTK 4.0b2, experimental)**; stable runtime ID: `wine-cx26.3-d3dmetal-gptk4.0b2-1`.
 Targets Apple Silicon, macOS 26+, and Rosetta 2; macOS 26 hardware requires separate validation.
 The Wine loader and Unix modules are x86_64, Windows modules are i386/x86_64, and wineserver is ARM64.
 
@@ -22,7 +23,7 @@ Cursor changes remain a separate future A/B candidate, not part of this build.
 ## Source and input boundaries
 
 `scripts/build-wine-crossover.sh` verifies the pinned official `crossover-sources-26.3.0.tar.gz` and prepares `build/cx26.3/source-root/sources/wine`.
-Only three patches in `patches/wine-cx/` and explicitly enumerated new FSR sources are applied.
+Three selected feature patches, one macOS Vulkan loader build-compatibility patch, and explicitly enumerated new FSR sources are applied. The compatibility patch names the existing dynamic loader probe; it does not add Vulkan payload or claim Vulkan support.
 The repository root contains that CX 26.3 / Wine 11.0 source with the selected patches and new FSR modules already applied.
 The build reconstructs a separate verified source tree from the pinned archive and the same patches; it does not inherit an older Wine core or build tree.
 
@@ -45,6 +46,7 @@ scripts/build-wine-crossover.sh all
 
 Individual actions are `prepare`, `configure`, `build`, `install`, and `package`.
 Existing configure trees and package outputs are not overwritten. Resolve the cause of an interrupted step before resuming that step.
+Build-only SDK search paths are removed from staged Mach-O files before the archive is sealed.
 
 Defaults reflect the local build environment. Override paths with `WINE_CX_ROOT`, `WINE_CX_MINGW`, `WINE_CX_DEPS_PREFIX`, `WINE_CX_GSTREAMER_ROOT`, and `WINE_CX_DONOR`.
 Changing `WINE_CX_DONOR` does not bypass the pinned donor inventory.

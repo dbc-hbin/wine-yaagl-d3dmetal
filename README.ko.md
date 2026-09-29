@@ -3,6 +3,7 @@
 [English](README.md)
 
 Yaagl용 CrossOver 26.3 기반 Wine 11.0 클린 빌드 경로입니다.
+표시 이름: **Wine 11.0 D3DMetal (CX 26.3, GPTK 4.0b2, experimental)**, 고정 런타임 ID: `wine-cx26.3-d3dmetal-gptk4.0b2-1`.
 Apple Silicon·macOS 26 이상·Rosetta 2를 대상으로 하며, macOS 26 실기기 검증은 별도로 필요합니다.
 Wine 로더와 Unix 모듈은 x86_64, Windows 모듈은 i386/x86_64, wineserver는 ARM64로 빌드합니다.
 
@@ -22,7 +23,7 @@ Wine 로더와 Unix 모듈은 x86_64, Windows 모듈은 i386/x86_64, wineserver�
 ## 소스와 입력 경계
 
 `scripts/build-wine-crossover.sh`는 고정된 공식 `crossover-sources-26.3.0.tar.gz`를 검증하고 `build/cx26.3/source-root/sources/wine`에 준비합니다.
-`patches/wine-cx/`의 세 패치와 명시적으로 열거한 신규 FSR 소스만 적용합니다.
+선택한 기능 패치 세 개와 macOS Vulkan 로더 빌드 호환 패치 한 개, 명시적으로 열거한 신규 FSR 소스만 적용합니다. 호환 패치는 기존 동적 로더 탐색에 이름을 지정할 뿐 Vulkan 파일을 추가하거나 Vulkan 지원을 주장하지 않습니다.
 저장소 루트에는 선택 패치와 신규 FSR 모듈까지 적용한 CX 26.3 / Wine 11.0 소스가 들어 있습니다.
 빌드는 고정 아카이브와 같은 패치로 별도의 검증된 소스 트리를 재구성하며, 이전 Wine 본체나 빌드 트리를 상속하지 않습니다.
 
@@ -45,6 +46,7 @@ scripts/build-wine-crossover.sh all
 
 단계별 실행은 `prepare`, `configure`, `build`, `install`, `package`를 사용합니다.
 기존 구성 트리나 패키지 출력은 덮어쓰지 않습니다. 중단된 작업은 원인을 해결한 뒤 해당 단계부터 실행합니다.
+빌드에만 필요한 SDK 검색 경로는 아카이브를 봉인하기 전에 Mach-O 파일에서 제거합니다.
 
 기본 입력 경로는 제작 환경에 맞춰져 있습니다. 다른 환경에서는 `WINE_CX_ROOT`, `WINE_CX_MINGW`, `WINE_CX_DEPS_PREFIX`, `WINE_CX_GSTREAMER_ROOT`, `WINE_CX_DONOR`를 지정합니다.
 `WINE_CX_DONOR`는 경로만 변경하며 고정된 입력 매니페스트 검증을 우회하지 않습니다.

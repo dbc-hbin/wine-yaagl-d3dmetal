@@ -2994,6 +2994,11 @@ static const struct vulkan_driver_funcs lazydrv_funcs =
     .p_map_device_extensions = lazydrv_map_device_extensions,
 };
 
+#if defined(__APPLE__) && !defined(SONAME_LIBVULKAN)
+/* CX probes the macOS Vulkan loader even when configured without its SDK. */
+#define SONAME_LIBVULKAN "libvulkan.1.dylib"
+#endif
+
 static void vulkan_init_once(void)
 {
     struct vulkan_instance_extensions extensions = {0};

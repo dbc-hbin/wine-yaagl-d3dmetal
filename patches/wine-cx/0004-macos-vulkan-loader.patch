@@ -1,0 +1,14 @@
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -2995,5 +2995,10 @@
+ };
+-
++
++#if defined(__APPLE__) && !defined(SONAME_LIBVULKAN)
++/* CX probes the macOS Vulkan loader even when configured without its SDK. */
++#define SONAME_LIBVULKAN "libvulkan.1.dylib"
++#endif
++
+ static void vulkan_init_once(void)
+ {
+     struct vulkan_instance_extensions extensions = {0};

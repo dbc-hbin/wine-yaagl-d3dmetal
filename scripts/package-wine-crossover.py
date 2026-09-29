@@ -15,7 +15,7 @@ import tarfile
 ARCHIVE_SHA = 'ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872'
 ARCHIVE_NAME = 'crossover-sources-26.3.0.tar.gz'
 PATCHES = ('0001-yaagl-compat.patch', '0002-arm64-server.patch',
-           '0003-d3dmetal-display.patch')
+           '0003-d3dmetal-display.patch', '0004-macos-vulkan-loader.patch')
 OVERLAY = (
     'include/yaagl_d3dmetal_display.h', 'include/yaagl_fsr_bridge.h',
     'include/yaagl_fsr_fg_bridge.h',
@@ -31,6 +31,7 @@ OVERLAY = (
        'framegeneration/include/dx12/ffx_api_framegeneration_dx12.h')),
 )
 RUNTIME_ID = 'wine-cx26.3-d3dmetal-gptk4.0b2-1'
+RUNTIME_NAME = 'Wine 11.0 D3DMetal (CX 26.3, GPTK 4.0b2, experimental)'
 ARCHIVE_OUT = 'wine-cx26.3-d3dmetal-gptk4.0b2-macos26.tar.xz'
 GRAPHICS_INPUTS = frozenset({
     'lib/external/libd3dshared.dylib',
@@ -257,25 +258,32 @@ def mach(path):
 def relocate_mach(path, wine):
     lib = wine / 'lib'
     relative = os.path.relpath(lib, path.parent)
-    rpath = '@loader_path/' + relative
+    rpath = '@loader_path' if relative == '.' else '@loader_path/' + relative
     listing = subprocess.check_output(['otool', '-L', str(path)], text=True)
+    required_rpaths = set()
     for dependency in re.findall(r'^\s+(.*?) \(compatibility version', listing, re.M):
         if dependency.startswith(('/System/', '/usr/lib/')):
             continue
-        name = Path(dependency).name
-        known = (lib / name, lib / 'external' / name,
-                 lib / 'GStreamer.framework/Versions/1.0/lib' / name,
-                 path.parent / name)
-        require(any(p.exists() for p in known), f'unbundled Mach dependency: {path}: {dependency}')
+        name = dependency[len('@rpath/'):] if dependency.startswith('@rpath/') else Path(dependency).name
+        require(not Path(name).is_absolute() and '..' not in Path(name).parts,
+                f'unsafe Mach dependency: {dependency}')
+        known = ((lib / name, rpath), (lib / 'external' / name, rpath + '/external'),
+                 (lib / 'GStreamer.framework/Versions/1.0/lib' / name,
+                  rpath + '/GStreamer.framework/Versions/1.0/lib'),
+                 (path.parent / name, '@loader_path'))
+        location = next((entry for candidate, entry in known if candidate.exists()), None)
+        require(location is not None, f'unbundled Mach dependency: {path}: {dependency}')
         if dependency.startswith('/'):
             run('install_name_tool', '-change', dependency, '@rpath/' + name, path)
+        if (dependency.startswith(('@rpath/', '/')) and
+                dependency != '@rpath/' + path.name):
+            required_rpaths.add(location)
     current = subprocess.check_output(['otool', '-l', str(path)], text=True)
     existing = re.findall(r'cmd LC_RPATH\s+cmdsize \d+\s+path (.*?) \(offset', current)
     for old in set(existing):
         if old.startswith('/') and not old.startswith(('/System/', '/usr/lib/')):
             run('install_name_tool', '-delete_rpath', old, path)
-    for entry in (rpath, rpath + '/external',
-                  rpath + '/GStreamer.framework/Versions/1.0/lib'):
+    for entry in sorted(required_rpaths):
         if entry not in existing:
             run('install_name_tool', '-add_rpath', entry, path)
     run('codesign', '--force', '--sign', '-', path)
@@ -352,7 +360,7 @@ def package(repo, root):
             require(not os.path.isabs(item['target']) and target.exists(),
                     f'broken/absolute staged symlink: {item["path"]}')
     provenance = {
-        'schemaVersion': 1, 'runtimeId': RUNTIME_ID, 'wineVersion': version,
+        'schemaVersion': 1, 'name': RUNTIME_NAME, 'runtimeId': RUNTIME_ID, 'wineVersion': version,
         'source': source_info, 'serverProtocol': 1809, 'deploymentTarget': '26.0',
         'buildArchitectures': {'loaderAndUnix': 'x86_64', 'windowsPE': ['i386', 'x86_64'],
                                'wineserver': 'arm64'},
