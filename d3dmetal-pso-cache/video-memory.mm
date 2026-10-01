@@ -25,12 +25,14 @@ constexpr std::uint32_t kLocalSegment = 0;
 // freeing anything. Apple GPUs are UMA, and D3D12 reports UMA adapters with a
 // single local segment group: the non-local group is all zero, as MoltenVK's
 // single heap shows through DXVK. Reservations are not implemented
-// (SetVideoMemoryReservation is a no-op).
-std::int32_t query(void* adapter, std::uint32_t node, std::uint32_t group,
+// (SetVideoMemoryReservation is a no-op). The node index is ignored, as stock
+// D3DMetal does: the adapter has one node, and under Wine the node register
+// holds an unrelated value (observed 0x4000364c for NodeIndex 0).
+std::int32_t query(void* adapter, std::uint32_t, std::uint32_t group,
                    QueryVideoMemoryInfo* info) noexcept {
     if (info == nullptr) return 0;
     *info = {};
-    if (adapter == nullptr || node != 0 || group != kLocalSegment) return 0;
+    if (adapter == nullptr || group != kLocalSegment) return 0;
     id<MTLDevice> device = nil;
     std::memcpy(&device, static_cast<const char*>(adapter) + kAdapterDevice, sizeof(device));
     if (device == nil) return 0;
