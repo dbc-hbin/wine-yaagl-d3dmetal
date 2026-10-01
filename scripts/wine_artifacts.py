@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 CATALOG = Path(__file__).with_name('wine-artifacts.json')
-PROFILES = {'tuned', 'safe-msync', 'yaagl-overlay'}
+PROFILES = {'yaagl-overlay'}
 
 
 def _relative(value):
@@ -60,7 +60,7 @@ def load_catalog(path=CATALOG):
             raise ValueError(f'invalid artifact identity: {key}')
     by_key = {item['key']: item for item in artifacts}
     for name, profile in profiles.items():
-        if not isinstance(profile, dict) or set(profile) - {'artifacts', 'buildDirs', 'sourceOverrides', 'sourceInputs'}:
+        if not isinstance(profile, dict) or set(profile) - {'artifacts', 'buildDirs', 'sourceInputs'}:
             raise ValueError(f'invalid profile: {name}')
         selected = profile.get('artifacts')
         if (not isinstance(selected, list) or not selected or
@@ -76,11 +76,6 @@ def load_catalog(path=CATALOG):
         targets = [(by_key[key]['buildTree'], by_key[key]['makeTarget']) for key in selected]
         if len(set(installed)) != len(installed) or len(set(targets)) != len(targets):
             raise ValueError(f'duplicate installed path or build target: {name}')
-        overrides = profile.get('sourceOverrides', {})
-        if not isinstance(overrides, dict) or not set(overrides) <= set(selected):
-            raise ValueError(f'invalid source overrides: {name}')
-        for sources in overrides.values():
-            _paths(sources)
         if 'sourceInputs' in profile:
             _paths(profile['sourceInputs'])
     return data
@@ -92,8 +87,7 @@ def profile_artifacts(name, catalog=None):
         raise ValueError(f'unknown artifact profile: {name}')
     profile = data['profiles'][name]
     by_key = {item['key']: item for item in data['artifacts']}
-    return [{**by_key[key], 'sources': profile.get('sourceOverrides', {}).get(key, by_key[key]['sources'])}
-            for key in profile['artifacts']]
+    return [by_key[key] for key in profile['artifacts']]
 
 
 def profile_sources(name, catalog=None):
@@ -107,16 +101,11 @@ def profile_sources(name, catalog=None):
 
 def main():
     if len(sys.argv) not in (3, 4):
-        raise SystemExit('usage: wine_artifacts.py rows|sources|targets|build-dir PROFILE [BUILD_TREE]')
+        raise SystemExit('usage: wine_artifacts.py sources|targets|build-dir PROFILE [BUILD_TREE]')
     operation, name = sys.argv[1:3]
     data = load_catalog()
     artifacts = profile_artifacts(name, data)
-    if operation == 'rows' and len(sys.argv) == 3:
-        for item in artifacts:
-            print('|'.join((item['key'], item['buildTree'], item['makeTarget'],
-                            item['installedPath'], item['architecture'], item['format'],
-                            ','.join(item['sources']))))
-    elif operation == 'sources' and len(sys.argv) == 3:
+    if operation == 'sources' and len(sys.argv) == 3:
         print('\n'.join(profile_sources(name, data)))
     elif operation == 'targets' and len(sys.argv) == 4 and sys.argv[3] in ('x86_64', 'arm64'):
         print(' '.join(item['makeTarget'] for item in artifacts if item['buildTree'] == sys.argv[3]))

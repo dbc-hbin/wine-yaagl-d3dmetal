@@ -713,13 +713,7 @@ static void register_wait( mach_register_message_t *message, unsigned int tid, u
         }
     }
 
-    if (publish_wait_state( tid, token, wait_token_with_state( token, MSYNC_WAIT_ARMED ) ))
-    {
-        if (getenv("WINE_MSYNC_TEST_TRACE") && getenv("WINE_MSYNC_TEST_TRACE")[0] == '1' &&
-            !getenv("WINE_MSYNC_TEST_TRACE")[1])
-            fprintf( stderr, "msync: MSYNC_WAIT_ARMED tid %u count %u\n", tid, count );
-    }
-    else
+    if (!publish_wait_state( tid, token, wait_token_with_state( token, MSYNC_WAIT_ARMED ) ))
         detach_registration( registration );
 }
 
@@ -1040,7 +1034,6 @@ static unsigned int msync_alloc_shm( int low, int high, enum msync_type type )
 {
     unsigned int shm_idx;
     struct msync_shm *shm;
-    int allocated_new = 0;
 
     pthread_mutex_lock( &shm_index_mutex );
     if (free_shm_idx != UINT32_MAX)
@@ -1055,7 +1048,6 @@ static unsigned int msync_alloc_shm( int low, int high, enum msync_type type )
             fatal_error( "msync shared object index space exhausted\n" );
         shm_idx = next_unused_shm_idx++;
         shm = get_shm( shm_idx );
-        allocated_new = 1;
     }
 
     assert( shm && !__atomic_load_n( &shm->refcount, __ATOMIC_SEQ_CST ) );
@@ -1064,11 +1056,6 @@ static unsigned int msync_alloc_shm( int low, int high, enum msync_type type )
     shm->msync_type = type;
     shm->multiple_waiters = 0;
     __atomic_store_n( &shm->refcount, 1, __ATOMIC_RELEASE );
-    if (allocated_new && !(shm_idx % MSYNC_SHM_OBJECTS_PER_PAGE) &&
-        getenv("WINE_MSYNC_TEST_TRACE") && getenv("WINE_MSYNC_TEST_TRACE")[0] == '1' &&
-        !getenv("WINE_MSYNC_TEST_TRACE")[1])
-        fprintf( stderr, "msync: MSYNC_SHM_HIGH_WATER index %u page %u\n", shm_idx,
-                 shm_idx / MSYNC_SHM_OBJECTS_PER_PAGE );
     pthread_mutex_unlock( &shm_index_mutex );
 
     return shm_idx;

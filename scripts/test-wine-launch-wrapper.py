@@ -113,7 +113,7 @@ class WineLaunchWrapperTests(unittest.TestCase):
         (self.root / "yaagl-wine-p3-runtime.txt").unlink()
 
         (self.root / "yaagl-d3dmetal-runtime.json").write_text(
-            json.dumps({"schemaVersion": 1, "runtimeId": "wine-11.17-d3dmetal-gptk4.0b2-2"}))
+            json.dumps({"schemaVersion": 1, "runtimeId": "wine-11.17-d3dmetal-gptk4.0b2-4"}))
         native = self.record_policy(args, YAAGL_FSR_UPSCALER="native", MTL_HUD_ENABLED="1",
                                     WINE_ENABLE_TIMEOUT_FIX="0", **{
                                         "DYLD_FALLBACK_LIBRARY_PATH": "/inherited/lib"})

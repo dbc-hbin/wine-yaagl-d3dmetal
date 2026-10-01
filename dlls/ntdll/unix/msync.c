@@ -529,9 +529,6 @@ static void *request_shm_from_server( int entry, int tid )
     send_message.header.msgh_remote_port = server_port;
     send_message.header.msgh_local_port = reply_port;
     send_message.wire_version = MSYNC_SHM_WIRE_VERSION;
-    if (getenv("WINE_MSYNC_TEST_TRACE") && getenv("WINE_MSYNC_TEST_TRACE")[0] == '1' &&
-        !getenv("WINE_MSYNC_TEST_TRACE")[1] && getenv("WINE_MSYNC_TEST_WIRE_VERSION"))
-        send_message.wire_version = strtoul( getenv("WINE_MSYNC_TEST_WIRE_VERSION"), NULL, 0 );
     send_message.entry = entry;
 
     mr = mach_msg_overwrite( &send_message.header, MACH_SEND_MSG | MACH_RCV_MSG,

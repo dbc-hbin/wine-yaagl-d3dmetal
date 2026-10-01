@@ -22,7 +22,6 @@ dedicated close message id and no owned export.
 No Wine install, no wineserver, no game, no sleeps.
 """
 
-import os
 import pathlib
 import shutil
 import subprocess
@@ -674,7 +673,7 @@ class MSyncMessageDispatchTests(unittest.TestCase):
 
     def run_case(self, name):
         result = subprocess.run([str(self.binary), name], capture_output=True, text=True,
-                                timeout=30, env={**os.environ, "WINE_MSYNC_TEST_TRACE": ""})
+                                timeout=30)
         self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
         self.assertIn("ok " + name, result.stdout)
 
