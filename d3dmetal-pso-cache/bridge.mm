@@ -289,6 +289,14 @@ bool matchesImage(const mach_header* untyped) noexcept {
     return std::atomic_ref<std::uintptr_t>(slot).load(std::memory_order_acquire) == 0;
 }
 
+void constructAdapter(void* adapter, void* factory, void* device) {
+    using Constructor = void (*)(void*, void*, void*);
+    const auto original = reinterpret_cast<Constructor>(
+        originalFunctions[static_cast<std::size_t>(layout::Hook::ConstructAdapter)]);
+    original(adapter, factory, device);
+    video_memory::updateAdapterDescription(adapter);
+}
+
 __attribute__((constructor)) void initialize() noexcept {
     try {
         const std::uint8_t* base = nullptr;
@@ -357,6 +365,7 @@ __attribute__((constructor)) void initialize() noexcept {
             ngxHooks[1],
             displayHooks.getContainingOutput,
             displayHooks.setFullscreenState,
+            reinterpret_cast<std::uintptr_t>(&constructAdapter),
             displayHooks.presentFlush,
             reinterpret_cast<std::uintptr_t>(&d3dmetal::commitRecordedBatch),
             reinterpret_cast<std::uintptr_t>(&addPresentResidency),

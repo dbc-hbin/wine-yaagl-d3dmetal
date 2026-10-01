@@ -15,19 +15,19 @@ const layoutText = await readFile(
 );
 const layoutSha256 = createHash("sha256").update(layoutText).digest("hex");
 const expectedLayoutSha256 =
-  "f8130776ff39ec46e64428818bd37742abc1b159e72b5ab3d772134c818805da";
+  "c1d97fd481475590f576d89349e567a7dddd7d9deb0001cef72a2a6b610c5018";
 if (layoutSha256 !== expectedLayoutSha256) {
   throw new Error(
     `layout corruption: expected SHA-256 ${expectedLayoutSha256}, got ${layoutSha256}`
   );
 }
 const layout = JSON.parse(layoutText);
-if (layout.formatVersion !== 15) {
+if (layout.formatVersion !== 16) {
   throw new Error(`unsupported layout format ${layout.formatVersion}`);
 }
 
 export const D3DMETAL_PSO_CACHE_PATCHED_PAYLOAD_SHA256 =
-  "dd47281c38bb94768b541c8e2d70f6b8b324696399c58fdaa404c11351f5010a";
+  "b28e77f404070482a12b04a00e118848acecb5ce48017f63042715e0448efb9a";
 
 const LC_SEGMENT_64 = 0x19;
 const LC_UUID = 0x1b;
@@ -422,6 +422,31 @@ for (const hook of layout.hooks) {
       hook.gateOffset + 10 + gate.readInt8(9) !== hook.trampolineOffset) {
     throw new Error(`layout corruption: invalid relocated prologue for ${hook.id}`);
   }
+}
+
+// Only the complete C1 constructor is called by the two adapter factories.
+// Its five-byte prologue has no RIP-relative operands; C2 uses a different ABI.
+const adapter = layout.hooks[21];
+if (layout.hooks.length !== 22 || adapter.id !== "ConstructAdapter" ||
+    adapter.entryOffset !== 0x152d82 || adapter.originalHex !== "5541574156" ||
+    adapter.gateOffset !== 4905952 || adapter.trampolineOffset !== 4905984 ||
+    adapter.dispatchFieldOffset !== 21 * 8) {
+  throw new Error("layout corruption: invalid complete DXGI adapter constructor");
+}
+const adapterEntry = Buffer.from(adapter.entryPatchHex, "hex");
+const adapterGate = Buffer.from(adapter.gateHex, "hex");
+const adapterTrampoline = Buffer.from(adapter.trampolineHex, "hex");
+if (adapterEntry.length !== 5 || adapterEntry[0] !== 0xe9 ||
+    adapter.entryOffset + 5 + adapterEntry.readInt32LE(1) !== adapter.gateOffset ||
+    adapterGate.length !== 24 ||
+    adapterGate.subarray(0, 3).toString("hex") !== "48833d" ||
+    adapterGate[7] !== 0 ||
+    adapterGate.subarray(10, 13).toString("hex") !== "4c8b1d" ||
+    adapterGate.subarray(17, 20).toString("hex") !== "41ffa3" ||
+    adapterGate.readUInt32LE(20) !== adapter.dispatchFieldOffset ||
+    adapterTrampoline.length !== 10 || adapterTrampoline[5] !== 0xe9 ||
+    adapter.trampolineOffset + 10 + adapterTrampoline.readInt32LE(6) !== adapter.continuationOffset) {
+  throw new Error("layout corruption: invalid complete DXGI adapter constructor gate");
 }
 
 const commit = layout.commitHook;

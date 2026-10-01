@@ -52,9 +52,9 @@ const hookNames = [
   "CreateComputeStageKey", "CreateGraphicsStageKey",
   "ExtractFunctions", "LoadGraphicsFunctions",
   "ReplayTemporalScaleMPL", "EncodeTemporalScaleMTL",
-  "GetContainingOutput", "SetFullscreenState",
+  "GetContainingOutput", "SetFullscreenState", "ConstructAdapter",
 ];
-if (layout.formatVersion !== 15 || layout.hooks.length !== hookNames.length ||
+if (layout.formatVersion !== 16 || layout.hooks.length !== hookNames.length ||
     layout.commitHook.id !== "CommitMetal4Batch" ||
     layout.presentHook.id !== "RefreshDisplayAndFlush" ||
     layout.presentHook.dispatchFieldOffset !== hookNames.length * 8 ||

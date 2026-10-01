@@ -4,6 +4,10 @@
 
 namespace yaagl::pso::video_memory {
 
+// Updates the stored description after the original adapter constructor. All
+// native, COM and Wine unixcall GetDesc variants copy these same fields.
+void updateAdapterDescription(void* adapter) noexcept;
+
 // DXGI_QUERY_VIDEO_MEMORY_INFO.
 struct QueryVideoMemoryInfo final {
     std::uint64_t budget;

@@ -1,5 +1,5 @@
 {
-  "formatVersion": 15,
+  "formatVersion": 16,
   "source": {
     "machUuid": "674e662b6b5c3fd99a8af415609d2f6a",
     "cpuType": 16777223,
@@ -18,8 +18,8 @@
   },
   "constructorVerification": {
     "markerOffset": 4904624,
-    "markerHex": "594141474c50534f43414348450f0000",
-    "description": "Version 15 verifies the 21-entry PSO/FSR/display dispatch table, four special presentation/commit/residency gates, the DXGI video-memory budget hook, and the null dispatch slot; stock NGX Evaluate and recording paths remain unpatched."
+    "markerHex": "594141474c50534f4341434845100000",
+    "description": "Version 16 verifies the 22-entry generic PSO/FSR/display/adapter dispatch table, four special presentation/commit/residency gates, the DXGI video-memory budget hook, and the null dispatch slot; stock NGX Evaluate and recording paths remain unpatched."
   },
   "textCave": {
     "endOffset": 4907008,
@@ -35,7 +35,7 @@
     "commonSectionNewSize": 17376,
     "commonSectionOldEndVMAddr": 5407136,
     "segmentEndVMAddr": 5410816,
-    "description": "The patch claims the first eight zero-fill bytes after __common by extending that section; the constructor atomically publishes one pointer to its immutable 26-entry dispatch table."
+    "description": "The patch claims the first eight zero-fill bytes after __common by extending that section; the constructor atomically publishes one pointer to its immutable 27-entry dispatch table."
   },
   "binaryPatches": [
     {
@@ -81,9 +81,9 @@
     "originalHex": "ff15638f3500",
     "entryPatchHex": "e8ac86350090",
     "gateOffset": 4905584,
-    "gateHex": "48833d28a7070000740e4c8b1d1fa7070041ffa3b0000000ff259a080000",
+    "gateHex": "48833d28a7070000740e4c8b1d1fa7070041ffa3b8000000ff259a080000",
     "objcMsgSendGotOffset": 4907816,
-    "dispatchFieldOffset": 176
+    "dispatchFieldOffset": 184
   },
   "presentHook": {
     "id": "RefreshDisplayAndFlush",
@@ -91,8 +91,8 @@
     "originalHex": "498b7e28488b07ff5010",
     "entryPatchHex": "e82a8d39009090909090",
     "gateOffset": 4905760,
-    "gateHex": "4c8b1d79a607004d85db740a4c89f741ffa3a8000000498b7e28488b07ff6010",
-    "dispatchFieldOffset": 168
+    "gateHex": "4c8b1d79a607004d85db740a4c89f741ffa3b0000000498b7e28488b07ff6010",
+    "dispatchFieldOffset": 176
   },
   "presentResidencyAddHook": {
     "id": "ScopedMetal4PresentResidencyAdd",
@@ -100,9 +100,9 @@
     "originalHex": "ff1582863500",
     "entryPatchHex": "e8bb7e350090",
     "gateOffset": 4905824,
-    "gateHex": "48833d38a6070000740e4c8b1d2fa6070041ffa3b8000000ff25aa070000",
+    "gateHex": "48833d38a6070000740e4c8b1d2fa6070041ffa3c0000000ff25aa070000",
     "objcMsgSendGotOffset": 4907816,
-    "dispatchFieldOffset": 184
+    "dispatchFieldOffset": 192
   },
   "presentResidencyFinishHook": {
     "id": "ScopedMetal4PresentResidencyFinish",
@@ -110,9 +110,9 @@
     "originalHex": "498bbe90000000",
     "entryPatchHex": "e9347b35009090",
     "gateOffset": 4905856,
-    "gateHex": "4c8b1d19a607004d85db740741ff93c0000000498bbe90000000e9af84caff",
+    "gateHex": "4c8b1d19a607004d85db740741ff93c8000000498bbe90000000e9af84caff",
     "continuationOffset": 1400910,
-    "dispatchFieldOffset": 192
+    "dispatchFieldOffset": 200
   },
   "videoMemoryHook": {
     "id": "QueryVideoMemoryInfo",
@@ -122,9 +122,9 @@
     "continuationOffset": 1379151,
     "originalHex": "534889f80f57c0",
     "entryPatchHex": "e953d035009090",
-    "gateHex": "48833df8a507000074164c8b1defa5070041ffa3c8000000",
+    "gateHex": "48833df8a507000074164c8b1defa5070041ffa3d0000000",
     "trampolineHex": "534889f80f57c0e9832fcaff",
-    "dispatchFieldOffset": 200
+    "dispatchFieldOffset": 208
   },
 
   "verificationSpans": [
@@ -431,6 +431,18 @@
       "gateHex": "48833db8a607000074164c8b1dafa6070041ffa3a0000000",
       "trampolineHex": "554156534881ec90000000e9f96bc6ff",
       "dispatchFieldOffset": 160
+    },
+    {
+      "id": "ConstructAdapter",
+      "entryOffset": 1387906,
+      "gateOffset": 4905952,
+      "trampolineOffset": 4905984,
+      "continuationOffset": 1387911,
+      "originalHex": "5541574156",
+      "entryPatchHex": "e959ae3500",
+      "gateHex": "48833db8a507000074164c8b1dafa5070041ffa3a8000000",
+      "trampolineHex": "5541574156e97d51caff",
+      "dispatchFieldOffset": 168
     }
   ]
 }
