@@ -41,6 +41,8 @@ Metal HUD의 MetalFX “Frame Interpolator” 항목은 FG가 멈추고 약 0.5�
 SR·FG 자원 매핑은 네이티브 자원 소유권을 한 번만 획득하고, 출력의 UAV 권한을 Metal 텍스처 추출 전에 검사합니다. 실패 시 참조를 남기지 않으며, 성공 시 보유한 텍스처는 호출자가 해제합니다. Descriptor 레이아웃의 정확한 바이트 검증을 유지합니다.
 FG Prepare·Generate 입력은 한 번 정규화·검증한 스택 패킷으로 전달합니다. 공급자 선택 조건은 컨텍스트 잠금 안에서 다시 확인하며, 네이티브 확장·fallback, V1·V2 reset 의미, 콜백이 만든 입력의 처리를 유지합니다.
 MetalFX·자동 제공자의 유효한 FFX 메모리 조회(V1/V2)는 D3DMetal의 DLSS 호환 정책처럼 두 바이트 값을 0으로 채우고 성공을 반환합니다. 0은 실측 사용량이 아니라 통계 미제공을 뜻하며, native FG·swapchain 조회는 기존 native 결과를 유지합니다. FFX SR/FG export는 SDK의 cdecl ABI를 씁니다.
+네이티브 PSO·함수 캐시는 동시 생성을 한 번으로 합치고, 살아 있는 결과만 재사용합니다. 완료된 항목은 약한 참조만 가지므로 D3DMetal이 파이프라인·reflection·추출 함수를 해제하면 함께 해제되며, 이후 요청은 D3DMetal과 Metal의 디스크 캐시가 처리합니다.
+`QueryVideoMemoryInfo`는 DXMT·MoltenVK처럼 고정 예산을 보고합니다. 로컬 세그먼트 그룹의 예산은 `recommendedMaxWorkingSetSize`, 사용량은 64비트 `currentAllocatedSize` 전체입니다. 비로컬 그룹은 D3D12가 UMA 어댑터에 정한 대로 모두 0입니다. 원래 D3DMetal은 권장치의 2배를 예산으로 보고하고 사용량을 32비트에서 자릅니다. D3DMetal의 `Evict`·`MakeResident`는 아무것도 하지 않으므로, 예산을 시스템 메모리에 따라 줄이면 메모리는 그대로인 채 게임이 텍스처 화질만 낮춥니다. 그래서 예산을 고정합니다. 예약은 구현하지 않아 0으로 보고합니다.
 
 경계 검증: `python3 scripts/test-msync-message-dispatch.py`, `python3 scripts/test-resource-map.py`, `python3 scripts/test-fg-normalization.py`, `python3 scripts/test-fsr-memory-query.py`, `python3 scripts/test-wine-artifact-catalog.py`.
 

@@ -15,19 +15,19 @@ const layoutText = await readFile(
 );
 const layoutSha256 = createHash("sha256").update(layoutText).digest("hex");
 const expectedLayoutSha256 =
-  "a08343959223d336c0710995001ff8361a4046d5bb165abb2922e92675050ba0";
+  "f8130776ff39ec46e64428818bd37742abc1b159e72b5ab3d772134c818805da";
 if (layoutSha256 !== expectedLayoutSha256) {
   throw new Error(
     `layout corruption: expected SHA-256 ${expectedLayoutSha256}, got ${layoutSha256}`
   );
 }
 const layout = JSON.parse(layoutText);
-if (layout.formatVersion !== 14) {
+if (layout.formatVersion !== 15) {
   throw new Error(`unsupported layout format ${layout.formatVersion}`);
 }
 
 export const D3DMETAL_PSO_CACHE_PATCHED_PAYLOAD_SHA256 =
-  "2a7b3f2cc60c75038ccb575c06a32811e3ba03de5968bc4961baeaebdc2e6f8b";
+  "dd47281c38bb94768b541c8e2d70f6b8b324696399c58fdaa404c11351f5010a";
 
 const LC_SEGMENT_64 = 0x19;
 const LC_UUID = 0x1b;
@@ -370,6 +370,24 @@ const patchSites = [
       patched: Buffer.from(hook.gateHex, "hex"),
     },
   ]),
+  {
+    name: `${layout.videoMemoryHook.id}-entry`,
+    offset: layout.videoMemoryHook.entryOffset,
+    expectedOriginal: Buffer.from(layout.videoMemoryHook.originalHex, "hex"),
+    patched: Buffer.from(layout.videoMemoryHook.entryPatchHex, "hex"),
+  },
+  {
+    name: `${layout.videoMemoryHook.id}-gate`,
+    offset: layout.videoMemoryHook.gateOffset,
+    expectedOriginal: Buffer.alloc(Buffer.from(layout.videoMemoryHook.gateHex, "hex").length),
+    patched: Buffer.from(layout.videoMemoryHook.gateHex, "hex"),
+  },
+  {
+    name: `${layout.videoMemoryHook.id}-original-trampoline`,
+    offset: layout.videoMemoryHook.trampolineOffset,
+    expectedOriginal: Buffer.alloc(Buffer.from(layout.videoMemoryHook.trampolineHex, "hex").length),
+    patched: Buffer.from(layout.videoMemoryHook.trampolineHex, "hex"),
+  },
 ];
 
 for (const site of patchSites) {
@@ -493,6 +511,39 @@ if (residencyFinish.originalHex !== "498bbe90000000" ||
     residencyFinish.gateOffset + residencyFinishGate.length > layout.textCave.endOffset ||
     residencyFinish.dispatchFieldOffset !== (layout.hooks.length + 3) * 8) {
   throw new Error("layout corruption: invalid Metal4 Present residency retirement gate");
+}
+
+// DXGIAdapter::QueryVideoMemoryInfo: every D3DMetal caller (the COM thunk,
+// the unixcall unpacker, and D3D12 downlevel) ignores its return value. The
+// relocated prologue has no rip-relative operands and no branch targets it.
+const videoMemory = layout.videoMemoryHook;
+const videoMemoryOriginal = Buffer.from(videoMemory.originalHex, "hex");
+const videoMemoryEntry = Buffer.from(videoMemory.entryPatchHex, "hex");
+const videoMemoryGate = Buffer.from(videoMemory.gateHex, "hex");
+const videoMemoryTrampoline = Buffer.from(videoMemory.trampolineHex, "hex");
+if (videoMemory.originalHex !== "534889f80f57c0" ||
+    videoMemory.entryOffset !== 0x150b48 ||
+    videoMemory.continuationOffset !== videoMemory.entryOffset + videoMemoryOriginal.length ||
+    videoMemoryEntry.length !== videoMemoryOriginal.length || videoMemoryEntry[0] !== 0xe9 ||
+    videoMemoryEntry.subarray(5).toString("hex") !== "9090" ||
+    videoMemory.entryOffset + 5 + videoMemoryEntry.readInt32LE(1) !== videoMemory.gateOffset ||
+    videoMemoryGate.length !== 24 || videoMemoryGate[8] !== 0x74 ||
+    videoMemoryGate.subarray(0, 3).toString("hex") !== "48833d" ||
+    videoMemoryGate.subarray(10, 13).toString("hex") !== "4c8b1d" ||
+    videoMemoryGate.subarray(17, 20).toString("hex") !== "41ffa3" ||
+    videoMemory.gateOffset + 8 + videoMemoryGate.readInt32LE(3) !== layout.dispatch.dataSlotVMAddr ||
+    videoMemory.gateOffset + 17 + videoMemoryGate.readInt32LE(13) !== layout.dispatch.dataSlotVMAddr ||
+    videoMemory.gateOffset + 10 + videoMemoryGate.readInt8(9) !== videoMemory.trampolineOffset ||
+    videoMemoryGate.readUInt32LE(20) !== videoMemory.dispatchFieldOffset ||
+    !videoMemoryTrampoline.subarray(0, videoMemoryOriginal.length).equals(videoMemoryOriginal) ||
+    videoMemoryTrampoline.length !== videoMemoryOriginal.length + 5 ||
+    videoMemoryTrampoline[videoMemoryOriginal.length] !== 0xe9 ||
+    videoMemory.trampolineOffset + videoMemoryTrampoline.length +
+      videoMemoryTrampoline.readInt32LE(videoMemoryOriginal.length + 1) !== videoMemory.continuationOffset ||
+    videoMemory.gateOffset < layout.constructorVerification.markerOffset ||
+    videoMemory.trampolineOffset + videoMemoryTrampoline.length > layout.textCave.endOffset ||
+    videoMemory.dispatchFieldOffset !== (layout.hooks.length + 4) * 8) {
+  throw new Error("layout corruption: invalid DXGI video-memory query gate");
 }
 
 export const D3DMETAL_PSO_CACHE_PATCH_SITES = patchSites;
@@ -650,27 +701,25 @@ async function patchFile(inputPath, outputPath) {
   return inspectD3DMetalPsoCachePatch(output);
 }
 
-const DEFAULT_INPUT =
-  "build/wine-p3/gptk-overlay/wine/lib/external/D3DMetal.framework/Versions/A/D3DMetal";
 const DEFAULT_OUTPUT = "build/d3dmetal-pso-cache/D3DMetal";
 
 async function main(argv) {
   const [command, ...args] = argv;
-  if (command === "inspect" && args.length <= 1) {
-    const inputPath = args[0] ?? DEFAULT_INPUT;
+  if (command === "inspect" && args.length === 1) {
+    const inputPath = args[0];
     console.log(
       JSON.stringify(inspectD3DMetalPsoCachePatch(await readFile(inputPath)), null, 2)
     );
     return;
   }
-  if (command === "patch" && args.length <= 2) {
-    const inputPath = args[0] ?? DEFAULT_INPUT;
+  if (command === "patch" && args.length >= 1 && args.length <= 2) {
+    const inputPath = args[0];
     const outputPath = args[1] ?? DEFAULT_OUTPUT;
     console.log(JSON.stringify(await patchFile(inputPath, outputPath), null, 2));
     return;
   }
   throw new Error(
-    "Usage: d3dmetal-pso-cache-patch.mjs inspect [binary] | patch [pristine-or-stage-locked-binary] [output]"
+    "Usage: d3dmetal-pso-cache-patch.mjs inspect <binary> | patch <pristine-or-stage-locked-binary> [output]"
   );
 }
 

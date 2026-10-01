@@ -4,6 +4,8 @@
 #error "d3dmetal-pso-cache must be compiled with Objective-C automatic reference counting disabled"
 #endif
 
+#import <objc/runtime.h>
+
 #include <algorithm>
 #include <condition_variable>
 #include <exception>
@@ -12,6 +14,13 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+// Exported by libobjc (the __weak ABI) but only declared in private headers.
+// objc_storeWeakOrNil stores nil instead of aborting when an object refuses
+// weak references, which makes such a result uncacheable instead of fatal.
+extern "C" id objc_storeWeakOrNil(id* location, id object);
+extern "C" id objc_loadWeakRetained(id* location);
+extern "C" void objc_destroyWeak(id* location);
 
 namespace yaagl::pso {
 
@@ -89,8 +98,11 @@ struct KeyEqual final {
 
 struct Entry final {
     ~Entry() {
+        for (std::size_t index = 0; index < weakFunctionCount; ++index) {
+            objc_destroyWeak(&weakFunctions[index]);
+        }
+        objc_destroyWeak(&weakLibrary);
         [library release];
-        [snapshot release];
         [objcException release];
     }
 
@@ -98,19 +110,107 @@ struct Entry final {
     Entry& operator=(const Entry&) = delete;
     Entry() = default;
 
+    // Strong only while the producer runs; released once the entry completes.
     id library = nil;
-    NSArray* snapshot = nil;
     bool complete = false;
+    // Set once weak slots are published. They are never written again, so
+    // holders of the entry may load them without the scope mutex.
     bool cached = false;
+    // Weak slots live in the entry or in a fixed heap block so their addresses
+    // stay stable from objc_storeWeak until objc_destroyWeak.
+    id weakLibrary = nil;
+    std::unique_ptr<id[]> weakFunctions;
+    std::size_t weakFunctionCount = 0;
     std::exception_ptr cppException;
     NSException* objcException = nil;
     std::condition_variable ready;
 };
 
+constexpr std::size_t kMinimumSweepSize = 64;
+
 struct DeviceScope final {
     std::mutex mutex;
     std::unordered_map<Key, std::shared_ptr<Entry>, KeyHash, KeyEqual> entries;
+    std::size_t sweepAt = kMinimumSweepSize;
 };
+
+// Records weak references to the library and every extracted function. Any
+// failure leaves the entry uncacheable; the producer keeps its own result.
+bool publishWeak(Entry& entry, NSArray* functions) noexcept {
+    try {
+        @try {
+            const NSUInteger count = [functions count];
+            entry.weakFunctions.reset(new id[count]());
+            entry.weakFunctionCount = count;
+            for (NSUInteger index = 0; index < count; ++index) {
+                id function = [functions objectAtIndex:index];
+                if (objc_storeWeakOrNil(&entry.weakFunctions[index], function) == nil) {
+                    return false;
+                }
+            }
+            return objc_storeWeakOrNil(&entry.weakLibrary, entry.library) != nil;
+        } @catch (NSException*) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+}
+
+// Returns false if the library or any function has been deallocated. On live
+// entries, output receives a new +1 array of the loaded functions. Allocation
+// exceptions propagate after releasing every temporary.
+bool loadWeak(Entry& entry, NSMutableArray*& output) {
+    id library = objc_loadWeakRetained(&entry.weakLibrary);
+    if (library == nil) {
+        return false;
+    }
+    [library release];
+
+    NSMutableArray* functions = nil;
+    @try {
+        functions = [[NSMutableArray alloc] initWithCapacity:entry.weakFunctionCount];
+        for (std::size_t index = 0; index < entry.weakFunctionCount; ++index) {
+            id function = objc_loadWeakRetained(&entry.weakFunctions[index]);
+            if (function == nil) {
+                [functions release];
+                return false;
+            }
+            @try {
+                [functions addObject:function];
+            } @finally {
+                [function release];
+            }
+        }
+    } @catch (NSException*) {
+        [functions release];
+        @throw;
+    }
+    output = functions;
+    return true;
+}
+
+// Drops completed entries whose library or any function died. Runs under the
+// scope mutex and only performs weak loads.
+void sweep(DeviceScope& scope) noexcept {
+    const auto dead = [](id& slot) {
+        id object = objc_loadWeakRetained(&slot);
+        [object release];
+        return object == nil;
+    };
+    for (auto current = scope.entries.begin(); current != scope.entries.end();) {
+        Entry& entry = *current->second;
+        if (entry.complete && entry.cached
+            && (dead(entry.weakLibrary)
+                || std::any_of(entry.weakFunctions.get(),
+                    entry.weakFunctions.get() + entry.weakFunctionCount, dead))) {
+            current = scope.entries.erase(current);
+            continue;
+        }
+        ++current;
+    }
+    scope.sweepAt = std::max(kMinimumSweepSize, scope.entries.size() * 2);
+}
 
 thread_local unsigned producerDepth = 0;
 
@@ -156,6 +256,9 @@ public:
                 std::unique_lock lock(scope->mutex);
                 const auto found = scope->entries.find(key);
                 if (found == scope->entries.end()) {
+                    if (scope->entries.size() >= scope->sweepAt) {
+                        sweep(*scope);
+                    }
                     try {
                         entry = std::make_shared<Entry>();
                         scope->entries.emplace(Key(key.begin(), key.end()), entry);
@@ -186,24 +289,35 @@ public:
             }
 
             if (!producer) {
+                // Weak slots are immutable once cached, so they are loaded (and
+                // any temporaries released) without holding the scope mutex.
                 ProducerGuard hitGuard;
+                bool live = false;
                 NSMutableArray* functions = nil;
                 NSException* objcException = nil;
                 try {
                     @try {
-                        functions = [entry->snapshot mutableCopy];
+                        live = loadWeak(*entry, functions);
                     } @catch (NSException* exception) {
                         if ([[exception name] isEqualToString:NSMallocException]) {
-                            functions = nil;
+                            live = true;
                         } else {
                             objcException = exception;
                         }
                     }
                 } catch (const std::bad_alloc&) {
-                    functions = nil;
+                    live = true;
                 }
                 if (objcException != nil) {
+                    [functions release];
                     @throw objcException;
+                }
+                if (!live) {
+                    {
+                        std::lock_guard lock(scope->mutex);
+                        eraseIfCurrent(*scope, key, entry);
+                    }
+                    continue;
                 }
                 if (functions != nil) {
                     return FunctionResult(functions, true);
@@ -269,46 +383,22 @@ public:
                 std::rethrow_exception(cppException);
             }
 
-            NSArray* snapshot = nil;
-            NSException* snapshotObjcException = nil;
-            std::exception_ptr snapshotCppException;
-            if (produced->functions() != nil && produced->reusable()) {
-                try {
-                    @try {
-                        snapshot = [produced->functions() copy];
-                    } @catch (NSException* exception) {
-                        if ([[exception name] isEqualToString:NSMallocException]) {
-                            snapshot = nil;
-                        } else {
-                            snapshotObjcException = [exception retain];
-                        }
-                    }
-                } catch (const std::bad_alloc&) {
-                    snapshot = nil;
-                } catch (...) {
-                    snapshotCppException = std::current_exception();
-                }
-            }
-            if (snapshotObjcException != nil) {
-                publishException(*scope, key, entry, snapshotObjcException, {});
-                @throw snapshotObjcException;
-            }
-            if (snapshotCppException) {
-                publishException(*scope, key, entry, nil, snapshotCppException);
-                std::rethrow_exception(snapshotCppException);
-            }
-
+            // Waiters only read the entry after complete is set under the
+            // mutex, so the weak slots can be published before locking.
+            const bool cached = produced->functions() != nil && produced->reusable()
+                && publishWeak(*entry, produced->functions());
+            id retainedLibrary = nil;
             {
                 std::lock_guard lock(scope->mutex);
                 entry->complete = true;
-                if (snapshot != nil) {
-                    entry->snapshot = std::exchange(snapshot, nil);
-                    entry->cached = true;
-                } else {
+                entry->cached = cached;
+                retainedLibrary = std::exchange(entry->library, nil);
+                if (!cached) {
                     eraseIfCurrent(*scope, key, entry);
                 }
             }
             entry->ready.notify_all();
+            [retainedLibrary release];
             return std::move(*produced);
         }
     }

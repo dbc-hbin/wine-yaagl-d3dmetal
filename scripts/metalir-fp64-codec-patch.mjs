@@ -7,8 +7,7 @@ import { fileURLToPath } from "node:url";
 
 export const METAL_IR_CONVERTER_4_0_BETA_2_SHA256 =
   "75974d49ad4dd1bdf17ab3cd666ae7cac43e7f7a5760237699ab33ecd3d31daf";
-// Recovered from the package artifact recorded in
-// build/prebuilt-d3dmetal-runtime/wine-11.0-d3dmetal-gptk4.0b2-rtx5060-i1.tar.xz.manifest.json.
+// Pinned output of FP64_CODEC_PATCH_SITES applied to the 4.0b2 converter.
 export const METAL_IR_CONVERTER_4_0_BETA_2_FP64_PATCHED_SHA256 =
   "5c5619ef17a7d62e84db0a7f5181d746623b47364379271fd5827e6bd961ba34";
 

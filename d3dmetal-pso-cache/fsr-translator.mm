@@ -392,7 +392,6 @@ yaagl_fsr_api(std::uint32_t operation, void* arguments) noexcept {
                 case YAAGL_FSR_CREATE: return create(*static_cast<yaagl_fsr_create_packet*>(arguments));
                 case YAAGL_FSR_DESTROY: return destroy(header);
                 case YAAGL_FSR_CONFIGURE: return configure(*static_cast<yaagl_fsr_configure_packet*>(arguments));
-                case YAAGL_FSR_QUERY: return 2;
                 case YAAGL_FSR_DISPATCH: return dispatch(*static_cast<yaagl_fsr_dispatch_packet*>(arguments));
                 default: return 2;
                 }

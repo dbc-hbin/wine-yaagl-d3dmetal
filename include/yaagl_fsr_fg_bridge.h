@@ -15,7 +15,7 @@ enum yaagl_fsr_fg_create_flags
 
 enum yaagl_fsr_fg_operation
 {
-    YAAGL_FSR_FG_PROBE = 0,
+    /* 0 is reserved; it was a removed capability probe. */
     YAAGL_FSR_FG_CREATE = 1,
     YAAGL_FSR_FG_PREPARE = 2,
     YAAGL_FSR_FG_DISPATCH = 3,
@@ -31,18 +31,6 @@ struct yaagl_fsr_fg_packet_header
     uint32_t operation;
     uint32_t result;
     uint64_t context;
-};
-
-struct yaagl_fsr_fg_probe_packet
-{
-    struct yaagl_fsr_fg_packet_header header;
-    uint64_t device;
-    uint32_t display_width;
-    uint32_t display_height;
-    uint32_t backbuffer_format;
-    uint32_t flags;
-    uint32_t legacy_supported;
-    uint32_t metal4_supported;
 };
 
 struct yaagl_fsr_fg_create_packet

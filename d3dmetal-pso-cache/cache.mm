@@ -4,6 +4,8 @@
 #error "d3dmetal-pso-cache must be compiled with Objective-C automatic reference counting disabled"
 #endif
 
+#import <objc/runtime.h>
+
 #include <algorithm>
 #include <condition_variable>
 #include <exception>
@@ -12,6 +14,14 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+#include <vector>
+
+// Exported by libobjc (the __weak ABI) but only declared in private headers.
+// objc_storeWeakOrNil stores nil instead of aborting when an object refuses
+// weak references, which makes such a result uncacheable instead of fatal.
+extern "C" id objc_storeWeakOrNil(id* location, id object);
+extern "C" id objc_loadWeakRetained(id* location);
+extern "C" void objc_destroyWeak(id* location);
 
 namespace yaagl::pso {
 
@@ -107,9 +117,16 @@ struct KeyEqual final {
     }
 };
 
+const char kReflectionAssociation = 0;
+
 struct Entry final {
     explicit Entry(NSArray* resources) : keyResources([resources retain]) {}
     ~Entry() {
+        for (std::size_t index = 0; index < weakResourceCount; ++index) {
+            objc_destroyWeak(&weakResources[index]);
+        }
+        objc_destroyWeak(&weakState);
+        objc_destroyWeak(&weakReflection);
         [keyResources release];
         [objcException release];
     }
@@ -117,8 +134,21 @@ struct Entry final {
     Entry(const Entry&) = delete;
     Entry& operator=(const Entry&) = delete;
 
+    // Strong only while the producer runs; released once the entry completes.
     NSArray* keyResources;
     bool complete = false;
+    // Set once weak slots are published. They are never written again, so
+    // holders of the entry may load them without the scope mutex.
+    bool cached = false;
+    bool hasReflection = false;
+    // Weak slots live in the entry or in a fixed heap block so their addresses
+    // stay stable from objc_storeWeak until objc_destroyWeak.
+    std::unique_ptr<id[]> weakResources;
+    std::size_t weakResourceCount = 0;
+    id weakState = nil;
+    id weakReflection = nil;
+    // Only uncached completions (failures) keep a strong result for waiters
+    // that already hold this erased entry.
     std::optional<NativeResult> result;
     std::exception_ptr cppException;
     NSException* objcException = nil;
@@ -126,10 +156,98 @@ struct Entry final {
     Entry* waitingOn = nullptr;
 };
 
+constexpr std::size_t kMinimumSweepSize = 64;
+
 struct DeviceScope final {
     std::mutex mutex;
     std::unordered_map<Key, std::shared_ptr<Entry>, KeyHash, KeyEqual> entries;
+    std::size_t sweepAt = kMinimumSweepSize;
 };
+
+// Converts a successful result into weak slots. Any failure leaves the entry
+// uncacheable; the producer still returns its strong result.
+bool publishWeak(Entry& entry, const NativeResult& result) noexcept {
+    try {
+        @try {
+            const NSUInteger count = [entry.keyResources count];
+            entry.weakResources.reset(new id[count]());
+            entry.weakResourceCount = count;
+            for (NSUInteger index = 0; index < count; ++index) {
+                id resource = [entry.keyResources objectAtIndex:index];
+                if (objc_storeWeakOrNil(&entry.weakResources[index], resource) == nil) {
+                    return false;
+                }
+            }
+            id reflection = result.reflection();
+            if (reflection != nil) {
+                // The reflection has no other owner once D3DMetal drops it;
+                // tie its lifetime to the state it describes.
+                objc_setAssociatedObject(result.state(), &kReflectionAssociation,
+                    reflection, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                if (objc_storeWeakOrNil(&entry.weakReflection, reflection) == nil) {
+                    return false;
+                }
+                entry.hasReflection = true;
+            }
+            return objc_storeWeakOrNil(&entry.weakState, result.state()) != nil;
+        } @catch (NSException*) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+}
+
+// Returns a live result with fresh owned references, or nothing if any object
+// the entry refers to has been deallocated.
+std::optional<NativeResult> loadWeak(Entry& entry) noexcept {
+    for (std::size_t index = 0; index < entry.weakResourceCount; ++index) {
+        id resource = objc_loadWeakRetained(&entry.weakResources[index]);
+        if (resource == nil) {
+            return std::nullopt;
+        }
+        [resource release];
+    }
+    id state = objc_loadWeakRetained(&entry.weakState);
+    if (state == nil) {
+        return std::nullopt;
+    }
+    id reflection = nil;
+    if (entry.hasReflection) {
+        reflection = objc_loadWeakRetained(&entry.weakReflection);
+        if (reflection == nil) {
+            [state release];
+            return std::nullopt;
+        }
+    }
+    std::optional<NativeResult> result(std::in_place, state, reflection, nil);
+    [reflection release];
+    return result;
+}
+
+// Drops completed entries whose state, reflection, or any key resource died.
+// Runs under the scope mutex and only performs weak loads; each release
+// returns an object someone else still owns unless it raced to zero.
+void sweep(DeviceScope& scope) noexcept {
+    const auto dead = [](id& slot) {
+        id object = objc_loadWeakRetained(&slot);
+        [object release];
+        return object == nil;
+    };
+    for (auto current = scope.entries.begin(); current != scope.entries.end();) {
+        Entry& entry = *current->second;
+        if (entry.complete && entry.cached
+            && (dead(entry.weakState)
+                || (entry.hasReflection && dead(entry.weakReflection))
+                || std::any_of(entry.weakResources.get(),
+                    entry.weakResources.get() + entry.weakResourceCount, dead))) {
+            current = scope.entries.erase(current);
+            continue;
+        }
+        ++current;
+    }
+    scope.sweepAt = std::max(kMinimumSweepSize, scope.entries.size() * 2);
+}
 
 std::mutex dependencyMutex;
 thread_local Entry* activeProducer = nullptr;
@@ -217,90 +335,119 @@ public:
             return create();
         }
 
-        std::shared_ptr<Entry> entry;
-        std::optional<ProducerGuard> producer;
-        {
-            std::unique_lock lock(scope->mutex);
-            const auto found = scope->entries.find(key);
-            if (found == scope->entries.end()) {
-                try {
-                    entry = std::make_shared<Entry>(keyResources);
-                    scope->entries.emplace(Key(key.begin(), key.end()), entry);
-                    producer.emplace(entry.get());
-                } catch (const std::bad_alloc&) {
-                    lock.unlock();
-                    return create();
-                }
-            } else {
-                entry = found->second;
-                if (!entry->complete) {
-                    WaitDependency dependency(entry.get());
-                    if (dependency.cyclic()) {
+        for (;;) {
+            std::shared_ptr<Entry> entry;
+            std::optional<ProducerGuard> producer;
+            {
+                std::unique_lock lock(scope->mutex);
+                const auto found = scope->entries.find(key);
+                if (found == scope->entries.end()) {
+                    if (scope->entries.size() >= scope->sweepAt) {
+                        sweep(*scope);
+                    }
+                    try {
+                        entry = std::make_shared<Entry>(keyResources);
+                        scope->entries.emplace(Key(key.begin(), key.end()), entry);
+                        producer.emplace(entry.get());
+                    } catch (const std::bad_alloc&) {
                         lock.unlock();
                         return create();
                     }
-                    entry->ready.wait(lock, [&entry] { return entry->complete; });
+                } else {
+                    entry = found->second;
+                    if (!entry->complete) {
+                        WaitDependency dependency(entry.get());
+                        if (dependency.cyclic()) {
+                            lock.unlock();
+                            return create();
+                        }
+                        entry->ready.wait(lock, [&entry] { return entry->complete; });
+                    }
+                    if (entry->objcException != nil) {
+                        @throw entry->objcException;
+                    }
+                    if (entry->cppException) {
+                        std::rethrow_exception(entry->cppException);
+                    }
+                    if (!entry->cached) {
+                        if (!entry->result) {
+                            throw std::logic_error("completed pipeline cache entry has no result");
+                        }
+                        return *entry->result;
+                    }
                 }
-                if (entry->objcException != nil) {
-                    @throw entry->objcException;
-                }
-                if (entry->cppException) {
-                    std::rethrow_exception(entry->cppException);
-                }
-                if (!entry->result) {
-                    throw std::logic_error("completed pipeline cache entry has no result");
-                }
-
-                return *entry->result;
             }
-        }
 
-        std::optional<NativeResult> produced;
-        std::exception_ptr cppException;
-        NSException* objcException = nil;
-        try {
-            @try {
-                produced.emplace(create());
-            } @catch (NSException* exception) {
-                objcException = [exception retain];
+            if (!producer) {
+                // Weak slots are immutable once cached, so they are loaded (and
+                // any temporaries released) without holding the scope mutex.
+                std::optional<NativeResult> live = loadWeak(*entry);
+                if (live) {
+                    return std::move(*live);
+                }
+                {
+                    std::lock_guard lock(scope->mutex);
+                    eraseIfCurrent(*scope, key, entry);
+                }
+                continue;
             }
-        } catch (...) {
-            cppException = std::current_exception();
-        }
 
-        if (objcException != nil) {
+            std::optional<NativeResult> produced;
+            std::exception_ptr cppException;
+            NSException* objcException = nil;
+            try {
+                @try {
+                    produced.emplace(create());
+                } @catch (NSException* exception) {
+                    objcException = [exception retain];
+                }
+            } catch (...) {
+                cppException = std::current_exception();
+            }
+
+            if (objcException != nil) {
+                {
+                    std::lock_guard lock(scope->mutex);
+                    entry->objcException = objcException;
+                    entry->complete = true;
+                    eraseIfCurrent(*scope, key, entry);
+                }
+                entry->ready.notify_all();
+                @throw objcException;
+            }
+
+            if (cppException) {
+                {
+                    std::lock_guard lock(scope->mutex);
+                    entry->cppException = cppException;
+                    entry->complete = true;
+                    eraseIfCurrent(*scope, key, entry);
+                }
+                entry->ready.notify_all();
+                std::rethrow_exception(cppException);
+            }
+
+            // Waiters only read the entry after complete is set under the
+            // mutex, so the weak slots can be published before locking.
+            const bool cached = produced->state() != nil && !produced->hasError()
+                && publishWeak(*entry, *produced);
+            NSArray* resources = nil;
             {
                 std::lock_guard lock(scope->mutex);
-                entry->objcException = objcException;
+                if (!cached) {
+                    entry->result.emplace(*produced);
+                }
+                entry->cached = cached;
                 entry->complete = true;
-                eraseIfCurrent(*scope, key, entry);
+                resources = std::exchange(entry->keyResources, nil);
+                if (!cached) {
+                    eraseIfCurrent(*scope, key, entry);
+                }
             }
             entry->ready.notify_all();
-            @throw objcException;
+            [resources release];
+            return std::move(*produced);
         }
-
-        if (cppException) {
-            {
-                std::lock_guard lock(scope->mutex);
-                entry->cppException = cppException;
-                entry->complete = true;
-                eraseIfCurrent(*scope, key, entry);
-            }
-            entry->ready.notify_all();
-            std::rethrow_exception(cppException);
-        }
-
-        const bool successful = produced->state() != nil && !produced->hasError();
-        {
-            std::lock_guard lock(scope->mutex);
-            entry->result.emplace(std::move(*produced));
-            entry->complete = true;
-            if (!successful) {
-                eraseIfCurrent(*scope, key, entry);
-            }
-        }
-        entry->ready.notify_all();
-        return *entry->result;
     }
 
     void withDeviceRetired(

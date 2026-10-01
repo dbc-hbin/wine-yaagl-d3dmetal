@@ -7,7 +7,7 @@ enum yaagl_fsr_operation
     YAAGL_FSR_CREATE = 0,
     YAAGL_FSR_DESTROY = 1,
     YAAGL_FSR_CONFIGURE = 2,
-    YAAGL_FSR_QUERY = 3,
+    /* 3 is reserved; queries are answered in the PE module. */
     YAAGL_FSR_DISPATCH = 4
 };
 
@@ -35,14 +35,6 @@ struct yaagl_fsr_configure_packet
     struct yaagl_fsr_packet_header header;
     uint32_t debug_level;
     uint32_t reserved;
-};
-
-struct yaagl_fsr_query_packet
-{
-    struct yaagl_fsr_packet_header header;
-    uint64_t type;
-    uint64_t required_resources;
-    uint64_t optional_resources;
 };
 
 struct yaagl_fsr_dispatch_packet

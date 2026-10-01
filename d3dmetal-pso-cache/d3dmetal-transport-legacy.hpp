@@ -18,7 +18,7 @@ bool resolveCommandList(NativeCommandList& commandList) noexcept;
 // D3DMCommandAllocator resource lifetime list.
 bool record(NativeCommandList& commandList, const RecordRequest& request) noexcept;
 
-// Prime's legacy EncodeTemporallyScaleMTLFX hook calls this before the native
+// The EncodeTemporalScaleMTL hook (ngx-hooks) calls this before the native
 // parser. Only NotRecorded may fall through; recognized failures remain ours.
 ReplayResult replay(void* d3dmCommandEncoder, const void* command) noexcept;
 

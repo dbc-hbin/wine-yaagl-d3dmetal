@@ -1304,35 +1304,6 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
             }
             if (!available()) return finish(Unsupported);
 
-            if (operation == YAAGL_FSR_FG_PROBE) {
-                if (header.size != sizeof(yaagl_fsr_fg_probe_packet))
-                    return finish(Parameter);
-                auto& p = *static_cast<yaagl_fsr_fg_probe_packet*>(arguments);
-                p.legacy_supported = p.metal4_supported = 0;
-                auto device = owner(pointer(p.device), false);
-                Luid luid{};
-                if (!device || !getLuid(device.get(), luid) ||
-                    !p.display_width || !p.display_height)
-                    return finish(Parameter);
-                if (colorFormat(p.backbuffer_format) == MTLPixelFormatInvalid)
-                    return finish(Unsupported);
-                /*
-                 * Probe is advisory. The authoritative device and command mode
-                 * are resolved from the caller's command list during Prepare.
-                 */
-                if (@available(macOS 26.0, *)) {
-                    NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
-                    for (id<MTLDevice> metalDevice in devices) {
-                        p.legacy_supported |=
-                            [MTLFXFrameInterpolatorDescriptor supportsDevice:metalDevice] ? 1u : 0u;
-                        p.metal4_supported |=
-                            [MTLFXFrameInterpolatorDescriptor supportsMetal4FX:metalDevice] ? 1u : 0u;
-                    }
-                    [devices release];
-                }
-                return finish(p.legacy_supported || p.metal4_supported ? Ok : Unsupported);
-            }
-
             if (operation == YAAGL_FSR_FG_CREATE) {
                 if (header.size != sizeof(yaagl_fsr_fg_create_packet))
                     return finish(Parameter);

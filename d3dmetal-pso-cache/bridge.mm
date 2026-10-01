@@ -21,9 +21,9 @@
 #include "d3dmetal-transport.hpp"
 #include "display-routing.hpp"
 #include "layout.hpp"
-#include "persistent-cache.hpp"
 #include "rt-key.hpp"
 #include "stage-cache.hpp"
+#include "video-memory.hpp"
 
 namespace yaagl::pso {
 namespace {
@@ -38,7 +38,8 @@ static_assert(layout::kPresentDispatchIndex == kHookCount);
 static_assert(layout::kCommitDispatchIndex == kHookCount + 1);
 static_assert(layout::kPresentResidencyAddDispatchIndex == kHookCount + 2);
 static_assert(layout::kPresentResidencyFinishDispatchIndex == kHookCount + 3);
-std::array<std::uintptr_t, kHookCount + 4> dispatchTable{};
+static_assert(layout::kVideoMemoryDispatchIndex == kHookCount + 4);
+std::array<std::uintptr_t, kHookCount + 5> dispatchTable{};
 thread_local Context currentContext{};
 thread_local FunctionContext currentFunctionContext{};
 std::uintptr_t functionImageBase = 0;
@@ -300,7 +301,6 @@ __attribute__((constructor)) void initialize() noexcept {
         if (base == nullptr) return;
         static_cast<void>(fsr::initialize(base));
         static_cast<void>(fsr::framegeneration::initialize(base));
-        warmPersistentCachesFromEnvironment();
         static_cast<void>(runtime());
         for (std::size_t index = 0; index < kHookCount; ++index) {
             originalFunctions[index] = reinterpret_cast<std::uintptr_t>(base + layout::kTrampolines[index]);
@@ -361,6 +361,7 @@ __attribute__((constructor)) void initialize() noexcept {
             reinterpret_cast<std::uintptr_t>(&d3dmetal::commitRecordedBatch),
             reinterpret_cast<std::uintptr_t>(&addPresentResidency),
             reinterpret_cast<std::uintptr_t>(&finishPresentResidency),
+            reinterpret_cast<std::uintptr_t>(&video_memory::query),
         };
         auto& slot = *reinterpret_cast<std::uintptr_t*>(const_cast<std::uint8_t*>(base) + layout::kDataSlot);
         std::atomic_ref<std::uintptr_t>(slot).store(

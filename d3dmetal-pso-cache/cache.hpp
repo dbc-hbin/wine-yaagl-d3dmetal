@@ -21,6 +21,7 @@ public:
     ~NativeResult();
 
     [[nodiscard]] id state() const noexcept { return state_; }
+    [[nodiscard]] id reflection() const noexcept { return reflection_; }
     [[nodiscard]] bool hasError() const noexcept { return error_ != nil; }
 
     // Transfer this result's owned reference to the caller.
@@ -43,8 +44,12 @@ public:
     Cache& operator=(const Cache&) = delete;
     ~Cache();
 
-    // keyResources is retained only when a new entry is created; its objects
-    // stay alive with that in-flight or completed entry.
+    // keyResources is retained only while a newly admitted entry is in flight.
+    // A successful entry then keeps only weak references to those objects, the
+    // state, and its reflection (associated with the state so both die
+    // together); it never extends their lifetime. Key bytes embed object
+    // addresses, but a reused address can only hit an entry whose weak slot for
+    // the dead original is nil, so such an entry is discarded and recreated.
     [[nodiscard]] NativeResult getOrCreate(
         const void* device,
         std::span<const std::uint8_t> key,

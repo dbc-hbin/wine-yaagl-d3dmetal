@@ -384,27 +384,25 @@ async function patchFile(inputPath, outputPath) {
   return inspectD3DMetalStageLockPatch(output);
 }
 
-const DEFAULT_INPUT =
-  "build/wine-p3/gptk-overlay/wine/lib/external/D3DMetal.framework/Versions/A/D3DMetal";
 const DEFAULT_OUTPUT = "build/d3dmetal-stage-lock/D3DMetal";
 
 async function main(argv) {
   const [command, ...args] = argv;
-  if (command === "inspect" && args.length <= 1) {
-    const inputPath = args[0] ?? DEFAULT_INPUT;
+  if (command === "inspect" && args.length === 1) {
+    const inputPath = args[0];
     console.log(
       JSON.stringify(inspectD3DMetalStageLockPatch(await readFile(inputPath)), null, 2)
     );
     return;
   }
-  if (command === "patch" && args.length <= 2) {
-    const inputPath = args[0] ?? DEFAULT_INPUT;
+  if (command === "patch" && args.length >= 1 && args.length <= 2) {
+    const inputPath = args[0];
     const outputPath = args[1] ?? DEFAULT_OUTPUT;
     console.log(JSON.stringify(await patchFile(inputPath, outputPath), null, 2));
     return;
   }
   throw new Error(
-    "Usage: d3dmetal-stage-lock-patch.mjs inspect [binary] | patch [pristine-binary] [output]"
+    "Usage: d3dmetal-stage-lock-patch.mjs inspect <binary> | patch <pristine-binary> [output]"
   );
 }
 

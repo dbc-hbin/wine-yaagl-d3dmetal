@@ -157,8 +157,8 @@ struct RecordRequest {
 bool initialize(const void* d3dmetalImageBase = nullptr) noexcept;
 
 // Public DX12 command-list -> private MPL/legacy transport.  MPL returns the
-// current IMPLCommandList and IMPLCommandAllocator.  Legacy is identified but
-// intentionally has no custom replay transport in this implementation.
+// current IMPLCommandList and IMPLCommandAllocator; legacy command lists are
+// recorded and replayed through d3dmetal-transport-legacy.
 bool unwrapCommandList(void* d3d12CommandList, NativeCommandList& out) noexcept;
 void releaseCommandList(NativeCommandList& commandList) noexcept;
 

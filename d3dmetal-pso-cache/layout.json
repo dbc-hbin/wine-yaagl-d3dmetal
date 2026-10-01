@@ -1,7 +1,6 @@
 {
-  "formatVersion": 14,
+  "formatVersion": 15,
   "source": {
-    "sha256": "32f8adb414806e63dcb46c4260f399a36b85454ad255e40c3dc5d8e0dfad95eb",
     "machUuid": "674e662b6b5c3fd99a8af415609d2f6a",
     "cpuType": 16777223,
     "fileType": 6
@@ -15,20 +14,16 @@
     "patchedCommandCount": 34,
     "originalCommandsSize": 3776,
     "patchedCommandsSize": 3856,
-    "firstTextOffset": 3920,
-    "originalPaddingSize": 112
+    "firstTextOffset": 3920
   },
   "constructorVerification": {
     "markerOffset": 4904624,
-    "markerHex": "594141474c50534f43414348450e0000",
-    "description": "Version 14 verifies the 21-entry PSO/FSR/display dispatch table, four special presentation/commit/residency gates, and the null dispatch slot; stock NGX Evaluate and recording paths remain unpatched."
+    "markerHex": "594141474c50534f43414348450f0000",
+    "description": "Version 15 verifies the 21-entry PSO/FSR/display dispatch table, four special presentation/commit/residency gates, the DXGI video-memory budget hook, and the null dispatch slot; stock NGX Evaluate and recording paths remain unpatched."
   },
   "textCave": {
-    "offset": 4904624,
     "endOffset": 4907008,
-    "ehFrameEndOffset": 4904592,
-    "stageLockUsedEndOffset": 4904617,
-    "requiredOriginalByte": 0
+    "ehFrameEndOffset": 4904592
   },
   "dispatch": {
     "dataSlotOffset": 5407136,
@@ -40,7 +35,7 @@
     "commonSectionNewSize": 17376,
     "commonSectionOldEndVMAddr": 5407136,
     "segmentEndVMAddr": 5410816,
-    "description": "The patch claims the first eight zero-fill bytes after __common by extending that section; the constructor atomically publishes one pointer to its immutable 25-entry dispatch table."
+    "description": "The patch claims the first eight zero-fill bytes after __common by extending that section; the constructor atomically publishes one pointer to its immutable 26-entry dispatch table."
   },
   "binaryPatches": [
     {
@@ -119,6 +114,19 @@
     "continuationOffset": 1400910,
     "dispatchFieldOffset": 192
   },
+  "videoMemoryHook": {
+    "id": "QueryVideoMemoryInfo",
+    "entryOffset": 1379144,
+    "gateOffset": 4905888,
+    "trampolineOffset": 4905920,
+    "continuationOffset": 1379151,
+    "originalHex": "534889f80f57c0",
+    "entryPatchHex": "e953d035009090",
+    "gateHex": "48833df8a507000074164c8b1defa5070041ffa3c8000000",
+    "trampolineHex": "534889f80f57c0e9832fcaff",
+    "dispatchFieldOffset": 200
+  },
+
   "verificationSpans": [
     {
       "id": "ExtractCall1107d0",
