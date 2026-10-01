@@ -43,8 +43,9 @@ Its `install` action finishes after publishing the profile host and provenance; 
 The MSync patch stack is consolidated in `patches/wine-tuned/0001-msync-tuned.patch`, without follow-up overrides. Apply it through the source builder’s `patch` flow.
 SR/FG resource mapping acquires the native resource owner once, checks output UAV access before extracting its Metal texture, and balances the owner and retained texture references on success and failure. Descriptor-layout byte checks remain fail-closed.
 FG Prepare/Generate descriptors are normalized and validated once into a stack packet. Provider eligibility is rechecked under the context lock; native extensions/fallback, V1/V2 reset semantics, and callback-produced descriptors retain their existing handling.
+Valid MetalFX/automatic-provider FFX memory-usage queries (V1/V2) return success with both byte counts set to zero, matching D3DMetal DLSS compatibility behavior. Zero means unreported usage, not a measured footprint; native FG/swapchain queries retain their native results. FFX SR/FG exports use the SDK cdecl ABI.
 
-Focused checks: `python3 scripts/test-msync-message-dispatch.py`, `python3 scripts/test-resource-map.py`, `python3 scripts/test-fg-normalization.py`, and `python3 scripts/test-wine-artifact-catalog.py`.
+Focused checks: `python3 scripts/test-msync-message-dispatch.py`, `python3 scripts/test-resource-map.py`, `python3 scripts/test-fg-normalization.py`, `python3 scripts/test-fsr-memory-query.py`, and `python3 scripts/test-wine-artifact-catalog.py`.
 
 ## Cursor handling
 

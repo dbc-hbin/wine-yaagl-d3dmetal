@@ -83,7 +83,7 @@ static int allocation_compatible(const ffxAllocationCallbacks *a, const ffxAlloc
     return a->pUserData == b->pUserData && a->alloc == b->alloc && a->dealloc == b->dealloc;
 }
 
-ffxReturnCode_t WINAPI ffxCreateContext(ffxContext *output, ffxCreateContextDescHeader *desc,
+ffxReturnCode_t ffxCreateContext(ffxContext *output, ffxCreateContextDescHeader *desc,
                                         const ffxAllocationCallbacks *callbacks)
 {
     const ffxApiHeader *entry;
@@ -163,7 +163,7 @@ ffxReturnCode_t WINAPI ffxCreateContext(ffxContext *output, ffxCreateContextDesc
     return FFX_API_RETURN_OK;
 }
 
-ffxReturnCode_t WINAPI ffxDestroyContext(ffxContext *handle, const ffxAllocationCallbacks *callbacks)
+ffxReturnCode_t ffxDestroyContext(ffxContext *handle, const ffxAllocationCallbacks *callbacks)
 {
     struct fsr_context **link, *context = NULL;
     struct yaagl_fsr_packet_header packet;
@@ -191,7 +191,7 @@ ffxReturnCode_t WINAPI ffxDestroyContext(ffxContext *handle, const ffxAllocation
     return result;
 }
 
-ffxReturnCode_t WINAPI ffxConfigure(ffxContext *handle, const ffxConfigureDescHeader *desc)
+ffxReturnCode_t ffxConfigure(ffxContext *handle, const ffxConfigureDescHeader *desc)
 {
     const struct ffxConfigureDescGlobalDebug1 *debug;
     struct fsr_context *context = NULL;
@@ -254,11 +254,45 @@ static void pe_log_result(const char *api, const ffxContext *handle, uint64_t ty
     ReleaseSRWLockExclusive(&pe_log_lock);
 }
 
+/* D3DMetal DLSS-compatible unreported usage: zero is not a measured footprint. */
+static ffxReturnCode_t query_memory(ffxContext *handle, ffxQueryDescHeader *desc)
+{
+    struct FfxApiEffectMemoryUsage *usage;
+    struct fsr_context *context;
+
+    if (desc->type == FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE_V2)
+    {
+        const struct ffxQueryDescUpscaleGetGPUMemoryUsageV2 *query = (void *)desc;
+        if (!(usage = query->gpuMemoryUsageUpscaler)) return FFX_API_RETURN_ERROR_PARAMETER;
+        memset(usage, 0, sizeof(*usage));
+        if (handle)
+        {
+            if (!(context = find_context(handle))) return FFX_API_RETURN_ERROR_PARAMETER;
+            release_context(context);
+        }
+        if (!query->device || !query->maxRenderSize.width || !query->maxRenderSize.height ||
+            !query->maxUpscaleSize.width || !query->maxUpscaleSize.height ||
+            query->maxRenderSize.width > query->maxUpscaleSize.width ||
+            query->maxRenderSize.height > query->maxUpscaleSize.height)
+            return FFX_API_RETURN_ERROR_PARAMETER;
+        return FFX_API_RETURN_OK;
+    }
+    usage = ((struct ffxQueryDescUpscaleGetGPUMemoryUsage *)desc)->gpuMemoryUsageUpscaler;
+    if (!usage) return FFX_API_RETURN_ERROR_PARAMETER;
+    memset(usage, 0, sizeof(*usage));
+    if (!(context = find_context(handle))) return FFX_API_RETURN_ERROR_PARAMETER;
+    release_context(context);
+    return FFX_API_RETURN_OK;
+}
+
 static ffxReturnCode_t query_impl(ffxContext *handle, ffxQueryDescHeader *desc)
 {
     struct fsr_context *context = NULL;
     BOOL has_context = FALSE;
     if (!desc) return FFX_API_RETURN_ERROR_PARAMETER;
+    if (desc->type == FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE ||
+        desc->type == FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE_V2)
+        return query_memory(handle, desc);
     if (handle)
     {
         if (!(context = find_context(handle))) return FFX_API_RETURN_ERROR_PARAMETER;
@@ -334,9 +368,6 @@ static ffxReturnCode_t query_impl(ffxContext *handle, ffxQueryDescHeader *desc)
                                     FFX_API_QUERY_RESOURCE_INPUT_TRANSPARENCYCOMPOSITION;
         return FFX_API_RETURN_OK;
     }
-    case FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE:
-    case FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE_V2:
-        return FFX_API_RETURN_ERROR_RUNTIME_ERROR; /* MetalFX does not expose truthful allocation totals. */
     default:
         return (desc->type & FFX_API_EFFECT_MASK) == FFX_API_EFFECT_ID_UPSCALE
             ? FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE : FFX_API_RETURN_NO_PROVIDER;
@@ -384,7 +415,7 @@ static ffxReturnCode_t dispatch_impl(struct fsr_context *context, const ffxDispa
     return result;
 }
 
-ffxReturnCode_t WINAPI ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
+ffxReturnCode_t ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
 {
     ffxReturnCode_t result = query_impl(handle, desc);
     const char *reason = result == FFX_API_RETURN_OK ? "ok" : "query_rejected";
@@ -398,7 +429,7 @@ ffxReturnCode_t WINAPI ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
     return result;
 }
 
-ffxReturnCode_t WINAPI ffxDispatch(ffxContext *handle, const ffxDispatchDescHeader *desc)
+ffxReturnCode_t ffxDispatch(ffxContext *handle, const ffxDispatchDescHeader *desc)
 {
     struct fsr_context *known_context = find_context(handle);
     BOOL context_known = known_context != NULL;

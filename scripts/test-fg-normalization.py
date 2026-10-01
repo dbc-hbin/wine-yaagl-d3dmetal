@@ -363,7 +363,7 @@ class FrameGenerationNormalizationTest(unittest.TestCase):
             section("static BOOL valid_chain(", "static void initialize_packet("),
             section("struct normalized_dispatch\n", "static ffxReturnCode_t present_callback("),
             section("static ffxReturnCode_t generation_callback(", "static void build_swapchain_config("),
-            section("ffxReturnCode_t WINAPI ffxDispatch(", "BOOL WINAPI DllMain("),
+            section("ffxReturnCode_t ffxDispatch(", "BOOL WINAPI DllMain("),
             EPILOGUE,
         ))
         with tempfile.TemporaryDirectory() as directory:

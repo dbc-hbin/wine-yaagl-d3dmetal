@@ -107,12 +107,12 @@ static const GUID stable_swapchain_iid =
 
 struct native_api
 {
-    ffxReturnCode_t (WINAPI *create)(ffxContext *, ffxCreateContextDescHeader *,
+    ffxReturnCode_t (*create)(ffxContext *, ffxCreateContextDescHeader *,
                                     const ffxAllocationCallbacks *);
-    ffxReturnCode_t (WINAPI *destroy)(ffxContext *, const ffxAllocationCallbacks *);
-    ffxReturnCode_t (WINAPI *configure)(ffxContext *, const ffxConfigureDescHeader *);
-    ffxReturnCode_t (WINAPI *query)(ffxContext *, ffxQueryDescHeader *);
-    ffxReturnCode_t (WINAPI *dispatch)(ffxContext *, const ffxDispatchDescHeader *);
+    ffxReturnCode_t (*destroy)(ffxContext *, const ffxAllocationCallbacks *);
+    ffxReturnCode_t (*configure)(ffxContext *, const ffxConfigureDescHeader *);
+    ffxReturnCode_t (*query)(ffxContext *, ffxQueryDescHeader *);
+    ffxReturnCode_t (*dispatch)(ffxContext *, const ffxDispatchDescHeader *);
 };
 
 static HINSTANCE builtin_instance;
@@ -1609,7 +1609,7 @@ static ffxReturnCode_t create_original(struct fg_context *context,
     return result;
 }
 
-ffxReturnCode_t WINAPI ffxCreateContext(ffxContext *output,
+ffxReturnCode_t ffxCreateContext(ffxContext *output,
                                       ffxCreateContextDescHeader *desc,
                                       const ffxAllocationCallbacks *callbacks)
 {
@@ -1773,7 +1773,7 @@ ffxReturnCode_t WINAPI ffxCreateContext(ffxContext *output,
     return FFX_API_RETURN_OK;
 }
 
-ffxReturnCode_t WINAPI ffxDestroyContext(ffxContext *handle,
+ffxReturnCode_t ffxDestroyContext(ffxContext *handle,
                                        const ffxAllocationCallbacks *callbacks)
 {
     struct fg_context *context, **link;
@@ -1891,7 +1891,7 @@ static ffxReturnCode_t configure_debug(ffxContext *handle,
     return result;
 }
 
-ffxReturnCode_t WINAPI ffxConfigure(ffxContext *handle,
+ffxReturnCode_t ffxConfigure(ffxContext *handle,
                                    const ffxConfigureDescHeader *desc)
 {
     struct fg_context *context;
@@ -1987,12 +1987,48 @@ static ffxReturnCode_t query_versions(ffxQueryDescHeader *desc)
     return FFX_API_RETURN_OK;
 }
 
-ffxReturnCode_t WINAPI ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
+static struct FfxApiEffectMemoryUsage *memory_query_output(ffxQueryDescHeader *desc)
 {
+    if (desc->type == FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE)
+        return ((struct ffxQueryDescFrameGenerationGetGPUMemoryUsage *)desc)->gpuMemoryUsageFrameGeneration;
+    return ((struct ffxQueryDescFrameGenerationGetGPUMemoryUsageV2 *)desc)->gpuMemoryUsageFrameGeneration;
+}
+
+/*
+ * D3DMetal DLSS-compatible unreported usage for the automatic/MetalFX
+ * provider: zero is not a measured footprint.  V2 only checks the basic
+ * create contract.
+ */
+static ffxReturnCode_t query_unreported_memory(const ffxQueryDescHeader *desc)
+{
+    const struct ffxQueryDescFrameGenerationGetGPUMemoryUsageV2 *query = (const void *)desc;
+
+    if (desc->pNext) return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
+    if (desc->type == FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE_V2 &&
+        (!query->device || !query->maxRenderSize.width || !query->maxRenderSize.height ||
+         !query->displaySize.width || !query->displaySize.height ||
+         query->maxRenderSize.width > query->displaySize.width ||
+         query->maxRenderSize.height > query->displaySize.height))
+        return FFX_API_RETURN_ERROR_PARAMETER;
+    return FFX_API_RETURN_OK;
+}
+
+ffxReturnCode_t ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
+{
+    struct FfxApiEffectMemoryUsage *memory_output = NULL;
     struct fg_context *context;
     ffxReturnCode_t result;
 
-    if (!desc || !valid_chain(desc)) return FFX_API_RETURN_ERROR_PARAMETER;
+    if (!desc) return FFX_API_RETURN_ERROR_PARAMETER;
+    if (desc->type == FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE ||
+        desc->type == FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE_V2)
+    {
+        /* Clear before any validation so no error path leaves stale totals. */
+        memory_output = memory_query_output(desc);
+        if (!memory_output) return FFX_API_RETURN_ERROR_PARAMETER;
+        memset(memory_output, 0, sizeof(*memory_output));
+    }
+    if (!valid_chain(desc)) return FFX_API_RETURN_ERROR_PARAMETER;
 
     if (!handle)
     {
@@ -2002,13 +2038,11 @@ ffxReturnCode_t WINAPI ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
         if (desc->type == FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION)
             return FFX_API_RETURN_ERROR_PARAMETER;
 
-        /*
-         * An automatic provider cannot report native-only FG memory totals
-         * before eligibility and provider selection are known.
-         */
-        if (desc->type == FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE ||
-            desc->type == FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE_V2)
-            return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
+        /* V1 describes a live context; V2 answers for the automatic provider. */
+        if (desc->type == FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE)
+            return FFX_API_RETURN_ERROR_PARAMETER;
+        if (desc->type == FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE_V2)
+            return query_unreported_memory(desc);
 
         if (!have_native()) return FFX_API_RETURN_NO_PROVIDER;
         return native.query(NULL, desc);
@@ -2043,21 +2077,22 @@ ffxReturnCode_t WINAPI ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
     {
         result = query_versions(desc);
     }
-    else if (desc->type == FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE ||
-             desc->type == FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE_V2)
+    else if (memory_output)
     {
-        result = FFX_API_RETURN_ERROR_RUNTIME_ERROR;
+        result = query_unreported_memory(desc);
     }
     else
     {
         result = FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
     }
+    if (memory_output && result != FFX_API_RETURN_OK)
+        memset(memory_output, 0, sizeof(*memory_output));
 
     release_context(context);
     return result;
 }
 
-ffxReturnCode_t WINAPI ffxDispatch(ffxContext *handle,
+ffxReturnCode_t ffxDispatch(ffxContext *handle,
                                   const ffxDispatchDescHeader *desc)
 {
     struct fg_context *context;
