@@ -348,10 +348,11 @@ bool record(NativeCommandList& commandList, const RecordRequest& request) noexce
 }
 
 ReplayResult replay(void* d3dmCommandEncoder, const void* command) noexcept {
-    if (!command || loadAt<std::uint64_t>(command) != kNativeHeader)
+    if (!command || loadAt<std::uint64_t>(command) != kNativeHeader ||
+        loadAt<std::uint64_t>(command, offsetof(RecordedCommand, magic)) != kMagic)
         return ReplayResult::NotRecorded;
     const RecordedCommand value = loadAt<RecordedCommand>(command);
-    if (value.magic != kMagic || !value.owner)
+    if (!value.owner)
         return ReplayResult::NotRecorded;
     const auto ownerBits = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(value.owner));
     if (value.cookie != (kCookie ^ ownerBits)) return ReplayResult::NotRecorded;
@@ -395,7 +396,6 @@ ReplayResult replay(void* d3dmCommandEncoder, const void* command) noexcept {
         if (!preScaleBlit) return ReplayResult::Failed;
         using FenceMessage = void (*)(void*, void*, void*);
         reinterpret_cast<FenceMessage>(objc_msgSend)(preScaleBlit, updateSelector, fence);
-        flushEncoders(d3dmCommandEncoder, 4u);
 
         void* commandBuffer = getExternalCommandBuffer(d3dmCommandEncoder);
         if (!commandBuffer) return ReplayResult::Failed;

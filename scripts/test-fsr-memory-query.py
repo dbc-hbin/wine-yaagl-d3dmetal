@@ -307,7 +307,7 @@ class MemoryQueryTest(unittest.TestCase):
             "static void context_free(const ffxAllocationCallbacks *, void *);",
             section(SR_SOURCE, "static struct fsr_context *find_context(", "static void report("),
             section(SR_SOURCE, "static void release_context(", "static int allocation_compatible("),
-            section(SR_SOURCE, "static float upscale_ratio(", "\n\nstatic volatile LONG pe_log_count"),
+            section(SR_SOURCE, "static float upscale_ratio(", "static ffxReturnCode_t query_memory("),
             section(SR_SOURCE, "static ffxReturnCode_t query_memory(", "static ffxReturnCode_t dispatch_impl("),
             SR_EPILOGUE,
         ))

@@ -25,7 +25,6 @@ struct FrameContract {
 };
 
 ContractStatus validateCreate(const yaagl_fsr_create_packet&, CreateContract&) noexcept;
-ContractStatus validateFrame(const CreateContract&, const yaagl_fsr_dispatch_packet&, FrameContract&,
-                             const char** detail = nullptr) noexcept;
+ContractStatus validateFrame(const CreateContract&, const yaagl_fsr_dispatch_packet&, FrameContract&) noexcept;
 
 } // namespace yaagl::pso::fsr

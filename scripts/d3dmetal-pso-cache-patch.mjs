@@ -5,6 +5,7 @@ import { chmod, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  D3DMETAL_STAGE_LOCK_PATCH_SITES,
   applyD3DMetalStageLockPatch,
   inspectD3DMetalStageLockPatch,
 } from "./d3dmetal-stage-lock-patch.mjs";
@@ -15,19 +16,19 @@ const layoutText = await readFile(
 );
 const layoutSha256 = createHash("sha256").update(layoutText).digest("hex");
 const expectedLayoutSha256 =
-  "c1d97fd481475590f576d89349e567a7dddd7d9deb0001cef72a2a6b610c5018";
+  "9ca7ec3c041d49f8eef4ea93616c21cc141ab6d3c83cc0fd9cb3365c33e2deab";
 if (layoutSha256 !== expectedLayoutSha256) {
   throw new Error(
     `layout corruption: expected SHA-256 ${expectedLayoutSha256}, got ${layoutSha256}`
   );
 }
 const layout = JSON.parse(layoutText);
-if (layout.formatVersion !== 16) {
+if (layout.formatVersion !== 20) {
   throw new Error(`unsupported layout format ${layout.formatVersion}`);
 }
 
 export const D3DMETAL_PSO_CACHE_PATCHED_PAYLOAD_SHA256 =
-  "b28e77f404070482a12b04a00e118848acecb5ce48017f63042715e0448efb9a";
+  "4aa6ed51fa673a7b48220d3e133845e97d400ea0703ba0a35c338225f6147f17";
 
 const LC_SEGMENT_64 = 0x19;
 const LC_UUID = 0x1b;
@@ -404,19 +405,96 @@ for (let index = 1; index < orderedPatchSites.length; index += 1) {
     throw new Error(`layout corruption: overlapping spans ${previous.name} and ${current.name}`);
   }
 }
-for (const hook of layout.hooks) {
+// Stage-lock pins the whole cave, including its unused zero tail. Native
+// patches may claim that padding, but must never overwrite a live stage thunk.
+for (const site of patchSites) {
+  for (const stageSite of D3DMETAL_STAGE_LOCK_PATCH_SITES) {
+    const start = Math.max(site.offset, stageSite.offset);
+    const end = Math.min(
+      site.offset + site.patched.length,
+      stageSite.offset + stageSite.patched.length
+    );
+    if (start >= end) continue;
+    const stageOriginal = stageSite.expectedOriginal.subarray(
+      start - stageSite.offset, end - stageSite.offset
+    );
+    const stagePatched = stageSite.patched.subarray(
+      start - stageSite.offset, end - stageSite.offset
+    );
+    const nativeOriginal = site.expectedOriginal.subarray(
+      start - site.offset, end - site.offset
+    );
+    if (stagePatched.some(byte => byte !== 0) ||
+        !stageOriginal.equals(stagePatched) ||
+        !nativeOriginal.equals(stagePatched)) {
+      throw new Error(`layout corruption: ${site.name} overlaps live stage-lock bytes in ${stageSite.name}`);
+    }
+  }
+}
+// Legacy CreateSwapChain has no IDXGIOutput argument. Its preceding
+// AsInterface leaves the UUID fragment in RDX, which the stock method ignored.
+// Keep the original CALL return address and let the existing entry gate handle
+// the tail jump, with only the absent target argument explicitly initialized.
+const legacyFullscreenCall = layout.binaryPatches.find(
+  patch => patch.id === "NullLegacyCreateSwapChainFullscreenCall"
+);
+const legacyFullscreenTarget = layout.binaryPatches.find(
+  patch => patch.id === "NullLegacyCreateSwapChainFullscreenTarget"
+);
+if (!legacyFullscreenCall || !legacyFullscreenTarget) {
+  throw new Error("layout corruption: missing legacy fullscreen call stub");
+}
+const legacyCall = Buffer.from(legacyFullscreenCall.patchedHex, "hex");
+const legacyOriginalCall = Buffer.from(legacyFullscreenCall.originalHex, "hex");
+const legacyStub = Buffer.from(legacyFullscreenTarget.patchedHex, "hex");
+if (legacyFullscreenCall.offset !== 0x105568 ||
+    legacyOriginalCall.length !== 5 || legacyOriginalCall[0] !== 0xe8 ||
+    legacyFullscreenCall.offset + 5 + legacyOriginalCall.readInt32LE(1) !== 0x1146fe ||
+    legacyCall.length !== 5 || legacyCall[0] !== 0xe8 ||
+    legacyFullscreenCall.offset + 5 + legacyCall.readInt32LE(1) !== legacyFullscreenTarget.offset ||
+    legacyStub.length !== 7 || legacyStub.subarray(0, 3).toString("hex") !== "31d2e9" ||
+    legacyFullscreenTarget.originalHex !== "00000000000000" ||
+    legacyFullscreenTarget.offset < EH_FRAME_END ||
+    legacyFullscreenTarget.offset + legacyStub.length > TEXT_END ||
+    legacyFullscreenTarget.offset + legacyStub.length + legacyStub.readInt32LE(3) !== 0x1146fe) {
+  throw new Error("layout corruption: invalid null-target legacy fullscreen tail call");
+}
+
+const hookNames = [
+  "Metal4Render", "Render", "Mesh", "Compute", "GetRender", "CompileCompute",
+  "DestroyDevice", "CreateRTFunction", "CreateRTCombined", "CreateRTIntersection",
+  "GetAndRetainLibrary",
+  "ReplayTemporalScaleMPL", "EncodeTemporalScaleMTL",
+  "GetContainingOutput", "SetFullscreenState", "ConstructAdapter",
+];
+if (layout.hooks.length !== hookNames.length) {
+  throw new Error("layout corruption: invalid generic dispatch count");
+}
+for (const [index, hook] of layout.hooks.entries()) {
   const original = Buffer.from(hook.originalHex, "hex");
   const entryPatch = Buffer.from(hook.entryPatchHex, "hex");
   const gate = Buffer.from(hook.gateHex, "hex");
   const trampoline = Buffer.from(hook.trampolineHex, "hex");
-  if (hook.continuationOffset !== hook.entryOffset + original.length ||
+  const compactGate = gate.length === 21 && gate.subarray(17, 20).toString("hex") === "41ff63";
+  const wideGate = gate.length === 24 && gate.subarray(17, 20).toString("hex") === "41ffa3";
+  if (hook.id !== hookNames[index] || hook.dispatchFieldOffset !== index * 8 ||
+      (!compactGate && !wideGate) ||
+      (compactGate ? gate.readInt8(20) : gate.readInt32LE(20)) !== hook.dispatchFieldOffset ||
+      hook.continuationOffset !== hook.entryOffset + original.length ||
       entryPatch.length !== original.length ||
+      entryPatch[0] !== 0xe9 ||
+      hook.entryOffset + 5 + entryPatch.readInt32LE(1) !== hook.gateOffset ||
+      entryPatch.subarray(5).some(byte => byte !== 0x90) ||
+      trampoline.length !== original.length + 5 ||
       !trampoline.subarray(0, original.length).equals(original) ||
+      trampoline[original.length] !== 0xe9 ||
+      hook.trampolineOffset + trampoline.length + trampoline.readInt32LE(original.length + 1) !== hook.continuationOffset ||
       hook.gateOffset < layout.constructorVerification.markerOffset ||
       hook.trampolineOffset < layout.constructorVerification.markerOffset ||
       hook.gateOffset + gate.length > layout.textCave.endOffset ||
       hook.trampolineOffset + trampoline.length > layout.textCave.endOffset ||
-      gate[8] !== 0x74 ||
+      gate.subarray(0, 3).toString("hex") !== "48833d" || gate[7] !== 0 ||
+      gate[8] !== 0x74 || gate.subarray(10, 13).toString("hex") !== "4c8b1d" ||
       hook.gateOffset + 8 + gate.readInt32LE(3) !== layout.dispatch.dataSlotVMAddr ||
       hook.gateOffset + 17 + gate.readInt32LE(13) !== layout.dispatch.dataSlotVMAddr ||
       hook.gateOffset + 10 + gate.readInt8(9) !== hook.trampolineOffset) {
@@ -426,11 +504,11 @@ for (const hook of layout.hooks) {
 
 // Only the complete C1 constructor is called by the two adapter factories.
 // Its five-byte prologue has no RIP-relative operands; C2 uses a different ABI.
-const adapter = layout.hooks[21];
-if (layout.hooks.length !== 22 || adapter.id !== "ConstructAdapter" ||
+const adapter = layout.hooks[15];
+if (adapter.id !== "ConstructAdapter" ||
     adapter.entryOffset !== 0x152d82 || adapter.originalHex !== "5541574156" ||
     adapter.gateOffset !== 4905952 || adapter.trampolineOffset !== 4905984 ||
-    adapter.dispatchFieldOffset !== 21 * 8) {
+    adapter.dispatchFieldOffset !== 15 * 8) {
   throw new Error("layout corruption: invalid complete DXGI adapter constructor");
 }
 const adapterEntry = Buffer.from(adapter.entryPatchHex, "hex");
@@ -453,7 +531,8 @@ const commit = layout.commitHook;
 const originalCall = Buffer.from(commit.originalHex, "hex");
 const patchedCall = Buffer.from(commit.entryPatchHex, "hex");
 const commitGate = Buffer.from(commit.gateHex, "hex");
-if (originalCall.length !== 6 || originalCall[0] !== 0xff || originalCall[1] !== 0x15 ||
+if (commit.id !== "CommitMetal4Batch" ||
+    originalCall.length !== 6 || originalCall[0] !== 0xff || originalCall[1] !== 0x15 ||
     commit.entryOffset + 6 + originalCall.readInt32LE(2) !== commit.objcMsgSendGotOffset ||
     patchedCall.length !== 6 || patchedCall[0] !== 0xe8 || patchedCall[5] !== 0x90 ||
     commit.entryOffset + 5 + patchedCall.readInt32LE(1) !== commit.gateOffset ||
@@ -475,7 +554,7 @@ if (originalCall.length !== 6 || originalCall[0] !== 0xff || originalCall[1] !==
 const present = layout.presentHook;
 const presentCall = Buffer.from(present.entryPatchHex, "hex");
 const presentGate = Buffer.from(present.gateHex, "hex");
-if (present.originalHex !== "498b7e28488b07ff5010" ||
+if (present.id !== "RefreshDisplayAndFlush" || present.originalHex !== "498b7e28488b07ff5010" ||
     presentCall.length !== 10 || presentCall[0] !== 0xe8 ||
     presentCall.subarray(5).some(byte => byte !== 0x90) ||
     present.entryOffset + 5 + presentCall.readInt32LE(1) !== present.gateOffset ||
@@ -497,7 +576,7 @@ const residencyAdd = layout.presentResidencyAddHook;
 const residencyOriginalCall = Buffer.from(residencyAdd.originalHex, "hex");
 const residencyAddEntry = Buffer.from(residencyAdd.entryPatchHex, "hex");
 const residencyAddGate = Buffer.from(residencyAdd.gateHex, "hex");
-if (residencyOriginalCall.length !== 6 ||
+if (residencyAdd.id !== "ScopedMetal4PresentResidencyAdd" || residencyOriginalCall.length !== 6 ||
     residencyOriginalCall.subarray(0, 2).toString("hex") !== "ff15" ||
     residencyAdd.entryOffset + 6 + residencyOriginalCall.readInt32LE(2) !== residencyAdd.objcMsgSendGotOffset ||
     residencyAddEntry.length !== 6 || residencyAddEntry[0] !== 0xe8 || residencyAddEntry[5] !== 0x90 ||
@@ -520,7 +599,8 @@ if (residencyOriginalCall.length !== 6 ||
 const residencyFinish = layout.presentResidencyFinishHook;
 const residencyFinishEntry = Buffer.from(residencyFinish.entryPatchHex, "hex");
 const residencyFinishGate = Buffer.from(residencyFinish.gateHex, "hex");
-if (residencyFinish.originalHex !== "498bbe90000000" ||
+if (residencyFinish.id !== "ScopedMetal4PresentResidencyFinish" ||
+    residencyFinish.originalHex !== "498bbe90000000" ||
     residencyFinishEntry.length !== 7 || residencyFinishEntry[0] !== 0xe9 ||
     residencyFinishEntry.subarray(5).toString("hex") !== "9090" ||
     residencyFinish.entryOffset + 5 + residencyFinishEntry.readInt32LE(1) !== residencyFinish.gateOffset ||
@@ -546,7 +626,7 @@ const videoMemoryOriginal = Buffer.from(videoMemory.originalHex, "hex");
 const videoMemoryEntry = Buffer.from(videoMemory.entryPatchHex, "hex");
 const videoMemoryGate = Buffer.from(videoMemory.gateHex, "hex");
 const videoMemoryTrampoline = Buffer.from(videoMemory.trampolineHex, "hex");
-if (videoMemory.originalHex !== "534889f80f57c0" ||
+if (videoMemory.id !== "QueryVideoMemoryInfo" || videoMemory.originalHex !== "534889f80f57c0" ||
     videoMemory.entryOffset !== 0x150b48 ||
     videoMemory.continuationOffset !== videoMemory.entryOffset + videoMemoryOriginal.length ||
     videoMemoryEntry.length !== videoMemoryOriginal.length || videoMemoryEntry[0] !== 0xe9 ||

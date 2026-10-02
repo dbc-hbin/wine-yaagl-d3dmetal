@@ -15,7 +15,6 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -38,10 +37,7 @@ constexpr std::uint32_t Parameter = 6;
 std::atomic<bool> ready{false};
 std::atomic<std::uint64_t> nextContext{1};
 std::atomic<unsigned> errorCount{0};
-std::atomic<bool> firstEncodeLogged{false};
 std::mutex registryMutex;
-std::mutex logMutex;
-FILE* fsrLog = nullptr;
 
 void logFailure(std::uint32_t operation, const char* stage, std::uint32_t result,
                 std::uint32_t flags = 0, std::uint32_t width = 0,
@@ -52,26 +48,6 @@ void logFailure(std::uint32_t operation, const char* stage, std::uint32_t result
         "yaagl-fsr-framegeneration: operation=%u stage=%s result=%u flags=0x%x "
         "input=%ux%u camera_near=%.9g camera_far=%.9g fov=%.9g scale=%.9g\n",
         operation, stage, result, flags, width, height, cameraNear, cameraFar, fov, scale);
-}
-
-void logFirstEncode(Mode mode, std::uint32_t flags, std::uint32_t width,
-                    std::uint32_t height, float nearPlane, float farPlane,
-                    float fov, float scale) noexcept {
-    if (!fsrLog || firstEncodeLogged.exchange(true, std::memory_order_relaxed)) return;
-    std::array<char, 32> farPlaneText{};
-    if (std::isfinite(farPlane))
-        std::snprintf(farPlaneText.data(), farPlaneText.size(), "%.9g", farPlane);
-    else
-        std::snprintf(farPlaneText.data(), farPlaneText.size(), "null");
-    std::lock_guard lock(logMutex);
-    std::fprintf(fsrLog,
-        "{\"schema\":1,\"component\":\"fsr-framegeneration\","
-        "\"event\":\"first_encode\",\"mode\":\"%s\",\"flags\":%u,"
-        "\"input\":[%u,%u],\"nearPlane\":%.9g,\"farPlane\":%s,"
-        "\"fovRadians\":%.9g,\"viewSpaceToMeters\":%.9g}\n",
-        mode == Mode::Metal4 ? "metal4" : "legacy", flags, width, height,
-        nearPlane, farPlaneText.data(), fov, scale);
-    std::fflush(fsrLog);
 }
 
 template<class R, class... A>
@@ -1177,10 +1153,6 @@ bool PreparedFrame::encode(
                     state.historyDispatch = impl_->dispatch;
                     state.historyFrame = frame;
                 }
-                logFirstEncode(configuration.mode, state.creation.flags,
-                               p.render_width, p.render_height,
-                               effect.nearPlane, effect.farPlane,
-                               p.camera_fov_vertical_radians, p.view_space_to_meters);
                 return true;
             }
             return fail("encode_os_unavailable");
@@ -1202,8 +1174,6 @@ bool initialize(const std::uint8_t* imageBase) noexcept {
         } else {
             result = false;
         }
-        const char* path = std::getenv("YAAGL_FSR_LOG");
-        if (path && path[0] == '/' && !fsrLog) fsrLog = std::fopen(path, "a");
         ready.store(result, std::memory_order_release);
         return result;
     } catch (...) {

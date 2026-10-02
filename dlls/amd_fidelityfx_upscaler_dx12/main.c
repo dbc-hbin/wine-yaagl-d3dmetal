@@ -2,7 +2,6 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "windef.h"
@@ -229,31 +228,6 @@ static float radical_inverse(uint32_t index, uint32_t base)
     return value;
 }
 
-
-static volatile LONG pe_log_count;
-static SRWLOCK pe_log_lock = SRWLOCK_INIT;
-
-static void pe_log_result(const char *api, const ffxContext *handle, uint64_t type,
-                          ffxReturnCode_t result, const char *reason) {
-    const char *path = getenv("YAAGL_FSR_LOG");
-    FILE *file;
-    LONG sequence;
-    if (!path || path[0] != '/') return;
-    sequence = InterlockedIncrement(&pe_log_count);
-    if (sequence > 120) return;
-    AcquireSRWLockExclusive(&pe_log_lock);
-    file = fopen(path, "a");
-    if (file) {
-        fprintf(file, "{\"schema\":1,\"component\":\"fsr-pe\",\"event\":\"api\","
-                      "\"sequence\":%ld,\"api\":\"%s\",\"type\":%llu,"
-                      "\"handleAddress\":%llu,\"contextValue\":%llu,\"result\":%u,\"reason\":\"%s\"}\n",
-                sequence, api, (unsigned long long)type, (unsigned long long)(uintptr_t)handle,
-                (unsigned long long)(uintptr_t)(handle ? *handle : NULL), result, reason);
-        fclose(file);
-    }
-    ReleaseSRWLockExclusive(&pe_log_lock);
-}
-
 /* D3DMetal DLSS-compatible unreported usage: zero is not a measured footprint. */
 static ffxReturnCode_t query_memory(ffxContext *handle, ffxQueryDescHeader *desc)
 {
@@ -417,32 +391,15 @@ static ffxReturnCode_t dispatch_impl(struct fsr_context *context, const ffxDispa
 
 ffxReturnCode_t ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
 {
-    ffxReturnCode_t result = query_impl(handle, desc);
-    const char *reason = result == FFX_API_RETURN_OK ? "ok" : "query_rejected";
-    if (!desc) reason = "null_descriptor";
-    else if (result == FFX_API_RETURN_ERROR_PARAMETER && handle) {
-        struct fsr_context *context = find_context(handle);
-        if (!context) reason = "context_not_found";
-        else release_context(context);
-    }
-    pe_log_result("query", handle, desc ? desc->type : 0, result, reason);
-    return result;
+    return query_impl(handle, desc);
 }
 
 ffxReturnCode_t ffxDispatch(ffxContext *handle, const ffxDispatchDescHeader *desc)
 {
     struct fsr_context *known_context = find_context(handle);
-    BOOL context_known = known_context != NULL;
     ffxReturnCode_t result;
-    const char *reason;
     result = dispatch_impl(known_context, desc);
     if (known_context) release_context(known_context);
-    reason = result == FFX_API_RETURN_OK ? "ok" : "dispatch_rejected";
-    if (!desc) reason = "null_descriptor";
-    else if (desc->type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE) reason = "unsupported_descriptor";
-    else if (result == FFX_API_RETURN_ERROR_PARAMETER)
-        reason = context_known ? "native_parameter" : "context_not_found";
-    pe_log_result("dispatch", handle, desc ? desc->type : 0, result, reason);
     return result;
 }
 

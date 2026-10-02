@@ -39,9 +39,9 @@ export const D3DMETAL_RUNTIME_HASHES = Object.freeze({
   fp64Signed: METAL_IR_CONVERTER_4_0_BETA_2_FP64_PATCHED_SHA256,
   compositeInput: D3DMETAL_STAGE_LOCK_SOURCE_SHA256,
   stagePatched: D3DMETAL_STAGE_LOCK_PATCHED_SHA256,
-  compositePreSign: "9896c4e6cec0b32b8f47ad6f3051805e24e0c35488b10de2acb1597a40d62d89",
+  compositePreSign: "ae2acc2fda582574d5010ef5855fde8c6363779236f94e0bc7892ee21a003ce4",
   compositePayload: D3DMETAL_PSO_CACHE_PATCHED_PAYLOAD_SHA256,
-  finalD3DMetal: "8ded9b73ec370c9bc1bbf182927c5ba5bd1e0ace6013be21f25b514d33b7d8fe",
-  rawSidecar: "d254e2e29c58b76910c09d6f80f10fb7286eda0bbadc952185b4ff4be3e0b8b2",
-  signedSidecar: "c6c90e13cf7cb2537b4579f371e0a483ba247154eb7a3f9f2740b1f7e61d6ac6",
+  finalD3DMetal: "0ae07b7e37404c9f8b409c77c46f3ac8a25223b7ea764339214be0d08d9c97d4",
+  rawSidecar: "5bedd9bbb76e76ff4ae96bf03a8937d979069c10cb603255bd11194e95a1a0a4",
+  signedSidecar: "bdbcf4657193391b2e4a090a215801a53a6e73b89b3ed851490e6e3f9458b6b4",
 });

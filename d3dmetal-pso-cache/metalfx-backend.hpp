@@ -67,14 +67,6 @@ struct Error {
     explicit operator bool() const noexcept { return code != ErrorCode::None; }
 };
 
-struct TemporalOutputInfo {
-    std::uint32_t width = 0;
-    std::uint32_t height = 0;
-    std::uint32_t placementX = 0;
-    std::uint32_t placementY = 0;
-    bool capped = false;
-};
-
 class PreparedFrame;
 class ExecutionLease;
 
@@ -133,7 +125,6 @@ public:
                 Error* error = nullptr) const noexcept;
 
     CommandMode mode() const noexcept;
-    TemporalOutputInfo temporalOutputInfo() const noexcept;
 
 private:
     friend class Feature;

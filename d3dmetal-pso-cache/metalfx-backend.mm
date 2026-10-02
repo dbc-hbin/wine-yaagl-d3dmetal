@@ -773,10 +773,10 @@ bool validateCreate(const CreateContext& context, const CreateInfo& create,
 }
 
 bool validateFrameScalars(const FrameInfo& frame, Error* error) noexcept {
-    if (!finite(frame.jitterOffsetX.value) || !finite(frame.jitterOffsetY.value) ||
-        !finite(frame.motionVectorScaleX.value) || !finite(frame.motionVectorScaleY.value) ||
-        !finite(frame.preExposure.value) || frame.motionVectorScaleX.value == 0.0f ||
-        frame.motionVectorScaleY.value == 0.0f || frame.preExposure.value <= 0.0f) {
+    if (!finite(frame.jitterOffsetX) || !finite(frame.jitterOffsetY) ||
+        !finite(frame.motionVectorScaleX) || !finite(frame.motionVectorScaleY) ||
+        !finite(frame.preExposure) || frame.motionVectorScaleX == 0.0f ||
+        frame.motionVectorScaleY == 0.0f || frame.preExposure <= 0.0f) {
         setError(error, ErrorCode::InvalidFrame, "MetalFX frame contains an invalid scalar");
         return false;
     }
@@ -902,14 +902,14 @@ bool validateFrameTextures(const Feature::Impl& feature, const FrameInfo& frame,
                  "MetalFX motion-vector subrect dimensions do not match its creation mode");
         return false;
     }
-    if (frame.reactiveMask.value &&
+    if (frame.reactiveMask &&
         (frame.reactiveRect.width != frame.inputContent.width ||
          frame.reactiveRect.height != frame.inputContent.height)) {
         setError(error, ErrorCode::InvalidFrame,
                  "MetalFX reactive-mask subrect dimensions must match the dynamic input content");
         return false;
     }
-    if (!feature.create.outputSubrects.value &&
+    if (!feature.create.outputSubrects &&
         (frame.outputRect.x != 0 || frame.outputRect.y != 0)) {
         setError(error, ErrorCode::InvalidFrame,
                  "MetalFX output subrect offset requires create-time output-subrect opt-in");
@@ -928,7 +928,7 @@ bool validateFrameTextures(const Feature::Impl& feature, const FrameInfo& frame,
         return false;
     }
     if (frame.exposureMode == ExposureMode::Texture) {
-        if (!frame.exposureTexture.value || !exposure || !basicTextureShape(exposure) ||
+        if (!frame.exposureTexture || !exposure || !basicTextureShape(exposure) ||
             !sameDevice(feature.device, exposure) || exposure.width == 0 || exposure.height == 0) {
             setError(error, ErrorCode::IncompatibleTexture, "manual MetalFX exposure texture is invalid");
             return false;
@@ -949,7 +949,7 @@ bool validateFrameTextures(const Feature::Impl& feature, const FrameInfo& frame,
     }
 
     if (reactive) {
-        if (!frame.reactiveMask.value || !basicTextureShape(reactive) ||
+        if (!frame.reactiveMask || !basicTextureShape(reactive) ||
             !sameDevice(feature.device, reactive) || !rectFits(frame.reactiveRect, reactive)) {
             setError(error, ErrorCode::IncompatibleTexture, "MetalFX bias-current-color mask texture is invalid");
             return false;
@@ -959,7 +959,7 @@ bool validateFrameTextures(const Feature::Impl& feature, const FrameInfo& frame,
             setError(error, ErrorCode::UnsupportedFeature, "reactive-mask translation requires the macOS 27 MetalFX usage contract");
             return false;
         }
-    } else if (frame.reactiveMask.value && !operations.combineCompositionMask) {
+    } else if (frame.reactiveMask && !operations.combineCompositionMask) {
         setError(error, ErrorCode::InvalidFrame, "MetalFX reactive mask resource was not resolved to a Metal texture");
         return false;
     }
@@ -1352,7 +1352,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                 Params params{{source.x, source.y}, {destination.x, destination.y},
                               {source.width, source.height}, {dispatch.x, dispatch.y},
                               {dispatch.width, dispatch.height}, static_cast<std::uint32_t>(transfer),
-                              flags, frame.operations.sharpness, frame.frame.preExposure.value};
+                              flags, frame.operations.sharpness, frame.frame.preExposure};
                 id<MTLBuffer> buffer = feature.takeBuffer(sizeof(params));
                 if (buffer) {
                     std::memcpy(buffer.contents, &params, sizeof(params));
@@ -1918,11 +1918,11 @@ void configureScalerForFrame(Feature::Impl& feature, ScalerGeneration& generatio
         [scaler setOutputOffsetX:0];
         [scaler setOutputOffsetY:0];
     }
-    [scaler setPreExposure:frame.frame.preExposure.value];
-    [scaler setJitterOffsetX:frame.frame.jitterOffsetX.value];
-    [scaler setJitterOffsetY:frame.frame.jitterOffsetY.value];
-    [scaler setMotionVectorScaleX:frame.frame.motionVectorScaleX.value];
-    [scaler setMotionVectorScaleY:frame.frame.motionVectorScaleY.value];
+    [scaler setPreExposure:frame.frame.preExposure];
+    [scaler setJitterOffsetX:frame.frame.jitterOffsetX];
+    [scaler setJitterOffsetY:frame.frame.jitterOffsetY];
+    [scaler setMotionVectorScaleX:frame.frame.motionVectorScaleX];
+    [scaler setMotionVectorScaleY:frame.frame.motionVectorScaleY];
     [scaler setReset:effectiveReset ? YES : NO];
     [scaler setDepthReversed:feature.create.depthInverted() ? YES : NO];
     [scaler setFence:fence];
@@ -2097,14 +2097,6 @@ CommandMode PreparedFrame::mode() const noexcept {
     return impl_ && impl_->feature ? impl_->feature->commandMode : CommandMode::Legacy;
 }
 
-TemporalOutputInfo PreparedFrame::temporalOutputInfo() const noexcept {
-    if (!impl_) return {};
-    return {static_cast<std::uint32_t>(impl_->temporalOutputWidth),
-            static_cast<std::uint32_t>(impl_->temporalOutputHeight),
-            static_cast<std::uint32_t>(impl_->placementX),
-            static_cast<std::uint32_t>(impl_->placementY), impl_->cappedOutput};
-}
-
 bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
                            std::shared_ptr<const ExecutionLease>& leaseResult,
                            Error* error) const noexcept {
@@ -2140,7 +2132,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
         const bool inputExtentChanged = generation.hasLastInputContent &&
             (generation.lastInputContentWidth != impl_->frame.inputContent.width ||
              generation.lastInputContentHeight != impl_->frame.inputContent.height);
-        const bool effectiveReset = impl_->frame.resetHistory.value ||
+        const bool effectiveReset = impl_->frame.resetHistory ||
                                     generation.encodedActivation != impl_->activation ||
                                     inputExtentChanged;
         @try {

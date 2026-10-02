@@ -6,12 +6,6 @@ namespace yaagl::pso::metalfx {
 
 using Resource = void*;
 
-template <typename T>
-struct ParameterValue {
-    T value{};
-    bool present = false;
-};
-
 struct Extent {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
@@ -35,10 +29,10 @@ enum FeatureFlag : std::uint32_t {
 struct CreateInfo {
     Extent input{};
     Extent output{};
-    ParameterValue<std::uint32_t> featureFlags{};
-    ParameterValue<bool> outputSubrects{};
+    std::uint32_t featureFlags = 0;
+    bool outputSubrects = false;
 
-    constexpr std::uint32_t flags() const noexcept { return featureFlags.value; }
+    constexpr std::uint32_t flags() const noexcept { return featureFlags; }
     constexpr bool lowResolutionMotionVectors() const noexcept {
         return (flags() & FeatureFlagMVLowRes) != 0;
     }
@@ -64,9 +58,9 @@ struct FrameInfo {
     Resource depth = nullptr;
     Resource motionVectors = nullptr;
     Resource output = nullptr;
-    ParameterValue<Resource> exposureTexture{};
-    ParameterValue<Resource> reactiveMask{};
-    ParameterValue<Resource> compositionMask{};
+    Resource exposureTexture = nullptr;
+    Resource reactiveMask = nullptr;
+    Resource compositionMask = nullptr;
 
     Extent inputContent{};
     Rect colorRect{};
@@ -75,12 +69,12 @@ struct FrameInfo {
     Rect reactiveRect{};
     Rect outputRect{};
 
-    ParameterValue<float> jitterOffsetX{0.0f, false};
-    ParameterValue<float> jitterOffsetY{0.0f, false};
-    ParameterValue<float> motionVectorScaleX{1.0f, false};
-    ParameterValue<float> motionVectorScaleY{1.0f, false};
-    ParameterValue<float> preExposure{1.0f, false};
-    ParameterValue<bool> resetHistory{false, false};
+    float jitterOffsetX = 0.0f;
+    float jitterOffsetY = 0.0f;
+    float motionVectorScaleX = 1.0f;
+    float motionVectorScaleY = 1.0f;
+    float preExposure = 1.0f;
+    bool resetHistory = false;
 
     ExposureMode exposureMode = ExposureMode::None;
 };

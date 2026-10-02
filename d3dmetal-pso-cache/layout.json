@@ -1,5 +1,5 @@
 {
-  "formatVersion": 16,
+  "formatVersion": 20,
   "source": {
     "machUuid": "674e662b6b5c3fd99a8af415609d2f6a",
     "cpuType": 16777223,
@@ -18,8 +18,8 @@
   },
   "constructorVerification": {
     "markerOffset": 4904624,
-    "markerHex": "594141474c50534f4341434845100000",
-    "description": "Version 16 verifies the 22-entry generic PSO/FSR/display/adapter dispatch table, four special presentation/commit/residency gates, the DXGI video-memory budget hook, and the null dispatch slot; stock NGX Evaluate and recording paths remain unpatched."
+    "markerHex": "594141474c50534f4341434845140000",
+    "description": "Version 20 removes the ExtractFunctions and LoadGraphicsFunctions hooks. The null-target legacy CreateSwapChain fullscreen call, all 17 native CacheFile publication sequences, the 16-entry generic PSO/FSR/display/adapter dispatch table, four special presentation/commit/residency gates, the DXGI video-memory budget hook, and the null dispatch slot remain verified. Outer stage compilation/key creation, stock NGX Evaluate, and recording paths remain unpatched."
   },
   "textCave": {
     "endOffset": 4907008,
@@ -35,9 +35,21 @@
     "commonSectionNewSize": 17376,
     "commonSectionOldEndVMAddr": 5407136,
     "segmentEndVMAddr": 5410816,
-    "description": "The patch claims the first eight zero-fill bytes after __common by extending that section; the constructor atomically publishes one pointer to its immutable 27-entry dispatch table."
+    "description": "The patch claims the first eight zero-fill bytes after __common by extending that section; the constructor atomically publishes one pointer to its immutable 21-entry dispatch table."
   },
   "binaryPatches": [
+    {
+      "id": "NullLegacyCreateSwapChainFullscreenCall",
+      "offset": 1070440,
+      "originalHex": "e891f10000",
+      "patchedHex": "e8b3863a00"
+    },
+    {
+      "id": "NullLegacyCreateSwapChainFullscreenTarget",
+      "offset": 4906016,
+      "originalHex": "00000000000000",
+      "patchedHex": "31d2e9d76ac6ff"
+    },
     {
       "id": "ForwardExplicitFullscreenDirectCall",
       "offset": 1144014,
@@ -73,6 +85,102 @@
       "offset": 540201,
       "originalHex": "488b07488b4810488948084c8b7720498d7e18498b7608e82300000049894610488b43284889c148f7d949894c06f848c7432000000000",
       "patchedHex": "4c8b7720498d7e18498b7608e82e00000049894610488b43284889c148f7d949894c06f8488b03488b48104889480848c7432000000000"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderComputeStages",
+      "offset": 555437,
+      "originalHex": "498b4608488b481048894808498b5e28488d7b18488b7308e89ec4ffff48894310498b46304889c148f7d948894c03f8",
+      "patchedHex": "498b5e28488d7b18488b7308e8aac4ffff48894310498b46304889c148f7d948894c03f8498b4608488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderCompute",
+      "offset": 558157,
+      "originalHex": "488b03488b4810488948084c8b7320498d7e18498b7608e8ffb9ffff49894610488b43284889c148f7d949894c06f8",
+      "patchedHex": "4c8b7320498d7e18498b7608e80abaffff49894610488b43284889c148f7d949894c06f8488b03488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderBytecode",
+      "offset": 560885,
+      "originalHex": "498b4608488b481048894808498b5e28488d7b18488b7308e856afffff48894310498b46304889c148f7d948894c03f8",
+      "patchedHex": "498b5e28488d7b18488b7308e862afffff48894310498b46304889c148f7d948894c03f8498b4608488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderGraphicsStages",
+      "offset": 581357,
+      "originalHex": "498b4608488b481048894808498b5e28488d7b18488b7308e85e5fffff48894310498b46304889c148f7d948894c03f8",
+      "patchedHex": "498b5e28488d7b18488b7308e86a5fffff48894310498b46304889c148f7d948894c03f8498b4608488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderStreamOut",
+      "offset": 582589,
+      "originalHex": "488b03488b4810488948084c8b7320498d7e18498b7608e88f5affff49894610488b43284889c148f7d949894c06f8",
+      "patchedHex": "4c8b7320498d7e18498b7608e89a5affff49894610488b43284889c148f7d949894c06f8488b03488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderStageIn",
+      "offset": 584419,
+      "originalHex": "488b03488b4810488948084c8b7320498d7e18498b7608e86953ffff49894610488b43284889c148f7d949894c06f8",
+      "patchedHex": "4c8b7320498d7e18498b7608e87453ffff49894610488b43284889c148f7d949894c06f8488b03488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderVertex",
+      "offset": 586280,
+      "originalHex": "488b03488b4810488948084c8b7320498d7e18498b7608e8244cffff49894610488b43284889c148f7d949894c06f8",
+      "patchedHex": "4c8b7320498d7e18498b7608e82f4cffff49894610488b43284889c148f7d949894c06f8488b03488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderDomain",
+      "offset": 588498,
+      "originalHex": "488b03488b4810488948084c8b7320498d7e18498b7608e87a43ffff49894610488b43284889c148f7d949894c06f8",
+      "patchedHex": "4c8b7320498d7e18498b7608e88543ffff49894610488b43284889c148f7d949894c06f8488b03488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderHull",
+      "offset": 590164,
+      "originalHex": "488b03488b4810488948084c8b7320498d7e18498b7608e8f83cffff49894610488b43284889c148f7d949894c06f8",
+      "patchedHex": "4c8b7320498d7e18498b7608e8033dffff49894610488b43284889c148f7d949894c06f8488b03488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderAmplification",
+      "offset": 591799,
+      "originalHex": "488b03488b4810488948084c8b7320498d7e18498b7608e89536ffff49894610488b43284889c148f7d949894c06f8",
+      "patchedHex": "4c8b7320498d7e18498b7608e8a036ffff49894610488b43284889c148f7d949894c06f8488b03488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderMesh",
+      "offset": 593435,
+      "originalHex": "488b03488b4810488948084c8b7320498d7e18498b7608e83130ffff49894610488b43284889c148f7d949894c06f8",
+      "patchedHex": "4c8b7320498d7e18498b7608e83c30ffff49894610488b43284889c148f7d949894c06f8488b03488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderFragment",
+      "offset": 595346,
+      "originalHex": "488b03488b4810488948084c8b7320498d7e18498b7608e8ba28ffff49894610488b43284889c148f7d949894c06f8",
+      "patchedHex": "4c8b7320498d7e18498b7608e8c528ffff49894610488b43284889c148f7d949894c06f8488b03488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderGeometry",
+      "offset": 597358,
+      "originalHex": "488b03488b4810488948084c8b7320498d7e18498b7608e8de20ffff49894610488b43284889c148f7d949894c06f8",
+      "patchedHex": "4c8b7320498d7e18498b7608e8e920ffff49894610488b43284889c148f7d949894c06f8488b03488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderRootSignature",
+      "offset": 603191,
+      "originalHex": "498b4608488b481048894808498b5e28488d7b18488b7308e8140affff48894310498b46304889c148f7d948894c03f8",
+      "patchedHex": "498b5e28488d7b18488b7308e8200affff48894310498b46304889c148f7d948894c03f8498b4608488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderRaytracing",
+      "offset": 632532,
+      "originalHex": "488b03488b4810488948084c8b7320498d7e18498b7608e87897feff49894610488b43284889c148f7d949894c06f8",
+      "patchedHex": "4c8b7320498d7e18498b7608e88397feff49894610488b43284889c148f7d949894c06f8488b03488b481048894808"
+    },
+    {
+      "id": "CacheFileEndPublicationOrderNode",
+      "offset": 647259,
+      "originalHex": "488b03488b4810488948084c8b7320498d7e18498b7608e8f15dfeff49894610488b43284889c148f7d949894c06f8",
+      "patchedHex": "4c8b7320498d7e18498b7608e8fc5dfeff49894610488b43284889c148f7d949894c06f8488b03488b481048894808"
     }
   ],
   "commitHook": {
@@ -81,9 +189,9 @@
     "originalHex": "ff15638f3500",
     "entryPatchHex": "e8ac86350090",
     "gateOffset": 4905584,
-    "gateHex": "48833d28a7070000740e4c8b1d1fa7070041ffa3b8000000ff259a080000",
+    "gateHex": "48833d28a7070000740e4c8b1d1fa7070041ffa388000000ff259a080000",
     "objcMsgSendGotOffset": 4907816,
-    "dispatchFieldOffset": 184
+    "dispatchFieldOffset": 136
   },
   "presentHook": {
     "id": "RefreshDisplayAndFlush",
@@ -91,8 +199,8 @@
     "originalHex": "498b7e28488b07ff5010",
     "entryPatchHex": "e82a8d39009090909090",
     "gateOffset": 4905760,
-    "gateHex": "4c8b1d79a607004d85db740a4c89f741ffa3b0000000498b7e28488b07ff6010",
-    "dispatchFieldOffset": 176
+    "gateHex": "4c8b1d79a607004d85db740a4c89f741ffa380000000498b7e28488b07ff6010",
+    "dispatchFieldOffset": 128
   },
   "presentResidencyAddHook": {
     "id": "ScopedMetal4PresentResidencyAdd",
@@ -100,9 +208,9 @@
     "originalHex": "ff1582863500",
     "entryPatchHex": "e8bb7e350090",
     "gateOffset": 4905824,
-    "gateHex": "48833d38a6070000740e4c8b1d2fa6070041ffa3c0000000ff25aa070000",
+    "gateHex": "48833d38a6070000740e4c8b1d2fa6070041ffa390000000ff25aa070000",
     "objcMsgSendGotOffset": 4907816,
-    "dispatchFieldOffset": 192
+    "dispatchFieldOffset": 144
   },
   "presentResidencyFinishHook": {
     "id": "ScopedMetal4PresentResidencyFinish",
@@ -110,9 +218,9 @@
     "originalHex": "498bbe90000000",
     "entryPatchHex": "e9347b35009090",
     "gateOffset": 4905856,
-    "gateHex": "4c8b1d19a607004d85db740741ff93c8000000498bbe90000000e9af84caff",
+    "gateHex": "4c8b1d19a607004d85db740741ff9398000000498bbe90000000e9af84caff",
     "continuationOffset": 1400910,
-    "dispatchFieldOffset": 200
+    "dispatchFieldOffset": 152
   },
   "videoMemoryHook": {
     "id": "QueryVideoMemoryInfo",
@@ -122,63 +230,11 @@
     "continuationOffset": 1379151,
     "originalHex": "534889f80f57c0",
     "entryPatchHex": "e953d035009090",
-    "gateHex": "48833df8a507000074164c8b1defa5070041ffa3d0000000",
+    "gateHex": "48833df8a507000074164c8b1defa5070041ffa3a0000000",
     "trampolineHex": "534889f80f57c0e9832fcaff",
-    "dispatchFieldOffset": 208
+    "dispatchFieldOffset": 160
   },
-
-  "verificationSpans": [
-    {
-      "id": "ExtractCall1107d0",
-      "offset": 1116112,
-      "expectedHex": "e8ddd80500"
-    },
-    {
-      "id": "TessellationExtractCall",
-      "offset": 1116546,
-      "expectedHex": "e82bd70500"
-    },
-    {
-      "id": "ExtractCall110a56",
-      "offset": 1116758,
-      "expectedHex": "e857d60500"
-    },
-    {
-      "id": "ExtractCall110d96",
-      "offset": 1117590,
-      "expectedHex": "e817d30500"
-    },
-    {
-      "id": "ExtractCall110e51",
-      "offset": 1117777,
-      "expectedHex": "e85cd20500"
-    },
-    {
-      "id": "ExtractCall110f1a",
-      "offset": 1117978,
-      "expectedHex": "e893d10500"
-    },
-    {
-      "id": "StreamOutputExtractCall",
-      "offset": 1119518,
-      "expectedHex": "e88fcb0500"
-    },
-    {
-      "id": "ExtractCall1115e1",
-      "offset": 1119713,
-      "expectedHex": "e8ccca0500"
-    },
-    {
-      "id": "ExtractCall1116d3",
-      "offset": 1119955,
-      "expectedHex": "e8dac90500"
-    },
-    {
-      "id": "ComputeExtractCall",
-      "offset": 1110248,
-      "expectedHex": "e8c5ef0500"
-    }
-  ],
+  "verificationSpans": [],
   "hooks": [
     {
       "id": "Metal4Render",
@@ -313,78 +369,6 @@
       "dispatchFieldOffset": 80
     },
     {
-      "id": "CompileComputeStages",
-      "entryOffset": 552536,
-      "gateOffset": 4905024,
-      "trampolineOffset": 4905045,
-      "continuationOffset": 552541,
-      "originalHex": "5541574156",
-      "entryPatchHex": "e9e3694200",
-      "gateHex": "48833d58a9070000740b4c8b1d4fa9070041ff6358",
-      "trampolineHex": "5541574156e9fe95bdff",
-      "dispatchFieldOffset": 88
-    },
-    {
-      "id": "CompileGraphicsStages",
-      "entryOffset": 561544,
-      "gateOffset": 4905056,
-      "trampolineOffset": 4905077,
-      "continuationOffset": 561549,
-      "originalHex": "5541574156",
-      "entryPatchHex": "e9d3464200",
-      "gateHex": "48833d38a9070000740b4c8b1d2fa9070041ff6360",
-      "trampolineHex": "5541574156e90eb9bdff",
-      "dispatchFieldOffset": 96
-    },
-    {
-      "id": "CreateComputeStageKey",
-      "entryOffset": 544112,
-      "gateOffset": 4905088,
-      "trampolineOffset": 4905109,
-      "continuationOffset": 544117,
-      "originalHex": "5541574156",
-      "entryPatchHex": "e90b8b4200",
-      "gateHex": "48833d18a9070000740b4c8b1d0fa9070041ff6368",
-      "trampolineHex": "5541574156e9d674bdff",
-      "dispatchFieldOffset": 104
-    },
-    {
-      "id": "CreateGraphicsStageKey",
-      "entryOffset": 542008,
-      "gateOffset": 4905120,
-      "trampolineOffset": 4905141,
-      "continuationOffset": 542013,
-      "originalHex": "5541574156",
-      "entryPatchHex": "e963934200",
-      "gateHex": "48833df8a8070000740b4c8b1defa8070041ff6370",
-      "trampolineHex": "5541574156e97e6cbdff",
-      "dispatchFieldOffset": 112
-    },
-    {
-      "id": "ExtractFunctions",
-      "entryOffset": 1499314,
-      "gateOffset": 4905152,
-      "trampolineOffset": 4905173,
-      "continuationOffset": 1499319,
-      "originalHex": "5541574156",
-      "entryPatchHex": "e909f83300",
-      "gateHex": "48833dd8a8070000740b4c8b1dcfa8070041ff6378",
-      "trampolineHex": "5541574156e9d807ccff",
-      "dispatchFieldOffset": 120
-    },
-    {
-      "id": "LoadGraphicsFunctions",
-      "entryOffset": 1115974,
-      "gateOffset": 4905184,
-      "trampolineOffset": 4905232,
-      "continuationOffset": 1115979,
-      "originalHex": "5541574156",
-      "entryPatchHex": "e995d13900",
-      "gateHex": "48833db8a807000074264c8b1dafa8070041ffa380000000",
-      "trampolineHex": "5541574156e9312ec6ff",
-      "dispatchFieldOffset": 128
-    },
-    {
       "id": "ReplayTemporalScaleMPL",
       "entryOffset": 222806,
       "gateOffset": 4905456,
@@ -392,9 +376,9 @@
       "continuationOffset": 222812,
       "originalHex": "554889e54157",
       "entryPatchHex": "e99573470090",
-      "gateHex": "48833da8a707000074164c8b1d9fa7070041ffa388000000",
+      "gateHex": "48833da8a707000074164c8b1d9fa7070041ffa358000000",
       "trampolineHex": "554889e54157e9418cb8ff",
-      "dispatchFieldOffset": 136
+      "dispatchFieldOffset": 88
     },
     {
       "id": "EncodeTemporalScaleMTL",
@@ -404,9 +388,9 @@
       "continuationOffset": 1243994,
       "originalHex": "5541574156",
       "entryPatchHex": "e9d6de3700",
-      "gateHex": "48833d68a707000074164c8b1d5fa7070041ffa390000000",
+      "gateHex": "48833d68a707000074164c8b1d5fa7070041ffa360000000",
       "trampolineHex": "5541574156e90021c8ff",
-      "dispatchFieldOffset": 144
+      "dispatchFieldOffset": 96
     },
     {
       "id": "GetContainingOutput",
@@ -416,9 +400,9 @@
       "continuationOffset": 1133514,
       "originalHex": "415741564154",
       "entryPatchHex": "e9d78e390090",
-      "gateHex": "48833df8a607000074164c8b1defa6070041ffa398000000",
+      "gateHex": "48833df8a607000074164c8b1defa6070041ffa368000000",
       "trampolineHex": "415741564154e9ff70c6ff",
-      "dispatchFieldOffset": 152
+      "dispatchFieldOffset": 104
     },
     {
       "id": "SetFullscreenState",
@@ -428,9 +412,9 @@
       "continuationOffset": 1132297,
       "originalHex": "554156534881ec90000000",
       "entryPatchHex": "e9dd933900909090909090",
-      "gateHex": "48833db8a607000074164c8b1dafa6070041ffa3a0000000",
+      "gateHex": "48833db8a607000074164c8b1dafa6070041ffa370000000",
       "trampolineHex": "554156534881ec90000000e9f96bc6ff",
-      "dispatchFieldOffset": 160
+      "dispatchFieldOffset": 112
     },
     {
       "id": "ConstructAdapter",
@@ -440,9 +424,9 @@
       "continuationOffset": 1387911,
       "originalHex": "5541574156",
       "entryPatchHex": "e959ae3500",
-      "gateHex": "48833db8a507000074164c8b1dafa5070041ffa3a8000000",
+      "gateHex": "48833db8a507000074164c8b1dafa5070041ffa378000000",
       "trampolineHex": "5541574156e97d51caff",
-      "dispatchFieldOffset": 168
+      "dispatchFieldOffset": 120
     }
   ]
 }

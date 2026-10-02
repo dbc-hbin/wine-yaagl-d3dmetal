@@ -34,55 +34,49 @@ ContractStatus validateCreate(const yaagl_fsr_create_packet& input, CreateContra
     if (input.flags & kJitteredMotion) flags |= metalfx::FeatureFlagMVJittered;
     if (input.flags & kDepthInverted) flags |= metalfx::FeatureFlagDepthInverted;
     if (input.flags & kAutoExposure) flags |= metalfx::FeatureFlagAutoExposure;
-    output.backend.featureFlags = {flags, true};
+    output.backend.featureFlags = flags;
     return ContractStatus::Ok;
 }
 
 ContractStatus validateFrame(const CreateContract& create, const yaagl_fsr_dispatch_packet& input,
-                             FrameContract& output, const char** detail) noexcept {
-    if (detail) *detail = "ok";
-    const auto invalid = [detail](const char* reason) noexcept {
-        if (detail) *detail = reason;
-        return ContractStatus::InvalidParameter;
-    };
+                             FrameContract& output) noexcept {
     const bool defaultUpscale = input.upscale_width == 0 && input.upscale_height == 0;
     const std::uint32_t upscaleWidth = defaultUpscale ? create.backend.output.width : input.upscale_width;
     const std::uint32_t upscaleHeight = defaultUpscale ? create.backend.output.height : input.upscale_height;
     if (!input.command_list || !input.color || !input.depth || !input.motion_vectors || !input.output)
-        return invalid("missing_required_resource");
+        return ContractStatus::InvalidParameter;
     if (!input.color_state || !input.depth_state || !input.motion_state || !input.output_state)
-        return invalid("missing_required_resource_state");
+        return ContractStatus::InvalidParameter;
     if ((input.color_state | input.depth_state | input.motion_state | input.exposure_state |
          input.reactive_state | input.composition_state | input.output_state) & ~kKnownResourceStates)
-        return invalid("unknown_resource_state_bits");
+        return ContractStatus::InvalidParameter;
     if ((input.exposure && !input.exposure_state) || (input.reactive && !input.reactive_state) ||
         (input.composition && !input.composition_state))
-        return invalid("missing_optional_resource_state");
-    if (!input.render_width || !input.render_height) return invalid("zero_render_size");
+        return ContractStatus::InvalidParameter;
+    if (!input.render_width || !input.render_height) return ContractStatus::InvalidParameter;
     if (input.render_width > create.backend.input.width || input.render_height > create.backend.input.height)
-        return invalid("render_size_exceeds_context");
+        return ContractStatus::InvalidParameter;
     if (!defaultUpscale && (!input.upscale_width || !input.upscale_height))
-        return invalid("partial_zero_upscale_size");
+        return ContractStatus::InvalidParameter;
     if (!upscaleWidth || !upscaleHeight || upscaleWidth > create.backend.output.width ||
-        upscaleHeight > create.backend.output.height) return invalid("upscale_size_exceeds_context");
-    if (!finite(input.jitter_x) || !finite(input.jitter_y)) return invalid("nonfinite_jitter");
-    if (!finite(input.motion_scale_x) || !finite(input.motion_scale_y)) return invalid("nonfinite_motion_scale");
+        upscaleHeight > create.backend.output.height) return ContractStatus::InvalidParameter;
+    if (!finite(input.jitter_x) || !finite(input.jitter_y)) return ContractStatus::InvalidParameter;
+    if (!finite(input.motion_scale_x) || !finite(input.motion_scale_y)) return ContractStatus::InvalidParameter;
     if (!finite(input.sharpness) || input.sharpness < 0.0f || input.sharpness > 1.0f)
-        return invalid("invalid_sharpness");
+        return ContractStatus::InvalidParameter;
     if (!finite(input.frame_time_delta) || input.frame_time_delta < 0.0f)
-        return invalid("invalid_frame_time_delta");
-    if (!finite(input.pre_exposure) || input.pre_exposure <= 0.0f) return invalid("invalid_pre_exposure");
-    if (!finite(input.camera_near) || !finite(input.camera_far)) return invalid("nonfinite_camera_planes");
+        return ContractStatus::InvalidParameter;
+    if (!finite(input.pre_exposure) || input.pre_exposure <= 0.0f) return ContractStatus::InvalidParameter;
+    if (!finite(input.camera_near) || !finite(input.camera_far)) return ContractStatus::InvalidParameter;
     if (!finite(input.camera_fov_vertical) || input.camera_fov_vertical <= 0.0f ||
-        input.camera_fov_vertical > 3.14159265358979323846f) return invalid("invalid_camera_fov");
+        input.camera_fov_vertical > 3.14159265358979323846f) return ContractStatus::InvalidParameter;
     // The public API describes this as a diagnostic scale and the pinned provider forwards zero.
     if (!finite(input.view_space_to_meters) || input.view_space_to_meters < 0.0f)
-        return invalid("invalid_view_space_scale");
-    if (input.reset > 1 || input.enable_sharpening > 1) return invalid("invalid_boolean");
-    if (input.flags & ~kKnownDispatchFlags) return invalid("unknown_dispatch_flags");
-    if ((input.flags & kSrgb) && (input.flags & kPq)) return invalid("conflicting_color_transfer");
+        return ContractStatus::InvalidParameter;
+    if (input.reset > 1 || input.enable_sharpening > 1) return ContractStatus::InvalidParameter;
+    if (input.flags & ~kKnownDispatchFlags) return ContractStatus::InvalidParameter;
+    if ((input.flags & kSrgb) && (input.flags & kPq)) return ContractStatus::InvalidParameter;
     if (input.flags & 1u) {
-        if (detail) *detail = "debug_view_unsupported";
         return ContractStatus::Unsupported;
     }
 
@@ -91,9 +85,9 @@ ContractStatus validateFrame(const CreateContract& create, const yaagl_fsr_dispa
     output.backend.depth = reinterpret_cast<void*>(static_cast<std::uintptr_t>(input.depth));
     output.backend.motionVectors = reinterpret_cast<void*>(static_cast<std::uintptr_t>(input.motion_vectors));
     output.backend.output = reinterpret_cast<void*>(static_cast<std::uintptr_t>(input.output));
-    output.backend.exposureTexture = {reinterpret_cast<void*>(static_cast<std::uintptr_t>(input.exposure)), input.exposure != 0};
-    output.backend.reactiveMask = {reinterpret_cast<void*>(static_cast<std::uintptr_t>(input.reactive)), input.reactive != 0};
-    output.backend.compositionMask = {reinterpret_cast<void*>(static_cast<std::uintptr_t>(input.composition)), input.composition != 0};
+    output.backend.exposureTexture = reinterpret_cast<void*>(static_cast<std::uintptr_t>(input.exposure));
+    output.backend.reactiveMask = reinterpret_cast<void*>(static_cast<std::uintptr_t>(input.reactive));
+    output.backend.compositionMask = reinterpret_cast<void*>(static_cast<std::uintptr_t>(input.composition));
     output.backend.inputContent = {input.render_width, input.render_height};
     output.backend.colorRect = {0, 0, input.render_width, input.render_height};
     output.backend.depthRect = output.backend.colorRect;
@@ -102,12 +96,12 @@ ContractStatus validateFrame(const CreateContract& create, const yaagl_fsr_dispa
     output.backend.motionRect = {0, 0, lowMotion ? input.render_width : upscaleWidth,
                                       lowMotion ? input.render_height : upscaleHeight};
     output.backend.outputRect = {0, 0, upscaleWidth, upscaleHeight};
-    output.backend.jitterOffsetX = {input.jitter_x, true};
-    output.backend.jitterOffsetY = {input.jitter_y, true};
-    output.backend.motionVectorScaleX = {input.motion_scale_x, true};
-    output.backend.motionVectorScaleY = {input.motion_scale_y, true};
-    output.backend.preExposure = {input.pre_exposure, true};
-    output.backend.resetHistory = {input.reset != 0, true};
+    output.backend.jitterOffsetX = input.jitter_x;
+    output.backend.jitterOffsetY = input.jitter_y;
+    output.backend.motionVectorScaleX = input.motion_scale_x;
+    output.backend.motionVectorScaleY = input.motion_scale_y;
+    output.backend.preExposure = input.pre_exposure;
+    output.backend.resetHistory = input.reset != 0;
     output.backend.exposureMode = (create.apiFlags & kAutoExposure)
         ? metalfx::ExposureMode::Automatic : (input.exposure ? metalfx::ExposureMode::Texture : metalfx::ExposureMode::None);
     output.operations.colorTransfer = (input.flags & kSrgb) ? metalfx::ColorTransfer::SRGB

@@ -15,8 +15,6 @@ const outputDirectory = resolve(output);
 const sourceDirectory = resolve(root, "d3dmetal-pso-cache");
 const sourcePaths = [
   "d3dmetal-pso-cache/cache.hpp", "d3dmetal-pso-cache/cache.mm",
-  "d3dmetal-pso-cache/function-cache.hpp", "d3dmetal-pso-cache/function-cache.mm",
-  "d3dmetal-pso-cache/function-hooks.hpp", "d3dmetal-pso-cache/function-hooks.mm",
   "d3dmetal-pso-cache/key.hpp", "d3dmetal-pso-cache/key.mm",
   "d3dmetal-pso-cache/metalfx-contract.hpp",
   "d3dmetal-pso-cache/metalfx-backend.hpp", "d3dmetal-pso-cache/metalfx-backend.mm",
@@ -48,13 +46,10 @@ const hookNames = [
   "Metal4Render", "Render", "Mesh", "Compute", "GetRender", "CompileCompute",
   "DestroyDevice", "CreateRTFunction", "CreateRTCombined", "CreateRTIntersection",
   "GetAndRetainLibrary",
-  "CompileComputeStages", "CompileGraphicsStages",
-  "CreateComputeStageKey", "CreateGraphicsStageKey",
-  "ExtractFunctions", "LoadGraphicsFunctions",
   "ReplayTemporalScaleMPL", "EncodeTemporalScaleMTL",
   "GetContainingOutput", "SetFullscreenState", "ConstructAdapter",
 ];
-if (layout.formatVersion !== 16 || layout.hooks.length !== hookNames.length ||
+if (layout.formatVersion !== 20 || layout.hooks.length !== hookNames.length ||
     layout.commitHook.id !== "CommitMetal4Batch" ||
     layout.presentHook.id !== "RefreshDisplayAndFlush" ||
     layout.presentHook.dispatchFieldOffset !== hookNames.length * 8 ||
@@ -144,7 +139,7 @@ const compileArgs = [
   "-mmacosx-version-min=14.0", "-O2", "-Wall", "-Wextra", "-Werror",
   "-dynamiclib", "-pthread", "-framework", "Foundation", "-framework", "Metal", "-framework", "QuartzCore", "-framework", "MetalFX",
   "-I", sourceDirectory, "-I", outputDirectory,
-  ...["cache.mm", "function-cache.mm", "function-hooks.mm", "key.mm", "metalfx-backend.mm", "d3dmetal-transport.mm", "d3dmetal-transport-legacy.mm", "ngx-hooks.mm", "display-routing.mm", "fsr-contract.cpp", "fsr-translator.mm", "fsr-framegeneration.mm", "rt-key.mm", "stage-cache.mm", "video-memory.mm", "bridge.mm"].map((file) => resolve(sourceDirectory, file)),
+  ...["cache.mm", "key.mm", "metalfx-backend.mm", "d3dmetal-transport.mm", "d3dmetal-transport-legacy.mm", "ngx-hooks.mm", "display-routing.mm", "fsr-contract.cpp", "fsr-translator.mm", "fsr-framegeneration.mm", "rt-key.mm", "stage-cache.mm", "video-memory.mm", "bridge.mm"].map((file) => resolve(sourceDirectory, file)),
   "-Wl,-install_name,@rpath/libYaaglNativePsoCache.dylib", "-o", modulePath,
 ];
 const compiled = spawnSync(compiler, compileArgs, { cwd: root, stdio: "inherit" });
@@ -158,16 +153,11 @@ if (!moduleBytes.includes(Buffer.from("yaagl_fsr_api"))) {
 if (!moduleBytes.includes(Buffer.from("yaagl_fsr_fg_api"))) {
   throw new Error("native cache is missing the FSR frame-generation sidecar API export");
 }
-const diagnosticControls = ["YAAGL_FSR_LOG"];
-for (const control of diagnosticControls) {
-  if (!moduleBytes.includes(Buffer.from(control))) {
-    throw new Error(`native cache is missing production diagnostic control: ${control}`);
-  }
-}
 if (moduleBytes.includes(Buffer.from("YAAGL_METALFX_RENDER_PRESET"))) {
   throw new Error("native cache still contains the removed render-size override");
 }
 const forbiddenMarkers = [
+  "YAAGL_FSR_LOG",
   "YAAGL_NATIVE_PSO_CACHE_PROBE",
   "YAAGL_NATIVE_PSO_CACHE_PROBE_BYPASS",
   "YAAGL_D3DMETAL_CACHE_ROOT",
