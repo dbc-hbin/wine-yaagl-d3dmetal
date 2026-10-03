@@ -16,19 +16,19 @@ const layoutText = await readFile(
 );
 const layoutSha256 = createHash("sha256").update(layoutText).digest("hex");
 const expectedLayoutSha256 =
-  "9ca7ec3c041d49f8eef4ea93616c21cc141ab6d3c83cc0fd9cb3365c33e2deab";
+  "f669013238be7e53f9598f72e59e294dcbefaa345be18d8818402040505f54ec";
 if (layoutSha256 !== expectedLayoutSha256) {
   throw new Error(
     `layout corruption: expected SHA-256 ${expectedLayoutSha256}, got ${layoutSha256}`
   );
 }
 const layout = JSON.parse(layoutText);
-if (layout.formatVersion !== 20) {
+if (layout.formatVersion !== 21) {
   throw new Error(`unsupported layout format ${layout.formatVersion}`);
 }
 
 export const D3DMETAL_PSO_CACHE_PATCHED_PAYLOAD_SHA256 =
-  "4aa6ed51fa673a7b48220d3e133845e97d400ea0703ba0a35c338225f6147f17";
+  "b09f9646bddaa6342bb5aaaf1c7196a0af0312dfe621dfa438a6c95140b1519e";
 
 const LC_SEGMENT_64 = 0x19;
 const LC_UUID = 0x1b;
@@ -460,12 +460,34 @@ if (legacyFullscreenCall.offset !== 0x105568 ||
   throw new Error("layout corruption: invalid null-target legacy fullscreen tail call");
 }
 
+// The duplicate compute insertion has already unlocked and selected RBP as its
+// canonical result. Free only its malloc(88) candidate at [RSP+8], then resume
+// the existing key cleanup; the borrowed stage results remain untouched.
+const computeLoser = layout.binaryPatches.find(patch => patch.id === "ComputePipelineLoserFree");
+const computeLoserStub = layout.binaryPatches.find(patch => patch.id === "ComputePipelineLoserFreeStub");
+if (!computeLoser || !computeLoserStub) {
+  throw new Error("layout corruption: missing compute loser cleanup");
+}
+const loserJump = Buffer.from(computeLoser.patchedHex, "hex");
+const loserStub = Buffer.from(computeLoserStub.patchedHex, "hex");
+if (computeLoser.offset !== 0x871f3 || computeLoser.originalHex !== "e966fdffff" ||
+    loserJump.length !== 5 || loserJump[0] !== 0xe9 ||
+    computeLoser.offset + 5 + loserJump.readInt32LE(1) !== computeLoserStub.offset ||
+    loserStub.length !== 15 || loserStub.subarray(0, 6).toString("hex") !== "488b7c2408e8" ||
+    loserStub[10] !== 0xe9 || computeLoserStub.originalHex !== "000000000000000000000000000000" ||
+    computeLoserStub.offset < EH_FRAME_END || computeLoserStub.offset + loserStub.length > TEXT_END ||
+    computeLoserStub.offset + 10 + loserStub.readInt32LE(6) !== 0x37079e ||
+    computeLoserStub.offset + 15 + loserStub.readInt32LE(11) !== 0x86f5e) {
+  throw new Error("layout corruption: invalid compute loser cleanup");
+}
+
 const hookNames = [
   "Metal4Render", "Render", "Mesh", "Compute", "GetRender", "CompileCompute",
   "DestroyDevice", "CreateRTFunction", "CreateRTCombined", "CreateRTIntersection",
   "GetAndRetainLibrary",
   "ReplayTemporalScaleMPL", "EncodeTemporalScaleMTL",
   "GetContainingOutput", "SetFullscreenState", "ConstructAdapter",
+  "ExtractFunctions", "LoadGraphicsFunctions",
 ];
 if (layout.hooks.length !== hookNames.length) {
   throw new Error("layout corruption: invalid generic dispatch count");

@@ -16,6 +16,8 @@ const sourceDirectory = resolve(root, "d3dmetal-pso-cache");
 const sourcePaths = [
   "d3dmetal-pso-cache/cache.hpp", "d3dmetal-pso-cache/cache.mm",
   "d3dmetal-pso-cache/key.hpp", "d3dmetal-pso-cache/key.mm",
+  "d3dmetal-pso-cache/function-cache.hpp", "d3dmetal-pso-cache/function-cache.mm",
+  "d3dmetal-pso-cache/function-hooks.hpp", "d3dmetal-pso-cache/function-hooks.mm",
   "d3dmetal-pso-cache/metalfx-contract.hpp",
   "d3dmetal-pso-cache/metalfx-backend.hpp", "d3dmetal-pso-cache/metalfx-backend.mm",
   "d3dmetal-pso-cache/d3dmetal-transport.hpp", "d3dmetal-pso-cache/d3dmetal-transport.mm",
@@ -48,8 +50,9 @@ const hookNames = [
   "GetAndRetainLibrary",
   "ReplayTemporalScaleMPL", "EncodeTemporalScaleMTL",
   "GetContainingOutput", "SetFullscreenState", "ConstructAdapter",
+  "ExtractFunctions", "LoadGraphicsFunctions",
 ];
-if (layout.formatVersion !== 20 || layout.hooks.length !== hookNames.length ||
+if (layout.formatVersion !== 21 || layout.hooks.length !== hookNames.length ||
     layout.commitHook.id !== "CommitMetal4Batch" ||
     layout.presentHook.id !== "RefreshDisplayAndFlush" ||
     layout.presentHook.dispatchFieldOffset !== hookNames.length * 8 ||
@@ -139,7 +142,7 @@ const compileArgs = [
   "-mmacosx-version-min=14.0", "-O2", "-Wall", "-Wextra", "-Werror",
   "-dynamiclib", "-pthread", "-framework", "Foundation", "-framework", "Metal", "-framework", "QuartzCore", "-framework", "MetalFX",
   "-I", sourceDirectory, "-I", outputDirectory,
-  ...["cache.mm", "key.mm", "metalfx-backend.mm", "d3dmetal-transport.mm", "d3dmetal-transport-legacy.mm", "ngx-hooks.mm", "display-routing.mm", "fsr-contract.cpp", "fsr-translator.mm", "fsr-framegeneration.mm", "rt-key.mm", "stage-cache.mm", "video-memory.mm", "bridge.mm"].map((file) => resolve(sourceDirectory, file)),
+  ...["cache.mm", "key.mm", "function-cache.mm", "function-hooks.mm", "metalfx-backend.mm", "d3dmetal-transport.mm", "d3dmetal-transport-legacy.mm", "ngx-hooks.mm", "display-routing.mm", "fsr-contract.cpp", "fsr-translator.mm", "fsr-framegeneration.mm", "rt-key.mm", "stage-cache.mm", "video-memory.mm", "bridge.mm"].map((file) => resolve(sourceDirectory, file)),
   "-Wl,-install_name,@rpath/libYaaglNativePsoCache.dylib", "-o", modulePath,
 ];
 const compiled = spawnSync(compiler, compileArgs, { cwd: root, stdio: "inherit" });

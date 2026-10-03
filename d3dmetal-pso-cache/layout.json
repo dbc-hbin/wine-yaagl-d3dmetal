@@ -1,5 +1,5 @@
 {
-  "formatVersion": 20,
+  "formatVersion": 21,
   "source": {
     "machUuid": "674e662b6b5c3fd99a8af415609d2f6a",
     "cpuType": 16777223,
@@ -18,8 +18,8 @@
   },
   "constructorVerification": {
     "markerOffset": 4904624,
-    "markerHex": "594141474c50534f4341434845140000",
-    "description": "Version 20 removes the ExtractFunctions and LoadGraphicsFunctions hooks. The null-target legacy CreateSwapChain fullscreen call, all 17 native CacheFile publication sequences, the 16-entry generic PSO/FSR/display/adapter dispatch table, four special presentation/commit/residency gates, the DXGI video-memory budget hook, and the null dispatch slot remain verified. Outer stage compilation/key creation, stock NGX Evaluate, and recording paths remain unpatched."
+    "markerHex": "594141474c50534f4341434845150000",
+    "description": "Version 21 restores only ExtractFunctions and LoadGraphicsFunctions with verified native callers and frees losing Compute stage tables. The null-target legacy CreateSwapChain fullscreen call, all 17 native CacheFile publication sequences, the 18-entry generic dispatch table, five special presentation/commit/residency/video-memory entries, and the null dispatch slot remain verified. Outer stage compilation/key creation, stock NGX Evaluate, and recording paths remain unhooked."
   },
   "textCave": {
     "endOffset": 4907008,
@@ -35,9 +35,21 @@
     "commonSectionNewSize": 17376,
     "commonSectionOldEndVMAddr": 5407136,
     "segmentEndVMAddr": 5410816,
-    "description": "The patch claims the first eight zero-fill bytes after __common by extending that section; the constructor atomically publishes one pointer to its immutable 21-entry dispatch table."
+    "description": "The patch claims the first eight zero-fill bytes after __common by extending that section; the constructor atomically publishes one pointer to its immutable 23-entry dispatch table."
   },
   "binaryPatches": [
+    {
+      "id": "ComputePipelineLoserFree",
+      "offset": 553459,
+      "originalHex": "e966fdffff",
+      "patchedHex": "e9486a4200"
+    },
+    {
+      "id": "ComputePipelineLoserFreeStub",
+      "offset": 4906048,
+      "originalHex": "000000000000000000000000000000",
+      "patchedHex": "488b7c2408e8542becffe90f93bdff"
+    },
     {
       "id": "NullLegacyCreateSwapChainFullscreenCall",
       "offset": 1070440,
@@ -189,9 +201,9 @@
     "originalHex": "ff15638f3500",
     "entryPatchHex": "e8ac86350090",
     "gateOffset": 4905584,
-    "gateHex": "48833d28a7070000740e4c8b1d1fa7070041ffa388000000ff259a080000",
+    "gateHex": "48833d28a7070000740e4c8b1d1fa7070041ffa398000000ff259a080000",
     "objcMsgSendGotOffset": 4907816,
-    "dispatchFieldOffset": 136
+    "dispatchFieldOffset": 152
   },
   "presentHook": {
     "id": "RefreshDisplayAndFlush",
@@ -199,8 +211,8 @@
     "originalHex": "498b7e28488b07ff5010",
     "entryPatchHex": "e82a8d39009090909090",
     "gateOffset": 4905760,
-    "gateHex": "4c8b1d79a607004d85db740a4c89f741ffa380000000498b7e28488b07ff6010",
-    "dispatchFieldOffset": 128
+    "gateHex": "4c8b1d79a607004d85db740a4c89f741ffa390000000498b7e28488b07ff6010",
+    "dispatchFieldOffset": 144
   },
   "presentResidencyAddHook": {
     "id": "ScopedMetal4PresentResidencyAdd",
@@ -208,9 +220,9 @@
     "originalHex": "ff1582863500",
     "entryPatchHex": "e8bb7e350090",
     "gateOffset": 4905824,
-    "gateHex": "48833d38a6070000740e4c8b1d2fa6070041ffa390000000ff25aa070000",
+    "gateHex": "48833d38a6070000740e4c8b1d2fa6070041ffa3a0000000ff25aa070000",
     "objcMsgSendGotOffset": 4907816,
-    "dispatchFieldOffset": 144
+    "dispatchFieldOffset": 160
   },
   "presentResidencyFinishHook": {
     "id": "ScopedMetal4PresentResidencyFinish",
@@ -218,9 +230,9 @@
     "originalHex": "498bbe90000000",
     "entryPatchHex": "e9347b35009090",
     "gateOffset": 4905856,
-    "gateHex": "4c8b1d19a607004d85db740741ff9398000000498bbe90000000e9af84caff",
+    "gateHex": "4c8b1d19a607004d85db740741ff93a8000000498bbe90000000e9af84caff",
     "continuationOffset": 1400910,
-    "dispatchFieldOffset": 152
+    "dispatchFieldOffset": 168
   },
   "videoMemoryHook": {
     "id": "QueryVideoMemoryInfo",
@@ -230,11 +242,62 @@
     "continuationOffset": 1379151,
     "originalHex": "534889f80f57c0",
     "entryPatchHex": "e953d035009090",
-    "gateHex": "48833df8a507000074164c8b1defa5070041ffa3a0000000",
+    "gateHex": "48833df8a507000074164c8b1defa5070041ffa3b0000000",
     "trampolineHex": "534889f80f57c0e9832fcaff",
-    "dispatchFieldOffset": 160
+    "dispatchFieldOffset": 176
   },
-  "verificationSpans": [],
+  "verificationSpans": [
+    {
+      "id": "ExtractCall1107d0",
+      "offset": 1116112,
+      "expectedHex": "e8ddd80500"
+    },
+    {
+      "id": "TessellationExtractCall",
+      "offset": 1116546,
+      "expectedHex": "e82bd70500"
+    },
+    {
+      "id": "ExtractCall110a56",
+      "offset": 1116758,
+      "expectedHex": "e857d60500"
+    },
+    {
+      "id": "ExtractCall110d96",
+      "offset": 1117590,
+      "expectedHex": "e817d30500"
+    },
+    {
+      "id": "ExtractCall110e51",
+      "offset": 1117777,
+      "expectedHex": "e85cd20500"
+    },
+    {
+      "id": "ExtractCall110f1a",
+      "offset": 1117978,
+      "expectedHex": "e893d10500"
+    },
+    {
+      "id": "StreamOutputExtractCall",
+      "offset": 1119518,
+      "expectedHex": "e88fcb0500"
+    },
+    {
+      "id": "ExtractCall1115e1",
+      "offset": 1119713,
+      "expectedHex": "e8ccca0500"
+    },
+    {
+      "id": "ExtractCall1116d3",
+      "offset": 1119955,
+      "expectedHex": "e8dac90500"
+    },
+    {
+      "id": "ComputeExtractCall",
+      "offset": 1110248,
+      "expectedHex": "e8c5ef0500"
+    }
+  ],
   "hooks": [
     {
       "id": "Metal4Render",
@@ -427,6 +490,30 @@
       "gateHex": "48833db8a507000074164c8b1dafa5070041ffa378000000",
       "trampolineHex": "5541574156e97d51caff",
       "dispatchFieldOffset": 120
+    },
+    {
+      "id": "ExtractFunctions",
+      "entryOffset": 1499314,
+      "gateOffset": 4905024,
+      "trampolineOffset": 4905056,
+      "continuationOffset": 1499319,
+      "originalHex": "5541574156",
+      "entryPatchHex": "e989f73300",
+      "gateHex": "48833d58a907000074164c8b1d4fa9070041ffa380000000",
+      "trampolineHex": "5541574156e94d08ccff",
+      "dispatchFieldOffset": 128
+    },
+    {
+      "id": "LoadGraphicsFunctions",
+      "entryOffset": 1115974,
+      "gateOffset": 4905088,
+      "trampolineOffset": 4905120,
+      "continuationOffset": 1115979,
+      "originalHex": "5541574156",
+      "entryPatchHex": "e935d13900",
+      "gateHex": "48833d18a907000074164c8b1d0fa9070041ffa388000000",
+      "trampolineHex": "5541574156e9a12ec6ff",
+      "dispatchFieldOffset": 136
     }
   ]
 }

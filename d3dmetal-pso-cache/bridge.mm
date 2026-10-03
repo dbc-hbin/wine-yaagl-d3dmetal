@@ -14,6 +14,8 @@
 #include "cache.hpp"
 #include "fsr-translator.hpp"
 #include "fsr-framegeneration.hpp"
+#include "function-cache.hpp"
+#include "function-hooks.hpp"
 #include "key.hpp"
 #include "ngx-hooks.hpp"
 #include "d3dmetal-transport.hpp"
@@ -38,6 +40,8 @@ static_assert(layout::kPresentResidencyFinishDispatchIndex == kHookCount + 3);
 static_assert(layout::kVideoMemoryDispatchIndex == kHookCount + 4);
 std::array<std::uintptr_t, kHookCount + 5> dispatchTable{};
 thread_local Context currentContext{};
+thread_local FunctionContext currentFunctionContext{};
+std::uintptr_t functionImageBase = 0;
 
 struct PresentResidency final {
     id queue = nil;
@@ -72,8 +76,18 @@ struct ContextScope final {
     Context previous;
 };
 
+struct FunctionContextScope final {
+    explicit FunctionContextScope(const FunctionContext& next) noexcept
+        : previous(currentFunctionContext) {
+        currentFunctionContext = next;
+    }
+    ~FunctionContextScope() { currentFunctionContext = previous; }
+    FunctionContext previous;
+};
+
 struct Runtime final {
     Cache cache;
+    FunctionCache functions;
 };
 
 Runtime& runtime() {
@@ -146,6 +160,63 @@ id createCompute(const void* device, id descriptor, std::uint64_t options, id* r
     return createPipeline(Api::Compute, device, descriptor, options, reflection, error);
 }
 
+struct ExtractionInvocation final {
+    ExtractFunctionsEntry original;
+    std::uintptr_t ignoredDevice;
+    id library;
+    std::uintptr_t rawFlag;
+    const void* reflection;
+    std::uintptr_t ignoredNames;
+    MTLFunctionConstantValues* constants;
+
+    static FunctionResult create(void* opaque) {
+        auto& call = *static_cast<ExtractionInvocation*>(opaque);
+        NSMutableArray* functions = nil;
+        call.original(&functions, call.ignoredDevice, call.library, call.rawFlag,
+            call.reflection, call.ignoredNames, call.constants);
+        // The pinned native helper discards the whole array on NSError. Other
+        // exceptions propagate; a nonnil return is a complete extraction.
+        return FunctionResult(functions, functions != nil);
+    }
+};
+
+__attribute__((noinline)) void* extractFunctions(
+    void* output, std::uintptr_t ignoredDevice, id library,
+    std::uintptr_t rawFlag, const void* reflection,
+    std::uintptr_t ignoredNames, MTLFunctionConstantValues* constants) {
+    const auto caller = reinterpret_cast<std::uintptr_t>(
+        __builtin_extract_return_addr(__builtin_return_address(0)));
+    const auto original = reinterpret_cast<ExtractFunctionsEntry>(
+        originalFunctions[static_cast<std::size_t>(layout::Hook::ExtractFunctions)]);
+    Runtime& state = runtime();
+    ExtractionInvocation invocation {original, ignoredDevice, library, rawFlag,
+        reflection, ignoredNames, constants};
+    KeyBytes key;
+    const void* device = nullptr;
+    bool recognized = false;
+    if (functionImageBase != 0 && caller >= functionImageBase) {
+        try {
+            recognized = makeFunctionExtractionKey(library, rawFlag, reflection, constants,
+                caller - functionImageBase, currentFunctionContext, key, device);
+        } catch (const std::bad_alloc&) {
+            // A cache-key allocation must not replace the native operation.
+        }
+    }
+    FunctionResult result = recognized ? state.functions.getOrCreate(
+        device, key, library, &ExtractionInvocation::create, &invocation) :
+        ExtractionInvocation::create(&invocation);
+    NSMutableArray* functions = result.takeFunctions();
+    std::memcpy(output, &functions, sizeof(functions));
+    return output;
+}
+
+void loadGraphicsFunctions(const void* owner, const void* stages) {
+    const FunctionContextScope scope({ContextKind::Graphics, owner, stages});
+    const auto original = reinterpret_cast<LoadGraphicsFunctionsEntry>(
+        originalFunctions[static_cast<std::size_t>(layout::Hook::LoadGraphicsFunctions)]);
+    original(owner, stages);
+}
+
 id getRender(const void* owner, std::uint32_t dynamicFlags, std::uint64_t formats) {
     const ContextScope scope({ContextKind::Graphics, owner, dynamicFlags, formats});
     const auto original = reinterpret_cast<GetRender>(originalFunctions[static_cast<std::size_t>(layout::Hook::GetRender)]);
@@ -154,14 +225,20 @@ id getRender(const void* owner, std::uint32_t dynamicFlags, std::uint64_t format
 
 void compileCompute(const void* owner, bool indirect) {
     const ContextScope scope({ContextKind::Compute, owner, static_cast<std::uint32_t>(indirect), 0});
+    const FunctionContextScope functionScope({ContextKind::Compute, owner, nullptr});
     const auto original = reinterpret_cast<CompileCompute>(originalFunctions[static_cast<std::size_t>(layout::Hook::CompileCompute)]);
     original(owner, indirect);
 }
 
-void destroyDevice(const void* device, const void* vtt) {
+void destroyWithFunctionCacheRetired(const void* device, const void* vtt) {
     Runtime& state = runtime();
     const auto original = reinterpret_cast<DestroyDevice>(originalFunctions[static_cast<std::size_t>(layout::Hook::DestroyDevice)]);
     state.cache.withDeviceRetired(device, original, vtt);
+}
+
+void destroyDevice(const void* device, const void* vtt) {
+    Runtime& state = runtime();
+    state.functions.withDeviceRetired(device, &destroyWithFunctionCacheRetired, vtt);
 }
 
 bool matchesImage(const mach_header* untyped) noexcept {
@@ -252,6 +329,7 @@ __attribute__((constructor)) void initialize() noexcept {
         for (const auto hook : ngxHooks) {
             if (hook == 0) return;
         }
+        functionImageBase = reinterpret_cast<std::uintptr_t>(base);
         const display::Hooks displayHooks = display::initialize(reinterpret_cast<std::uintptr_t>(base),
             originalFunctions[static_cast<std::size_t>(layout::Hook::GetContainingOutput)],
             originalFunctions[static_cast<std::size_t>(layout::Hook::SetFullscreenState)]);
@@ -272,6 +350,8 @@ __attribute__((constructor)) void initialize() noexcept {
             displayHooks.getContainingOutput,
             displayHooks.setFullscreenState,
             reinterpret_cast<std::uintptr_t>(&constructAdapter),
+            reinterpret_cast<std::uintptr_t>(&extractFunctions),
+            reinterpret_cast<std::uintptr_t>(&loadGraphicsFunctions),
             displayHooks.presentFlush,
             reinterpret_cast<std::uintptr_t>(&d3dmetal::commitRecordedBatch),
             reinterpret_cast<std::uintptr_t>(&addPresentResidency),
