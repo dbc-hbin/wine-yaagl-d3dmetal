@@ -40,6 +40,18 @@ Metal HUD의 MetalFX “Frame Interpolator” 항목은 FG가 멈추고 약 0.5�
 오버레이는 `GSTREAMER_ROOT`의 GStreamer·FFmpeg 개발 헤더와 pkg-config 메타데이터를 사용합니다. 기준 런타임의 framework에 개발 파일이 있을 때만 이를 기본값으로 사용할 수 있고, 개발 파일을 제외한 배포 기준본에는 별도 개발 framework가 필요합니다. 선택적 `WINE_DEPS_ROOT`에는 GnuTLS·SDL 등 필수 의존성의 외부 개발 prefix(`include/`, `lib/`, `lib/pkgconfig/`)를 지정합니다. pkg-config는 각 패키지를 해당 SDK의 prefix로 재배치하며, 이 입력은 x86_64에만 적용하고 ARM64 서버 빌드에는 전달하지 않습니다. 고정된 기준본에 파일을 추가하거나 필수 configure 기능을 끄지 마세요.
 `scripts/wine-artifacts.json`은 오버레이 빌드가 다시 빌드하고 패키저가 교체하는 모듈 목록입니다.
 
+## 런타임 수정
+
+XAudio2는 별도 등록 잠금·고정 슬롯·등록 세대를 사용합니다. 외부 콜백과 메모리 할당·해제는 잠금 밖에서 수행합니다. 다른 스레드의 해제는 해당 실행 중 콜백만 기다리며, 자기/다음 콜백 해제와 실행 중 새 등록도 처리합니다. 새 등록은 이후 dispatch부터 호출합니다. x64/i386의 XAudio2 0~9에서 각 10개 시나리오(200건), 양쪽 아키텍처의 버전 9 계측 ON(20건)을 모두 통과했습니다. 첫 등록 경합, 할당 실패·복구, Start/End 재진입, 다른 스레드의 등록·음성 생성/파괴 진행, 동기 해제, 할당 중 목록 접근, 종료를 확인했습니다. CriticalError도 같은 dispatcher를 사용하지만 실제 장치 손실 알림은 실행하지 않았습니다.
+
+해제는 동기식입니다. 콜백이 자신을 해제 중인 다른 스레드를 기다리는 순환 대기는 허용하지 않습니다. 콜백 스레드에서 마지막 Release/master voice 파괴, 클라이언트 예외가 FAudio로 빠져나온 뒤 복구하는 동작은 지원하지 않습니다. 예외 unwind에서는 등록 목록의 스택 레코드만 안전하게 제거하며 FAudio 예외 처리까지 수정했다고 주장하지 않습니다.
+
+오디오 검사는 `python3 scripts/test-xaudio-callback-runtime.py RUNTIME --arch x86_64`와 `--arch i386`이며, `--version 9 --trace`를 추가하면 계측 ON 시나리오를 실행합니다. 게임이 아닌 무음 오디오 PE 재현 프로그램만 실행합니다.
+
+XAudio2의 마지막 Release에서 빠져 있던 mastering voice 잠금 해제를 추가했습니다. 음성을 만들지 않아도 엔진마다 48바이트 디버그 정보가 남던 결함입니다. `--case lock-lifetime`은 워밍업 후 공개 API로 엔진 생성·해제를 8회 반복하고 힙 사용량이 기준값으로 돌아오는지 검사합니다. x64/i386의 버전 0~9 계측 OFF, 양쪽 버전 9 계측 ON과 다른 스레드에서의 오디오 종료를 통과했습니다. 닫힌 계측 기록에서 수정 전 9개 할당·해제 0개·432바이트 잔존이 수정 후 9개 할당·해제 9개·잔존 0바이트로 바뀌었습니다. 격리 검증본은 `build/xaudio-lock-fixed/wine`, 근거는 `build/xaudio-lock-fixed/mastering-lock-lifetimes.json`입니다. 설치본과 게임은 건드리지 않았으며, 이 작은 누수로 게임의 대용량 증가를 설명하지 않습니다.
+
+macOS의 `MEM_RESET`은 `MADV_DONTNEED` 대신 `MADV_FREE`를 사용해 버려도 되는 anonymous dirty 페이지의 이전 내용을 스왑에 보존하지 않고 폐기할 수 있게 합니다. commit·보호 속성과 이후 쓰기는 유지하며, 즉시 RSS가 줄어야 하는 것은 아닙니다. `python3 scripts/test-memory-reset-runtime.py RUNTIME`과 `--arch i386`은 실제 네이티브 호출의 전체 대상 범위 및 Windows API 계약을 검사합니다. 격리본 `build/memory-reset-reclaim-20261004/wine`은 양쪽 아키텍처에서 통과했고, 원본은 dirty 페이지 검사에 실패했습니다. 게임 기록의 두 RESET 범위는 각각 0.307초·0.078초 뒤 전체 decommit됐으므로, 이 수정으로 지속적인 증가를 설명하지 않습니다.
+
 ## 런타임 내부 처리
 
 FSR 전용 JSON 진단(`YAAGL_FSR_LOG`)과 진단용 카운터·메타데이터를 제거했습니다. 내부 MetalFX 계약은 읽지 않는 입력 여부 표시 없이 값을 직접 저장하며, 기본값·입력 검증·SDK 디버그 콜백·오류 반환·렌더링 동작은 유지합니다. 나머지 자체 Wine 튜닝도 유지합니다.
@@ -50,6 +62,7 @@ Metal4 화면 표시의 layer residency 등록은 제출·표시 예약 후 해�
 SR·FG 자원 매핑은 네이티브 자원 소유권을 한 번만 획득하고, 출력의 UAV 권한을 Metal 텍스처 추출 전에 검사합니다. 실패 시 참조를 남기지 않으며, 성공 시 보유한 텍스처는 호출자가 해제합니다. Descriptor 레이아웃의 정확한 바이트 검증을 유지합니다.
 Legacy SR·FG replay는 명령 태그가 다르면 payload를 복사하기 전에 원래 경로로 넘깁니다. MetalFX 직전의 blit encoder 종료는 바이트가 검증된 원래 `GetExternalCommandBuffer` 호출에 맡겨 중복 flush만 없앴습니다. 앞선 전체 encoder flush, fence 갱신·대기, 동기화와 GPU 완료까지의 자원 수명은 유지합니다.
 FG Prepare·Generate 입력은 한 번 정규화·검증한 스택 패킷으로 전달합니다. 공급자 선택 조건은 컨텍스트 잠금 안에서 다시 확인하며, 네이티브 확장·fallback, V1·V2 reset 의미, 콜백이 만든 입력의 처리를 유지합니다.
+FG 컨텍스트를 직접 파괴할 때 기록된 프레임이 컨텍스트를 보유하고 있어도 캐시된 MetalFX 구성과 이전 프레임 이력을 해제합니다. 기록된 프레임은 필요한 자원을 직접 보유하며, 파괴 후 replay는 이력을 초기화하고 폐기된 컨텍스트에 다시 저장하지 않습니다. 실행 중 8개 항목 캐시는 유지합니다. `python3 scripts/test-fg-normalization.py`로 파괴와 대기 중 replay의 실제 GPU 완료를 검증합니다. 이는 종료 시 과도한 자원 보유 수정이지, 지속적인 프레임별 누수를 입증한 것은 아닙니다.
 MetalFX·자동 제공자의 유효한 FFX 메모리 조회(V1/V2)는 D3DMetal의 DLSS 호환 정책처럼 두 바이트 값을 0으로 채우고 성공을 반환합니다. 0은 실측 사용량이 아니라 통계 미제공을 뜻하며, native FG·swapchain 조회는 기존 native 결과를 유지합니다. FFX SR/FG export는 SDK의 cdecl ABI를 씁니다.
 사이드카는 서로 다른 네이티브 pipeline 소유자의 동등한 PSO 생성을 합치고, 살아 있는 결과만 재사용합니다. 완료된 항목은 PSO와 키 자원을 약한 참조로 보관하며, reflection은 PSO에 연결되어 해당 PSO가 해제될 때까지 유지됩니다. 함수 캐시에는 `ExtractFunctions`·`LoadGraphicsFunctions` 훅만 복원합니다. 검증된 호출 위치와 실제 특수화 상수를 키에 반영해 같은 device·살아 있는 library 안에서만 재사용합니다. 같은 키의 동시 요청은 한 번만 생성하고, 완료된 함수는 약한 참조로 보관하며, device 소멸 시 캐시를 정리합니다. 캐시 miss와 적용 대상이 아닌 요청은 원래 추출 경로를 사용합니다. 수명·동시성·키 구분과 실제 Metal GPU 검증은 `python3 scripts/test-function-cache.py`로 실행합니다.
 바깥쪽 Compute·Graphics stage 컴파일과 stage 키 생성은 훅하지 않습니다. D3DMetal 원래 stage 캐시와 생성 중 결과를 기다리는 동기화를 그대로 사용합니다. 중복 삽입 경쟁에서 진 88바이트 Compute stage table만 해제하도록 원본 경로를 직접 수정하며, 정식 table과 빌려 쓰는 stage 결과는 유지합니다. 해제 경로 회귀 검증은 `node --test scripts/d3dmetal-compute-loser.test.mjs`로 실행합니다. 별도의 stage-ID 조회 패치는 대기 전에 바깥 잠금을 풀도록 유지합니다. Library 동시 생성 방지와 서로 다른 pipeline 간 살아 있는 PSO 재사용도 유지하며, dispatch 레이아웃 21은 일반 항목 18개와 특수 항목 5개로 구성됩니다. 원래 컴파일러·디스크 캐시와 exp 7 정확성 수정을 유지합니다. 게임 FPS 향상을 입증한 변경은 아닙니다.

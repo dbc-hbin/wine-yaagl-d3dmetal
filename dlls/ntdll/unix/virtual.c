@@ -5253,7 +5253,15 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     else if (type & MEM_RESET)
     {
         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
-        else madvise( base, size, MADV_DONTNEED );
+        else
+        {
+#ifdef __APPLE__
+            /* Darwin DONTNEED preserves dirty contents for paging; RESET must make them discardable. */
+            madvise( base, size, MADV_FREE );
+#else
+            madvise( base, size, MADV_DONTNEED );
+#endif
+        }
     }
     else  /* commit the pages */
     {

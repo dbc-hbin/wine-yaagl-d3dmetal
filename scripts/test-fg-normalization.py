@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Compile production FG dispatch bodies against the pinned SDK, then exercise
-normalization, provider selection and generation callback behavior without Wine
-or a game. The bridge and native DLL are captured at their call boundaries.
+"""Exercise production FG dispatch and native retired-context ownership without
+Wine or a game. Dispatch tests capture the bridge/native DLL boundaries; the
+ownership test uses real Metal4/MetalFX objects and GPU completion.
 """
 
 import pathlib
@@ -355,7 +355,145 @@ int main(void)
 '''
 
 
+NATIVE_DESTROY = r'''
+#include <array>
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include "metalfx-backend.hpp"
+// Only expose the native frame constructor; standard headers are already loaded.
+#define private public
+#include "fsr-framegeneration.hpp"
+#undef private
+#include "fsr-framegeneration.mm"
+#include <cassert>
+extern "C" id objc_initWeak(id*, id);
+extern "C" id objc_loadWeakRetained(id*);
+extern "C" void objc_destroyWeak(id*);
+using namespace yaagl::pso::fsr::framegeneration;
+
+int main() {
+    std::array<id, 3> weak{}; // Unused factory, recorded factory, retired history.
+    std::shared_ptr<const PreparedFrame> recorded;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    @autoreleasepool {
+        auto descriptor = [MTL4CompilerDescriptor new];
+        NSError* error = nil;
+        auto compiler = [device newCompilerWithDescriptor:descriptor error:&error];
+        [descriptor release];
+        assert(device && compiler);
+        auto state = std::make_shared<State>();
+        state->creation.display_width = state->creation.display_height = 136;
+        Command command;
+        command.value.kind = transport::CommandListKind::mpl;
+        command.value.device = device;
+        command.value.compiler = compiler;
+        auto snapshot = std::make_shared<Snapshot>();
+        auto& parameters = snapshot->parameters;
+        parameters.render_width = parameters.render_height = 64;
+        parameters.camera_near = .1f; parameters.camera_far = 1000;
+        parameters.camera_fov_vertical_radians = 1;
+        parameters.view_space_to_meters = 1; parameters.frame_time_delta_ms = 16;
+        snapshot->depth = privateTexture(device, MTLPixelFormatR32Float, 64, 64, MTLTextureUsageShaderRead);
+        snapshot->motion = privateTexture(device, MTLPixelFormatRG16Float, 64, 64, MTLTextureUsageShaderRead);
+        snapshot->depthWidth = snapshot->depthHeight = snapshot->motionWidth = snapshot->motionHeight = 64;
+        for (unsigned i = 0; i < 2; ++i) {
+            auto configuration = configure(*state, command, parameters,
+                (id<MTLTexture>)snapshot->depth.get(), MTLPixelFormatRGBA16Float,
+                MTLPixelFormatInvalid, 128 + i * 8, 128 + i * 8,
+                FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB);
+            assert(configuration);
+            objc_initWeak(&weak[i], configuration->factory.get());
+            snapshot->configuration = configuration;
+        }
+        state->historyConfiguration = state->configurations.front();
+        state->history = privateTexture(device, MTLPixelFormatRGBA16Float, 128, 128, MTLTextureUsageShaderRead);
+        objc_initWeak(&weak[2], state->history.get());
+        auto impl = std::make_shared<PreparedFrame::Impl>();
+        impl->state = state; impl->snapshot = snapshot;
+        impl->kind = PreparedFrame::Impl::Kind::Generate;
+        impl->generationEpoch = state->generationEpoch;
+        impl->first = privateTexture(device, MTLPixelFormatRGBA16Float, 136, 136, MTLTextureUsageShaderRead);
+        impl->second = privateTexture(device, MTLPixelFormatRGBA16Float, 136, 136,
+                                     MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+        impl->dispatch.frame_id = 1;
+        impl->dispatch.backbuffer_transfer_function = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+        recorded = std::shared_ptr<const PreparedFrame>(new PreparedFrame(impl));
+        // Install native ownership directly; this test does not need COM or transport mapping.
+        { std::lock_guard lock(registryMutex); contexts.emplace(1, state); }
+        yaagl_fsr_fg_destroy_packet destroy{};
+        destroy.header = {sizeof(destroy), YAAGL_FSR_FG_BRIDGE_VERSION, YAAGL_FSR_FG_DESTROY, 0, 1};
+        assert(yaagl_fsr_fg_api(YAAGL_FSR_FG_DESTROY, &destroy) == Ok);
+        state.reset(); impl.reset(); snapshot.reset(); command.value = {};
+        [compiler release];
+    }
+    for (unsigned i : {0u, 2u}) {
+        id object = objc_loadWeakRetained(&weak[i]);
+        assert(!object && "DESTROY kept an unrelated factory or history texture");
+        [object release];
+    }
+    @autoreleasepool {
+        id required = objc_loadWeakRetained(&weak[1]);
+        assert(required && "recorded snapshot lost its required configuration");
+        auto queue = [device newMTL4CommandQueue];
+        auto allocator = [device newCommandAllocator];
+        auto buffer = [device newCommandBuffer];
+        auto fence = [device newFence];
+        [buffer beginCommandBufferWithAllocator:allocator];
+        auto initialization = [buffer computeCommandEncoder];
+        [initialization updateFence:fence afterEncoderStages:MTLStageDispatch];
+        [initialization endEncoding];
+        std::shared_ptr<const ExecutionLease> lease;
+        assert(recorded->encode(buffer, fence, lease) && lease);
+        [buffer endCommandBuffer];
+        auto options = [MTL4CommitOptions new];
+        auto completed = dispatch_semaphore_create(0);
+        [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            assert(!feedback.error); dispatch_semaphore_signal(completed);
+        }];
+        [queue commit:&buffer count:1 options:options];
+        assert(dispatch_semaphore_wait(completed, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
+        [options release]; dispatch_release(completed);
+        lease.reset(); recorded.reset();
+        [buffer release]; [fence release]; [allocator release]; [queue release]; [required release];
+        [device release];
+    }
+    for (auto& reference : weak) {
+        id object = objc_loadWeakRetained(&reference);
+        assert(!object); [object release]; objc_destroyWeak(&reference);
+    }
+    puts("FG native DESTROY: unrelated resources freed; outstanding frame encoded successfully");
+}
+'''
+
+
 class FrameGenerationNormalizationTest(unittest.TestCase):
+    def test_native_destroy_ownership(self):
+        native = ROOT / "d3dmetal-pso-cache"
+        kernels = (native / "fsr-kernels.metal").read_text()
+        self.assertNotIn(')YAAGL_METAL"', kernels)
+        with tempfile.TemporaryDirectory(prefix="yaagl-fg-destroy-") as directory:
+            directory = pathlib.Path(directory)
+            source = directory / "fg-destroy.mm"
+            binary = directory / "fg-destroy"
+            source.write_text(NATIVE_DESTROY)
+            (directory / "fsr-kernels.inc").write_text(
+                'static const char kFsrKernelsSource[] = R"YAAGL_METAL(' + kernels + ')YAAGL_METAL";\n')
+            subprocess.run(("xcrun", "clang++", "-arch", "x86_64", "-std=c++20", "-fno-objc-arc",
+                            "-I", str(native), "-I", str(directory), str(source),
+                            *(str(native / file) for file in ("metalfx-backend.mm",
+                              "d3dmetal-transport.mm", "d3dmetal-transport-legacy.mm")),
+                            "-framework", "Foundation", "-framework", "Metal",
+                            "-framework", "MetalFX", "-o", str(binary)), check=True)
+            subprocess.run((str(binary),), check=True)
+
     def test_production_dispatch(self):
         code = "\n".join((
             PROLOGUE,

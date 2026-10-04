@@ -1228,6 +1228,10 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                 // Commands recorded before DESTROY may still encode; mark them stale.
                 std::lock_guard executionLock(state->executionMutex);
                 ++state->generationEpoch;
+                // Snapshots own queued configurations; retired caches/history are no longer needed.
+                state->configurations.clear();
+                state->history = {};
+                state->historyConfiguration.reset();
                 releaseHudRow(state->hudCounted);
                 return finish(Ok);
             }

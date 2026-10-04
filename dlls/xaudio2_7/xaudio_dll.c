@@ -34,6 +34,7 @@
 
 #include "wine/asm.h"
 #include "wine/debug.h"
+#include "wine/exception.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(xaudio2);
 
@@ -476,32 +477,78 @@ static inline IXAudio2Impl *impl_from_FAudioEngineCallback(FAudioEngineCallback 
     return CONTAINING_RECORD(iface, IXAudio2Impl, FAudioEngineCallback_vtbl);
 }
 
+struct callback_dispatch
+{
+    struct list entry;
+    IXAudio2Impl *owner;
+    IXAudio2EngineCallback *callback;
+    DWORD thread;
+};
+
+static void CALLBACK callback_dispatch_unwind(BOOL normal, void *context)
+{
+    struct callback_dispatch *dispatch = context;
+    IXAudio2Impl *This = dispatch->owner;
+
+    if (normal) return;
+    /* Do not leave a pointer to an unwound callback stack in the registry.
+     * FAudio itself does not promise recovery from escaping client exceptions. */
+    EnterCriticalSection(&This->callback_lock);
+    list_remove(&dispatch->entry);
+    WakeAllConditionVariable(&This->callback_done);
+    LeaveCriticalSection(&This->callback_lock);
+}
+
+static void dispatch_engine_callbacks(IXAudio2Impl *This, unsigned int event, HRESULT error)
+{
+    struct callback_dispatch dispatch = { .owner = This, .thread = GetCurrentThreadId() };
+    UINT64 serial;
+    UINT32 i, count;
+
+    /* FAudio calls us with callbackLock held. This independent lock protects
+     * only the registry; never take a voice lock or call FAudio while holding it.
+     * Slots stay put, and registrations during a dispatch wait for the next one.
+     * No snapshot allocation or external call under the registry lock is needed. */
+    EnterCriticalSection(&This->callback_lock);
+    serial = This->callback_serial;
+    count = This->ncbs;
+    list_add_tail(&This->callback_dispatches, &dispatch.entry);
+    __TRY
+    {
+        for (i = 0; i < count; ++i)
+        {
+            if (!This->cbs[i].callback || This->cbs[i].serial > serial) continue;
+            dispatch.callback = This->cbs[i].callback;
+            LeaveCriticalSection(&This->callback_lock);
+            switch (event)
+            {
+            case 0: IXAudio2EngineCallback_OnProcessingPassStart(dispatch.callback); break;
+            case 1: IXAudio2EngineCallback_OnProcessingPassEnd(dispatch.callback); break;
+            case 2: IXAudio2EngineCallback_OnCriticalError(dispatch.callback, error); break;
+            }
+            EnterCriticalSection(&This->callback_lock);
+            dispatch.callback = NULL;
+            WakeAllConditionVariable(&This->callback_done);
+        }
+        list_remove(&dispatch.entry);
+        LeaveCriticalSection(&This->callback_lock);
+    }
+    __FINALLY_CTX(callback_dispatch_unwind, &dispatch);
+}
+
 static void FAUDIOCALL XA2ECB_OnProcessingPassStart(FAudioEngineCallback *iface)
 {
-    IXAudio2Impl *This = impl_from_FAudioEngineCallback(iface);
-    int i;
-    TRACE("%p\n", This);
-    for(i = 0; i < This->ncbs && This->cbs[i]; ++i)
-        IXAudio2EngineCallback_OnProcessingPassStart(This->cbs[i]);
+    dispatch_engine_callbacks(impl_from_FAudioEngineCallback(iface), 0, S_OK);
 }
 
 static void FAUDIOCALL XA2ECB_OnProcessingPassEnd(FAudioEngineCallback *iface)
 {
-    IXAudio2Impl *This = impl_from_FAudioEngineCallback(iface);
-    int i;
-    TRACE("%p\n", This);
-    for(i = 0; i < This->ncbs && This->cbs[i]; ++i)
-        IXAudio2EngineCallback_OnProcessingPassEnd(This->cbs[i]);
+    dispatch_engine_callbacks(impl_from_FAudioEngineCallback(iface), 1, S_OK);
 }
 
-static void FAUDIOCALL XA2ECB_OnCriticalError(FAudioEngineCallback *iface,
-        uint32_t error)
+static void FAUDIOCALL XA2ECB_OnCriticalError(FAudioEngineCallback *iface, uint32_t error)
 {
-    IXAudio2Impl *This = impl_from_FAudioEngineCallback(iface);
-    int i;
-    TRACE("%p\n", This);
-    for(i = 0; i < This->ncbs && This->cbs[i]; ++i)
-        IXAudio2EngineCallback_OnCriticalError(This->cbs[i], error);
+    dispatch_engine_callbacks(impl_from_FAudioEngineCallback(iface), 2, error);
 }
 
 static const FAudioEngineCallback FAudioEngineCallback_Vtbl = {
@@ -1493,9 +1540,14 @@ static ULONG WINAPI IXAudio2Impl_Release(IXAudio2 *iface)
         }
 
         free(This->cbs);
+        This->callback_lock.DebugInfo->Spare[0] = 0;
+        DeleteCriticalSection(&This->callback_lock);
 
         This->lock.DebugInfo->Spare[0] = 0;
         DeleteCriticalSection(&This->lock);
+
+        This->mst.lock.DebugInfo->Spare[0] = 0;
+        DeleteCriticalSection(&This->mst.lock);
 
         free(This);
     }
@@ -1536,27 +1588,52 @@ static HRESULT WINAPI IXAudio2Impl_RegisterForCallbacks(IXAudio2 *iface,
         IXAudio2EngineCallback *pCallback)
 {
     IXAudio2Impl *This = impl_from_IXAudio2(iface);
-    int i;
+    struct engine_callback *callbacks = NULL, *retired = NULL;
+    UINT32 i, slot, capacity = 0;
 
     TRACE("(%p)->(%p)\n", This, pCallback);
-
-    EnterCriticalSection(&This->lock);
-
-    for(i = 0; i < This->ncbs; ++i){
-        if(!This->cbs[i] || This->cbs[i] == pCallback){
-            This->cbs[i] = pCallback;
-            LeaveCriticalSection(&This->lock);
+retry:
+    EnterCriticalSection(&This->callback_lock);
+    slot = This->ncbs;
+    for (i = 0; i < This->ncbs; ++i)
+    {
+        if (This->cbs[i].callback == pCallback)
+        {
+            LeaveCriticalSection(&This->callback_lock);
+            free(callbacks);
             return S_OK;
         }
+        if (!This->cbs[i].callback && slot == This->ncbs) slot = i;
     }
-
-    This->ncbs++;
-    This->cbs = realloc(This->cbs, This->ncbs * sizeof(*This->cbs));
-
-    This->cbs[i] = pCallback;
-
-    LeaveCriticalSection(&This->lock);
-
+    if (slot == This->ncbs)
+    {
+        if (This->ncbs == UINT32_MAX || This->ncbs >= SIZE_MAX / sizeof(*callbacks) - 1)
+        {
+            LeaveCriticalSection(&This->callback_lock);
+            free(callbacks);
+            return E_OUTOFMEMORY;
+        }
+        if (capacity <= This->ncbs)
+        {
+            capacity = This->ncbs + 1;
+            LeaveCriticalSection(&This->callback_lock);
+            /* Allocation can invoke diagnostic unwind callbacks. Keep it, and
+             * freeing retired storage, outside the registry lock too. */
+            free(callbacks);
+            if (!(callbacks = malloc(capacity * sizeof(*callbacks)))) return E_OUTOFMEMORY;
+            goto retry;
+        }
+        if (This->ncbs) memcpy(callbacks, This->cbs, This->ncbs * sizeof(*callbacks));
+        retired = This->cbs;
+        This->cbs = callbacks;
+        callbacks = NULL;
+        ++This->ncbs;
+    }
+    This->cbs[slot].callback = pCallback;
+    This->cbs[slot].serial = ++This->callback_serial;
+    LeaveCriticalSection(&This->callback_lock);
+    free(retired);
+    free(callbacks);
     return S_OK;
 }
 
@@ -1564,29 +1641,26 @@ static void WINAPI IXAudio2Impl_UnregisterForCallbacks(IXAudio2 *iface,
         IXAudio2EngineCallback *pCallback)
 {
     IXAudio2Impl *This = impl_from_IXAudio2(iface);
-    int i;
+    struct callback_dispatch *dispatch;
+    DWORD thread = GetCurrentThreadId();
+    UINT32 i;
 
     TRACE("(%p)->(%p)\n", This, pCallback);
+    EnterCriticalSection(&This->callback_lock);
+    for (i = 0; i < This->ncbs; ++i)
+        if (This->cbs[i].callback == pCallback) This->cbs[i].callback = NULL;
 
-    EnterCriticalSection(&This->lock);
-
-    if(This->ncbs == 0){
-        LeaveCriticalSection(&This->lock);
-        return;
+    /* Returning on another thread must permit the client to free its callback.
+     * Windows forbids unregistering inside callbacks, but tolerate self-removal
+     * without waiting on our own stack. Pending, removed callbacks are skipped. */
+    for (;;)
+    {
+        LIST_FOR_EACH_ENTRY(dispatch, &This->callback_dispatches, struct callback_dispatch, entry)
+            if (dispatch->callback == pCallback && dispatch->thread != thread) break;
+        if (&dispatch->entry == &This->callback_dispatches) break;
+        SleepConditionVariableCS(&This->callback_done, &This->callback_lock, INFINITE);
     }
-
-    for(i = 0; i < This->ncbs; ++i){
-        if(This->cbs[i] == pCallback)
-            break;
-    }
-
-    for(; i < This->ncbs - 1 && This->cbs[i + 1]; ++i)
-        This->cbs[i] = This->cbs[i + 1];
-
-    if(i < This->ncbs)
-        This->cbs[i] = NULL;
-
-    LeaveCriticalSection(&This->lock);
+    LeaveCriticalSection(&This->callback_lock);
 }
 
 static inline XA2VoiceImpl *create_voice(IXAudio2Impl *This)
@@ -1961,6 +2035,11 @@ static HRESULT WINAPI XAudio2CF_CreateInstance(IClassFactory *iface, IUnknown *p
 
     InitializeCriticalSectionEx(&object->lock, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
     object->lock.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": IXAudio2Impl.lock");
+
+    InitializeCriticalSectionEx(&object->callback_lock, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+    object->callback_lock.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": IXAudio2Impl.callback_lock");
+    InitializeConditionVariable(&object->callback_done);
+    list_init(&object->callback_dispatches);
 
     InitializeCriticalSectionEx(&object->mst.lock, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
     object->mst.lock.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": XA2MasteringVoice.lock");
