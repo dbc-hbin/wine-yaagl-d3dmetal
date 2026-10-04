@@ -5,13 +5,14 @@
 GPTK 4.0b2 D3DMetal과 MetalFX를 사용하는 Yaagl용 Wine 11.17 런타임 소스입니다.
 Apple Silicon·macOS 26 이상·Rosetta 2를 대상으로 하며 macOS 26 실기기는 미검증입니다. 독립 설치기와 Apple framework는 포함하지 않습니다.
 
-현재 릴리스: [experimental 7](https://github.com/dbc-hbin/wine-yaagl-d3dmetal/releases/tag/wine-11.17-gptk4.0b2-7).
+현재 릴리스: [experimental 9](https://github.com/dbc-hbin/wine-yaagl-d3dmetal/releases/tag/wine-11.17-gptk4.0b2-9).
 
 ## D3DMetal 오토패치
 
 네이티브 실행 파일과 동봉 sidecar를 사용하므로 설치 시 Node.js·Python·Xcode 도구가 필요하지 않습니다.
 Yaagl은 UI에서 Apple 라이선스 동의를 받은 뒤에만 패처에 `--accept-apple-license`를 전달해야 합니다.
 패처는 PATH·심볼릭 링크 실행에서도 실제 실행 파일 옆의 sidecar를 찾으며, 다운로드·패치·서명을 검증한 뒤 framework를 출력합니다.
+원본 자산과 패치 결과의 고정 SHA-256 검증은 유지합니다. 모든 패치를 최종 서명 전에 적용하며, 현지에서 재서명한 파일은 고정 전체 해시 대신 `codesign`으로 검증하고 서명과 무관한 D3DMetal payload 해시 검증도 유지합니다. 준비 manifest에는 최종 파일의 실제 해시를 기록합니다.
 
 ## 오토패치 번들 빌드
 

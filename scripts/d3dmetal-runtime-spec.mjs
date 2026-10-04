@@ -1,12 +1,4 @@
-import {
-  METAL_IR_CONVERTER_4_0_BETA_2_FP64_PATCHED_SHA256,
-  METAL_IR_CONVERTER_4_0_BETA_2_SHA256,
-} from "./metalir-fp64-codec-patch.mjs";
-import {
-  D3DMETAL_STAGE_LOCK_PATCHED_SHA256,
-  D3DMETAL_STAGE_LOCK_SOURCE_SHA256,
-} from "./d3dmetal-stage-lock-patch.mjs";
-import { D3DMETAL_PSO_CACHE_PATCHED_PAYLOAD_SHA256 } from "./d3dmetal-pso-cache-patch.mjs";
+import { METAL_IR_CONVERTER_4_0_BETA_2_SHA256 } from "./metalir-fp64-codec-patch.mjs";
 
 // Build-host pins. The native installer receives these embedded in its recipe.
 export const D3DMETAL_RELEASE = Object.freeze({
@@ -36,12 +28,11 @@ export const D3DMETAL_RUNTIME_HASHES = Object.freeze({
   pristineD3DMetal: "f5b56df1b8fe8b364dd9530651a3769c8aed948bd343be3b4510604d503e2bad",
   pristineConverter: METAL_IR_CONVERTER_4_0_BETA_2_SHA256,
   fp64Unsigned: "c4c5265e355c59b93e4684de79289ff2b7606756b70c25258dd8d29f59c3ea04",
-  fp64Signed: METAL_IR_CONVERTER_4_0_BETA_2_FP64_PATCHED_SHA256,
-  compositeInput: D3DMETAL_STAGE_LOCK_SOURCE_SHA256,
-  stagePatched: D3DMETAL_STAGE_LOCK_PATCHED_SHA256,
-  compositePreSign: "a38d4e5b4988cd1631be1c25acc6d68ee93414fe8945c0b60bc756b287fdeba6",
-  compositePayload: D3DMETAL_PSO_CACHE_PATCHED_PAYLOAD_SHA256,
-  finalD3DMetal: "641f73863688f40c43e2aa27e0cb490eb80d3c4708f2b24d3935c83bc0960944",
+  stagePatched: "40f495987a9f5acce9c602578dbef78d2b3999db90edba10e4192c033b736ec2",
+  compositePreSign: "674e5aa6f6e5356fc2573d9ddaa56f9fa35b2a38f26e9e6ed31512b88c63650b",
+  // Excludes the signature blob/range and normalizes __LINKEDIT signature-dependent sizes.
+  compositePayload: "27b0e24395cf3e3f8816d183cd9a4ec5ff7db28e732c664656891c594ba6b070",
+  // Accepted original builder inputs only; local signing results are never pinned.
   rawSidecar: "619c47060643287b3254c9ae3a97621a6e4a2df31cbb7be1d4b0c3edd0c03bfb",
   signedSidecar: "b254eb0f48faadf3e3b46a25e2e7537850c84ccc8a8fbe255e26d0b97f92e270",
 });

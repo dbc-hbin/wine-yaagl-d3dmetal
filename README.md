@@ -5,13 +5,14 @@
 Wine 11.17 runtime source for Yaagl, using GPTK 4.0b2 D3DMetal and MetalFX.
 Targets Apple Silicon, macOS 26+, and Rosetta 2; macOS 26 hardware has not been tested. No standalone installer or Apple framework is bundled.
 
-Current release: [experimental 7](https://github.com/dbc-hbin/wine-yaagl-d3dmetal/releases/tag/wine-11.17-gptk4.0b2-7).
+Current release: [experimental 9](https://github.com/dbc-hbin/wine-yaagl-d3dmetal/releases/tag/wine-11.17-gptk4.0b2-9).
 
 ## D3DMetal autopatch
 
 Installation uses a native helper and bundled sidecar; Node.js, Python, and Xcode tools are not required.
 Yaagl must obtain Apple license consent in its UI before invoking the helper with `--accept-apple-license`.
 The helper resolves its sidecar beside the real executable, including PATH/symlink launches, and verifies downloads, patches, and signatures before publishing the framework.
+Original assets and patch results remain SHA-256 pinned. All patches are applied before final signing; locally re-signed files are checked with `codesign` rather than fixed whole-file hashes, while the signature-independent D3DMetal payload hash remains enforced. The prepared manifest records the actual final file hashes.
 
 ## Build the autopatch bundle
 

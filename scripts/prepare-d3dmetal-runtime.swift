@@ -24,14 +24,10 @@ private struct Hashes: Decodable {
     let pristineD3DMetal: String
     let pristineConverter: String
     let fp64Unsigned: String
-    let fp64Signed: String
-    let compositeInput: String
     let stagePatched: String
     let compositePreSign: String
     let compositePayload: String
-    let finalD3DMetal: String
-    let rawSidecar: String
-    let signedSidecar: String
+    let sidecarSource: String
 }
 
 private struct Patch: Decodable {
@@ -281,8 +277,15 @@ private func unsigned(_ bytes: Data, _ offset: Int) throws -> Int {
     return bytes[offset..<offset + 4].enumerated().reduce(0) { $0 | (Int($1.element) << ($1.offset * 8)) }
 }
 
+private func unsigned64(_ bytes: Data, _ offset: Int) throws -> Int {
+    guard offset >= 0, offset <= bytes.count - 8 else { try fail("truncated Mach-O segment") }
+    let value = bytes.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self)) }
+    guard let result = Int(exactly: value) else { try fail("oversized Mach-O segment") }
+    return result
+}
+
 private func inspectPayload(_ url: URL, expected: String) throws {
-    let bytes = try Data(contentsOf: url)
+    var bytes = try Data(contentsOf: url)
     guard bytes.count >= 32, try unsigned(bytes, 0) == 0xfeedfacf,
           try unsigned(bytes, 4) == 0x01000007, try unsigned(bytes, 12) == 6 else {
         try fail("unsupported final Mach-O binary")
@@ -294,11 +297,23 @@ private func inspectPayload(_ url: URL, expected: String) throws {
     var cursor = 32
     var dependencies = 0
     var signature: (command: Int, data: Int)?
+    var linkEdit: (command: Int, file: Int)?
     for _ in 0..<count {
         guard cursor <= end - 8 else { try fail("truncated Mach-O command") }
         let command = try unsigned(bytes, cursor)
         let size = try unsigned(bytes, cursor + 4)
         guard size >= 8, size <= end - cursor else { try fail("invalid Mach-O command length") }
+        if command == 0x19 {
+            guard size >= 72 else { try fail("invalid LC_SEGMENT_64") }
+            if try unsigned64(bytes, cursor + 8) == 0x44454b4e494c5f5f, try unsigned64(bytes, cursor + 16) == 0x5449 {
+                guard linkEdit == nil else { try fail("duplicate __LINKEDIT segment") }
+                let offset = try unsigned64(bytes, cursor + 40)
+                let length = try unsigned64(bytes, cursor + 48)
+                guard offset >= end, offset <= bytes.count, length == bytes.count - offset,
+                      try unsigned64(bytes, cursor + 32) >= length else { try fail("invalid __LINKEDIT range") }
+                linkEdit = (cursor, offset)
+            }
+        }
         if command == 0xc {
             guard size >= 24 else { try fail("invalid LC_LOAD_DYLIB") }
             let offset = try unsigned(bytes, cursor + 8)
@@ -312,15 +327,21 @@ private func inspectPayload(_ url: URL, expected: String) throws {
             guard size == 16, signature == nil else { try fail("invalid LC_CODE_SIGNATURE") }
             let offset = try unsigned(bytes, cursor + 8)
             let length = try unsigned(bytes, cursor + 12)
-            guard offset >= end, offset <= bytes.count, length <= bytes.count - offset else {
+            guard offset >= end, offset <= bytes.count, length > 0, length == bytes.count - offset else {
                 try fail("invalid code signature range")
             }
             signature = (cursor, offset)
         }
         cursor += size
     }
-    guard cursor == end, dependencies == 1, let signature else {
+    guard cursor == end, dependencies == 1, let signature, let linkEdit, signature.data >= linkEdit.file else {
         try fail("final D3DMetal does not contain exactly one native PSO sidecar dependency and valid signature")
+    }
+    // Signing changes __LINKEDIT sizes as well as LC_CODE_SIGNATURE; hash canonical signature-free sizes.
+    let payloadSize = signature.data - linkEdit.file
+    bytes.withUnsafeMutableBytes { raw in
+        raw.storeBytes(of: UInt64((payloadSize + 4095) & ~4095).littleEndian, toByteOffset: linkEdit.command + 32, as: UInt64.self)
+        raw.storeBytes(of: UInt64(payloadSize).littleEndian, toByteOffset: linkEdit.command + 48, as: UInt64.self)
     }
     var sha = SHA256()
     sha.update(data: bytes[0..<signature.command + 8])
@@ -363,7 +384,7 @@ private func prepare(_ options: Options, recipe: Recipe) throws {
     }
     let sidecar = try options.psoModule ?? executableDirectory().appendingPathComponent("libYaaglNativePsoCache.dylib")
     let sourceHash = try hashFile(sidecar)
-    guard sourceHash == hashes.rawSidecar || sourceHash == hashes.signedSidecar else {
+    guard sourceHash == hashes.sidecarSource else {
         try fail("unexpected native PSO module: \(sourceHash)")
     }
     try files.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -396,11 +417,7 @@ private func prepare(_ options: Options, recipe: Recipe) throws {
 
     try patch(converter, sites: recipe.patches.fp64, input: hashes.pristineConverter,
               output: hashes.fp64Unsigned, label: "FP64")
-    try run("/usr/bin/codesign", ["--force", "--sign", "-", converter.path])
-    try run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", framework.path])
-    try expectHash(converter, hashes.fp64Signed, "signed FP64 converter")
-    try expectHash(binary, hashes.compositeInput, "composite input")
-    try patch(binary, sites: recipe.patches.stageLock, input: hashes.compositeInput,
+    try patch(binary, sites: recipe.patches.stageLock, input: hashes.pristineD3DMetal,
               output: hashes.stagePatched, label: "stage-lock")
     try patch(binary, sites: recipe.patches.nativePso, input: hashes.stagePatched,
               output: hashes.compositePreSign, label: "native PSO")
@@ -418,9 +435,6 @@ private func prepare(_ options: Options, recipe: Recipe) throws {
         try adhoc(item)
     }
     try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", framework.path])
-    try expectHash(nested, hashes.signedSidecar, "signed native PSO module")
-    try expectHash(converter, hashes.fp64Signed, "final converter")
-    try expectHash(binary, hashes.finalD3DMetal, "final D3DMetal")
     try inspectPayload(binary, expected: hashes.compositePayload)
     try frameworkLinks(framework)
 
@@ -435,14 +449,14 @@ private func prepare(_ options: Options, recipe: Recipe) throws {
                    "acknowledgementsAsset": ["name": release.assets.acknowledgements.name, "sha256": release.assets.acknowledgements.sha256]],
         "licenseAcceptance": "explicit-cli-flag",
         "framework": ["version": "4.0b2", "pristineD3DMetalSha256": hashes.pristineD3DMetal,
-                      "compositeInputSha256": hashes.compositeInput, "compositePreSignSha256": hashes.compositePreSign,
-                      "compositePayloadSha256": hashes.compositePayload, "finalD3DMetalSha256": hashes.finalD3DMetal,
+                      "compositeInputSha256": hashes.pristineD3DMetal, "compositePreSignSha256": hashes.compositePreSign,
+                      "compositePayloadSha256": hashes.compositePayload, "finalD3DMetalSha256": try hashFile(binary),
                       "compositeMode": "patched-signed", "signature": "adhoc"],
         "metalIrConverter": ["pristineSha256": hashes.pristineConverter, "fp64UnsignedSha256": hashes.fp64Unsigned,
-                             "fp64SignedSha256": hashes.fp64Signed, "patchMode": "patched", "signature": "adhoc"],
-        "nativePsoSidecar": ["sourceSha256": sourceHash, "signedSha256": hashes.signedSidecar,
+                             "fp64SignedSha256": try hashFile(converter), "patchMode": "patched", "signature": "adhoc"],
+        "nativePsoSidecar": ["sourceSha256": sourceHash, "signedSha256": try hashFile(nested),
                              "dependency": dependency, "signature": "adhoc"],
-        "patchPipeline": ["fp64-codec", "framework-reseal-to-composite-input", "stage-lock", "native-pso-dxil-composite",
+        "patchPipeline": ["fp64-codec", "stage-lock", "native-pso-dxil-composite",
                           "native-pso-sidecar", "final-framework-reseal"]
     ]
     let json = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])

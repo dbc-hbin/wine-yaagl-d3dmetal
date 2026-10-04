@@ -89,11 +89,11 @@ function patchRecipe(sites) {
   });
 }
 
-export function createAutopatchRecipe() {
+export function createAutopatchRecipe(sidecarSource) {
   return {
     schema: 1,
     release: D3DMETAL_RELEASE,
-    hashes: D3DMETAL_RUNTIME_HASHES,
+    hashes: { ...D3DMETAL_RUNTIME_HASHES, sidecarSource },
     patches: {
       fp64: patchRecipe(FP64_CODEC_PATCH_SITES),
       stageLock: patchRecipe(D3DMETAL_STAGE_LOCK_PATCH_SITES),
@@ -152,11 +152,8 @@ async function build(options) {
     }
     run("/usr/bin/codesign", ["--verify", "--strict", sidecar]);
     const signedSidecarHash = await sha256File(sidecar);
-    if (signedSidecarHash !== D3DMETAL_RUNTIME_HASHES.signedSidecar) {
-      throw new Error(`signed native PSO module differs from pin: ${signedSidecarHash}`);
-    }
 
-    const recipe = JSON.stringify(createAutopatchRecipe());
+    const recipe = JSON.stringify(createAutopatchRecipe(signedSidecarHash));
     const recipeBase64 = Buffer.from(recipe, "utf8").toString("base64");
     await writeFile(recipeSource, `enum AutopatchRecipe {\n    static let base64 = "${recipeBase64}"\n}\n`, { flag: "wx" });
     const swiftVersion = run("/usr/bin/xcrun", ["swiftc", "--version"], true);
