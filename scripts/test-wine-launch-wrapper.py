@@ -162,6 +162,27 @@ class WineLaunchWrapperTests(unittest.TestCase):
         self.assertEqual(invalid.stdout, "")
         self.assertIn("YAAGL_FSR_UPSCALER must be metalfx or native", invalid.stderr)
 
+    def test_bootstrap_disables_optional_addon_dialogs_only_for_wineboot(self):
+        (self.root / "yaagl-d3dmetal-runtime.json").write_text("{}")
+        policies = {
+            "metalfx": "amd_fidelityfx_upscaler_dx12,amd_fidelityfx_framegeneration_dx12=b",
+            "native": "amd_fidelityfx_upscaler_dx12=n;amd_fidelityfx_framegeneration_dx12=b",
+        }
+        for mode, policy in policies.items():
+            for args in (["wineboot", "-u"], ["wineboot.exe", "-u"],
+                         ["winecfg", "-v", "win10"], ["cmd", "/c", "wineboot"],
+                         ["wineboot.exe.bak"], []):
+                with self.subTest(mode=mode, args=args):
+                    observed = self.record_policy(args, YAAGL_FSR_UPSCALER=mode,
+                                                  MTL_HUD_ENABLED="0",
+                                                  WINE_ENABLE_TIMEOUT_FIX="0")
+                    bootstrap = bool(args) and args[0] in ("wineboot", "wineboot.exe")
+                    expected = policy + (";mscoree,mshtml=d" if bootstrap else "")
+                    self.assertEqual(observed["args"], args)
+                    self.assertEqual(observed["env"]["WINEDLLOVERRIDES"], expected)
+                    self.assertEqual(observed["env"]["MTL_HUD_ENABLED"], "0")
+                    self.assertEqual(observed["env"]["WINE_ENABLE_TIMEOUT_FIX"], "0")
+
     def test_direct_and_steam_launches_override_inherited_gpu(self):
         cases = (
             ([r"Z:\Games\ZZZ\ZenlessZoneZero.exe"], NVIDIA, "rtx4060"),

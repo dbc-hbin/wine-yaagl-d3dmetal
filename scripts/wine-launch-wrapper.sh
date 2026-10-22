@@ -37,6 +37,14 @@ if [ -f "$wine_root/yaagl-d3dmetal-runtime.json" ]; then
   export YAAGL_FSR_FG_NATIVE_DLL="Z:$wine_root/lib/wine/x86_64-windows/amd_fidelityfx_framegeneration_dx12_native.dll"
 fi
 
+# Prefix bootstrap must not wait for optional Mono/Gecko installer dialogs.
+# Do not persist these disables or apply them to ordinary application launches.
+case "${1:-}" in
+  wineboot|wineboot.exe)
+    export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}mscoree,mshtml=d"
+    ;;
+esac
+
 # Load bundled MacDeps/GStreamer from the final runtime.
 if [ -f "$wine_root/yaagl-d3dmetal-runtime.json" ]; then
   wine_lib="$wine_root/lib"

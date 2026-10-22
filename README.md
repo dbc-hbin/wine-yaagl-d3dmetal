@@ -78,6 +78,8 @@ python3 scripts/stage-runtime.py --verify-runtime build/staged/wine --current-so
 
 The staged launcher uses `yaagl-d3dmetal-runtime.json`, enables Metal4/MetalFX, and selects the RTX 4060 adapter identity. `YAAGL_FSR_UPSCALER=metalfx` selects the translated upscaler; `native` retains the native upscaler while using the packaged frame-generation bridge. The stock NGX pair remains the DLSS route.
 
+Explicit `wineboot` and `wineboot.exe` launches skip optional Mono/Gecko installer dialogs so unattended prefix initialization can finish. This applies only to that process tree, preserves the FSR loader policy, and writes no persistent DLL-disable settings. Ordinary application launches do not inherit these bootstrap-only disables.
+
 `package-wine-p3-runtime.sh` packages the complete local runtime. `package-yaagl-runtime.py STAGED_WINE_ROOT AUTOPATCH_DIR OUTPUT_DIR` instead packages a verified staged runtime with the native preparation helper and omits the Apple framework. The split-package entrypoint uses the same beta3 contracts. Apple framework redistribution remains subject to Apple's license.
 
 ## Verification

@@ -78,6 +78,8 @@ python3 scripts/stage-runtime.py --verify-runtime build/staged/wine --current-so
 
 스테이징된 런처는 `yaagl-d3dmetal-runtime.json`을 사용하며 Metal4/MetalFX와 RTX 4060 식별값을 설정합니다. `YAAGL_FSR_UPSCALER=metalfx`는 번역 업스케일러를 선택하고, `native`는 네이티브 업스케일러와 패키지의 프레임 생성 브리지를 사용합니다. DLSS 경로는 원본 NGX PE/Unix 쌍을 유지합니다.
 
+명시적인 `wineboot`·`wineboot.exe` 실행에서는 선택적 Mono/Gecko 설치 대화상자를 생략해 무인 프리픽스 초기화가 끝나도록 합니다. 해당 프로세스 트리에만 적용하고 FSR 로더 정책은 유지하며, 영구적인 DLL 비활성화 설정을 기록하지 않습니다. 일반 애플리케이션 실행에는 이 초기화 전용 비활성화가 적용되지 않습니다.
+
 `package-wine-p3-runtime.sh`로 완전한 로컬 런타임을 패키징합니다. `package-yaagl-runtime.py STAGED_WINE_ROOT AUTOPATCH_DIR OUTPUT_DIR`는 검증된 런타임과 네이티브 준비 도구를 묶되 Apple framework를 제외합니다. 분리 패키징 진입점도 같은 beta3 계약을 사용합니다. Apple framework의 재배포에는 Apple 라이선스가 적용됩니다.
 
 ## 검증
