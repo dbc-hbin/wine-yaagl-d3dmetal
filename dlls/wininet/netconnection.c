@@ -412,6 +412,7 @@ static DWORD netcon_secure_connect_setup(netconn_t *connection, BOOL compat_mode
     const CERT_CONTEXT *cert;
     SECURITY_STATUS status;
     DWORD res = ERROR_SUCCESS;
+    BOOL context_complete = FALSE;
 
     const DWORD isc_req_flags = ISC_REQ_ALLOCATE_MEMORY|ISC_REQ_USE_SESSION_KEY|ISC_REQ_CONFIDENTIALITY
         |ISC_REQ_SEQUENCE_DETECT|ISC_REQ_REPLAY_DETECT|ISC_REQ_MANUAL_CRED_VALIDATION;
@@ -429,6 +430,7 @@ static DWORD netcon_secure_connect_setup(netconn_t *connection, BOOL compat_mode
     if(!read_buf)
         return ERROR_OUTOFMEMORY;
 
+    SecInvalidateHandle(&ctx);
     status = InitializeSecurityContextW(cred, NULL, connection->server->name, isc_req_flags, 0, 0, NULL, 0,
             &ctx, &out_desc, &attrs, NULL);
 
@@ -495,9 +497,7 @@ static DWORD netcon_secure_connect_setup(netconn_t *connection, BOOL compat_mode
         TRACE("InitializeSecurityContext ret %08lx\n", status);
 
         if(status == SEC_E_OK) {
-            if(SecIsValidHandle(&connection->ssl_ctx))
-                DeleteSecurityContext(&connection->ssl_ctx);
-            connection->ssl_ctx = ctx;
+            context_complete = TRUE;
 
             if(in_bufs[1].BufferType == SECBUFFER_EXTRA)
                 FIXME("SECBUFFER_EXTRA not supported\n");
@@ -531,6 +531,16 @@ static DWORD netcon_secure_connect_setup(netconn_t *connection, BOOL compat_mode
     }
 
     free(read_buf);
+    if(out_buf.pvBuffer)
+        FreeContextBuffer(out_buf.pvBuffer);
+
+    if(context_complete) {
+        if(SecIsValidHandle(&connection->ssl_ctx))
+            DeleteSecurityContext(&connection->ssl_ctx);
+        connection->ssl_ctx = ctx;
+    }else if(SecIsValidHandle(&ctx)) {
+        DeleteSecurityContext(&ctx);
+    }
 
     if(status != SEC_E_OK || res != ERROR_SUCCESS) {
         WARN("Failed to establish SSL connection: %08lx (%lu)\n", status, res);

@@ -96,6 +96,7 @@ struct media_sink
     struct list stream_sinks;
 
     wg_muxer_t muxer;
+    HRESULT status;
 };
 
 static struct stream_sink *impl_from_IMFStreamSink(IMFStreamSink *iface)
@@ -344,6 +345,13 @@ static HRESULT WINAPI stream_sink_ProcessSample(IMFStreamSink *iface, IMFSample 
         return MF_E_INVALIDREQUEST;
     }
 
+    if (FAILED(media_sink->status))
+    {
+        hr = media_sink->status;
+        LeaveCriticalSection(&media_sink->cs);
+        return hr;
+    }
+
     if (FAILED(hr = (async_command_create(ASYNC_PROCESS, &command))))
     {
         LeaveCriticalSection(&media_sink->cs);
@@ -570,6 +578,21 @@ static HRESULT media_sink_queue_stream_event(struct media_sink *media_sink, Medi
     return S_OK;
 }
 
+static HRESULT media_sink_latch_error(struct media_sink *media_sink, HRESULT hr)
+{
+    struct stream_sink *stream_sink;
+
+    if (SUCCEEDED(media_sink->status))
+    {
+        media_sink->status = hr;
+        IMFMediaEventQueue_QueueEventParamVar(media_sink->event_queue, MEError, &GUID_NULL, hr, NULL);
+        LIST_FOR_EACH_ENTRY(stream_sink, &media_sink->stream_sinks, struct stream_sink, entry)
+            IMFMediaEventQueue_QueueEventParamVar(stream_sink->event_queue, MEError, &GUID_NULL, hr, NULL);
+    }
+
+    return media_sink->status;
+}
+
 static HRESULT media_sink_write_stream(struct media_sink *media_sink)
 {
     BYTE buffer[1024];
@@ -580,11 +603,19 @@ static HRESULT media_sink_write_stream(struct media_sink *media_sink)
 
     while (SUCCEEDED(hr = wg_muxer_read_data(media_sink->muxer, buffer, &size, &offset)))
     {
+        ULONG total = 0;
+
         if (offset != UINT64_MAX && FAILED(hr = IMFByteStream_SetCurrentPosition(media_sink->bytestream, offset)))
             return hr;
 
-        if (FAILED(hr = IMFByteStream_Write(media_sink->bytestream, buffer, size, &written)))
-            return hr;
+        while (total < size)
+        {
+            if (FAILED(hr = IMFByteStream_Write(media_sink->bytestream, buffer + total, size - total, &written)))
+                return hr;
+            if (!written || written > size - total)
+                return E_FAIL;
+            total += written;
+        }
 
         size = sizeof(buffer);
     }
@@ -627,8 +658,14 @@ static HRESULT media_sink_process(struct media_sink *media_sink, IMFSample *samp
 
     TRACE("media_sink %p, sample %p, stream_id %u.\n", media_sink, sample, stream_id);
 
+    if (FAILED(media_sink->status))
+        return media_sink->status;
+
     if (FAILED(hr = media_sink_write_stream(media_sink)))
+    {
         WARN("Failed to write output samples to stream, hr %#lx.\n", hr);
+        return media_sink_latch_error(media_sink, hr);
+    }
 
     if (FAILED(hr = wg_sample_create_mf(sample, &wg_sample)))
         return hr;
@@ -688,10 +725,12 @@ static HRESULT media_sink_finalize(struct media_sink *media_sink, IMFAsyncResult
 
     media_sink->state = STATE_FINALIZED;
 
-    hr = wg_muxer_finalize(media_sink->muxer);
-
-    if (SUCCEEDED(hr))
-        hr = media_sink_write_stream(media_sink);
+    if (FAILED(media_sink->status))
+        hr = media_sink->status;
+    else if (FAILED(hr = wg_muxer_finalize(media_sink->muxer)))
+        hr = media_sink_latch_error(media_sink, hr);
+    else if (FAILED(hr = media_sink_write_stream(media_sink)))
+        hr = media_sink_latch_error(media_sink, hr);
 
     IMFAsyncResult_SetStatus(result, hr);
     MFInvokeCallback(result);

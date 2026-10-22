@@ -199,7 +199,9 @@ extern void macdrv_set_cocoa_retina_mode(bool new_mode);
 
 /* cursor */
 extern void macdrv_set_cursor(CFStringRef name, CFArrayRef frames);
+struct macdrv_native_cursor_context;
 extern int macdrv_get_cursor_position(CGPoint *pos);
+extern bool macdrv_get_native_cursor_context(struct macdrv_native_cursor_context *context, WineWindow *candidate);
 extern int macdrv_set_cursor_position(CGPoint pos);
 extern int macdrv_clip_cursor(CGRect rect);
 
@@ -256,6 +258,7 @@ enum {
     APP_ACTIVATED,
     APP_DEACTIVATED,
     APP_QUIT_REQUESTED,
+    CLIENT_SURFACE_PRESENTED, /* CW HACK 22435 */
     DISPLAYS_CHANGED,
     HOTKEY_PRESS,
     KEY_PRESS,
@@ -276,6 +279,7 @@ enum {
     WINDOW_CLOSE_REQUESTED,
     WINDOW_DID_MINIMIZE,
     WINDOW_DID_UNMINIMIZE,
+    WINDOW_NATIVE_CURSOR_SYNC,
     WINDOW_DRAG_BEGIN,
     WINDOW_DRAG_END,
     WINDOW_FRAME_CHANGED,
@@ -297,6 +301,11 @@ enum {
 
 typedef uint64_t macdrv_event_mask;
 
+struct macdrv_native_cursor_context
+{
+    void *window;
+};
+
 typedef struct macdrv_event {
     int                 refs;
     int                 deliver;
@@ -306,6 +315,10 @@ typedef struct macdrv_event {
         struct {
             int reason;
         }                                           app_quit_requested;
+        /* CW HACK 22435 */
+        struct {
+            void           *client_surface;
+        }                                           client_surface_presented;
         struct {
             bool activating;
         }                                           displays_changed;
@@ -337,6 +350,9 @@ typedef struct macdrv_event {
             int             x;
             int             y;
             bool            drag;
+            bool            noncoalescible;
+            int             raw_x;
+            int             raw_y;
             unsigned long   time_ms;
         }                                           mouse_moved;
         struct {
@@ -469,6 +485,8 @@ struct window_surface;
 
 extern WineWindow *macdrv_create_cocoa_window(const struct macdrv_window_features* wf,
         CGRect frame, void* hwnd, WineEventQueue *queue);
+extern WineWindow *macdrv_retain_cocoa_window(WineWindow *window);
+extern void macdrv_release_cocoa_window(WineWindow *window);
 extern void macdrv_destroy_cocoa_window(WineWindow *window);
 extern void* macdrv_get_window_hwnd(WineWindow *window);
 extern void macdrv_set_cocoa_window_features(WineWindow *window,
@@ -554,5 +572,12 @@ extern void macdrv_destroy_status_item(WineStatusItem *item);
 extern void macdrv_set_status_item_image(WineStatusItem *item, CGImageRef cgimage);
 extern void macdrv_set_status_item_tooltip(WineStatusItem *item, CFStringRef cftip);
 
+
+/* CW HACK 22435 */
+extern void macdrv_client_surface_presented(const macdrv_event *event);
+extern void macdrv_retain_d3dmetal_client_surface(void *surface);
+extern void macdrv_release_d3dmetal_client_surface(void *surface);
+extern void *macdrv_get_view_d3dmetal_client_surface(WineContentView *view);
+extern void macdrv_set_view_d3dmetal_client_surface(WineContentView *view, void *client_surface);
 
 #endif  /* __WINE_MACDRV_COCOA_H */

@@ -96,6 +96,7 @@ static struct xinput_controller controllers[XUSER_MAX_COUNT];
 static HMODULE xinput_instance;
 static HANDLE start_event;
 static HANDLE update_event;
+static LONG rescan_pending;
 
 static SRWLOCK state_lock = SRWLOCK_INIT;
 static XINPUT_STATE current_state[XUSER_MAX_COUNT];
@@ -558,6 +559,9 @@ static void controller_destroy(struct xinput_controller *controller, BOOL alread
         free(controller->hid.feature_report_buf);
         HidD_FreePreparsedData(controller->hid.preparsed);
         memset(&controller->hid, 0, sizeof(controller->hid));
+
+        InterlockedExchange(&rescan_pending, TRUE);
+        SetEvent(update_event);
     }
 }
 
@@ -699,7 +703,7 @@ static DWORD WINAPI hid_update_thread_proc(void *param)
 {
     struct xinput_controller *devices[XUSER_MAX_COUNT + 1];
     HANDLE events[XUSER_MAX_COUNT + 1];
-    DWORD i, count = 1, ret = WAIT_TIMEOUT;
+    DWORD i, count = 1, ret = WAIT_FAILED, wait_timeout;
     DEV_BROADCAST_DEVICEINTERFACE_W filter =
     {
         .dbcc_size = sizeof(DEV_BROADCAST_DEVICEINTERFACE_W),
@@ -722,7 +726,8 @@ static DWORD WINAPI hid_update_thread_proc(void *param)
     RegisterClassExW(&cls);
     hwnd = CreateWindowExW(0, cls.lpszClassName, NULL, 0, 0, 0, 0, 0,
                            HWND_MESSAGE, NULL, NULL, NULL);
-    notif = RegisterDeviceNotificationW(hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+    notif = hwnd ? RegisterDeviceNotificationW(hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE) : NULL;
+    wait_timeout = notif ? INFINITE : 2000;
 
     update_controller_list();
     SetEvent(start_event);
@@ -730,7 +735,13 @@ static DWORD WINAPI hid_update_thread_proc(void *param)
     do
     {
         if (ret == count) while (PeekMessageW(&msg, hwnd, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
-        if (ret == WAIT_TIMEOUT) update_controller_list();
+        if (ret == WAIT_TIMEOUT)
+        {
+            InterlockedExchange(&rescan_pending, FALSE);
+            update_controller_list();
+        }
+        else if (ret == count - 1 && InterlockedExchange(&rescan_pending, FALSE))
+            update_controller_list();
 
         EnterCriticalSection(&xinput_cs);
         if (ret < count - 1 && devices[ret]->device) read_controller_state(devices[ret]);
@@ -746,7 +757,7 @@ static DWORD WINAPI hid_update_thread_proc(void *param)
         events[count++] = update_event;
         LeaveCriticalSection(&xinput_cs);
     }
-    while ((ret = MsgWaitForMultipleObjectsEx(count, events, 2000, QS_ALLINPUT, MWMO_ALERTABLE)) <= count ||
+    while ((ret = MsgWaitForMultipleObjectsEx(count, events, wait_timeout, QS_ALLINPUT, MWMO_ALERTABLE)) <= count ||
             ret == WAIT_TIMEOUT);
 
     ERR("wait failed in the update thread, ret %lu, error %lu\n", ret, GetLastError());
@@ -840,7 +851,6 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputSetState(DWORD index, XINPUT_VIBRATION *vib
     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
 
     EnterCriticalSection(&xinput_cs);
-    if (!controllers[index].device) update_controller_list();
     if (!controllers[index].device)
         ret = ERROR_DEVICE_NOT_CONNECTED;
     else
@@ -864,7 +874,6 @@ static DWORD xinput_get_state(DWORD index, XINPUT_STATE *state)
     if (get_current_state(index, state)) return ERROR_SUCCESS;
 
     EnterCriticalSection(&xinput_cs);
-    update_controller_list();
     ret = get_current_state(index, state) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
     LeaveCriticalSection(&xinput_cs);
 
@@ -1164,7 +1173,6 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilitiesEx(DWORD unk, DWORD index, D
     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
 
     EnterCriticalSection(&xinput_cs);
-    if (!controllers[index].device) update_controller_list();
     if (!controllers[index].device)
         ret = ERROR_DEVICE_NOT_CONNECTED;
     else if (flags & XINPUT_FLAG_GAMEPAD && controllers[index].caps.SubType != XINPUT_DEVSUBTYPE_GAMEPAD)

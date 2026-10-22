@@ -307,7 +307,10 @@ struct window_surface_funcs
 struct window_surface
 {
     const struct window_surface_funcs *funcs; /* driver-specific implementations  */
-    struct list                        entry; /* entry in global list managed by user32 */
+    struct list                        entry; /* entry in dirty list managed by user32 */
+    BOOL                               registered; /* surface is registered with user32 */
+    BOOL                               dirty; /* surface is linked in the dirty list */
+    UINT                               dirty_generation; /* flush generation assigned when queued */
     LONG                               ref;   /* reference count */
     HWND                               hwnd;  /* window the surface was created for */
     RECT                               rect;  /* constant, no locking needed */

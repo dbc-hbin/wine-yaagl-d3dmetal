@@ -176,8 +176,12 @@ static NTSTATUS get_hid_device_desc( minidriver *minidriver, DEVICE_OBJECT *devi
     if (!(report_desc = malloc( descriptor.DescriptorList[i].wReportLength ))) return STATUS_NO_MEMORY;
     call_minidriver( IOCTL_HID_GET_REPORT_DESCRIPTOR, device, NULL, 0, report_desc,
                      descriptor.DescriptorList[i].wReportLength, &io );
-    if (!io.Status) io.Status = HidP_GetCollectionDescription( report_desc, descriptor.DescriptorList[i].wReportLength,
-                                                               PagedPool, desc );
+    if (!io.Status)
+    {
+        io.Status = HidP_GetCollectionDescription( report_desc, descriptor.DescriptorList[i].wReportLength,
+                                                   PagedPool, desc );
+        if (io.Status != HIDP_STATUS_SUCCESS) memset( desc, 0, sizeof(*desc) );
+    }
     free( report_desc );
 
     if (io.Status && io.Status != HIDP_STATUS_SUCCESS) return STATUS_INVALID_PARAMETER;
@@ -204,7 +208,7 @@ static NTSTATUS initialize_device( minidriver *minidriver, DEVICE_OBJECT *device
         return status;
     }
 
-    if (!(fdo->child_pdos = malloc( fdo->device_desc.CollectionDescLength * sizeof(*fdo->child_pdos) )))
+    if (!(fdo->child_pdos = calloc( fdo->device_desc.CollectionDescLength, sizeof(*fdo->child_pdos) )))
     {
         ERR( "Cannot allocate child PDOs array\n" );
         return STATUS_NO_MEMORY;
@@ -274,7 +278,6 @@ static NTSTATUS create_child_pdos( minidriver *minidriver, DEVICE_OBJECT *device
         TRACE( "created pdo %p, rawinput handle %#x\n", pdo, pdo->rawinput_handle );
     }
 
-    IoInvalidateDeviceRelations( fdo->base.hid.PhysicalDeviceObject, BusRelations );
     return STATUS_SUCCESS;
 }
 
@@ -297,8 +300,26 @@ static NTSTATUS create_device_thread( DEVICE_OBJECT *device )
     fdo->io_packet->reportBuffer = (BYTE *)(fdo->io_packet + 1);
     fdo->io_packet->reportBufferLen = input_length;
 
-    if (!(fdo->thread = CreateThread( NULL, 0, hid_device_thread, device, 0, NULL ))) return STATUS_UNSUCCESSFUL;
+    if (!(fdo->thread = CreateThread( NULL, 0, hid_device_thread, device, 0, NULL )))
+    {
+        free( fdo->io_packet );
+        fdo->io_packet = NULL;
+        return STATUS_UNSUCCESSFUL;
+    }
     return STATUS_SUCCESS;
+}
+
+static void cleanup_device_start( DEVICE_OBJECT *device )
+{
+    struct func_device *fdo = fdo_from_DEVICE_OBJECT( device );
+
+    while (fdo->child_count) IoDeleteDevice( fdo->child_pdos[--fdo->child_count] );
+    free( fdo->child_pdos );
+    fdo->child_pdos = NULL;
+    free( fdo->io_packet );
+    fdo->io_packet = NULL;
+    if (fdo->device_desc.CollectionDesc) HidP_FreeCollectionDescription( &fdo->device_desc );
+    memset( &fdo->device_desc, 0, sizeof(fdo->device_desc) );
 }
 
 static NTSTATUS fdo_pnp(DEVICE_OBJECT *device, IRP *irp)
@@ -345,6 +366,8 @@ static NTSTATUS fdo_pnp(DEVICE_OBJECT *device, IRP *irp)
             if (!status) status = initialize_device( minidriver, device );
             if (!status) status = create_child_pdos( minidriver, device );
             if (!status) status = create_device_thread( device );
+            if (status) cleanup_device_start( device );
+            else IoInvalidateDeviceRelations( fdo->base.hid.PhysicalDeviceObject, BusRelations );
             return status;
 
         case IRP_MN_REMOVE_DEVICE:
@@ -352,13 +375,15 @@ static NTSTATUS fdo_pnp(DEVICE_OBJECT *device, IRP *irp)
             {
                 KeSetEvent( &fdo->halt_event, IO_NO_INCREMENT, FALSE );
                 WaitForSingleObject( fdo->thread, INFINITE );
+                CloseHandle( fdo->thread );
+                fdo->thread = NULL;
             }
 
             if ((status = minidriver->PNPDispatch( device, irp ))) return status;
             if (fdo->io_irp) KeWaitForSingleObject( &fdo->io_event, Executive, KernelMode, FALSE, NULL );
             free( fdo->io_packet );
 
-            HidP_FreeCollectionDescription( &fdo->device_desc );
+            if (fdo->device_desc.CollectionDesc) HidP_FreeCollectionDescription( &fdo->device_desc );
             free( fdo->child_pdos );
             IoDetachDevice( fdo->base.hid.NextDeviceObject );
             IoDeleteDevice( device );

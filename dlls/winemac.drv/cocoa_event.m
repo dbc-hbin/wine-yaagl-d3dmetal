@@ -198,39 +198,77 @@ static const OSType WineHotKeySignature = 'Wine';
 
     - (void) postEventObject:(MacDrvEvent*)event
     {
-        NSIndexSet* indexes;
         MacDrvEvent* lastEvent;
+        NSUInteger cleanupCount, eventCount;
 
         [eventsLock lock];
 
-        indexes = [events indexesOfObjectsPassingTest:^BOOL(id obj, NSUInteger idx, BOOL *stop){
-            return ((MacDrvEvent*)obj)->event->deliver <= 0;
-        }];
-        [events removeObjectsAtIndexes:indexes];
+        /* Shared events can become obsolete after another queue delivers them.  Inspect
+           a bounded rotating slice so every retained event is eventually reconsidered
+           without scanning or allocating in proportion to the full queue on each post. */
+        eventCount = [events count];
+        cleanupCount = MIN(eventCount, 16);
+        if (eventCount && cleanupIndex >= eventCount) cleanupIndex %= eventCount;
+        while (cleanupCount-- && eventCount)
+        {
+            MacDrvEvent* candidate = events[cleanupIndex];
+
+            if (__atomic_load_n(&candidate->event->deliver, __ATOMIC_RELAXED) <= 0)
+            {
+                [events removeObjectAtIndex:cleanupIndex];
+                eventCount--;
+                if (cleanupIndex >= eventCount) cleanupIndex = 0;
+            }
+            else if (++cleanupIndex >= eventCount)
+                cleanupIndex = 0;
+        }
 
         if ((event->event->type == MOUSE_MOVED_RELATIVE ||
              event->event->type == MOUSE_MOVED_ABSOLUTE) &&
-            event->event->deliver == INT_MAX &&
+            __atomic_load_n(&event->event->deliver, __ATOMIC_RELAXED) == INT_MAX &&
             (lastEvent = [events lastObject]) &&
             (lastEvent->event->type == MOUSE_MOVED_RELATIVE ||
              lastEvent->event->type == MOUSE_MOVED_ABSOLUTE) &&
-            lastEvent->event->deliver == INT_MAX &&
+            __atomic_load_n(&lastEvent->event->deliver, __ATOMIC_RELAXED) == INT_MAX &&
             lastEvent->event->window == event->event->window &&
-            lastEvent->event->mouse_moved.drag == event->event->mouse_moved.drag)
+            lastEvent->event->mouse_moved.drag == event->event->mouse_moved.drag &&
+            !lastEvent->event->mouse_moved.noncoalescible &&
+            !event->event->mouse_moved.noncoalescible)
         {
+            int x, y, raw_x, raw_y;
+            BOOL merged;
+
+            merged = !__builtin_add_overflow(lastEvent->event->mouse_moved.raw_x,
+                                              event->event->mouse_moved.raw_x, &raw_x) &&
+                     !__builtin_add_overflow(lastEvent->event->mouse_moved.raw_y,
+                                              event->event->mouse_moved.raw_y, &raw_y);
             if (event->event->type == MOUSE_MOVED_RELATIVE)
+                merged = merged &&
+                         !__builtin_add_overflow(lastEvent->event->mouse_moved.x,
+                                                 event->event->mouse_moved.x, &x) &&
+                         !__builtin_add_overflow(lastEvent->event->mouse_moved.y,
+                                                 event->event->mouse_moved.y, &y);
+
+            if (merged)
             {
-                lastEvent->event->mouse_moved.x += event->event->mouse_moved.x;
-                lastEvent->event->mouse_moved.y += event->event->mouse_moved.y;
+                if (event->event->type == MOUSE_MOVED_RELATIVE)
+                {
+                    lastEvent->event->mouse_moved.x = x;
+                    lastEvent->event->mouse_moved.y = y;
+                }
+                else
+                {
+                    lastEvent->event->type = MOUSE_MOVED_ABSOLUTE;
+                    lastEvent->event->mouse_moved.x = event->event->mouse_moved.x;
+                    lastEvent->event->mouse_moved.y = event->event->mouse_moved.y;
+                }
+
+                lastEvent->event->mouse_moved.raw_x = raw_x;
+                lastEvent->event->mouse_moved.raw_y = raw_y;
+                lastEvent->event->mouse_moved.time_ms = event->event->mouse_moved.time_ms;
             }
             else
-            {
-                lastEvent->event->type = MOUSE_MOVED_ABSOLUTE;
-                lastEvent->event->mouse_moved.x = event->event->mouse_moved.x;
-                lastEvent->event->mouse_moved.y = event->event->mouse_moved.y;
-            }
-
-            lastEvent->event->mouse_moved.time_ms = event->event->mouse_moved.time_ms;
+                [events addObject:event];
         }
         else
             [events addObject:event];
@@ -278,8 +316,10 @@ static const OSType WineHotKeySignature = 'Wine';
             {
                 [[event retain] autorelease];
                 [events removeObjectAtIndex:index];
+                if (index < cleanupIndex) cleanupIndex--;
+                else if (cleanupIndex >= [events count]) cleanupIndex = 0;
 
-                if (event->event->deliver == INT_MAX ||
+                if (__atomic_load_n(&event->event->deliver, __ATOMIC_RELAXED) == INT_MAX ||
                     InterlockedDecrementNoFence(&event->event->deliver) >= 0)
                 {
                     ret = event;
@@ -308,6 +348,7 @@ static const OSType WineHotKeySignature = 'Wine';
         }];
 
         [events removeObjectsAtIndexes:indexes];
+        cleanupIndex = 0;
 
         [eventsLock unlock];
     }
@@ -334,10 +375,12 @@ static const OSType WineHotKeySignature = 'Wine';
         query->done = FALSE;
 
         [self postEvent:event];
-        macdrv_release_event(event);
         timedout = ![[WineApplicationController sharedController] waitUntilQueryDone:&query->done
                                                                              timeout:timeoutDate
                                                                        processEvents:(flags & WineQueryProcessEvents) != 0];
+        /* A timed-out query must remain queued: every current query type can invoke
+           application code or perform an ordered lifecycle transition. */
+        macdrv_release_event(event);
         return !timedout && query->status;
     }
 
@@ -665,6 +708,11 @@ void macdrv_release_event(macdrv_event *event)
     {
         switch (event->type)
         {
+            case CLIENT_SURFACE_PRESENTED:
+#if defined(__x86_64__)
+                macdrv_release_d3dmetal_client_surface(event->client_surface_presented.client_surface);
+#endif
+                break;
             case KEYBOARD_CHANGED:
                 CFRelease(event->keyboard_changed.uchr);
                 CFRelease(event->keyboard_changed.input_source);

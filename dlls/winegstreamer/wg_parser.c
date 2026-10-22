@@ -230,11 +230,14 @@ static NTSTATUS wg_parser_stream_get_current_format(void *args)
 {
     const struct wg_parser_stream_get_current_format_params *params = args;
     struct wg_parser_stream *stream = get_stream(params->stream);
+    struct wg_parser *parser = stream->parser;
 
+    pthread_mutex_lock(&parser->mutex);
     if (stream->current_caps)
         wg_format_from_caps(params->format, stream->current_caps);
     else
         memset(params->format, 0, sizeof(*params->format));
+    pthread_mutex_unlock(&parser->mutex);
 
     return S_OK;
 }
@@ -243,13 +246,16 @@ static NTSTATUS wg_parser_stream_get_codec_format(void *args)
 {
     struct wg_parser_stream_get_codec_format_params *params = args;
     struct wg_parser_stream *stream = get_stream(params->stream);
+    struct wg_parser *parser = stream->parser;
 
+    pthread_mutex_lock(&parser->mutex);
     if (caps_is_compressed(stream->codec_caps))
         wg_format_from_caps(params->format, stream->codec_caps);
     else if (stream->current_caps)
         wg_format_from_caps(params->format, stream->current_caps);
     else
         memset(params->format, 0, sizeof(*params->format));
+    pthread_mutex_unlock(&parser->mutex);
 
     return S_OK;
 }
@@ -261,12 +267,21 @@ static NTSTATUS wg_parser_stream_enable(void *args)
     const struct wg_format *format = params->format;
     struct wg_parser *parser = stream->parser;
 
+    GstCaps *caps, *old_caps;
+
+    if (!(caps = wg_format_to_caps(format)))
+        return E_OUTOFMEMORY;
+
     pthread_mutex_lock(&parser->mutex);
 
-    stream->desired_caps = wg_format_to_caps(format);
+    old_caps = stream->desired_caps;
+    stream->desired_caps = caps;
     stream->enabled = true;
 
     pthread_mutex_unlock(&parser->mutex);
+
+    if (old_caps)
+        gst_caps_unref(old_caps);
 
     if (format->major_type == WG_MAJOR_TYPE_VIDEO)
     {
@@ -699,12 +714,16 @@ static gboolean sink_event_cb(GstPad *pad, GstObject *parent, GstEvent *event)
 
         case GST_EVENT_CAPS:
         {
-            GstCaps *caps;
+            GstCaps *caps, *old_caps;
 
             gst_event_parse_caps(event, &caps);
+            caps = gst_caps_ref(caps);
             pthread_mutex_lock(&parser->mutex);
-            stream->current_caps = gst_caps_ref(caps);
+            old_caps = stream->current_caps;
+            stream->current_caps = caps;
             pthread_mutex_unlock(&parser->mutex);
+            if (old_caps)
+                gst_caps_unref(old_caps);
             pthread_cond_signal(&parser->init_cond);
             break;
         }
@@ -934,6 +953,8 @@ static void free_stream(struct wg_parser_stream *stream)
         gst_caps_unref(stream->codec_caps);
     if (stream->current_caps)
         gst_caps_unref(stream->current_caps);
+    if (stream->desired_caps)
+        gst_caps_unref(stream->desired_caps);
 
     free(stream);
 }

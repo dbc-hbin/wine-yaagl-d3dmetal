@@ -598,33 +598,44 @@ static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages, 
     return prefer_hidraw;
 }
 
+static void deliver_report(struct device_extension *ext, IRP *irp, const BYTE *buffer, DWORD length)
+{
+    ULONG i;
+
+    if (!ext->collection_desc.ReportIDs[0].ReportID)
+    {
+        buffer++;
+        length--;
+    }
+
+    memcpy(irp->UserBuffer, buffer, length);
+    irp->IoStatus.Information = length;
+    irp->IoStatus.Status = STATUS_SUCCESS;
+
+    if (TRACE_ON(hid))
+    {
+        TRACE("device %p/%#I64x input report length %lu:\n", ext->device, ext->unix_device, length);
+        for (i = 0; i < length;)
+        {
+            char line[256], *buf = line;
+            buf += sprintf(buf, "%08lx ", i);
+            do { buf += sprintf(buf, " %02x", buffer[i]); }
+            while (++i % 16 && i < length);
+            TRACE("%s\n", line);
+        }
+    }
+}
+
 static BOOL deliver_next_report(struct device_extension *ext, IRP *irp)
 {
     struct hid_report *report;
     struct list *entry;
-    ULONG i;
 
     if (!(entry = list_head(&ext->reports))) return FALSE;
     report = LIST_ENTRY(entry, struct hid_report, entry);
     list_remove(&report->entry);
 
-    memcpy(irp->UserBuffer, report->buffer, report->length);
-    irp->IoStatus.Information = report->length;
-    irp->IoStatus.Status = STATUS_SUCCESS;
-
-    if (TRACE_ON(hid))
-    {
-        TRACE("device %p/%#I64x input report length %lu:\n", ext->device, ext->unix_device, report->length);
-        for (i = 0; i < report->length;)
-        {
-            char buffer[256], *buf = buffer;
-            buf += sprintf(buf, "%08lx ", i);
-            do { buf += sprintf(buf, " %02x", report->buffer[i]); }
-            while (++i % 16 && i < report->length);
-            TRACE("%s\n", buffer);
-        }
-    }
-
+    deliver_report(ext, irp, report->buffer, report->length);
     RtlFreeHeap(GetProcessHeap(), 0, report);
     return TRUE;
 }
@@ -633,44 +644,16 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
 {
     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
     struct hid_report *report, *last_report;
-    ULONG size;
+    DWORD wire_length;
     IRP *irp;
 
-    TRACE("device %p report_buf %p (%#x), report_len %#lx\n", device, report_buf, *report_buf, report_len);
+    TRACE("device %p report_buf %p, report_len %#lx\n", device, report_buf, report_len);
 
-    RtlEnterCriticalSection(&ext->cs);
-
-    if (ext->state != DEVICE_STATE_STARTED)
+    if (!report_len)
     {
-        RtlLeaveCriticalSection(&ext->cs);
+        WARN("Ignoring empty HID report\n");
         return;
     }
-
-    if (!ext->collection_desc.ReportIDs[0].ReportID) last_report = ext->last_reports[0];
-    else last_report = ext->last_reports[report_buf[0]];
-    if (!last_report)
-    {
-        WARN("Ignoring report with unexpected id %#x\n", *report_buf);
-        RtlLeaveCriticalSection(&ext->cs);
-        return;
-    }
-
-    /* Devices may send more data than their report declares, but the cached report
-     * and hidclass.sys buffers are only sized to hold the declared size. */
-    if (report_len > last_report->length)
-    {
-        WARN("overlong report %#x length %lu truncated to declared length %lu\n", *report_buf, report_len, last_report->length);
-        report_len = last_report->length;
-    }
-
-    size = offsetof(struct hid_report, buffer[report_len]);
-    if (!(report = RtlAllocateHeap(GetProcessHeap(), 0, size)))
-    {
-        RtlLeaveCriticalSection(&ext->cs);
-        return;
-    }
-    memcpy(report->buffer, report_buf, report_len);
-    report->length = report_len;
 
     if (ext->report_fixups & HIDRAW_FIXUP_DUALSHOCK_BT)
     {
@@ -684,11 +667,11 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
          *
          * We have to translate it to input report #1, like native driver does.
          */
-        if (report->buffer[0] == 0x11 && report->length >= 12)
+        if (report_buf[0] == 0x11 && report_len >= 12)
         {
-            memmove(report->buffer, report->buffer + 2, 10);
-            report->buffer[0] = 1; /* fake report #1 */
-            report->length = 10;
+            memmove(report_buf, report_buf + 2, 10);
+            report_buf[0] = 1; /* fake report #1 */
+            report_len = 10;
         }
     }
 
@@ -706,33 +689,74 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
          * Extended #41 report:
          *   Prefix X  Y  Z  Rz  TriggerLeft  TriggerRight  Counter  Buttons[3] ...
          */
-        if (report->buffer[0] == 0x31 && report->length >= 12)
+        if (report_buf[0] == 0x31 && report_len >= 12)
         {
             BYTE trigger[2];
 
-            memmove(report->buffer, report->buffer + 1, 11);
-            report->buffer[0] = 1; /* fake report #1 */
-            report->length = 10;
+            memmove(report_buf, report_buf + 1, 11);
+            report_buf[0] = 1; /* fake report #1 */
+            report_len = 10;
 
-            trigger[0] = report->buffer[5]; /* TriggerLeft*/
-            trigger[1] = report->buffer[6]; /* TriggerRight */
+            trigger[0] = report_buf[5]; /* TriggerLeft*/
+            trigger[1] = report_buf[6]; /* TriggerRight */
 
-            report->buffer[5] = report->buffer[8];  /* Buttons[0] */
-            report->buffer[6] = report->buffer[9];  /* Buttons[1] */
-            report->buffer[7] = report->buffer[10]; /* Buttons[2] */
-            report->buffer[8] = trigger[0]; /* TriggerLeft */
-            report->buffer[9] = trigger[1]; /* TirggerRight */
+            report_buf[5] = report_buf[8];  /* Buttons[0] */
+            report_buf[6] = report_buf[9];  /* Buttons[1] */
+            report_buf[7] = report_buf[10]; /* Buttons[2] */
+            report_buf[8] = trigger[0]; /* TriggerLeft */
+            report_buf[9] = trigger[1]; /* TirggerRight */
         }
     }
 
-    list_add_tail(&ext->reports, &report->entry);
+    RtlEnterCriticalSection(&ext->cs);
 
-    memcpy(last_report->buffer, report_buf, report_len);
+    if (ext->state != DEVICE_STATE_STARTED)
+    {
+        RtlLeaveCriticalSection(&ext->cs);
+        return;
+    }
+
+    if (!ext->collection_desc.ReportIDs[0].ReportID) last_report = ext->last_reports[0];
+    else last_report = ext->last_reports[report_buf[0]];
+    if (!last_report)
+    {
+        WARN("Ignoring report with unexpected id %#x\n", report_buf[0]);
+        RtlLeaveCriticalSection(&ext->cs);
+        return;
+    }
+    wire_length = last_report->length - (!ext->collection_desc.ReportIDs[0].ReportID);
+    /* Preserve overlong device reports without overflowing the declared buffer.
+     * A zero report ID is synthetic and is not part of the wire report. */
+    if (report_len > wire_length)
+    {
+        WARN("overlong report %#x length %lu truncated to declared wire length %lu\n",
+             report_buf[0], report_len, wire_length);
+        report_len = wire_length;
+    }
+    if (report_len != wire_length)
+    {
+        WARN("Ignoring report id %#x with wire length %lu, expected %lu\n", report_buf[0], report_len,
+             wire_length);
+        RtlLeaveCriticalSection(&ext->cs);
+        return;
+    }
+
+    if (!ext->collection_desc.ReportIDs[0].ReportID)
+        memcpy(last_report->buffer + 1, report_buf, report_len);
+    else
+        memcpy(last_report->buffer, report_buf, report_len);
 
     if ((irp = pop_pending_read(ext)))
     {
-        deliver_next_report(ext, irp);
+        deliver_report(ext, irp, last_report->buffer, last_report->length);
         IoCompleteRequest(irp, IO_NO_INCREMENT);
+    }
+    else if ((report = RtlAllocateHeap(GetProcessHeap(), 0,
+                                       offsetof(struct hid_report, buffer[last_report->length]))))
+    {
+        memcpy(report->buffer, last_report->buffer, last_report->length);
+        report->length = last_report->length;
+        list_add_tail(&ext->reports, &report->entry);
     }
     RtlLeaveCriticalSection(&ext->cs);
 }
@@ -910,6 +934,7 @@ static NTSTATUS get_device_descriptors(UINT64 unix_device, BYTE **report_desc, U
     if (status != HIDP_STATUS_SUCCESS)
     {
         ERR("Failed to get device %#I64x report descriptor, status %#lx\n", unix_device, status);
+        memset(device_desc, 0, sizeof(*device_desc));
         RtlFreeHeap(GetProcessHeap(), 0, params.buffer);
         return status;
     }
@@ -1423,6 +1448,22 @@ static NTSTATUS pdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
                     }
                 }
                 if (!status) ext->state = DEVICE_STATE_STARTED;
+            }
+            if (status)
+            {
+                reports = ext->collection_desc.ReportIDs;
+                for (i = 0; i < ext->collection_desc.ReportIDsLength; ++i)
+                {
+                    if (!reports[i].InputLength) continue;
+                    RtlFreeHeap(GetProcessHeap(), 0, ext->last_reports[reports[i].ReportID]);
+                    ext->last_reports[reports[i].ReportID] = NULL;
+                }
+                if (ext->collection_desc.CollectionDesc)
+                    HidP_FreeCollectionDescription(&ext->collection_desc);
+                memset(&ext->collection_desc, 0, sizeof(ext->collection_desc));
+                RtlFreeHeap(GetProcessHeap(), 0, ext->report_desc);
+                ext->report_desc = NULL;
+                ext->report_desc_length = 0;
             }
             RtlLeaveCriticalSection(&ext->cs);
             break;

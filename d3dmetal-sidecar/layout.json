@@ -1,0 +1,100 @@
+{
+  "formatVersion": 27,
+  "source": {
+    "sha256": "a64950e8324cec32c9a442daa1fafd03823bd199fdd84fee5c73679b5fe86660",
+    "machUuid": "4418ec47c3f03285a05615d87d785ffe",
+    "cpuType": 16777223,
+    "fileType": 6
+  },
+  "dependency": {
+    "path": "@loader_path/Resources/libD3DMetalSidecar.dylib",
+    "commandHex": "0c0000005000000018000000000000000000000000000000406c6f616465725f706174682f5265736f75726365732f6c69624433444d6574616c536964656361722e64796c6962000000000000000000",
+    "commandOffset": 4608,
+    "commandSize": 80,
+    "originalCommandCount": 33,
+    "patchedCommandCount": 34,
+    "originalCommandsSize": 4576,
+    "patchedCommandsSize": 4656,
+    "firstTextOffset": 4720
+  },
+  "constructorVerification": {
+    "markerOffset": 5113792,
+    "markerHex": "594141474c4233534944456361721b",
+    "description": "GPTK4b3 feature-only dispatch; native PSO, function, RT, and library caching remains unmodified."
+  },
+  "textCave": {
+    "offset": 5111872,
+    "endOffset": 5115904,
+    "ehFrameEndOffset": 5111872
+  },
+  "dispatch": {
+    "dataSlotOffset": 5652248,
+    "dataSlotVMAddr": 5652248,
+    "commonSectionCommandOffset": 2736,
+    "commonSectionOldSize": 17456,
+    "commonSectionNewSize": 17464,
+    "commonSectionOldEndVMAddr": 5652248,
+    "segmentEndVMAddr": 5652480,
+    "pointerSize": 8,
+    "initialValue": 0
+  },
+  "hooks": [
+    {
+      "id": "GetContainingOutput",
+      "entryOffset": 1218400,
+      "gateOffset": 5111872,
+      "trampolineOffset": 5111896,
+      "continuationOffset": 1218406,
+      "originalHex": "415741565657",
+      "entryPatchHex": "e9db683b0000",
+      "gateHex": "48833dd03e080000740e4c8b1dc73e080041ffa300000000",
+      "trampolineHex": "415741565657e90397c4ff",
+      "dispatchFieldOffset": 0
+    },
+    {
+      "id": "SetFullscreenState",
+      "entryOffset": 1216484,
+      "gateOffset": 5111936,
+      "trampolineOffset": 5111960,
+      "continuationOffset": 1216497,
+      "originalHex": "4156565755534881ec30010000",
+      "entryPatchHex": "e997703b000000000000000000",
+      "gateHex": "48833d903e080000740e4c8b1d873e080041ffa308000000",
+      "trampolineHex": "4156565755534881ec30010000e9478fc4ff",
+      "dispatchFieldOffset": 8
+    },
+    {
+      "id": "QueryVideoMemoryInfo",
+      "entryOffset": 1472686,
+      "gateOffset": 5112000,
+      "trampolineOffset": 5112024,
+      "continuationOffset": 1472692,
+      "originalHex": "415741564154",
+      "entryPatchHex": "e90d88370000",
+      "gateHex": "48833d503e080000740e4c8b1d473e080041ffa310000000",
+      "trampolineHex": "415741564154e9d177c8ff",
+      "dispatchFieldOffset": 16
+    },
+    {
+      "id": "ReplayTemporalScale",
+      "entryOffset": 268256,
+      "gateOffset": 5112064,
+      "trampolineOffset": 5112088,
+      "continuationOffset": 268266,
+      "originalHex": "554889e5415741564154",
+      "entryPatchHex": "e91be949000000000000",
+      "gateHex": "48833d103e080000740e4c8b1d073e080041ffa318000000",
+      "trampolineHex": "554889e5415741564154e9c316b6ff",
+      "dispatchFieldOffset": 24
+    }
+  ],
+  "binaryPatches": [],
+  "verificationSpans": [
+    {
+      "id": "B3TextMarker",
+      "offset": 5113792,
+      "expectedHex": "594141474c4233534944456361721b"
+    }
+  ],
+  "patchedPayloadSha256": "a6261565f67b336b86d0a17812053b9afb5b749774bf50079ddfed066e6e74f1"
+}

@@ -2324,12 +2324,26 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     WND *win;
     HWND owner_hint, surface_win = 0, toplevel;
     struct ratio raw_dpi, dpi = get_thread_dpi();
-    BOOL ret, is_layered, is_child, need_icons = FALSE;
+    BOOL ret, is_layered, is_child, need_icons = FALSE, dummy_shm_surface = FALSE;
     struct window_rects old_rects;
     RECT extra_rects[3];
     struct window_surface *old_surface;
     HICON icon, icon_small;
     ICONINFO ii, ii_small;
+
+    /* CX HACK 23950: provide a default shm surface for windows with parents in other process */
+    HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+    if (!(swp_flags & SWP_HIDEWINDOW))
+    {
+        win = get_win_ptr( parent );
+        if (win == WND_OTHER_PROCESS)
+        {
+            /* borrowed sentinel; replaced by an owned shm surface below */
+            new_surface = &dummy_surface;
+            dummy_shm_surface = TRUE;
+        }
+        else if (win && win != WND_DESKTOP) release_win_ptr( win );
+    }
 
     toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
     is_layered = new_surface && new_surface->alpha_mask;
@@ -2343,6 +2357,11 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
     old_surface = win->surface;
+
+    /* CX HACK 23950 */
+    if (dummy_shm_surface && new_surface == &dummy_surface)
+        new_surface = create_shm_surface( hwnd, parent, &new_rects->visible, old_surface );
+
     if (old_surface != new_surface) swp_flags |= SWP_FRAMECHANGED;  /* force refreshing non-client area */
 
     if (new_surface == &dummy_surface) swp_flags |= SWP_NOREDRAW;
@@ -2501,6 +2520,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         update_client_surfaces( toplevel );
     }
 
+    /* CX HACK 23950: drop the reference returned by create_shm_surface */
+    if (dummy_shm_surface && new_surface) window_surface_release( new_surface );
     return ret;
 }
 

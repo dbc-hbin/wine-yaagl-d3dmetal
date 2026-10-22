@@ -497,19 +497,20 @@ done:
 
 
 /**********************************************************************
- *              destroy_cocoa_window
+ *              detach_cocoa_window
  *
- * Destroy the whole Mac window for a given window.
+ * Detach the Mac window while holding win_data_mutex.  Destroy it after
+ * releasing the mutex, since discarded events may release client surfaces.
  */
-static void destroy_cocoa_window(struct macdrv_win_data *data)
+static WineWindow *detach_cocoa_window(struct macdrv_win_data *data)
 {
-    if (!data->cocoa_window) return;
+    WineWindow *window = data->cocoa_window;
 
     TRACE("win %p Cocoa win %p\n", data->hwnd, data->cocoa_window);
 
-    macdrv_destroy_cocoa_window(data->cocoa_window);
     data->cocoa_window = 0;
     data->on_screen = FALSE;
+    return window;
 }
 
 
@@ -1082,6 +1083,7 @@ static void macdrv_client_surface_detach(struct client_surface *client)
     {
         struct macdrv_win_data *data;
 
+        macdrv_set_view_d3dmetal_client_surface(surface->cocoa_view, NULL);
         if ((data = get_win_data(client->hwnd)))
         {
             if (data->client_view == surface->cocoa_view)
@@ -1109,8 +1111,11 @@ static void macdrv_client_surface_update(struct client_surface *client)
 
 static void macdrv_client_surface_present(struct client_surface *client, HDC hdc)
 {
-    struct macdrv_client_surface *surface = impl_from_client_surface(client);
+    struct macdrv_client_surface *surface;
     struct macdrv_win_data *data;
+
+    surface = impl_from_client_surface(client);
+    if (!surface) return;
 
     TRACE("%s\n", debugstr_client_surface(client));
 
@@ -1143,8 +1148,13 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format, B
 {
     struct macdrv_client_surface *surface;
 
-    surface = client_surface_create(&macdrv_client_surface_funcs, hwnd, pixel_format, raw);
-    surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect));
+    if (!(surface = client_surface_create(&macdrv_client_surface_funcs, hwnd, pixel_format, raw)))
+        return NULL;
+    if (!(surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect))))
+    {
+        client_surface_release(&surface->client);
+        return NULL;
+    }
     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
 
     if (surface)
@@ -1258,6 +1268,7 @@ LRESULT macdrv_DesktopWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 void macdrv_DestroyWindow(HWND hwnd)
 {
     struct macdrv_win_data *data;
+    WineWindow *window;
 
     TRACE("%p\n", hwnd);
 
@@ -1265,10 +1276,21 @@ void macdrv_DestroyWindow(HWND hwnd)
 
     if (data->drag_event) NtSetEvent(data->drag_event, NULL);
 
-    destroy_cocoa_window(data);
+    window = detach_cocoa_window(data);
 
     CFDictionaryRemoveValue(win_datas, hwnd);
     release_win_data(data);
+    if (window) macdrv_destroy_cocoa_window(window);
+
+    /* The array holds the original client-surface references without CF callbacks.
+     * Release them only after dropping the window lock: detach may reacquire it. */
+    if (data->d3dmetal_client_surfaces)
+    {
+        CFIndex i, count = CFArrayGetCount(data->d3dmetal_client_surfaces);
+        for (i = 0; i < count; i++)
+            client_surface_release((struct client_surface *)CFArrayGetValueAtIndex(data->d3dmetal_client_surfaces, i));
+        CFRelease(data->d3dmetal_client_surfaces);
+    }
     free(data);
 }
 
@@ -1325,6 +1347,7 @@ void macdrv_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWOR
 void macdrv_SetParent(HWND hwnd, HWND parent, HWND old_parent)
 {
     struct macdrv_win_data *data;
+    WineWindow *window = NULL;
 
     TRACE("%p, %p, %p\n", hwnd, parent, old_parent);
 
@@ -1336,7 +1359,7 @@ void macdrv_SetParent(HWND hwnd, HWND parent, HWND old_parent)
         if (old_parent == NtUserGetDesktopWindow())
         {
             /* destroy the old Mac window */
-            destroy_cocoa_window(data);
+            window = detach_cocoa_window(data);
         }
     }
     else  /* new top level window */
@@ -1344,6 +1367,7 @@ void macdrv_SetParent(HWND hwnd, HWND parent, HWND old_parent)
         create_cocoa_window(data);
     }
     release_win_data(data);
+    if (window) macdrv_destroy_cocoa_window(window);
 }
 
 
@@ -1897,6 +1921,28 @@ void macdrv_window_did_minimize(HWND hwnd)
     /* If all our windows are minimized, disable cursor clipping. */
     if (!macdrv_is_any_wine_window_visible())
         NtUserClipCursor(NULL);
+}
+
+
+/***********************************************************************
+ *              macdrv_window_native_cursor_sync
+ *
+ * Synchronize server ownership after Cocoa has completed a native visibility
+ * transition, or AppKit has identified the authoritative tracking window.
+ */
+void macdrv_window_native_cursor_sync(WineWindow *candidate)
+{
+    struct macdrv_native_cursor_context context;
+
+    if (!macdrv_get_native_cursor_context(&context, candidate)) return;
+
+    SERVER_START_REQ(set_cursor)
+    {
+        req->flags = SET_CURSOR_OWNER;
+        req->win = wine_server_user_handle(context.window);
+        wine_server_call(req);
+    }
+    SERVER_END_REQ;
 }
 
 

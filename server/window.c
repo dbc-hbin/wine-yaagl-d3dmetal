@@ -1055,6 +1055,15 @@ user_handle_t shallow_window_from_point( struct desktop *desktop, int x, int y )
     return desktop->top_window->handle;
 }
 
+/* validate an authoritative native top-level window supplied by its client process */
+int is_native_cursor_window( user_handle_t handle, struct desktop *desktop, struct process *process )
+{
+    struct window *win = get_user_object( handle, NTUSER_OBJ_WINDOW );
+
+    return win && win->thread && win->thread->process == process && win->desktop == desktop &&
+           win->parent == desktop->top_window;
+}
+
 /* return thread of top-most window containing point (in absolute raw coords) */
 struct thread *window_thread_from_point( user_handle_t scope, int x, int y )
 {
@@ -1251,7 +1260,9 @@ static void set_region_visible_rect( struct region *region, struct window *win )
 /* get the top-level window to clip against for a given window */
 static inline struct window *get_top_clipping_window( struct window *win )
 {
-    while (!(win->paint_flags & PAINT_HAS_SURFACE) && win->parent && !is_desktop_window(win->parent))
+    while ((!(win->paint_flags & PAINT_HAS_SURFACE) || !win->thread ||
+            win->thread->process != current->process) /* CW HACK 23950 */
+           && win->parent && !is_desktop_window(win->parent))
         win = win->parent;
     return win;
 }

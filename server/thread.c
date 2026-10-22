@@ -59,6 +59,7 @@
 #include "request.h"
 #include "user.h"
 #include "security.h"
+#include "msync.h"
 
 
 /* thread queues */
@@ -570,8 +571,8 @@ static void cleanup_thread( struct thread *thread )
     }
     clear_apc_queue( &thread->system_apc );
     clear_apc_queue( &thread->user_apc );
-    free( thread->req_data );
-    free( thread->reply_data );
+    if (thread->req_data != thread->req_buffer.data) free( thread->req_data );
+    if (thread->reply_data != thread->reply_buffer.data) free( thread->reply_data );
     if (thread->request_fd) release_object( thread->request_fd );
     if (thread->reply_fd) release_object( thread->reply_fd );
     if (thread->wait_fd) release_object( thread->wait_fd );
@@ -607,7 +608,11 @@ static void thread_destroy( struct object *obj )
     list_remove( &thread->entry );
     cleanup_thread( thread );
     release_object( thread->process );
-    if (thread->id) free_ptid( thread->id );
+    if (thread->id)
+    {
+        msync_cleanup_thread( thread->id );
+        free_ptid( thread->id );
+    }
     if (thread->token) release_object( thread->token );
     if (thread->alert_sync) release_object( thread->alert_sync );
     if (thread->sync) release_object( thread->sync );
@@ -2397,6 +2402,12 @@ DECL_HANDLER(get_inproc_alert_fd)
     if ((fd = get_inproc_sync_fd( current->alert_sync )) < 0) set_error( STATUS_INVALID_PARAMETER );
     else
     {
+        if (do_msync())
+        {
+            reply->handle = (unsigned int)fd;
+            return;
+        }
+
         reply->handle = get_thread_id( current ) | 1; /* arbitrary token */
         send_client_fd( current->process, fd, reply->handle );
     }

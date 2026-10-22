@@ -81,6 +81,16 @@
     BOOL fakingClose;
 
     CAShapeLayer* contentViewMaskLayer;
+
+    NSLock* surfaceUpdateLock;
+    CGImageRef pendingColorImage;
+    CGImageRef pendingShapeImage;
+    CGRect pendingSurfaceRect;
+    CGRect pendingDirtyRect;
+    BOOL pendingColorUpdate;
+    BOOL pendingShapeUpdate;
+    BOOL surfaceUpdateScheduled;
+    BOOL surfaceUpdatesClosed;
 }
 
 @property (retain, readonly, nonatomic) WineEventQueue* queue;
@@ -90,6 +100,7 @@
 @property (readonly, nonatomic) BOOL floating;
 @property (readonly, getter=isFullscreen, nonatomic) BOOL fullscreen;
 @property (readonly, getter=isFakingClose, nonatomic) BOOL fakingClose;
+@property (readonly, getter=isClosing, nonatomic) BOOL closing;
 @property (readonly, nonatomic) NSRect wine_fractionalFrame;
 
 /* Whether this window, when ordered in and not miniaturized, would appear to

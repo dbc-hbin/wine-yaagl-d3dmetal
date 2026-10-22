@@ -5805,7 +5805,9 @@ struct set_cursor_request
     int            show_count;
     int            x;
     int            y;
+    user_handle_t  win;
     struct rectangle clip;
+    char __pad_52[4];
 };
 struct set_cursor_reply
 {
@@ -5826,6 +5828,7 @@ struct set_cursor_reply
 #define SET_CURSOR_CLIP   0x08
 #define SET_CURSOR_NOCLIP 0x10
 #define SET_CURSOR_FSCLIP 0x20
+#define SET_CURSOR_OWNER    0x40
 
 
 struct get_cursor_history_request
@@ -6082,6 +6085,8 @@ struct get_inproc_sync_fd_reply
     struct reply_header __header;
     int           type;
     unsigned int access;
+    unsigned int shm_idx;
+    char __pad_20[4];
 };
 
 
@@ -7201,6 +7206,6 @@ union generic_reply
     struct alpc_create_port_reply alpc_create_port_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 964
+#define SERVER_PROTOCOL_VERSION 965
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

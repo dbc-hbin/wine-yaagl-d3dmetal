@@ -49,8 +49,36 @@ static struct list dce_list = LIST_INIT(dce_list);
 
 #define DCE_CACHE_SIZE 64
 
-static struct list window_surfaces = LIST_INIT( window_surfaces );
+static struct list dirty_surfaces = LIST_INIT( dirty_surfaces );
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
+static UINT dirty_generation;
+
+/* Called with the surface mutex held. */
+static void mark_window_surface_dirty( struct window_surface *surface )
+{
+    if (surface == &dummy_surface || IsRectEmpty( &surface->bounds )) return;
+
+    pthread_mutex_lock( &surfaces_lock );
+    if (surface->registered && !surface->dirty)
+    {
+        list_add_tail( &dirty_surfaces, &surface->entry );
+        surface->dirty = TRUE;
+        surface->dirty_generation = dirty_generation;
+    }
+    pthread_mutex_unlock( &surfaces_lock );
+}
+
+/* Called with the surface mutex held. */
+static void clear_window_surface_dirty( struct window_surface *surface )
+{
+    pthread_mutex_lock( &surfaces_lock );
+    if (surface->dirty)
+    {
+        list_remove( &surface->entry );
+        surface->dirty = FALSE;
+    }
+    pthread_mutex_unlock( &surfaces_lock );
+}
 
 /*******************************************************************
  * Dummy window surface for windows that shouldn't get painted.
@@ -610,10 +638,12 @@ void window_surface_lock( struct window_surface *surface )
 void window_surface_unlock( struct window_surface *surface )
 {
     if (surface == &dummy_surface) return;
+    mark_window_surface_dirty( surface );
     pthread_mutex_unlock( &surface->mutex );
 }
 
-void window_surface_flush( struct window_surface *surface )
+/* Called with the surface mutex held. */
+static void window_surface_flush_locked( struct window_surface *surface )
 {
     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     char shape_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -621,8 +651,6 @@ void window_surface_flush( struct window_surface *surface )
     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
     RECT dirty = surface->rect, bounds;
     void *color_bits;
-
-    window_surface_lock( surface );
 
     /* align bounds / dirty rect to help with 1bpp shape bitmap updates */
     bounds.left = surface->bounds.left & ~7;
@@ -645,6 +673,13 @@ void window_surface_flush( struct window_surface *surface )
             reset_bounds( &surface->bounds );
     }
 
+}
+
+void window_surface_flush( struct window_surface *surface )
+{
+    window_surface_lock( surface );
+    clear_window_surface_dirty( surface );
+    window_surface_flush_locked( surface );
     window_surface_unlock( surface );
 }
 
@@ -732,6 +767,220 @@ void window_surface_set_shape( struct window_surface *surface, HRGN shape_region
     window_surface_flush( surface );
 }
 
+
+/* CX HACK 23950 - START */
+
+struct shm_window_surface
+{
+    struct window_surface header;
+    HANDLE      section;
+    HWND        parent;
+    DWORD       parent_pid; /* owns section; the parent HWND may be destroyed first */
+    BITMAPINFO  info;
+};
+
+static struct shm_window_surface *get_shm_surface( struct window_surface *surface )
+{
+    return CONTAINING_RECORD(surface, struct shm_window_surface, header);
+}
+
+static void shm_surface_set_clip( struct window_surface *window_surface, const RECT *rects, UINT count )
+{
+    struct shm_window_surface *surface = get_shm_surface( window_surface );
+    FIXME( "(%p %p)\n", surface, rects );
+}
+
+static BOOL shm_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
+                               const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
+                               const BITMAPINFO *shape_info, const void *shape_bits )
+{
+    struct shm_window_surface *surface = get_shm_surface( window_surface );
+    struct flush_shm_surface_params params;
+
+    TRACE("%p\n", surface);
+
+    params.section = HandleToLong( surface->section );
+    params.hwnd = HandleToLong( surface->header.hwnd );
+    params.info = surface->info;
+    params.bounds = *dirty;
+
+    return send_message_timeout( surface->parent, WM_WINE_FLUSHSHMSURFACE, 0, (LPARAM)&params,
+                                 SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, FALSE );
+}
+
+static void shm_surface_destroy( struct window_surface *window_surface )
+{
+    struct shm_window_surface *surface = get_shm_surface( window_surface );
+    OBJECT_ATTRIBUTES attr = { .Length = sizeof(OBJECT_ATTRIBUTES) };
+    HANDLE parent_process;
+    unsigned int status;
+    CLIENT_ID cid;
+    HANDLE h2;
+
+    TRACE( "freeing %p\n", surface );
+    if (surface->section)
+    {
+        cid.UniqueProcess = ULongToHandle(surface->parent_pid);
+        cid.UniqueThread  = 0;
+        status = NtOpenProcess( &parent_process, PROCESS_DUP_HANDLE, &attr, &cid );
+        if (status)
+        {
+            ERR( "NtOpenProcess failed: %x\n", status );
+        }
+        else
+        {
+            status = NtDuplicateObject( parent_process, surface->section, GetCurrentProcess(), &h2,
+                                        0, FALSE, DUPLICATE_CLOSE_SOURCE );
+            if (status)
+                ERR( "NtDuplicateObject failed: %x\n", status );
+            else
+                NtClose(h2);
+
+            NtClose(parent_process);
+        }
+    }
+}
+
+static const struct window_surface_funcs shm_surface_funcs =
+{
+    .size = sizeof(struct shm_window_surface),
+    .set_clip = shm_surface_set_clip,
+    .flush = shm_surface_flush,
+    .destroy = shm_surface_destroy,
+};
+
+struct window_surface *create_shm_surface( HWND window, HWND parent, const RECT *visible_rect,
+                                           struct window_surface *old_surface )
+{
+    OBJECT_ATTRIBUTES attr = { .Length = sizeof(OBJECT_ATTRIBUTES) };
+    struct shm_window_surface *surface;
+    LARGE_INTEGER section_size;
+    HANDLE parent_process;
+    CLIENT_ID cid;
+    BITMAPINFO info;
+    HANDLE mapping;
+    unsigned int status;
+    HBITMAP bitmap;
+    DWORD pid = 0;
+    RECT r;
+
+    TRACE( "hwnd %p parent %p\n", window, parent );
+
+    r = *visible_rect;
+    OffsetRect( &r, -r.left, -r.top );
+    if (IsRectEmpty( &r )) return NULL;
+
+    if (old_surface && old_surface->funcs == &shm_surface_funcs)
+    {
+        surface = get_shm_surface( old_surface );
+        if (EqualRect( &surface->header.rect, &r ))
+        {
+            TRACE( "reusing surface %p\n", surface );
+            window_surface_add_ref( old_surface );
+            return old_surface;
+        }
+    }
+
+    info.bmiHeader.biSize        = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth       = r.right;
+    info.bmiHeader.biHeight      = -r.bottom;
+    info.bmiHeader.biPlanes      = 1;
+    info.bmiHeader.biBitCount    = 32;
+    info.bmiHeader.biSizeImage   = get_dib_image_size( &info );
+    info.bmiHeader.biCompression = BI_RGB;
+    info.bmiHeader.biClrUsed     = 0;
+
+    section_size.QuadPart = info.bmiHeader.biSizeImage;
+    status = NtCreateSection( &mapping,
+                              GENERIC_READ | SECTION_MAP_READ | SECTION_MAP_WRITE,
+                              NULL, &section_size, PAGE_READWRITE, SEC_COMMIT, 0 );
+    if (status)
+    {
+        ERR( "NtCreateSection failed: %x\n", status );
+        return NULL;
+    }
+
+    if (!(bitmap = NtGdiCreateDIBSection( 0, mapping, 0, &info, DIB_RGB_COLORS, 0, 0, 0, NULL )))
+    {
+        ERR( "NtGdiCreateDIBSection failed: %x\n", status );
+        NtClose( mapping );
+        return NULL;
+    }
+
+    surface = (struct shm_window_surface *)window_surface_create( &shm_surface_funcs, window, &r, &info, bitmap );
+    if (!surface)
+    {
+        NtGdiDeleteObjectApp( bitmap );
+        NtClose( mapping );
+        return NULL;
+    }
+    surface->info = info;
+
+    TRACE( "crating surface %p for visible_rect %s of window %p\n", surface,
+           wine_dbgstr_rect(visible_rect), window );
+
+    surface->parent = parent;
+
+    get_window_thread( parent, &pid );
+    cid.UniqueProcess = ULongToHandle(pid);
+    cid.UniqueThread  = 0;
+    status = NtOpenProcess( &parent_process, PROCESS_DUP_HANDLE, &attr, &cid );
+    if (status)
+    {
+        ERR( "NtDuplicateObject failed: %x\n", status );
+        window_surface_release( &surface->header );
+        NtClose( mapping );
+        return NULL;
+    }
+
+    surface->parent_pid = pid;
+    status = NtDuplicateObject( GetCurrentProcess(), mapping, parent_process,
+                                &surface->section, FILE_MAP_READ, FALSE, 0 );
+    NtClose( parent_process );
+    NtClose( mapping );
+    if (status)
+    {
+        ERR( "NtDuplicateObject failed: %x\n", status );
+        window_surface_release( &surface->header );
+        return NULL;
+    }
+
+    return &surface->header;
+}
+
+void process_surface_message( struct flush_shm_surface_params *params )
+{
+    HANDLE mapping = LongToHandle( params->section );
+    HWND hwnd = LongToHandle( params->hwnd );
+    SIZE_T view_size = 0;
+    unsigned int height;
+    unsigned int status;
+    void *bits = NULL;
+    HDC hdc;
+
+    TRACE( "Flushing %p window surface %s\n", hwnd, wine_dbgstr_rect( &params->bounds ));
+
+    status = NtMapViewOfSection( mapping, GetCurrentProcess(), (void**)&bits,
+                                 0, 0, NULL, &view_size, ViewShare, 0, PAGE_READONLY );
+    if (!bits)
+    {
+        ERR( "NtMapViewOfSection failed: %x\n", status );
+        return;
+    }
+    height = abs( params->info.bmiHeader.biHeight );
+
+    hdc = NtUserGetDCEx( hwnd, NULL, DCX_CLIPSIBLINGS );
+    NtGdiSetDIBitsToDeviceInternal( hdc, params->bounds.left, params->bounds.top,
+                                    params->bounds.right - params->bounds.left, params->bounds.bottom - params->bounds.top,
+                                    params->bounds.left, height - params->bounds.bottom, 0, height,
+                                    bits, &params->info, DIB_RGB_COLORS, 0, 0, FALSE, NULL);
+    NtUserReleaseDC( hwnd, hdc );
+    NtUnmapViewOfSection( GetCurrentProcess(), bits );
+}
+
+/* CX HACK 23950 - END */
+
+
 /*******************************************************************
  *           register_window_surface
  *
@@ -742,10 +991,38 @@ void register_window_surface( struct window_surface *old, struct window_surface 
     if (old == &dummy_surface) old = NULL;
     if (new == &dummy_surface) new = NULL;
     if (old == new) return;
-    pthread_mutex_lock( &surfaces_lock );
-    if (old) list_remove( &old->entry );
-    if (new) list_add_tail( &window_surfaces, &new->entry );
-    pthread_mutex_unlock( &surfaces_lock );
+
+    /* Never wait for a surface while holding surfaces_lock.  Retire the old
+       surface completely before publishing its replacement, so detached work
+       cannot reach the native driver after newer output has become eligible. */
+    if (old)
+    {
+        window_surface_lock( old );
+        pthread_mutex_lock( &surfaces_lock );
+        if (old->dirty)
+        {
+            list_remove( &old->entry );
+            old->dirty = FALSE;
+        }
+        old->registered = FALSE;
+        pthread_mutex_unlock( &surfaces_lock );
+        pthread_mutex_unlock( &old->mutex );
+    }
+
+    if (new)
+    {
+        window_surface_lock( new );
+        pthread_mutex_lock( &surfaces_lock );
+        new->registered = TRUE;
+        if (!IsRectEmpty( &new->bounds ))
+        {
+            list_add_tail( &dirty_surfaces, &new->entry );
+            new->dirty = TRUE;
+            new->dirty_generation = dirty_generation;
+        }
+        pthread_mutex_unlock( &surfaces_lock );
+        pthread_mutex_unlock( &new->mutex );
+    }
 }
 
 /*******************************************************************
@@ -756,19 +1033,57 @@ void register_window_surface( struct window_surface *old, struct window_surface 
 void flush_window_surfaces( BOOL idle )
 {
     static DWORD last_idle;
+    UINT generation;
     DWORD now;
-    struct window_surface *surface;
 
     pthread_mutex_lock( &surfaces_lock );
     now = NtGetTickCount();
     if (idle) last_idle = now;
     /* if not idle, we only flush if there's evidence that the app never goes idle */
-    else if ((int)(now - last_idle) < 50) goto done;
-
-    LIST_FOR_EACH_ENTRY( surface, &window_surfaces, struct window_surface, entry )
-        window_surface_flush( surface );
-done:
+    else if ((int)(now - last_idle) < 50)
+    {
+        pthread_mutex_unlock( &surfaces_lock );
+        return;
+    }
+    generation = dirty_generation++;
     pthread_mutex_unlock( &surfaces_lock );
+
+    for (;;)
+    {
+        struct window_surface *surface;
+        BOOL flush = FALSE;
+
+        pthread_mutex_lock( &surfaces_lock );
+        /* Treat generations as wrapping serial numbers.  A later pass inherits
+           older work whose original flusher was delayed or abandoned. */
+        if (list_empty( &dirty_surfaces ) ||
+            (INT)(LIST_ENTRY( dirty_surfaces.next, struct window_surface, entry )->dirty_generation - generation) > 0)
+        {
+            pthread_mutex_unlock( &surfaces_lock );
+            break;
+        }
+
+        surface = LIST_ENTRY( dirty_surfaces.next, struct window_surface, entry );
+        window_surface_add_ref( surface );
+        pthread_mutex_unlock( &surfaces_lock );
+
+        /* The reference protects the surface while its mutex is acquired.  Recheck
+           registration under surface->global lock order so unregister can cancel a
+           detached candidate before it reaches the native driver. */
+        window_surface_lock( surface );
+        pthread_mutex_lock( &surfaces_lock );
+        if (surface->registered && surface->dirty && (INT)(surface->dirty_generation - generation) <= 0)
+        {
+            list_remove( &surface->entry );
+            surface->dirty = FALSE;
+            flush = TRUE;
+        }
+        pthread_mutex_unlock( &surfaces_lock );
+
+        if (flush) window_surface_flush_locked( surface );
+        window_surface_unlock( surface );
+        window_surface_release( surface );
+    }
 }
 
 /***********************************************************************

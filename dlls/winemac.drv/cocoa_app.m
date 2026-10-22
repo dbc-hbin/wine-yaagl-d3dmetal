@@ -107,6 +107,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
     - (void) setupObservations;
     - (void) applicationDidBecomeActive:(NSNotification *)notification;
+    - (void) cgDisplaysWereReconfigured:(NSArray*)changes;
+    - (void) setCursorWithSelector:(SEL)selector frames:(NSArray*)frames;
 
     static void PerformRequest(void *info);
 
@@ -198,6 +200,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
     - (void) dealloc
     {
+        warp_correction_destroy(&warpCorrections);
         [windowsBeingDragged release];
         [cursor release];
         [screenFrameCGRects release];
@@ -925,9 +928,27 @@ static NSString* WineLocalizedString(unsigned int stringID)
         return ([originalDisplayModes count] > 0 || displaysCapturedForFullscreen);
     }
 
-    - (void) updateCursor:(BOOL)force
+    - (BOOL) mouseIsOverWineWindow
     {
-        if (force || lastTargetWindow)
+        NSPoint point;
+        NSInteger windowNumber;
+        WineWindow* window;
+
+        if (![NSApp isActive] || [NSApp isHidden])
+            return FALSE;
+
+        point = [NSEvent mouseLocation];
+        windowNumber = [NSWindow windowNumberAtPoint:point belowWindowWithWindowNumber:0];
+        window = (WineWindow*)[NSApp windowWithWindowNumber:windowNumber];
+
+        return [window isKindOfClass:[WineWindow class]] && [window isVisible] &&
+               ![window isMiniaturized] && ![window isClosing] &&
+               NSMouseInRect(point, [window contentRectForFrameRect:[window frame]], NO);
+    }
+
+    - (void) updateCursor:(BOOL)mouseIsOverWineWindow
+    {
+        if (mouseIsOverWineWindow)
         {
             if (clientWantsCursorHidden && !cursorHidden)
             {
@@ -962,37 +983,100 @@ static NSString* WineLocalizedString(unsigned int stringID)
         }
     }
 
-    - (void) hideCursor
+    - (void) applyCursorForWindow:(WineWindow*)window
     {
-        if (!clientWantsCursorHidden)
-        {
-            clientWantsCursorHidden = TRUE;
-            [self updateCursor:TRUE];
-        }
+        NSPoint point = [NSEvent mouseLocation];
+        BOOL eligible = [NSApp isActive] && ![NSApp isHidden] && [window isVisible] &&
+                        ![window isMiniaturized] && ![window isClosing] &&
+                        NSMouseInRect(point, [window contentRectForFrameRect:[window frame]], NO);
+
+        if (eligible)
+            cursorIsCurrent = FALSE;
+        [self updateCursor:eligible];
     }
 
-    - (void) unhideCursor
+    - (void) reconcileCursorForCurrentMouseLocation
     {
-        if (clientWantsCursorHidden)
+        BOOL mouseIsOverWineWindow = [self mouseIsOverWineWindow];
+
+        /* Programmatic cursor changes require strict global hit-testing so a
+           Wine window cannot steal the cursor from a native overlay. */
+        if (mouseIsOverWineWindow)
+            cursorIsCurrent = FALSE;
+        [self updateCursor:mouseIsOverWineWindow];
+    }
+
+    /* Single entry point for a native cursor payload.  Prepares the retained
+       cursor, the animation frames and timer, and the desired visibility, then
+       performs exactly one strict reconciliation.  Runs on the main thread. */
+    - (void) setCursorWithSelector:(SEL)selector frames:(NSArray*)frames
+    {
+        if (selector)
         {
+            /* A named cursor takes precedence over frames and is always visible. */
+            [self stopCursorAnimation];
+            self.cursor = [NSCursor performSelector:selector];
             clientWantsCursorHidden = FALSE;
-            [self updateCursor:FALSE];
         }
+        else if ([frames count])
+        {
+            /* Identical frames keep the retained cursor and the running
+               animation, but still get the final reconciliation below to
+               repair an arrow the system may have installed over them. */
+            clientWantsCursorHidden = FALSE;
+            if (self.cursorFrames != frames && ![self.cursorFrames isEqualToArray:frames])
+            {
+                [cursorTimer invalidate];
+                self.cursorTimer = nil;
+                self.cursorFrames = frames;
+                cursorFrame = 0;
+
+                if ([frames count] > 1)
+                {
+                    NSDictionary* frame = frames[0];
+                    NSTimeInterval duration = [frame[@"duration"] doubleValue];
+                    NSDate* date = [NSDate dateWithTimeIntervalSinceNow:duration];
+                    self.cursorTimer = [[[NSTimer alloc] initWithFireDate:date
+                                                                 interval:1000000
+                                                                   target:self
+                                                                 selector:@selector(nextCursorFrame:)
+                                                                 userInfo:nil
+                                                                  repeats:YES] autorelease];
+                    [[NSRunLoop currentRunLoop] addTimer:cursorTimer forMode:NSRunLoopCommonModes];
+                }
+
+                [self setCursor];
+            }
+        }
+        else
+        {
+            /* Hidden payload: retain the last cursor so it can be restored
+               later, but drop the animation.  Reconcile even if already hidden. */
+            [self stopCursorAnimation];
+            clientWantsCursorHidden = TRUE;
+        }
+
+        [self reconcileCursorForCurrentMouseLocation];
     }
 
     - (void) setCursor:(NSCursor*)newCursor
     {
+        /* State only.  The native cursor is applied by the reconciliation at
+           the end of the payload entry point, never here.  The previously
+           applied native cursor stays valid until that reconcile, which
+           force-clears cursorIsCurrent on the eligible path, so the
+           ownership flag is deliberately left untouched. */
         if (newCursor != cursor)
         {
             [cursor release];
             cursor = [newCursor retain];
-            cursorIsCurrent = FALSE;
-            [self updateCursor:FALSE];
         }
     }
 
     - (void) setCursor
     {
+        /* State only: build the retained cursor for the current animation
+           frame.  The caller reconciles. */
         NSDictionary* frame = cursorFrames[cursorFrame];
         CGImageRef cgimage = (CGImageRef)frame[@"image"];
         CGSize size = CGSizeMake(CGImageGetWidth(cgimage), CGImageGetHeight(cgimage));
@@ -1005,7 +1089,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
         hotSpot = cgpoint_mac_from_win(hotSpot);
         self.cursor = [[[NSCursor alloc] initWithImage:image hotSpot:NSPointFromCGPoint(hotSpot)] autorelease];
         [image release];
-        [self unhideCursor];
     }
 
     - (void) nextCursorFrame:(NSTimer*)theTimer
@@ -1018,6 +1101,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
         if (cursorFrame >= [cursorFrames count])
             cursorFrame = 0;
         [self setCursor];
+        clientWantsCursorHidden = FALSE;
+        [self reconcileCursorForCurrentMouseLocation];
 
         frame = cursorFrames[cursorFrame];
         duration = [frame[@"duration"] doubleValue];
@@ -1025,34 +1110,12 @@ static NSString* WineLocalizedString(unsigned int stringID)
         [cursorTimer setFireDate:date];
     }
 
-    - (void) setCursorWithFrames:(NSArray*)frames
+    - (void) stopCursorAnimation
     {
-        if (self.cursorFrames == frames || [self.cursorFrames isEqualToArray:frames])
-            return;
-
-        self.cursorFrames = frames;
-        cursorFrame = 0;
         [cursorTimer invalidate];
         self.cursorTimer = nil;
-
-        if ([frames count])
-        {
-            if ([frames count] > 1)
-            {
-                NSDictionary* frame = frames[0];
-                NSTimeInterval duration = [frame[@"duration"] doubleValue];
-                NSDate* date = [NSDate dateWithTimeIntervalSinceNow:duration];
-                self.cursorTimer = [[[NSTimer alloc] initWithFireDate:date
-                                                             interval:1000000
-                                                               target:self
-                                                             selector:@selector(nextCursorFrame:)
-                                                             userInfo:nil
-                                                              repeats:YES] autorelease];
-                [[NSRunLoop currentRunLoop] addTimer:cursorTimer forMode:NSRunLoopCommonModes];
-            }
-
-            [self setCursor];
-        }
+        self.cursorFrames = nil;
+        cursorFrame = 0;
     }
 
     - (void) setApplicationIconFromCGImageArray:(NSArray*)images
@@ -1153,6 +1216,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
             ret = [clipCursorHandler setCursorPosition:pos];
         else
         {
+            struct warp_correction_record warpRecord;
+            NSPoint nativeLocation;
+            CGError warpError;
+
             if (self.clippingCursor)
                 [clipCursorHandler clipCursorLocation:&pos];
 
@@ -1170,14 +1237,42 @@ static NSString* WineLocalizedString(unsigned int stringID)
             // the local events suppression interval to 0 for the warp.  That's
             // deprecated, but I'm not aware of any other way.  For good
             // measure, we do both.
-            CGSetLocalEventsSuppressionInterval(0);
-            ret = (CGWarpMouseCursorPosition(pos) == kCGErrorSuccess);
-            CGSetLocalEventsSuppressionInterval(0.25);
-            if (ret)
+            //
+            // Unlike the cursor-clipping event tap, this direct warp has no
+            // tap to cancel its displacement out of the next event's deltas.
+            // Record the actual pre/post native locations so that
+            // -handleMouseMove: can subtract our own warp displacement when it
+            // is finally delivered (see cocoa_warpconsumption.h).
+            /* Reserve the record before the native warp so that a successful
+               warp can never go untracked; on allocation failure we simply
+               don't move the cursor. */
+            if (!warp_correction_reserve(&warpCorrections))
+                ret = FALSE;
+            else
             {
-                lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
+                nativeLocation = [self flippedMouseLocation:[NSEvent mouseLocation]];
+                warpRecord.from_x = nativeLocation.x;
+                warpRecord.from_y = nativeLocation.y;
+                warpRecord.time_before = [[NSProcessInfo processInfo] systemUptime];
+                CGSetLocalEventsSuppressionInterval(0);
+                warpError = CGWarpMouseCursorPosition(pos);
+                ret = (warpError == kCGErrorSuccess);
+                CGSetLocalEventsSuppressionInterval(0.25);
+                if (ret)
+                {
+                    warpRecord.time_after = [[NSProcessInfo processInfo] systemUptime];
+                    nativeLocation = [self flippedMouseLocation:[NSEvent mouseLocation]];
+                    warpRecord.to_x = nativeLocation.x;
+                    warpRecord.to_y = nativeLocation.y;
+                    /* A warp which didn't actually move the cursor (e.g. the
+                       recenter performed when clipping starts) has no displacement
+                       to correct later. */
+                    warp_correction_push(&warpCorrections, &warpRecord);
 
-                CGAssociateMouseAndMouseCursorPosition(true);
+                    lastSetCursorPositionTime = warpRecord.time_after;
+
+                    CGAssociateMouseAndMouseCursorPosition(true);
+                }
             }
         }
 
@@ -1226,6 +1321,9 @@ static NSString* WineLocalizedString(unsigned int stringID)
             return FALSE;
 
         [self setCursorPosition:NSPointToCGPoint([self flippedMouseLocation:[NSEvent mouseLocation]])];
+        lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
+        mouseMoveDeltaX = 0;
+        mouseMoveDeltaY = 0;
 
         [self updateWindowsForCursorClipping];
 
@@ -1241,6 +1339,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
             return FALSE;
 
         lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
+        mouseMoveDeltaX = 0;
+        mouseMoveDeltaY = 0;
 
         [self updateWindowsForCursorClipping];
 
@@ -1329,6 +1429,27 @@ static NSString* WineLocalizedString(unsigned int stringID)
     {
         WineWindow* targetWindow;
         BOOL drag = [anEvent type] != NSEventTypeMouseMoved;
+        CGPoint eventPoint = CGEventGetLocation([anEvent CGEvent]);
+        double deltaX = [anEvent deltaX], deltaY = [anEvent deltaY];
+        unsigned int warpsFinished;
+
+        /* Direct cursor warps (no event tap) fold their displacement into the
+           delta of a later event.  Subtract our own warp displacement before
+           the deltas contribute anything, even if the event ends up filtered
+           or not posted for a Wine window: movements consumed elsewhere must
+           not leave a stale correction to distort later real movement.  The
+           zero-delta notification around a warp does not consume its pending
+           displacement: the captured nonzero movement follows it later. */
+        warpsFinished = warp_correction_match(&warpCorrections, [anEvent timestamp], deltaX, deltaY,
+                                              eventPoint.x, eventPoint.y);
+        if (warpsFinished)
+        {
+            double subtractX, subtractY;
+
+            warp_correction_consume(&warpCorrections, warpsFinished, &subtractX, &subtractY);
+            deltaX -= subtractX;
+            deltaY -= subtractY;
+        }
 
         if ([windowsBeingDragged count])
             targetWindow = nil;
@@ -1342,8 +1463,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
                event indicates its window is the main window, even if the cursor is
                over a different window.  Find the actual WineWindow that is under the
                cursor and post the event as being for that window. */
-            CGPoint cgpoint = CGEventGetLocation([anEvent CGEvent]);
-            NSPoint point = [self flippedMouseLocation:NSPointFromCGPoint(cgpoint)];
+            NSPoint point = [self flippedMouseLocation:NSPointFromCGPoint(eventPoint)];
             NSInteger windowUnderNumber;
 
             windowUnderNumber = [NSWindow windowNumberAtPoint:point
@@ -1355,9 +1475,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
         if ([targetWindow isKindOfClass:[WineWindow class]])
         {
-            CGPoint point = CGEventGetLocation([anEvent CGEvent]);
+            CGPoint point = eventPoint;
             macdrv_event* event;
-            BOOL absolute;
+            BOOL absolute, noncoalescible;
+            double scale = retina_on ? 2 : 1;
 
             // If we recently warped the cursor (other than in our cursor-clipping
             // event tap), discard mouse move events until we see an event which is
@@ -1367,11 +1488,20 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 if ([anEvent timestamp] <= lastSetCursorPositionTime)
                     return;
 
+                /* The synthetic notification around our own warp (or the event
+                   tap removing the synthetic center-warp displacement) leaves a
+                   zero-motion event.  Keep waiting across that zero-motion event
+                   (and across buttons or wheels, which never enter this path)
+                   until the first real post-warp movement. */
+                if (!deltaX && !deltaY)
+                    return;
+
                 lastSetCursorPositionTime = 0;
                 forceNextMouseMoveAbsolute = TRUE;
             }
 
-            if (forceNextMouseMoveAbsolute || targetWindow != lastTargetWindow)
+            noncoalescible = forceNextMouseMoveAbsolute || targetWindow != lastTargetWindow;
+            if (noncoalescible)
             {
                 absolute = TRUE;
                 forceNextMouseMoveAbsolute = FALSE;
@@ -1386,8 +1516,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 // union of the screen frames), then we figure the cursor would
                 // have moved outside if it could but it was pinned.
                 CGPoint computedPoint = point;
-                CGFloat deltaX = [anEvent deltaX];
-                CGFloat deltaY = [anEvent deltaY];
 
                 if (deltaX > 0.001)
                     computedPoint.x++;
@@ -1438,12 +1566,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
             }
             else
             {
-                double scale = retina_on ? 2 : 1;
-
                 /* Add event delta to accumulated delta error */
                 /* deltaY is already flipped */
-                mouseMoveDeltaX += [anEvent deltaX];
-                mouseMoveDeltaY += [anEvent deltaY];
+                mouseMoveDeltaX += deltaX;
+                mouseMoveDeltaY += deltaY;
 
                 event = macdrv_create_event(MOUSE_MOVED_RELATIVE, targetWindow);
                 event->mouse_moved.x = mouseMoveDeltaX * scale;
@@ -1454,10 +1580,25 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 mouseMoveDeltaY -= event->mouse_moved.y / scale;
             }
 
-            if (event->type == MOUSE_MOVED_ABSOLUTE || event->mouse_moved.x || event->mouse_moved.y)
+            /* Preserve every physical Cocoa delta for RawInput independently of
+               the legacy absolute/relative baseline, minus our own direct-warp
+               displacement (the event tap has already corrected post-warp
+               deltas in its path).  deltaY is already flipped. */
+            rawMouseMoveDeltaX += deltaX;
+            rawMouseMoveDeltaY += deltaY;
+            event->mouse_moved.raw_x = rawMouseMoveDeltaX * scale;
+            event->mouse_moved.raw_y = rawMouseMoveDeltaY * scale;
+
+            /* Keep the remainder after integer truncation. */
+            rawMouseMoveDeltaX -= event->mouse_moved.raw_x / scale;
+            rawMouseMoveDeltaY -= event->mouse_moved.raw_y / scale;
+
+            if (event->type == MOUSE_MOVED_ABSOLUTE || event->mouse_moved.x || event->mouse_moved.y ||
+                event->mouse_moved.raw_x || event->mouse_moved.raw_y)
             {
                 event->mouse_moved.time_ms = [self ticksForEventTime:[anEvent timestamp]];
                 event->mouse_moved.drag = drag;
+                event->mouse_moved.noncoalescible = noncoalescible;
 
                 [targetWindow.queue postEvent:event];
             }
@@ -1469,7 +1610,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
         else
             lastTargetWindow = nil;
 
-        [self updateCursor:FALSE];
+        [self updateCursor:[targetWindow isKindOfClass:[WineWindow class]]];
     }
 
     - (void) handleMouseButton:(NSEvent*)theEvent
@@ -1619,6 +1760,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
         // dragged events and, after that, any notion of the cursor position
         // computed from accumulating deltas would be wrong.
         forceNextMouseMoveAbsolute = TRUE;
+        mouseMoveDeltaX = 0;
+        mouseMoveDeltaY = 0;
     }
 
     - (void) handleScrollWheel:(NSEvent*)theEvent
@@ -2155,10 +2298,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
     /*
      * ---------- NSApplicationDelegate methods ----------
      */
-    - (void)cgDisplay:(CGDirectDisplayID)display wasReconfiguredWithFlags:(CGDisplayChangeSummaryFlags)flags
+    - (void)cgDisplaysWereReconfigured:(NSArray*)changes
     {
-        NSDictionary *userInfo;
-
         primaryScreenHeightValid = FALSE;
         [self sendDisplaysChanged:FALSE];
         [self adjustWindowLevels];
@@ -2168,28 +2309,63 @@ static NSString* WineLocalizedString(unsigned int stringID)
            next mouse move event starts over from an absolute baseline. */
         forceNextMouseMoveAbsolute = TRUE;
 
-        userInfo = @{
-            WineDisplayConfigurationNotificationDisplayIDKey: @(display),
-            WineDisplayConfigurationNotificationFlagsKey: @(flags)
-        };
-        [NSNotificationCenter.defaultCenter postNotificationName:WineDisplayConfigurationChangedNotification
-                                                          object:NSApp
-                                                        userInfo:userInfo];
+        /* Preserve each callback's display, flags, and serialized order for
+           observers while doing the compatible global work once per burst. */
+        for (NSArray *change in changes)
+        {
+            NSDictionary *userInfo = @{
+                WineDisplayConfigurationNotificationDisplayIDKey: change[0],
+                WineDisplayConfigurationNotificationFlagsKey: change[1]
+            };
+            [NSNotificationCenter.defaultCenter postNotificationName:WineDisplayConfigurationChangedNotification
+                                                              object:NSApp
+                                                            userInfo:userInfo];
+        }
     }
 
     static void DisplayReconfigCallback(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void *userInfo)
     {
+        static dispatch_queue_t queue;
+        static NSMutableArray *pendingChanges;
+        static BOOL scheduled;
+        static dispatch_once_t once;
+        __block BOOL schedule = FALSE;
+
         /* A callback with flag == kCGDisplayBeginConfigurationFlag is
            documented to be sent at the beginning of a change set. We should
            ignore it; the actual changes will come in separate callbacks. */
         if (flags == kCGDisplayBeginConfigurationFlag)
             return;
 
-        /* We're called back on an internal CG thread, so kick this over to the
-           main thread. */
-        OnMainThreadAsync(^{
-            [WineApplicationController.sharedController cgDisplay:display wasReconfiguredWithFlags:flags];
+        dispatch_once(&once, ^{
+            queue = dispatch_queue_create("org.winehq.WineDisplayReconfigQueue", NULL);
+            pendingChanges = [[NSMutableArray alloc] init];
         });
+        dispatch_sync(queue, ^{
+            /* The CG callback thread has no pool; pendingChanges retains the record. */
+            @autoreleasepool
+            {
+                [pendingChanges addObject:@[ @(display), @(flags) ]];
+            }
+            if (!scheduled) schedule = scheduled = TRUE;
+        });
+
+        if (schedule)
+        {
+            /* We're called back on an internal CG thread, so kick the burst over
+               to the main thread. */
+            OnMainThreadAsync(^{
+                __block NSArray *changes;
+
+                dispatch_sync(queue, ^{
+                    changes = [pendingChanges copy];
+                    [pendingChanges removeAllObjects];
+                    scheduled = FALSE;
+                });
+                [WineApplicationController.sharedController cgDisplaysWereReconfigured:changes];
+                [changes release];
+            });
+        }
     }
 
     - (void)applicationDidFinishLaunching:(NSNotification *)notification
@@ -2230,8 +2406,17 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
         // The cursor probably moved while we were inactive.  Accumulated mouse
         // movement deltas are invalidated.  Make sure the next mouse move event
-        // starts over from an absolute baseline.
+        // starts over from an absolute baseline.  Pending warp corrections are
+        // invalidated, too: any folds delivered while we were inactive were not
+        // consumed here and must not distort later movement.
         forceNextMouseMoveAbsolute = TRUE;
+        mouseMoveDeltaX = 0;
+        mouseMoveDeltaY = 0;
+        warp_correction_clear(&warpCorrections);
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self reconcileCursorForCurrentMouseLocation];
+        });
     }
 
     - (void)applicationDidResignActive:(NSNotification *)notification
@@ -2240,6 +2425,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
         WineEventQueue* queue;
 
         [self invalidateGotFocusEvents];
+
+        /* Mouse movements are consumed by whoever is active from here on; any
+           warp folds they deliver are not ours to see.  Drop pending
+           corrections so they cannot leak into events we receive later. */
+        warp_correction_clear(&warpCorrections);
 
         event = macdrv_create_event(APP_DEACTIVATED, nil);
 
@@ -2473,36 +2663,14 @@ int macdrv_set_display_mode(CGDirectDisplayID displayID, CGDisplayModeRef displa
  */
 void macdrv_set_cursor(CFStringRef name, CFArrayRef frames)
 {
-    SEL sel;
+    SEL sel = NSSelectorFromString((NSString*)name);
+    NSArray* nsframes = sel ? nil : (NSArray*)frames;
 
-    sel = NSSelectorFromString((NSString*)name);
-    if (sel)
-    {
-        OnMainThreadAsync(^{
-            WineApplicationController* controller = [WineApplicationController sharedController];
-            [controller setCursorWithFrames:nil];
-            controller.cursor = [NSCursor performSelector:sel];
-            [controller unhideCursor];
-        });
-    }
-    else
-    {
-        NSArray* nsframes = (NSArray*)frames;
-        if ([nsframes count])
-        {
-            OnMainThreadAsync(^{
-                [[WineApplicationController sharedController] setCursorWithFrames:nsframes];
-            });
-        }
-        else
-        {
-            OnMainThreadAsync(^{
-                WineApplicationController* controller = [WineApplicationController sharedController];
-                [controller setCursorWithFrames:nil];
-                [controller hideCursor];
-            });
-        }
-    }
+    /* One asynchronous request per native payload.  The block retains the
+       payload and the controller entry performs exactly one reconciliation. */
+    OnMainThreadAsync(^{
+        [[WineApplicationController sharedController] setCursorWithSelector:sel frames:nsframes];
+    });
 }
 
 /***********************************************************************
@@ -2520,6 +2688,46 @@ int macdrv_get_cursor_position(CGPoint *pos)
     });
 
     return TRUE;
+}
+
+bool macdrv_get_native_cursor_context(struct macdrv_native_cursor_context *context, WineWindow *candidate)
+{
+    __block bool ret = false;
+
+    OnMainThread(^{
+        NSPoint point = [NSEvent mouseLocation];
+        NSInteger number;
+        WineWindow *window;
+
+        if (![NSApp isActive])
+        {
+            WineWindow *fallback = (WineWindow *)candidate;
+
+            /* An actual visible Wine ordering transition seeds the retained cursor while the
+               app is inactive; updateCursor still prevents native application until activation. */
+            if (![fallback isKindOfClass:[WineWindow class]] || ![fallback isVisible] ||
+                [fallback isMiniaturized] || [fallback isClosing] ||
+                !NSPointInRect(point, [fallback frame]))
+                return;
+            window = fallback;
+        }
+        else
+        {
+            if ([NSApp isHidden]) return;
+            number = [NSWindow windowNumberAtPoint:point belowWindowWithWindowNumber:0];
+            window = (WineWindow *)[NSApp windowWithWindowNumber:number];
+            if (number && !window) return;
+        }
+        if (window && (![window isKindOfClass:[WineWindow class]] || ![window isVisible] ||
+                       [window isMiniaturized] || [window isClosing] ||
+                       !NSMouseInRect(point, [window contentRectForFrameRect:[window frame]], NO)))
+            return;
+
+        context->window = macdrv_get_window_hwnd(window);
+        ret = true;
+    });
+
+    return ret;
 }
 
 /***********************************************************************

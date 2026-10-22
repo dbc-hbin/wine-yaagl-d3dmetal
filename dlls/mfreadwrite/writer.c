@@ -398,6 +398,7 @@ static ULONG WINAPI sink_writer_Release(IMFSinkWriterEx *iface)
             stream_release_transforms(stream);
             sink_writer_drop_pending_items(stream);
         }
+        free(writer->streams.items);
         DeleteCriticalSection(&writer->cs);
         free(writer);
     }

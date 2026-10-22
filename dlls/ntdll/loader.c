@@ -1393,6 +1393,9 @@ static BOOL alloc_tls_slot( LDR_DATA_TABLE_ENTRY *mod )
             if (!new) return FALSE;
             if (old) memcpy( new, old, old_module_count * sizeof(*new) );
             teb->ThreadLocalStoragePointer = new;
+#ifdef __x86_64__ /* The Unix host records the macOS pthread overlay here. */
+            if (teb->Instrumentation[0]) ((TEB *)teb->Instrumentation[0])->ThreadLocalStoragePointer = new;
+#endif
             TRACE( "thread %04lx tls block %p -> %p\n", HandleToULong(teb->ClientId.UniqueThread), old, new );
             /* FIXME: can't free old block here, should be freed at thread exit */
         }
@@ -1594,11 +1597,18 @@ static WINE_MODREF *alloc_module( HMODULE hModule, const UNICODE_STRING *nt_name
         ERR( "rtl_rb_tree_put failed.\n" );
     /* wait until init is called for inserting into InInitializationOrderModuleList */
 
+    /* HACK: MEM_EXECUTE_OPTION_ENABLE calls virtual_set_force_exec, which mprotects every mapped
+     * view — brutally slow on macOS 26.x under Rosetta. Skip it if WINE_DISABLE_NX_COMPAT is set. */
     if (!(nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_NX_COMPAT))
     {
-        ULONG flags = MEM_EXECUTE_OPTION_ENABLE;
-        WARN( "disabling no-exec because of %s\n", debugstr_w(wm->ldr.BaseDllName.Buffer) );
-        NtSetInformationProcess( GetCurrentProcess(), ProcessExecuteFlags, &flags, sizeof(flags) );
+        UNICODE_STRING val_str, name_str = RTL_CONSTANT_STRING( L"WINE_DISABLE_NX_COMPAT" );
+        val_str.MaximumLength = 0;
+        if (RtlQueryEnvironmentVariable_U( NULL, &name_str, &val_str ) == STATUS_VARIABLE_NOT_FOUND)
+        {
+            ULONG flags = MEM_EXECUTE_OPTION_ENABLE;
+            WARN( "disabling no-exec because of %s\n", debugstr_w(wm->ldr.BaseDllName.Buffer) );
+            NtSetInformationProcess( GetCurrentProcess(), ProcessExecuteFlags, &flags, sizeof(flags) );
+        }
     }
     return wm;
 }
@@ -1638,6 +1648,10 @@ static NTSTATUS alloc_thread_tls(void)
         TRACE( "slot %u: %u/%lu bytes at %p\n", i, size, dir->SizeOfZeroFill, pointers[i] );
     }
     NtCurrentTeb()->ThreadLocalStoragePointer = pointers;
+#ifdef __x86_64__
+    if (NtCurrentTeb()->Instrumentation[0])
+        ((TEB *)NtCurrentTeb()->Instrumentation[0])->ThreadLocalStoragePointer = pointers;
+#endif
     return STATUS_SUCCESS;
 }
 
@@ -2339,6 +2353,15 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
 
     TRACE_(loaddll)( "Loaded %s at %p: %s\n", debugstr_w(wm->ldr.FullDllName.Buffer), *module,
                      is_builtin ? "builtin" : "native" );
+
+#if defined(__x86_64__)
+    /* CW HACK 22434 */
+    if (is_builtin == FALSE)
+    {
+        struct pe_module_loaded_params params = { *module, (void *)((BYTE *)*module + map_size) };
+        WINE_UNIX_CALL( unix_pe_module_loaded, &params );
+    }
+#endif
 
     wm->ldr.LoadCount = 1;
     *pwm = wm;
@@ -3420,6 +3443,17 @@ NTSTATUS WINAPI __wine_ctrl_routine( void *arg )
 
 
 /***********************************************************************
+ *              __wine_unix_call
+ *
+ * CW HACK 22435: Needed by D3DMetal PE DLLs
+ */
+NTSTATUS WINAPI __wine_unix_call_exported( unixlib_handle_t handle, unsigned int code, void *args )
+{
+    return __wine_unix_call( handle, code, args );
+}
+
+
+/***********************************************************************
  *           __wine_unix_spawnvp
  */
 NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
@@ -3997,6 +4031,10 @@ void WINAPI LdrShutdownThread(void)
     if ((pointers = NtCurrentTeb()->ThreadLocalStoragePointer))
     {
         NtCurrentTeb()->ThreadLocalStoragePointer = NULL;
+#ifdef __x86_64__
+        if (NtCurrentTeb()->Instrumentation[0])
+            ((TEB *)NtCurrentTeb()->Instrumentation[0])->ThreadLocalStoragePointer = NULL;
+#endif
         for (i = 0; i < tls_module_count; i++) RtlFreeHeap( GetProcessHeap(), 0, pointers[i] );
         RtlFreeHeap( GetProcessHeap(), 0, pointers );
     }

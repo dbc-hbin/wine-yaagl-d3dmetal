@@ -84,6 +84,9 @@ extern bool allow_software_rendering;
 
 extern UINT64 app_icon_callback;
 extern UINT64 app_quit_request_callback;
+extern UINT64 regcreateopenkeyexa_callback;
+extern UINT64 regqueryvalueexa_callback;
+extern UINT64 regsetvalueexa_callback;
 
 extern const char* debugstr_cf(CFTypeRef t);
 
@@ -242,6 +245,9 @@ struct macdrv_win_data
     unsigned int        per_pixel_alpha : 1;    /* is window using per-pixel alpha? */
     unsigned int        minimized : 1;          /* is window minimized? */
     unsigned int        fullscreen : 1;         /* is the window visible rect fullscreen? (unrelated to native AppKit/Cocoa fullscreen) */
+
+    /* CW HACK 22435 */
+    CFMutableArrayRef   d3dmetal_client_surfaces;
 };
 
 struct macdrv_client_surface
@@ -274,6 +280,7 @@ extern void macdrv_window_maximize_requested(HWND hwnd);
 extern void macdrv_window_minimize_requested(HWND hwnd);
 extern void macdrv_window_did_minimize(HWND hwnd);
 extern void macdrv_window_did_unminimize(HWND hwnd);
+extern void macdrv_window_native_cursor_sync(WineWindow *candidate);
 extern void macdrv_window_brought_forward(HWND hwnd);
 extern void macdrv_window_resize_ended(HWND hwnd);
 extern void macdrv_window_restore_requested(HWND hwnd, const macdrv_event *event);

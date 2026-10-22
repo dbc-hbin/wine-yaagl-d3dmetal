@@ -292,7 +292,7 @@ void wg_parser_stream_get_codec_format(wg_parser_stream_t stream, struct wg_form
     WINE_UNIX_CALL(unix_wg_parser_stream_get_codec_format, &params);
 }
 
-void wg_parser_stream_enable(wg_parser_stream_t stream, const struct wg_format *format)
+HRESULT wg_parser_stream_enable(wg_parser_stream_t stream, const struct wg_format *format)
 {
     struct wg_parser_stream_enable_params params =
     {
@@ -302,7 +302,7 @@ void wg_parser_stream_enable(wg_parser_stream_t stream, const struct wg_format *
 
     TRACE("stream %#I64x, format %p.\n", stream, format);
 
-    WINE_UNIX_CALL(unix_wg_parser_stream_enable, &params);
+    return WINE_UNIX_CALL(unix_wg_parser_stream_enable, &params);
 }
 
 void wg_parser_stream_disable(wg_parser_stream_t stream)

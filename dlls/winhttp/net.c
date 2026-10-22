@@ -428,6 +428,8 @@ DWORD netconn_secure_connect( struct netconn *conn, WCHAR *hostname, DWORD secur
     }
 
     free(read_buf);
+    if(out_buf.pvBuffer)
+        FreeContextBuffer(out_buf.pvBuffer);
 
     if(status != SEC_E_OK || res != ERROR_SUCCESS) {
         WARN( "Failed to initialize security context: %#lx\n", status );

@@ -99,8 +99,15 @@ typedef struct _IXAudio2Impl {
 
     DWORD last_query_glitches;
 
+    CRITICAL_SECTION callback_lock;
+    CONDITION_VARIABLE callback_done;
+    struct list callback_dispatches;
+    UINT64 callback_serial;
     UINT32 ncbs;
-    IXAudio2EngineCallback **cbs;
+    struct engine_callback {
+        IXAudio2EngineCallback *callback;
+        UINT64 serial;
+    } *cbs;
 } IXAudio2Impl;
 
 /* xaudio_dll.c */

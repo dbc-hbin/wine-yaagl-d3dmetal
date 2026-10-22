@@ -89,6 +89,15 @@ WINE_DECLARE_DEBUG_CHANNEL(seh);
 
 #include "dwarf.h"
 
+#ifdef __APPLE__
+/* CW Hack 24256 */
+#include <sys/sysctl.h>
+static BOOL is_rosetta2;
+
+/* CW Hack 23427 */
+static BOOL sequoia_or_later = FALSE;
+#endif
+
 static USHORT cs32_sel;  /* selector for %cs in 32-bit mode */
 static USHORT cs64_sel;  /* selector for %cs in 64-bit mode */
 static USHORT ds64_sel;  /* selector for %ds/%es/%ss in 64-bit mode */
@@ -823,9 +832,8 @@ static inline void leave_handler( struct thread_data *data, ucontext_t *sigconte
         if (fs32_sel) __asm__ volatile( "movw %0,%%fs" :: "r" (fs32_sel) );
     }
 #elif defined __APPLE__
-    if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
-        !is_inside_syscall( data, RSP_sig(sigcontext )))
-        _thread_set_tsd_base( (uint64_t)data->teb );
+    /* CX Apple GS overlay: GSBASE stays pthread; TEB Self/TLS/Peb are mirrored
+     * into pthread TLS slots. Do not _thread_set_tsd_base(teb). */
 #endif
     if (is_16bit( sigcontext )) return;
 #ifdef DS_sig
@@ -894,6 +902,13 @@ static void save_context( struct thread_data *data, struct xcontext *xcontext,
 
         context->ContextFlags |= CONTEXT_FLOATING_POINT;
         memcpy( &context->FltSave, FPU_sig(sigcontext), sizeof(context->FltSave) );
+#ifdef __APPLE__
+        /* CW Hack 24256: mxcsr in signal contexts is incorrect in Rosetta.
+           In Rosetta only, the actual value of the register from within the
+           handler is correct (on Intel it has some default value). */
+        if (is_rosetta2)
+            __asm__ volatile( "stmxcsr %0" : "=m" (context->FltSave.MxCsr) );
+#endif
         context->MxCsr = context->FltSave.MxCsr;
         if (xstate_extended_features && (xs = XState_sig(FPU_sig(sigcontext))))
         {
@@ -1682,13 +1697,6 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
                    "jz 1f\n\t"
                    "movw %ax,%fs\n"
                    "1:\n\t"
-#elif defined __APPLE__
-                   "movq %rcx,%r10\n\t"
-                   "movq %r13,%rdi\n\t"
-                   "xorl %esi,%esi\n\t"
-                   "movl $0x3000003,%eax\n\t"  /* _thread_set_tsd_base */
-                   "syscall\n\t"
-                   "movq %r10,%rcx\n\t"
 #endif
                    "movq 0x330(%r13),%r10\n\t" /* amd64_thread_data()->instrumentation_callback */
                    "movq (%r10),%r10\n\t"
@@ -1808,6 +1816,154 @@ NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status 
     user_mode_callback_return( ret_ptr, ret_len, status, data->teb );
 }
 
+#ifdef __APPLE__
+/***********************************************************************
+ *           handle_cet_nop
+ *
+ * Check if the fault location is an Intel CET instruction that should be treated as a NOP.
+ * Rosetta on Big Sur throws an exception for this, but is fixed in Monterey.
+ * CW HACK 20186
+ */
+static inline BOOL handle_cet_nop( ucontext_t *sigcontext, CONTEXT *context )
+{
+    BYTE instr[16];
+    unsigned int i, prefix_count = 0;
+    unsigned int len = virtual_uninterrupted_read_memory( (BYTE *)context->Rip, instr, sizeof(instr) );
+
+    for (i = 0; i < len; i++) switch (instr[i])
+    {
+    /* instruction prefixes */
+    case 0x2e:  /* %cs: */
+    case 0x36:  /* %ss: */
+    case 0x3e:  /* %ds: */
+    case 0x26:  /* %es: */
+    case 0x40:  /* rex */
+    case 0x41:  /* rex */
+    case 0x42:  /* rex */
+    case 0x43:  /* rex */
+    case 0x44:  /* rex */
+    case 0x45:  /* rex */
+    case 0x46:  /* rex */
+    case 0x47:  /* rex */
+    case 0x48:  /* rex */
+    case 0x49:  /* rex */
+    case 0x4a:  /* rex */
+    case 0x4b:  /* rex */
+    case 0x4c:  /* rex */
+    case 0x4d:  /* rex */
+    case 0x4e:  /* rex */
+    case 0x4f:  /* rex */
+    case 0x64:  /* %fs: */
+    case 0x65:  /* %gs: */
+    case 0x66:  /* opcode size */
+    case 0x67:  /* addr size */
+    case 0xf0:  /* lock */
+    case 0xf2:  /* repne */
+    case 0xf3:  /* repe */
+        if (++prefix_count >= 15) return FALSE;
+        continue;
+
+    case 0x0f: /* extended instruction */
+        if (i == len - 1) return 0;
+        switch (instr[i + 1])
+        {
+        case 0x1E:
+            /* RDSSPD/RDSSPQ: (prefixes) 0F 1E (modrm) */
+            RIP_sig(sigcontext) += prefix_count + 3;
+            TRACE_(seh)( "skipped RDSSPD/RDSSPQ instruction\n" );
+            return TRUE;
+        }
+        break;
+    default:
+        return FALSE;
+    }
+    return FALSE;
+}
+
+
+/***********************************************************************
+ *           emulate_xgetbv
+ *
+ * Check if the fault location is an Intel XGETBV instruction for xcr0 and
+ * emulate it if so. Actual Intel hardware supports this instruction, so this
+ * will only take effect under Rosetta.
+ * CW HACK 23427
+ */
+static inline BOOL emulate_xgetbv( ucontext_t *sigcontext, CONTEXT *context )
+{
+    BYTE instr[3];
+    unsigned int len = virtual_uninterrupted_read_memory( (BYTE *)context->Rip, instr, sizeof(instr) );
+
+    /* Prefixed xgetbv is illegal, so no need to check. */
+    if (len < 3 || instr[0] != 0x0f || instr[1] != 0x01 || instr[2] != 0xd0 ||
+        (RCX_sig(sigcontext) & 0xffffffff) != 0 /* only handling xcr0 (ecx==0) */)
+    {
+        return FALSE;
+    }
+
+    RDX_sig(sigcontext) = 0;
+    if (sequoia_or_later)
+    {
+        /* Arguably we should only claim AVX support if ROSETTA_ADVERTISE_AVX is
+           set, but presumably apps will also check cpuid. */
+        RAX_sig(sigcontext) = 0xe7;  /* fpu/mmx, sse, avx, full avx-512 */
+    }
+    else
+        RAX_sig(sigcontext) = 0x07;  /* fpu/mmx, sse */
+
+    RIP_sig(sigcontext) += 3;
+    TRACE_(seh)( "emulated an XGETBV instruction\n" );
+    return TRUE;
+}
+
+/***********************************************************************
+ *           handle_fndisi
+ *
+ * Check if the fault location is an x87 FNDISI instruction that should be treated as a NOP.
+ */
+static inline BOOL handle_fndisi( ucontext_t *sigcontext, CONTEXT *context )
+{
+    BYTE instr[16];
+    unsigned int i, prefix_count = 0;
+    unsigned int len = virtual_uninterrupted_read_memory( (BYTE *)context->Rip, instr, sizeof(instr) );
+
+    for (i = 0; i < len; i++) switch (instr[i])
+    {
+    /* instruction prefixes */
+    case 0x2e:  /* %cs: */
+    case 0x36:  /* %ss: */
+    case 0x3e:  /* %ds: */
+    case 0x26:  /* %es: */
+    case 0x40: case 0x41: case 0x42: case 0x43:
+    case 0x44: case 0x45: case 0x46: case 0x47:
+    case 0x48: case 0x49: case 0x4a: case 0x4b:
+    case 0x4c: case 0x4d: case 0x4e: case 0x4f:
+    case 0x64:  /* %fs: */
+    case 0x65:  /* %gs: */
+    case 0x66:  /* opcode size */
+    case 0x67:  /* addr size */
+    case 0xf0:  /* lock */
+    case 0xf2:  /* repne */
+    case 0xf3:  /* repe */
+        if (++prefix_count >= 15) return FALSE;
+        continue;
+
+    case 0xdb:
+        if (i == len - 1) return 0;
+        switch (instr[i + 1])
+        {
+        case 0xe1:
+            RIP_sig(sigcontext) += prefix_count + 2;
+            TRACE_(seh)( "skipped FNDISI instruction\n" );
+            return TRUE;
+        }
+        break;
+    default:
+        return FALSE;
+    }
+    return FALSE;
+}
+#endif
 
 /***********************************************************************
  *           is_privileged_instr
@@ -2264,7 +2420,7 @@ static inline BOOL check_invalid_gsbase( struct thread_data *data, ucontext_t *u
 #elif defined(__NetBSD__)
     sysarch( X86_64_SET_GSBASE, &data->teb );
 #elif defined(__APPLE__)
-    /* leave_handler() will set GSBASE to the TEB */
+    /* CX Apple GS overlay: leave_handler keeps GSBASE as pthread */
 #endif
     return TRUE;
 }
@@ -2293,6 +2449,14 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         rec.ExceptionCode = EXCEPTION_ARRAY_BOUNDS_EXCEEDED;
         break;
     case TRAP_x86_PRIVINFLT:   /* Invalid opcode exception */
+#ifdef __APPLE__
+        /* CW HACK 20186 */
+        if (handle_cet_nop( sigcontext, &context.c )) return;
+        /* CW HACK 23427 */
+        if (emulate_xgetbv( sigcontext, &context.c )) return;
+        /* Winehq Bug 56441 */
+        if (handle_fndisi( sigcontext, &context.c )) return;
+#endif
         rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
         break;
     case TRAP_x86_STKFLT:  /* Stack fault */
@@ -2611,6 +2775,18 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 
 
 #if defined(__APPLE__) || defined(__linux__)
+
+#ifdef __APPLE__
+/* CW Hack 24265 */
+extern void __restore_mxcsr_thunk(void);
+__ASM_GLOBAL_FUNC( __restore_mxcsr_thunk,
+                   "pushq %rcx\n\t"
+                   "movq %gs:0x30,%rcx\n\t"
+                   "ldmxcsr 0x33c(%rcx)\n\t"  /* amd64_thread_data()->mxcsr */
+                   "popq %rcx\n\t"
+                   "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_prolog_end") );
+#endif
+
 /**********************************************************************
  *		sigsys_handler
  *
@@ -2648,6 +2824,30 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         frame->restore_flags |= CONTEXT_CONTROL;
     }
     RIP_sig(sigcontext) = (ULONG64)__wine_syscall_dispatcher_prolog_end_ptr;
+
+#ifdef __APPLE__
+    /* CW Hack 24265 */
+    if (is_rosetta2 && FPU_sig(sigcontext))
+    {
+        XMM_SAVE_AREA32 fpu;
+        unsigned int direct_mxcsr;
+        __asm__ volatile( "stmxcsr %0" : "=m" (direct_mxcsr) );
+        memcpy( &fpu, FPU_sig(sigcontext), sizeof(fpu) );
+
+        if (direct_mxcsr != fpu.MxCsr)
+        {
+            fpu.MxCsr = direct_mxcsr;
+            memcpy( FPU_sig(sigcontext), &fpu, sizeof(fpu) );
+
+            /* On the M3, Rosetta will restore mxcsr to the initial, incorrect
+               value from the sigcontext, even if we change it. So we jump to a
+               thunk that restores the value from amd64_thread_data. */
+            amd64_thread_data(data)->mxcsr = direct_mxcsr;
+            RIP_sig(sigcontext) = (ULONG64)__restore_mxcsr_thunk;
+        }
+    }
+#endif
+
 }
 #endif
 
@@ -2832,6 +3032,23 @@ void signal_init_process( TEB *teb )
     alloc_syscall_frame( (frame_size + 63) & ~63 );
     signal_alloc_thread( teb );
 
+#ifdef __APPLE__
+    /* CW Hack 24256: We need the value of sysctl.proc_translated in signal
+       handlers but sysctl[byname] is not signal-safe. */
+    {
+        int ret = 0;
+        size_t size = sizeof(ret);
+        if (sysctlbyname( "sysctl.proc_translated", &ret, &size, NULL, 0 ) == -1)
+            is_rosetta2 = 0;
+        else
+            is_rosetta2 = ret;
+    }
+
+    /* CW Hack 23427: __builtin_available presumably isn't signal-safe. */
+    if (__builtin_available( macOS 15.0, * ))
+        sequoia_or_later = TRUE;
+#endif
+
     sig_act.sa_mask = server_block_set;
     sig_act.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
 
@@ -2913,7 +3130,17 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
 #elif defined(__NetBSD__)
     sysarch( X86_64_SET_GSBASE, &teb );
 #elif defined (__APPLE__)
-    thread_data->pthread_teb = mac_thread_gsbase();
+    /* CX Apple GS overlay: keep GSBASE as pthread; mirror TEB fields into it.
+     * Skip when teb is unset (main system thread from apple_spawn_main_thread). */
+    if (teb && thread_data)
+    {
+        __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->Tib.Self), "n" (FIELD_OFFSET(TEB, Tib.Self)));
+        __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->ThreadLocalStoragePointer), "n" (FIELD_OFFSET(TEB, ThreadLocalStoragePointer)));
+        __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->Peb), "n" (FIELD_OFFSET(TEB, Peb)));
+        thread_data->pthread_teb = mac_thread_gsbase();
+        /* alloc_tls_slot() needs to poke a value relative to each thread's gsbase. */
+        teb->Instrumentation[0] = thread_data->pthread_teb;
+    }
 #else
 # error Please define setting %gs for your architecture
 #endif
@@ -3022,7 +3249,12 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
  */
 __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_gs_load") ":\n\t"
+#ifdef __APPLE__
+                   "movq %gs:0x30,%rcx\n\t"         /* Tib.Self (overlay) */
+                   "movq 0x378(%rcx),%rcx\n\t"      /* thread_data->syscall_frame */
+#else
                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
+#endif
                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
@@ -3146,12 +3378,6 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "popq %r8\n\t"
                    "leaq -0x98(%rbp),%rcx\n"
                    "2:\n\t"
-#elif defined __APPLE__
-                   "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
-                   "xorl %esi,%esi\n\t"
-                   "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
-                   "syscall\n\t"
-                   "leaq -0x98(%rbp),%rcx\n"
 #endif
                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
                    "movl 0xb0(%rcx),%eax\n\t"      /* frame->syscall_id */
@@ -3204,15 +3430,6 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "movw %dx,%ss\n\t"
 # endif
                    "1:\n\t"
-#elif defined __APPLE__
-                   "movq %rax,%r8\n\t"
-                   "movq %rcx,%rdx\n\t"
-                   "movq %r13,%rdi\n\t"            /* teb */
-                   "xorl %esi,%esi\n\t"
-                   "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
-                   "syscall\n\t"
-                   "movq %rdx,%rcx\n\t"
-                   "movq %r8,%rax\n\t"
 #endif
                    "movl 0xb4(%rcx),%edx\n\t"      /* frame->restore_flags */
                    "testl $0x48,%edx\n\t"          /* CONTEXT_FLOATING_POINT | CONTEXT_XSTATE */
@@ -3301,7 +3518,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "popfq\n\t"
                    "iretq\n"
                    /* RESTORE_FLAGS_INSTRUMENTATION */
+#ifdef __APPLE__
+                   "2:\tmovq %gs:0x30,%r10\n\t"
+                   "movq 0x330(%r10),%r10\n\t"
+#else
                    "2:\tmovq %gs:0x330,%r10\n\t"  /* amd64_thread_data()->instrumentation_callback */
+#endif
                    "movq (%r10),%r10\n\t"
                    "test %r10,%r10\n\t"
                    "jz 3b\n\t"
@@ -3360,7 +3582,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
                    "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
 
 __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_instrumentation,
+#ifdef __APPLE__
+                   "movq %gs:0x30,%rcx\n\t"
+                   "movq 0x378(%rcx),%rcx\n\t"
+#else
                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
+#endif
                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
@@ -3378,7 +3605,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_instrumentation,
 __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "movq %rcx,%r10\n\t"
                    __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_gs_load") ":\n\t"
+#ifdef __APPLE__
+                   "movq %gs:0x30,%rcx\n\t"
+                   "movq 0x378(%rcx),%rcx\n\t"
+#else
                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
+#endif
                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
@@ -3462,11 +3694,6 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "popq %r9\n\t"
                    "popq %r8\n\t"
                    "2:\n\t"
-#elif defined __APPLE__
-                   "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
-                   "xorl %esi,%esi\n\t"
-                   "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
-                   "syscall\n\t"
 #endif
                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
                    "movq %r8,%rdi\n\t"             /* args */
@@ -3500,16 +3727,6 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "movw %dx,%ss\n\t"
 # endif
                    "1:\n\t"
-#elif defined __APPLE__
-                   "movq %rax,%rdx\n\t"
-                   "movq %rcx,%r14\n\t"
-                   "movq %r13,%rdi\n\t"            /* teb */
-                   "xorl %esi,%esi\n\t"
-                   "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
-                   "syscall\n\t"
-                   "movq %r14,%rcx\n\t"
-                   "movq %rdx,%rax\n\t"
-                   "movq 0x60(%rcx),%r14\n\t"
 #endif
                    "movq 0x58(%rcx),%r13\n\t"
                    "movq 0x28(%rcx),%rdi\n\t"

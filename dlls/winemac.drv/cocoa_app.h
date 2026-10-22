@@ -21,6 +21,7 @@
 #import <AppKit/AppKit.h>
 
 #include "macdrv_cocoa.h"
+#include "cocoa_warpconsumption.h"
 
 /* Internal notification sent on NSApp for display configuration changes. The
    userInfo contains the two keys, NSNumbers for the effected CGDirectDisplayID
@@ -69,6 +70,10 @@ enum {
     WineWindow* mouseCaptureWindow;
     BOOL forceNextMouseMoveAbsolute;
     double mouseMoveDeltaX, mouseMoveDeltaY;
+    double rawMouseMoveDeltaX, rawMouseMoveDeltaY;
+    /* Pending direct-CGWarp displacements folded into future mouse-move
+       event deltas (main thread only).  See cocoa_warpconsumption.h. */
+    struct warp_correction_state warpCorrections;
     NSUInteger unmatchedMouseDowns;
 
     NSTimeInterval lastScrollTime;
@@ -116,6 +121,8 @@ enum {
     - (double) ticksForEventTime:(NSTimeInterval)eventTime;
 
     - (void) windowGotFocus:(WineWindow*)window;
+    - (void) applyCursorForWindow:(WineWindow*)window;
+    - (void) reconcileCursorForCurrentMouseLocation;
 
     - (BOOL) waitUntilQueryDone:(bool*)done timeout:(NSDate*)timeout processEvents:(BOOL)processEvents;
 

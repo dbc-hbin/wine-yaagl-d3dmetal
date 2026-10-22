@@ -1431,22 +1431,36 @@ static void send_buffer(struct parser_source *pin, struct parser *filter, const 
                         TRACE("New format:\n");
                         strmbase_dump_media_type(mt);
 
-                        FreeMediaType(&pin->pin.pin.mt);
-                        CopyMediaType(&pin->pin.pin.mt, mt);
-                        pin->current_format = format;
-                        wg_parser_stream_enable(pin->wg_stream, &format);
+                        if (FAILED(hr = wg_parser_stream_enable(pin->wg_stream, &format)))
+                        {
+                            IMediaEventSink *event_sink;
 
-                        /* We can't send the wg_parser_buffer we were about to
-                         * send; it's in the old format.
-                         *
-                         * Also, we need to seek to re-decode any further
-                         * queued buffers. This is not reliably seamless.
-                         * See reader_SetOutputProps() in wm_reader.c.
-                         * In practice it's unlikely to matter, since dynamic
-                         * reconnection is usually done only at the beginning
-                         * of a stream. */
-                        wg_parser_stream_seek(pin->wg_stream, pin->seek.dRate, pin->seek.llCurrent, 0,
-                                AM_SEEKING_AbsolutePositioning, AM_SEEKING_NoPositioning);
+                            ERR("Failed to enable stream for dynamic format, hr %#lx.\n", hr);
+                            if (filter->filter.graph && SUCCEEDED(IFilterGraph_QueryInterface(filter->filter.graph,
+                                    &IID_IMediaEventSink, (void **)&event_sink)))
+                            {
+                                IMediaEventSink_Notify(event_sink, EC_ERRORABORT, hr, 0);
+                                IMediaEventSink_Release(event_sink);
+                            }
+                        }
+                        else
+                        {
+                            FreeMediaType(&pin->pin.pin.mt);
+                            CopyMediaType(&pin->pin.pin.mt, mt);
+                            pin->current_format = format;
+
+                            /* We can't send the wg_parser_buffer we were about to
+                             * send; it's in the old format.
+                             *
+                             * Also, we need to seek to re-decode any further
+                             * queued buffers. This is not reliably seamless.
+                             * See reader_SetOutputProps() in wm_reader.c.
+                             * In practice it's unlikely to matter, since dynamic
+                             * reconnection is usually done only at the beginning
+                             * of a stream. */
+                            wg_parser_stream_seek(pin->wg_stream, pin->seek.dRate, pin->seek.llCurrent, 0,
+                                    AM_SEEKING_AbsolutePositioning, AM_SEEKING_NoPositioning);
+                        }
                     }
                 }
                 else
@@ -1637,11 +1651,10 @@ static HRESULT parser_init_stream(struct strmbase_filter *iface)
     DWORD stop_flags = AM_SEEKING_NoPositioning;
     const SourceSeeking *seeking;
     unsigned int i;
+    HRESULT hr;
 
     if (!filter->sink_connected)
         return S_OK;
-
-    filter->streaming = true;
 
     for (i = 0; i < filter->source_count; ++i)
     {
@@ -1650,15 +1663,21 @@ static HRESULT parser_init_stream(struct strmbase_filter *iface)
 
         if (source->pin.pin.peer)
         {
-            ret = amt_to_wg_format(&source->pin.pin.mt, &source->current_format);
+            struct wg_format format;
+
+            ret = amt_to_wg_format(&source->pin.pin.mt, &format);
             assert(ret);
-            wg_parser_stream_enable(source->wg_stream, &source->current_format);
+            if (FAILED(hr = wg_parser_stream_enable(source->wg_stream, &format)))
+                return hr;
+            source->current_format = format;
         }
         else
         {
             wg_parser_stream_disable(source->wg_stream);
         }
     }
+
+    filter->streaming = true;
 
     /* DirectShow retains the old seek positions, but resets to them every time
      * it transitions from stopped -> paused. */
@@ -1672,7 +1691,6 @@ static HRESULT parser_init_stream(struct strmbase_filter *iface)
     for (i = 0; i < filter->source_count; ++i)
     {
         struct parser_source *pin = filter->sources[i];
-        HRESULT hr;
 
         if (!pin->pin.pin.peer)
             continue;

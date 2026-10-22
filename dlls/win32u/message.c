@@ -918,6 +918,9 @@ static BOOL unpack_message( HWND hwnd, UINT message, WPARAM *wparam, LPARAM *lpa
         memcpy( &ps->hook, &h_extra, sizeof(h_extra) );
         break;
     }
+    case WM_WINE_FLUSHSHMSURFACE: /* CX HACK 23950 */
+        minsize = sizeof(struct flush_shm_surface_params);
+        break;
     case CB_GETCOMBOBOXINFO:
     {
         COMBOBOXINFO cbi = { sizeof(COMBOBOXINFO) };
@@ -1287,6 +1290,9 @@ static size_t pack_message( HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         push_data( data, (LPVOID)h_extra->lparam, sizeof(MSLLHOOKSTRUCT) );
         return 0;
     }
+    case WM_WINE_FLUSHSHMSURFACE: /* CX HACK 23950 */
+        push_data( data, (struct flush_shm_surface_params *)lparam, sizeof(struct flush_shm_surface_params) );
+        return 0;
     case WM_NCPAINT:
         if (wparam <= 1) return 0;
         FIXME( "WM_NCPAINT hdc packing not supported yet\n" );
@@ -2278,6 +2284,9 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         info.dwHoverTime = lparam;
         return NtUserTrackMouseEvent( &info );
     }
+    case WM_WINE_FLUSHSHMSURFACE: /* CX HACK 23950 */
+        process_surface_message( (struct flush_shm_surface_params *)lparam );
+        return 1;
     default:
         if (msg >= WM_WINE_FIRST_DRIVER_MSG && msg <= WM_WINE_LAST_DRIVER_MSG)
             return user_driver->pWindowMessage( hwnd, msg, wparam, lparam );
@@ -3386,11 +3395,13 @@ static inline LONGLONG get_driver_check_time(void)
 /* check for driver events if we detect that the app is not properly consuming messages */
 static inline void check_for_driver_events(void)
 {
-    if (get_user_thread_info()->last_driver_time != get_driver_check_time())
+    LONGLONG now = get_driver_check_time();
+
+    if (get_user_thread_info()->last_driver_time != now)
     {
         flush_window_surfaces( FALSE );
         process_driver_events( QS_ALLINPUT, 0, 0 );
-        get_user_thread_info()->last_driver_time = get_driver_check_time();
+        get_user_thread_info()->last_driver_time = now;
     }
 }
 

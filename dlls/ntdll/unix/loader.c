@@ -36,6 +36,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <dlfcn.h>
@@ -86,6 +87,7 @@
 #include "winioctl.h"
 #include "winternl.h"
 #include "unix_private.h"
+#include "msync.h"
 #include "wine/list.h"
 #include "wine/debug.h"
 
@@ -295,12 +297,21 @@ static WORD get_alt_machine( WORD machine )
 static void set_dll_path(void)
 {
     char *p, *path = getenv( "WINEDLLPATH" );
+    char *path_prepend = getenv( "WINEDLLPATH_PREPEND" );
     int i, count = 0;
 
-    if (path) for (p = path, count = 1; *p; p++) if (*p == ':') count++;
+    if (path) for (p = path, count++; *p; p++) if (*p == ':') count++;
+    if (path_prepend) for (p = path_prepend, count++; *p; p++) if (*p == ':') count++;
 
     dll_paths = malloc( (count + 2) * sizeof(*dll_paths) );
     count = 0;
+
+    if (path_prepend)
+    {
+        path_prepend = strdup( path_prepend );
+        for (p = strtok( path_prepend, ":" ); p; p = strtok( NULL, ":" )) dll_paths[count++] = strdup( p );
+        free( path_prepend );
+    }
 
     if (!build_dir) dll_paths[count++] = dll_dir;
 
@@ -436,8 +447,9 @@ char *get_alternate_wineloader( WORD machine )
 }
 
 
-static void preloader_exec( char **argv )
+static void preloader_exec( char **argv, WORD machine )
 {
+    char *path;
 #ifdef HAVE_WINE_PRELOADER
     asprintf( &argv[0], "%s-preloader", argv[1] );
 #ifdef __APPLE__
@@ -452,7 +464,12 @@ static void preloader_exec( char **argv )
     execv( argv[0], argv );
     free( argv[0] );
 #endif
-    execv( argv[1], argv + 1 );
+    path = getenv( "ROSETTA_X87_PATH" );
+    if (path && machine == IMAGE_FILE_MACHINE_I386) {
+        argv[0] = strdup( path );
+        execv( argv[0], argv );
+    } else
+        execv( argv[1], argv + 1 );
 }
 
 /* exec the appropriate wine loader for the specified machine */
@@ -462,10 +479,11 @@ static NTSTATUS loader_exec( char **argv, WORD machine )
 
     putenv( noexec );
 
-    if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv );
+    /* CW/Yaagl HACK: keep primary loader path for Rosetta x87 helper. */
+    //if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv );
 
     argv[1] = strdup( wineloader );
-    preloader_exec( argv );
+    preloader_exec( argv, machine );
     return STATUS_INVALID_IMAGE_FORMAT;
 }
 
@@ -506,7 +524,7 @@ NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info 
  */
 static int exec_wineserver( pid_t *pid, char **argv )
 {
-    char *path;
+    char *path, *path_copy;
 
     if (!is_win64 && alt_build_dir)  /* look for 64-bit server */
         return build_path_and_exec( pid, alt_build_dir, "server/wineserver", argv );
@@ -517,10 +535,14 @@ static int exec_wineserver( pid_t *pid, char **argv )
     if (!build_path_and_exec( pid, bin_dir, "wineserver", argv )) return 0;
     if ((path = getenv( "WINESERVER" )) && !build_path_and_exec( pid, "", path, argv )) return 0;
 
-    if ((path = getenv( "PATH" )))
+    if ((path = getenv( "PATH" )) && (path_copy = strdup( path )))
     {
-        for (path = strtok( strdup( path ), ":" ); path; path = strtok( NULL, ":" ))
-            if (!build_path_and_exec( pid, path, "wineserver", argv )) return 0;
+        int ret = -1;
+
+        for (path = strtok( path_copy, ":" ); path; path = strtok( NULL, ":" ))
+            if (!(ret = build_path_and_exec( pid, path, "wineserver", argv ))) break;
+        free( path_copy );
+        if (!ret) return 0;
     }
     return build_path_and_exec( pid, BINDIR, "wineserver", argv );
 }
@@ -1005,6 +1027,68 @@ static NTSTATUS unwind_builtin_dll( void *args )
 #endif /* SO_DLLS_SUPPORTED */
 
 
+
+/* CW HACK 22434 */
+#if defined(__APPLE__) && defined(__x86_64__)
+#include <sys/utsname.h>
+#include <stdbool.h>
+static pthread_once_t non_native_init_once = PTHREAD_ONCE_INIT;
+static void *non_native_support_lib;
+static void (*register_non_native_code_region)( void*, void* );
+static bool (*supports_non_native_code_regions)(void);
+
+/* Non-native code region support requires Sonoma or later */
+static BOOL sonoma_or_later(void)
+{
+    struct utsname name;
+    unsigned major, minor;
+
+    if (uname( &name ) == 0 && sscanf( name.release, "%u.%u", &major, &minor ) == 2 &&
+        major >= 23 /* macOS 14 Sonoma */)
+        return TRUE;
+    return FALSE;
+}
+
+static void init_non_native_support(void)
+{
+    char *libd3dshared_path = getenv( "CX_APPLEGPTK_LIBD3DSHARED_PATH" );
+
+    register_non_native_code_region = NULL;
+    supports_non_native_code_regions = NULL;
+
+    if (!libd3dshared_path || !sonoma_or_later())
+        return;
+
+    non_native_support_lib = dlopen( libd3dshared_path, RTLD_LOCAL );
+    if (non_native_support_lib)
+    {
+        register_non_native_code_region = dlsym( non_native_support_lib, "register_non_native_code_region" );
+        supports_non_native_code_regions = dlsym( non_native_support_lib, "supports_non_native_code_regions" );
+
+        TRACE( "Loaded libd3dshared.dylib, does%s support non-native code regions\n",
+                supports_non_native_code_regions ? (supports_non_native_code_regions() ? "" : " not") : " not" );
+    }
+    else
+        TRACE( "Loading libd3dshared.dylib failed: %s\n", dlerror() );
+}
+
+static NTSTATUS pe_module_loaded( void *args )
+{
+    struct pe_module_loaded_params *params = args;
+
+    pthread_once( &non_native_init_once, &init_non_native_support );
+    if ((supports_non_native_code_regions && supports_non_native_code_regions()))
+    {
+        TRACE( "Marking non_native_code_region: %p-%p\n", params->start, params->end );
+        register_non_native_code_region( params->start, params->end );
+    }
+    return STATUS_SUCCESS;
+}
+#elif defined(__x86_64__)
+static NTSTATUS pe_module_loaded( void *args ) { return STATUS_NOT_IMPLEMENTED; }
+#endif
+
+
 static const unixlib_entry_t unix_call_funcs[] =
 {
     load_so_dll,
@@ -1015,6 +1099,9 @@ static const unixlib_entry_t unix_call_funcs[] =
     unixcall_wine_server_handle_to_fd,
     unixcall_wine_spawnvp,
     system_time_precise,
+#if defined(__x86_64__)
+    pe_module_loaded,
+#endif
 };
 
 
@@ -1022,6 +1109,10 @@ static const unixlib_entry_t unix_call_funcs[] =
 
 static NTSTATUS wow64_load_so_dll( void *args ) { return STATUS_INVALID_IMAGE_FORMAT; }
 static NTSTATUS wow64_unwind_builtin_dll( void *args ) { return STATUS_UNSUCCESSFUL; }
+
+#if defined(__x86_64__)
+static NTSTATUS wow64_pe_module_loaded( void *args ) { return STATUS_NOT_IMPLEMENTED; }
+#endif
 
 const unixlib_entry_t unix_call_wow64_funcs[] =
 {
@@ -1033,6 +1124,9 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_wine_server_handle_to_fd,
     wow64_wine_spawnvp,
     system_time_precise,
+#if defined(__x86_64__)
+    wow64_pe_module_loaded,
+#endif
 };
 
 #endif  /* _WIN64 */
@@ -1849,11 +1943,52 @@ static ULONG_PTR get_image_address(void)
 /***********************************************************************
  *           start_main_thread
  */
+
+#if defined(__APPLE__) && defined(__x86_64__)
+static __thread struct tm localtime_tls;
+struct tm *my_localtime(const time_t *timep)
+{
+    return localtime_r(timep, &localtime_tls);
+}
+
+static void hook(void *to_hook, const void *replace)
+{
+    size_t offset;
+
+    struct hooked_function
+    {
+        char jmp[8];
+        const void *dst;
+    } *hooked_function = to_hook;
+    ULONG_PTR intval = (ULONG_PTR)to_hook;
+
+    intval -= (intval % 4096);
+    mprotect((void *)intval, 0x2000, PROT_EXEC | PROT_READ | PROT_WRITE);
+
+    /* The offset is from the end of the jmp instruction (6 bytes) to the start of the destination. */
+    offset = offsetof(struct hooked_function, dst) - offsetof(struct hooked_function, jmp) - 0x6;
+
+    /* jmp *(rip + offset) */
+    hooked_function->jmp[0] = 0xff;
+    hooked_function->jmp[1] = 0x25;
+    hooked_function->jmp[2] = offset;
+    hooked_function->jmp[3] = 0x00;
+    hooked_function->jmp[4] = 0x00;
+    hooked_function->jmp[5] = 0x00;
+    /* Filler */
+    hooked_function->jmp[6] = 0xcc;
+    hooked_function->jmp[7] = 0xcc;
+    /* Dest address absolute */
+    hooked_function->dst = replace;
+}
+#endif
+
 static void start_main_thread(void)
 {
     struct thread_data *data = virtual_alloc_first_thread_data();
 
     server_init_process( data );
+    msync_init();
     virtual_map_user_shared_data();
     init_cpu_info();
     init_files();
@@ -1866,6 +2001,13 @@ static void start_main_thread(void)
     load_ntdll();
     load_wow64_ntdll( main_image_info.Machine );
     load_apiset_dll();
+
+#if defined(__APPLE__) && defined(__x86_64__)
+    /* Poking PEB into pthread TLS at offset 0x60 steals Darwin localtime TLS.
+     * Redirect localtime() to a thread-local safe implementation. */
+    hook(localtime, my_localtime);
+#endif
+
     server_init_process_done();
 }
 
@@ -2027,8 +2169,8 @@ static void reexec_loader( int argc, char *argv[], char *extra_arg )
         memcpy( new_argv + 2, argv + 1, argc * sizeof(*argv) );
     }
 
-    /* default to 32-bit loader to support 32-bit prefixes */
-    if (machine == IMAGE_FILE_MACHINE_AMD64) machine = IMAGE_FILE_MACHINE_I386;
+    /* CW/Yaagl HACK: do not force 32-bit loader; ROSETTA_X87_PATH handles i386. */
+    //if (machine == IMAGE_FILE_MACHINE_AMD64) machine = IMAGE_FILE_MACHINE_I386;
 
     loader_exec( new_argv, machine );
     fatal_error( "could not exec the wine loader\n" );

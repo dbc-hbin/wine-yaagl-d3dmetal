@@ -89,7 +89,6 @@ struct media_stream
     IMFMediaStream *stream;
     IMFMediaType *current;
     struct list transforms;
-    IMFVideoSampleAllocatorEx *allocator;
     IMFTransform *transform_service;
     DWORD id;
     unsigned int index;
@@ -170,6 +169,7 @@ struct source_reader
     unsigned int flags;
     DWORD queue;
     enum media_source_state source_state;
+    HRESULT source_error;
     struct media_stream *streams;
     struct list responses;
     CRITICAL_SECTION cs;
@@ -232,8 +232,6 @@ static void media_stream_destroy(struct media_stream *stream)
         IMFMediaStream_Release(stream->stream);
     if (stream->current)
         IMFMediaType_Release(stream->current);
-    if (stream->allocator)
-        IMFVideoSampleAllocatorEx_Release(stream->allocator);
 }
 
 static ULONG source_reader_release(struct source_reader *reader)
@@ -434,39 +432,6 @@ static void source_reader_response_ready(struct source_reader *reader, struct st
         stream->requests--;
 }
 
-static void source_reader_copy_sample_buffer(IMFSample *src, IMFSample *dst)
-{
-    IMFMediaBuffer *buffer;
-    LONGLONG time;
-    DWORD flags;
-    HRESULT hr;
-
-    IMFSample_CopyAllItems(src, (IMFAttributes *)dst);
-
-    IMFSample_SetSampleDuration(dst, 0);
-    IMFSample_SetSampleTime(dst, 0);
-    IMFSample_SetSampleFlags(dst, 0);
-
-    if (SUCCEEDED(IMFSample_GetSampleDuration(src, &time)))
-        IMFSample_SetSampleDuration(dst, time);
-
-    if (SUCCEEDED(IMFSample_GetSampleTime(src, &time)))
-        IMFSample_SetSampleTime(dst, time);
-
-    if (SUCCEEDED(IMFSample_GetSampleFlags(src, &flags)))
-        IMFSample_SetSampleFlags(dst, flags);
-
-    if (SUCCEEDED(IMFSample_ConvertToContiguousBuffer(src, NULL)))
-    {
-        if (SUCCEEDED(IMFSample_GetBufferByIndex(dst, 0, &buffer)))
-        {
-            if (FAILED(hr = IMFSample_CopyToBuffer(src, buffer)))
-                WARN("Failed to copy a buffer, hr %#lx.\n", hr);
-            IMFMediaBuffer_Release(buffer);
-        }
-    }
-}
-
 static HRESULT source_reader_queue_response(struct source_reader *reader, struct media_stream *stream, HRESULT status,
         DWORD stream_flags, LONGLONG timestamp, IMFSample *sample)
 {
@@ -607,6 +572,41 @@ static HRESULT source_reader_source_state_handler(struct source_reader *reader, 
     return S_OK;
 }
 
+static HRESULT source_reader_source_error_handler(struct source_reader *reader, IMFMediaEvent *event)
+{
+    unsigned int i;
+    HRESULT hr, status;
+
+    if (FAILED(hr = IMFMediaEvent_GetStatus(event, &status))) status = hr;
+    if (SUCCEEDED(status)) status = E_UNEXPECTED;
+
+    EnterCriticalSection(&reader->cs);
+    reader->source_error = status;
+    reader->flags &= ~SOURCE_READER_SEEKING;
+    for (i = 0; i < reader->stream_count; ++i)
+    {
+        struct media_stream *stream = &reader->streams[i];
+
+        if (!reader->async_callback) stream->requests = 0;
+        while (stream->requests)
+        {
+            if (FAILED(hr = source_reader_queue_response(reader, stream, status, MF_SOURCE_READERF_ERROR, 0, NULL)))
+            {
+                WARN("Failed to queue source error, hr %#lx.\n", hr);
+                break;
+            }
+        }
+    }
+    WakeAllConditionVariable(&reader->state_event);
+    WakeAllConditionVariable(&reader->sample_event);
+    WakeAllConditionVariable(&reader->stop_event);
+    LeaveCriticalSection(&reader->cs);
+
+    if (reader->async_callback)
+        IMFSourceReaderCallback_OnEvent(reader->async_callback, MF_SOURCE_READER_MEDIASOURCE, event);
+    return S_OK;
+}
+
 static HRESULT WINAPI source_reader_source_events_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
 {
     struct source_reader *reader = impl_from_source_callback_IMFAsyncCallback(iface);
@@ -628,6 +628,9 @@ static HRESULT WINAPI source_reader_source_events_callback_Invoke(IMFAsyncCallba
 
     switch (event_type)
     {
+        case MEError:
+            hr = source_reader_source_error_handler(reader, event);
+            break;
         case MENewStream:
             hr = source_reader_new_stream_handler(reader, event);
             break;
@@ -1242,8 +1245,6 @@ static struct stream_response * media_stream_detach_response(struct source_reade
 static struct stream_response *media_stream_pop_response(struct source_reader *reader, struct media_stream *stream)
 {
     struct stream_response *response;
-    IMFSample *sample;
-    HRESULT hr;
 
     LIST_FOR_EACH_ENTRY(response, &reader->responses, struct stream_response, entry)
     {
@@ -1252,26 +1253,6 @@ static struct stream_response *media_stream_pop_response(struct source_reader *r
 
         if (!stream && response->stream_index < reader->stream_count)
             stream = &reader->streams[response->stream_index];
-
-        if (response->sample && stream->allocator)
-        {
-            /* Return allocation error to the caller, while keeping original response sample in for later. */
-            if (SUCCEEDED(hr = IMFVideoSampleAllocatorEx_AllocateSample(stream->allocator, &sample)))
-            {
-                source_reader_copy_sample_buffer(response->sample, sample);
-                IMFSample_Release(response->sample);
-                response->sample = sample;
-            }
-            else
-            {
-                if (!(response = calloc(1, sizeof(*response))))
-                    return NULL;
-
-                response->status = hr;
-                response->stream_flags = MF_SOURCE_READERF_ERROR;
-                return response;
-            }
-        }
 
         return media_stream_detach_response(reader, response);
     }
@@ -1303,6 +1284,8 @@ static HRESULT source_reader_start_source(struct source_reader *reader)
     PROPVARIANT position;
     HRESULT hr = S_OK;
     unsigned int i;
+
+    if (FAILED(reader->source_error)) return reader->source_error;
 
     for (i = 0; i < reader->stream_count; ++i)
     {
@@ -1582,6 +1565,13 @@ static HRESULT WINAPI source_reader_async_commands_callback_Invoke(IMFAsyncCallb
                     source_reader_queue_response(reader, &stub_stream, hr, MF_SOURCE_READERF_ERROR, 0, NULL);
                 }
             }
+            else
+            {
+                report_sample = TRUE;
+                status = hr;
+                stream_index = command->u.read.stream_index;
+                stream_flags = MF_SOURCE_READERF_ERROR;
+            }
 
             LeaveCriticalSection(&reader->cs);
 
@@ -1601,6 +1591,7 @@ static HRESULT WINAPI source_reader_async_commands_callback_Invoke(IMFAsyncCallb
                     &command->u.seek.position)))
             {
                 reader->flags &= ~SOURCE_READER_SEEKING;
+                WakeAllConditionVariable(&reader->state_event);
             }
             LeaveCriticalSection(&reader->cs);
 
@@ -1685,6 +1676,8 @@ static BOOL source_reader_is_source_stopped(const struct source_reader *reader)
 {
     unsigned int i;
 
+    if (FAILED(reader->source_error)) return TRUE;
+
     if (reader->source_state != SOURCE_STATE_STOPPED)
         return FALSE;
 
@@ -1701,7 +1694,6 @@ static ULONG WINAPI src_reader_Release(IMFSourceReaderEx *iface)
 {
     struct source_reader *reader = impl_from_IMFSourceReaderEx(iface);
     ULONG refcount = InterlockedDecrement(&reader->public_refcount);
-    unsigned int i;
 
     TRACE("%p, refcount %lu.\n", iface, refcount);
 
@@ -1719,22 +1711,6 @@ static ULONG WINAPI src_reader_Release(IMFSourceReaderEx *iface)
             }
 
             LeaveCriticalSection(&reader->cs);
-        }
-
-        for (i = 0; i < reader->stream_count; ++i)
-        {
-            struct media_stream *stream = &reader->streams[i];
-            IMFVideoSampleAllocatorCallback *callback;
-
-            if (!stream->allocator)
-                continue;
-
-            if (SUCCEEDED(IMFVideoSampleAllocatorEx_QueryInterface(stream->allocator, &IID_IMFVideoSampleAllocatorCallback,
-                    (void **)&callback)))
-            {
-                IMFVideoSampleAllocatorCallback_SetCallback(callback, NULL);
-                IMFVideoSampleAllocatorCallback_Release(callback);
-            }
         }
 
         MFUnlockWorkQueue(reader->queue);
@@ -1986,71 +1962,6 @@ static HRESULT source_reader_set_compatible_media_type(struct source_reader *rea
     IMFMediaTypeHandler_Release(type_handler);
 
     return type_set ? S_OK : S_FALSE;
-}
-
-static HRESULT source_reader_create_sample_allocator_attributes(const struct source_reader *reader,
-        IMFAttributes **attributes)
-{
-    UINT32 shared = 0, shared_without_mutex = 0;
-    HRESULT hr;
-
-    if (FAILED(hr = MFCreateAttributes(attributes, 1)))
-        return hr;
-
-    IMFAttributes_GetUINT32(reader->attributes, &MF_SA_D3D11_SHARED, &shared);
-    IMFAttributes_GetUINT32(reader->attributes, &MF_SA_D3D11_SHARED_WITHOUT_MUTEX, &shared_without_mutex);
-
-    if (shared_without_mutex)
-        hr = IMFAttributes_SetUINT32(*attributes, &MF_SA_D3D11_SHARED_WITHOUT_MUTEX, TRUE);
-    else if (shared)
-        hr = IMFAttributes_SetUINT32(*attributes, &MF_SA_D3D11_SHARED, TRUE);
-
-    return hr;
-}
-
-static HRESULT source_reader_setup_sample_allocator(struct source_reader *reader, unsigned int index)
-{
-    struct media_stream *stream = &reader->streams[index];
-    IMFAttributes *attributes = NULL;
-    GUID major = { 0 };
-    HRESULT hr;
-
-    IMFMediaType_GetMajorType(stream->current, &major);
-    if (!IsEqualGUID(&major, &MFMediaType_Video))
-        return S_OK;
-
-    if (!(reader->flags & SOURCE_READER_HAS_DEVICE_MANAGER))
-        return S_OK;
-
-    if (!stream->allocator)
-    {
-        if (FAILED(hr = MFCreateVideoSampleAllocatorEx(&IID_IMFVideoSampleAllocatorEx, (void **)&stream->allocator)))
-        {
-            WARN("Failed to create sample allocator, hr %#lx.\n", hr);
-            return hr;
-        }
-    }
-
-    IMFVideoSampleAllocatorEx_UninitializeSampleAllocator(stream->allocator);
-    if (FAILED(hr = IMFVideoSampleAllocatorEx_SetDirectXManager(stream->allocator, reader->device_manager)))
-    {
-        WARN("Failed to set device manager, hr %#lx.\n", hr);
-        return hr;
-    }
-
-    if (FAILED(hr = source_reader_create_sample_allocator_attributes(reader, &attributes)))
-        WARN("Failed to create allocator attributes, hr %#lx.\n", hr);
-
-    if (FAILED(hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(stream->allocator, 2, 8,
-            attributes, stream->current)))
-    {
-        WARN("Failed to initialize sample allocator, hr %#lx.\n", hr);
-    }
-
-    if (attributes)
-        IMFAttributes_Release(attributes);
-
-    return hr;
 }
 
 static BOOL source_reader_allow_video_processor(struct source_reader *reader, BOOL *advanced)
@@ -2390,8 +2301,6 @@ static HRESULT WINAPI src_reader_SetCurrentMediaType(IMFSourceReaderEx *iface, D
     hr = source_reader_set_compatible_media_type(reader, index, type);
     if (hr == S_FALSE)
         hr = source_reader_create_decoder_for_stream(reader, index, type);
-    if (SUCCEEDED(hr))
-        hr = source_reader_setup_sample_allocator(reader, index);
 
     LeaveCriticalSection(&reader->cs);
 
@@ -2415,6 +2324,7 @@ static HRESULT WINAPI src_reader_SetCurrentPosition(IMFSourceReaderEx *iface, RE
         return MF_E_INVALIDREQUEST;
 
     EnterCriticalSection(&reader->cs);
+    if (FAILED(hr = reader->source_error)) goto done;
 
     /* Check if we got pending requests. */
     for (i = 0; i < reader->stream_count; ++i)
@@ -2448,16 +2358,23 @@ static HRESULT WINAPI src_reader_SetCurrentPosition(IMFSourceReaderEx *iface, RE
         }
         else
         {
-            if (SUCCEEDED(IMFMediaSource_Start(reader->source, reader->descriptor, format, position)))
+            if (SUCCEEDED(hr = IMFMediaSource_Start(reader->source, reader->descriptor, format, position)))
             {
                 while (reader->flags & SOURCE_READER_SEEKING)
                 {
                     SleepConditionVariableCS(&reader->state_event, &reader->cs, INFINITE);
                 }
+                hr = reader->source_error;
             }
         }
     }
 
+    if (FAILED(hr))
+    {
+        reader->flags &= ~SOURCE_READER_SEEKING;
+        WakeAllConditionVariable(&reader->state_event);
+    }
+done:
     LeaveCriticalSection(&reader->cs);
 
     return hr;
@@ -2482,6 +2399,9 @@ static HRESULT source_reader_read_sample(struct source_reader *reader, DWORD ind
 
     if (!actual_index)
         actual_index = &actual_index_tmp;
+    *actual_index = index;
+    *stream_flags = 0;
+    *timestamp = 0;
 
     if (SUCCEEDED(hr = source_reader_start_source(reader)))
     {
@@ -2494,7 +2414,8 @@ static HRESULT source_reader_read_sample(struct source_reader *reader, DWORD ind
             if (!source_reader_get_read_result(reader, stream, flags, &hr, actual_index, stream_flags,
                    timestamp, sample))
             {
-                while (!source_reader_got_response_for_stream(reader, stream) && stream->state != STREAM_STATE_EOS)
+                while (SUCCEEDED(reader->source_error) && !source_reader_got_response_for_stream(reader, stream)
+                        && stream->state != STREAM_STATE_EOS)
                 {
                     stream->requests++;
                     if (FAILED(hr = source_reader_request_sample(reader, stream)))
@@ -2507,6 +2428,7 @@ static HRESULT source_reader_read_sample(struct source_reader *reader, DWORD ind
                     }
                     SleepConditionVariableCS(&reader->sample_event, &reader->cs, INFINITE);
                 }
+                if (FAILED(reader->source_error)) hr = reader->source_error;
                 if (SUCCEEDED(hr))
                     source_reader_get_read_result(reader, stream, flags, &hr, actual_index, stream_flags,
                        timestamp, sample);
@@ -2520,6 +2442,7 @@ static HRESULT source_reader_read_sample(struct source_reader *reader, DWORD ind
         }
     }
 
+    if (FAILED(hr)) *stream_flags = MF_SOURCE_READERF_ERROR;
     TRACE("Stream %lu, got sample %p, flags %#lx.\n", *actual_index, *sample, *stream_flags);
 
     return hr;
@@ -2533,6 +2456,8 @@ static HRESULT source_reader_read_sample_async(struct source_reader *reader, uns
 
     if (actual_index || stream_flags || timestamp || sample)
         return E_INVALIDARG;
+
+    if (FAILED(reader->source_error)) return reader->source_error;
 
     if (reader->flags & SOURCE_READER_FLUSHING)
         hr = MF_E_NOTACCEPTING;

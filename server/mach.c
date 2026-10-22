@@ -177,7 +177,12 @@ void init_thread_context( struct thread *thread )
 /* retrieve the thread x86 registers */
 void get_thread_context( struct thread *thread, struct context_data *context, unsigned int flags )
 {
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__aarch64__) && defined(WINE_TUNED_X86_SERVER)
+    /* Match the existing Rosetta fallback: x86 debug registers cannot be read cross-process. */
+    assert( flags == SERVER_CTX_DEBUG_REGISTERS );
+    memset( &context->debug, 0, sizeof(context->debug) );
+    context->flags |= SERVER_CTX_DEBUG_REGISTERS;
+#elif defined(__i386__) || defined(__x86_64__)
     x86_debug_state_t state;
     mach_msg_type_number_t count = sizeof(state) / sizeof(int);
     mach_msg_type_name_t type;
@@ -263,7 +268,11 @@ done:
 /* set the thread x86 registers */
 void set_thread_context( struct thread *thread, const struct context_data *context, unsigned int flags )
 {
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__aarch64__) && defined(WINE_TUNED_X86_SERVER)
+    /* Match the existing Rosetta fallback: x86 debug registers cannot be set cross-process. */
+    assert( flags == SERVER_CTX_DEBUG_REGISTERS );
+    set_error( STATUS_UNSUCCESSFUL );
+#elif defined(__i386__) || defined(__x86_64__)
     x86_debug_state_t state;
     mach_msg_type_number_t count = sizeof(state) / sizeof(int);
     mach_msg_type_name_t type;

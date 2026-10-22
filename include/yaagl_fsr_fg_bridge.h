@@ -1,0 +1,170 @@
+/* Fixed-width private PE/Unix/native contract for FSR frame generation.
+ * At bridge submission, every resource *_state is a D3D12_RESOURCE_STATES value.
+ * The PE shim converts public FFX states before crossing this boundary.
+ */
+#pragma once
+
+#include <stdint.h>
+
+#define YAAGL_FSR_FG_BRIDGE_VERSION 5u
+
+enum yaagl_fsr_fg_create_flags
+{
+    YAAGL_FSR_FG_DEPTH_INVERTED = 1u << 0,
+    YAAGL_FSR_FG_DEPTH_INFINITE = 1u << 1,
+    YAAGL_FSR_FG_DISPLAY_RESOLUTION_MOTION_VECTORS = 1u << 2,
+    YAAGL_FSR_FG_MOTION_VECTORS_JITTERED = 1u << 3
+};
+
+enum yaagl_fsr_fg_operation
+{
+    /* 0 is reserved; it was a removed capability probe. */
+    YAAGL_FSR_FG_CREATE = 1,
+    YAAGL_FSR_FG_PREPARE = 2,
+    YAAGL_FSR_FG_DISPATCH = 3,
+    YAAGL_FSR_FG_DESTROY = 4,
+    YAAGL_FSR_FG_CONFIGURE = 5,
+    YAAGL_FSR_FG_RETIRE_FRAME = 6
+};
+
+struct yaagl_fsr_fg_packet_header
+{
+    uint32_t size;
+    uint32_t version;
+    uint32_t operation;
+    uint32_t result;
+    uint64_t context;
+};
+
+struct yaagl_fsr_fg_create_packet
+{
+    struct yaagl_fsr_fg_packet_header header;
+    uint64_t device;
+    uint32_t display_width;
+    uint32_t display_height;
+    uint32_t max_render_width;
+    uint32_t max_render_height;
+    uint32_t backbuffer_format;
+    uint32_t flags;
+    uint32_t user_interface_recomposition;
+    uint32_t orthographic_projection;
+};
+
+struct yaagl_fsr_fg_prepare_packet
+{
+    struct yaagl_fsr_fg_packet_header header;
+    uint64_t command_list;
+    uint64_t frame_id;
+    uint64_t depth;
+    uint64_t motion_vectors;
+    uint32_t depth_state;
+    uint32_t motion_vectors_state;
+    uint32_t render_width;
+    uint32_t render_height;
+    uint32_t flags;
+    uint32_t reset;
+    float jitter_x;
+    float jitter_y;
+    float motion_scale_x;
+    float motion_scale_y;
+    float frame_time_delta_ms;
+    float camera_near;
+    float camera_far;
+    float camera_fov_vertical_radians;
+    float view_space_to_meters;
+    float camera_position[3];
+    float camera_up[3];
+    float camera_right[3];
+    float camera_forward[3];
+    uint32_t camera_info_present;
+    uint32_t depth_subrect_x;
+    uint32_t depth_subrect_y;
+    uint32_t motion_subrect_x;
+    uint32_t motion_subrect_y;
+    uint32_t motion_width;
+    uint32_t motion_height;
+    uint32_t projection_matrix_present;
+    uint32_t reconstruct_camera_motion;
+    uint32_t motion_invalid_value_present;
+    float motion_invalid_value;
+    float camera_aspect_ratio;
+    float view_to_clip[16];
+    float clip_to_previous_clip[16];
+};
+
+struct yaagl_fsr_fg_dispatch_packet
+{
+    struct yaagl_fsr_fg_packet_header header;
+    uint64_t command_list;
+    uint64_t frame_id;
+    uint64_t present_color;
+    uint64_t output;
+    uint64_t hudless_color;
+    uint64_t real_output;
+    uint64_t ui;
+    uint64_t ui_alpha;
+    uint64_t distortion;
+    uint64_t disable_interpolation;
+    uint32_t present_color_state;
+    uint32_t output_state;
+    uint32_t hudless_color_state;
+    uint32_t real_output_state;
+    uint32_t ui_state;
+    uint32_t ui_alpha_state;
+    uint32_t distortion_state;
+    uint32_t disable_interpolation_state;
+    uint32_t num_generated_frames;
+    uint32_t reset;
+    uint32_t backbuffer_transfer_function;
+    uint32_t output_subrect_only;
+    uint32_t independent_subrects;
+    uint32_t present_x;
+    uint32_t present_y;
+    uint32_t hudless_x;
+    uint32_t hudless_y;
+    uint32_t output_x;
+    uint32_t output_y;
+    uint32_t real_x;
+    uint32_t real_y;
+    uint32_t ui_x;
+    uint32_t ui_y;
+    uint32_t ui_alpha_x;
+    uint32_t ui_alpha_y;
+    uint32_t distortion_x;
+    uint32_t distortion_y;
+    uint32_t distortion_width;
+    uint32_t distortion_height;
+    uint32_t distortion_low_precision;
+    float distortion_scale;
+    float distortion_bias;
+    int32_t generation_rect_left;
+    int32_t generation_rect_top;
+    int32_t generation_rect_width;
+    int32_t generation_rect_height;
+    float min_luminance;
+    float max_luminance;
+    uint32_t flags;
+    uint32_t padding;
+    uint64_t disable_interpolation_offset;
+};
+
+/* Configure changes metadata ownership; recorded commands retain their own snapshots. */
+struct yaagl_fsr_fg_configure_packet
+{
+    struct yaagl_fsr_fg_packet_header header;
+    uint32_t enabled;
+};
+
+/* Retire one completed or skipped generation callback; encoded work owns its snapshot. */
+struct yaagl_fsr_fg_retire_frame_packet
+{
+    struct yaagl_fsr_fg_packet_header header;
+    uint64_t frame_id;
+    uint64_t oldest_pending_frame_id;
+    uint32_t has_pending_frame;
+};
+
+struct yaagl_fsr_fg_destroy_packet
+{
+    struct yaagl_fsr_fg_packet_header header;
+};

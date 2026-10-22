@@ -72,6 +72,8 @@ gboolean gst_element_register_winegstreamerstepper(GstPlugin *plugin)
 static bool wg_stepper_step(WgStepper *stepper);
 static void wg_stepper_flush(WgStepper *stepper);
 
+static GstStaticCaps transform_timestamp_caps = GST_STATIC_CAPS("timestamp/x-wg-transform");
+
 struct wg_transform
 {
     struct wg_transform_attrs attrs;
@@ -962,7 +964,7 @@ NTSTATUS wg_transform_push_data(void *args)
         GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DISCONT);
 
     if (transform->attrs.preserve_timestamps && (sample->flags & WG_SAMPLE_FLAG_HAS_PTS)
-            && (transform_timestamp = gst_caps_new_empty_simple("timestamp/x-wg-transform")))
+            && (transform_timestamp = gst_static_caps_get(&transform_timestamp_caps)))
     {
         gst_buffer_add_reference_timestamp_meta(buffer, transform_timestamp, GST_BUFFER_PTS(buffer), GST_BUFFER_DURATION(buffer));
         gst_caps_unref(transform_timestamp);
@@ -1047,7 +1049,7 @@ static void set_sample_flags_from_buffer(struct wg_sample *sample, GstBuffer *bu
     GstReferenceTimestampMeta *timestamps;
     GstCaps *transform_timestamp;
 
-    transform_timestamp = gst_caps_new_empty_simple("timestamp/x-wg-transform");
+    transform_timestamp = gst_static_caps_get(&transform_timestamp_caps);
     timestamps = gst_buffer_get_reference_timestamp_meta(buffer, transform_timestamp);
     gst_caps_unref(transform_timestamp);
 

@@ -142,10 +142,20 @@ void server_addref(server_t *server)
 
 void server_release(server_t *server)
 {
-    if(InterlockedDecrement(&server->ref))
-        return;
+    LONG ref;
 
-    list_remove(&server->entry);
+    EnterCriticalSection(&connection_pool_cs);
+    ref = InterlockedDecrement(&server->ref);
+    if(ref == 1 && !server->security_flags && !server->cert_chain && list_empty(&server->conn_pool) &&
+       !list_empty(&server->entry) && InterlockedCompareExchange(&server->ref, 0, 1) == 1) {
+        list_remove(&server->entry);
+        list_init(&server->entry);
+        ref = 0;
+    }
+    LeaveCriticalSection(&connection_pool_cs);
+
+    if(ref)
+        return;
 
     if(server->cert_chain)
         CertFreeCertificateChain(server->cert_chain);
@@ -205,6 +215,8 @@ server_t *get_server(substr_t name, INTERNET_PORT port, BOOL is_https, BOOL do_c
             if(server->name && process_host_port(server)) {
                 list_add_head(&connection_pool, &server->entry);
             }else {
+                free(server->scheme_host_port);
+                free(server->name);
                 free(server);
                 server = NULL;
             }
@@ -225,7 +237,11 @@ BOOL collect_connections(collect_type_t collect_type)
 
     now = GetTickCount64();
 
+    EnterCriticalSection(&connection_pool_cs);
+
     LIST_FOR_EACH_ENTRY_SAFE(server, server_safe, &connection_pool, server_t, entry) {
+        server_addref(server);
+
         LIST_FOR_EACH_ENTRY_SAFE(netconn, netconn_safe, &server->conn_pool, netconn_t, pool_entry) {
             if(collect_type > COLLECT_TIMEOUT || netconn->keep_until < now) {
                 TRACE("freeing %p\n", netconn);
@@ -241,8 +257,11 @@ BOOL collect_connections(collect_type_t collect_type)
             list_init(&server->entry);
             server_release(server);
         }
+
+        server_release(server);
     }
 
+    LeaveCriticalSection(&connection_pool_cs);
     return remaining;
 }
 

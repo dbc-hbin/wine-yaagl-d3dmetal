@@ -572,12 +572,19 @@ static HRESULT media_stream_start(struct media_stream *stream, BOOL active, BOOL
     TRACE("source %p, stream %p\n", source, stream);
 
     if (FAILED(hr = wg_format_from_stream_descriptor(stream->descriptor, &format)))
+    {
         WARN("Failed to get wg_format from stream descriptor, hr %#lx\n", hr);
-    wg_parser_stream_enable(stream->wg_stream, &format);
+        return hr;
+    }
+    if (FAILED(hr = wg_parser_stream_enable(stream->wg_stream, &format)))
+        return hr;
 
     if (FAILED(hr = IMFMediaEventQueue_QueueEventParamUnk(source->event_queue, active ? MEUpdatedStream : MENewStream,
             &GUID_NULL, S_OK, (IUnknown *)&stream->IMFMediaStream_iface)))
+    {
         WARN("Failed to send source stream event, hr %#lx\n", hr);
+        return hr;
+    }
     return IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, seeking ? MEStreamSeeked : MEStreamStarted,
             &GUID_NULL, S_OK, position);
 }
@@ -640,20 +647,23 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
         struct media_stream *stream = source->streams[i];
         BOOL was_active = !starting && stream->active;
 
+        if (!descriptors[i])
+        {
+            stream->active = FALSE;
+            wg_parser_stream_disable(stream->wg_stream);
+            continue;
+        }
+
+        if (FAILED(hr = media_stream_start(stream, was_active, seek_message, position)))
+        {
+            WARN("Failed to start media stream, hr %#lx\n", hr);
+            goto done;
+        }
+
+        stream->active = TRUE;
         if (position->vt != VT_EMPTY)
             stream->eos = FALSE;
-
-        if (!(stream->active = !!descriptors[i]))
-            wg_parser_stream_disable(stream->wg_stream);
-        else
-        {
-            if (FAILED(hr = media_stream_start(stream, was_active, seek_message, position)))
-                WARN("Failed to start media stream, hr %#lx\n", hr);
-            IMFStreamDescriptor_Release(descriptors[i]);
-        }
     }
-
-    free(descriptors);
 
     source->state = SOURCE_RUNNING;
 
@@ -664,8 +674,15 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
     for (i = 0; i < source->stream_count; i++)
         flush_token_queue(source->streams[i], position->vt == VT_EMPTY);
 
-    return IMFMediaEventQueue_QueueEventParamVar(source->event_queue,
+    hr = IMFMediaEventQueue_QueueEventParamVar(source->event_queue,
             seek_message ? MESourceSeeked : MESourceStarted, &GUID_NULL, S_OK, position);
+
+done:
+    for (i = 0; i < source->stream_count; ++i)
+        if (descriptors[i])
+            IMFStreamDescriptor_Release(descriptors[i]);
+    free(descriptors);
+    return hr;
 }
 
 static HRESULT media_source_pause(struct media_source *source)
@@ -843,7 +860,11 @@ static HRESULT WINAPI source_async_commands_Invoke(IMFAsyncCallback *iface, IMFA
             PROPVARIANT position = command->u.start.position;
 
             if (FAILED(hr = media_source_start(source, descriptor, &format, &position)))
+            {
                 WARN("Failed to start source %p, hr %#lx\n", source, hr);
+                IMFMediaEventQueue_QueueEventParamVar(source->event_queue, MEError,
+                        &GUID_NULL, hr, NULL);
+            }
             break;
         }
         case SOURCE_ASYNC_PAUSE:

@@ -1285,8 +1285,16 @@ int server_pipe( int fd[2] )
 
     if (have_pipe2)
     {
-        if (!(ret = pipe2( fd, O_CLOEXEC ))) return ret;
-        if (errno == ENOSYS || errno == EINVAL) have_pipe2 = FALSE;  /* don't try again */
+#ifdef __APPLE__
+        if (__builtin_available(macOS 27.0, *))
+        {
+#endif
+            if (!(ret = pipe2( fd, O_CLOEXEC ))) return ret;
+            if (errno == ENOSYS || errno == EINVAL) have_pipe2 = FALSE;  /* don't try again */
+#ifdef __APPLE__
+        }
+        else have_pipe2 = FALSE;
+#endif
     }
 #endif
     if (!(ret = pipe( fd )))

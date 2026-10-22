@@ -1192,6 +1192,7 @@ static void hid_device_destroy(struct unix_device *iface)
     free(iface->hid_report_descriptor.data);
     free(iface->hid_device_state.report_buf);
     free(iface->hid_device_state.last_report_buf);
+    free(iface->hid_physical.effect_state.report_buf);
 }
 
 static NTSTATUS hid_device_start(struct unix_device *iface)

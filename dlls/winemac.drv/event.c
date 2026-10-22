@@ -38,6 +38,7 @@ static const char *dbgstr_event(int type)
         "APP_ACTIVATED",
         "APP_DEACTIVATED",
         "APP_QUIT_REQUESTED",
+        "CLIENT_SURFACE_PRESENTED", /* CW HACK 22435 */
         "DISPLAYS_CHANGED",
         "HOTKEY_PRESS",
         "KEY_PRESS",
@@ -58,6 +59,7 @@ static const char *dbgstr_event(int type)
         "WINDOW_CLOSE_REQUESTED",
         "WINDOW_DID_MINIMIZE",
         "WINDOW_DID_UNMINIMIZE",
+        "WINDOW_NATIVE_CURSOR_SYNC",
         "WINDOW_DRAG_BEGIN",
         "WINDOW_DRAG_END",
         "WINDOW_FRAME_CHANGED",
@@ -111,11 +113,13 @@ static macdrv_event_mask get_event_mask(DWORD mask)
         event_mask |= event_mask_for_type(APP_ACTIVATED);
         event_mask |= event_mask_for_type(APP_DEACTIVATED);
         event_mask |= event_mask_for_type(APP_QUIT_REQUESTED);
+        event_mask |= event_mask_for_type(CLIENT_SURFACE_PRESENTED); /* CW HACK 22435 */
         event_mask |= event_mask_for_type(DISPLAYS_CHANGED);
         event_mask |= event_mask_for_type(LOST_PASTEBOARD_OWNERSHIP);
         event_mask |= event_mask_for_type(STATUS_ITEM_MOUSE_BUTTON);
         event_mask |= event_mask_for_type(STATUS_ITEM_MOUSE_MOVE);
         event_mask |= event_mask_for_type(WINDOW_DID_UNMINIMIZE);
+        event_mask |= event_mask_for_type(WINDOW_NATIVE_CURSOR_SYNC);
         event_mask |= event_mask_for_type(WINDOW_FRAME_CHANGED);
         event_mask |= event_mask_for_type(WINDOW_GOT_FOCUS);
         event_mask |= event_mask_for_type(WINDOW_LOST_FOCUS);
@@ -328,6 +332,11 @@ void macdrv_handle_event(const macdrv_event *event)
     case APP_QUIT_REQUESTED:
         macdrv_app_quit_requested(event);
         break;
+    case CLIENT_SURFACE_PRESENTED:    /* CW HACK 22435 */
+#if defined(__x86_64__)
+        macdrv_client_surface_presented(event);
+#endif
+        break;
     case DISPLAYS_CHANGED:
         macdrv_displays_changed(event);
         break;
@@ -381,6 +390,9 @@ void macdrv_handle_event(const macdrv_event *event)
         break;
     case WINDOW_DID_UNMINIMIZE:
         macdrv_window_did_unminimize(hwnd);
+        break;
+    case WINDOW_NATIVE_CURSOR_SYNC:
+        macdrv_window_native_cursor_sync(event->window);
         break;
     case WINDOW_DRAG_BEGIN:
         macdrv_window_drag_begin(hwnd, event);

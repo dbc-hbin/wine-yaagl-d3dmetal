@@ -1,0 +1,5 @@
+1 cdecl ffxConfigure(ptr ptr)
+2 cdecl ffxCreateContext(ptr ptr ptr)
+3 cdecl ffxDestroyContext(ptr ptr)
+4 cdecl ffxDispatch(ptr ptr)
+5 cdecl ffxQuery(ptr ptr)

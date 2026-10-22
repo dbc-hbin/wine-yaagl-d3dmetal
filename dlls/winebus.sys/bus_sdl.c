@@ -63,17 +63,17 @@ static pthread_mutex_t sdl_cs = PTHREAD_MUTEX_INITIALIZER;
 static const struct bus_options *options;
 
 static void *sdl_handle = NULL;
-static UINT quit_event = -1;
+static UINT quit_event = -1, effect_event = -1;
+static LONG effects_active, effects_generation, effects_checked_generation;
 static struct list event_queue = LIST_INIT(event_queue);
 static struct list device_list = LIST_INIT(device_list);
 
 #define MAKE_FUNCPTR(f) static typeof(f) * p##f = NULL
 MAKE_FUNCPTR(SDL_GetError);
 MAKE_FUNCPTR(SDL_Init);
+MAKE_FUNCPTR(SDL_Quit);
 MAKE_FUNCPTR(SDL_JoystickClose);
 MAKE_FUNCPTR(SDL_JoystickEventState);
-MAKE_FUNCPTR(SDL_JoystickGetGUID);
-MAKE_FUNCPTR(SDL_JoystickGetGUIDString);
 MAKE_FUNCPTR(SDL_JoystickInstanceID);
 MAKE_FUNCPTR(SDL_JoystickName);
 MAKE_FUNCPTR(SDL_JoystickNumAxes);
@@ -435,6 +435,24 @@ static NTSTATUS build_controller_report_descriptor(struct unix_device *iface)
 
 static void sdl_device_destroy(struct unix_device *iface)
 {
+    struct sdl_device *impl = impl_from_unix_device(iface);
+
+    if (impl->axis_offset) return; /* split devices share the first device's SDL handles */
+    if (impl->sdl_haptic)
+    {
+        pSDL_HapticClose(impl->sdl_haptic);
+        impl->sdl_haptic = NULL;
+    }
+    if (impl->sdl_controller)
+    {
+        pSDL_GameControllerClose(impl->sdl_controller);
+        impl->sdl_controller = NULL;
+    }
+    if (impl->sdl_joystick)
+    {
+        pSDL_JoystickClose(impl->sdl_joystick);
+        impl->sdl_joystick = NULL;
+    }
 }
 
 static NTSTATUS sdl_device_start(struct unix_device *iface)
@@ -452,13 +470,10 @@ static void sdl_device_stop(struct unix_device *iface)
 {
     struct sdl_device *impl = impl_from_unix_device(iface);
 
-    pSDL_JoystickClose(impl->sdl_joystick);
-    if (impl->sdl_controller) pSDL_GameControllerClose(impl->sdl_controller);
-    if (impl->sdl_haptic) pSDL_HapticClose(impl->sdl_haptic);
-
     pthread_mutex_lock(&sdl_cs);
     impl->started = FALSE;
     list_remove(&impl->unix_device.entry);
+    sdl_device_destroy(iface);
     pthread_mutex_unlock(&sdl_cs);
 }
 
@@ -524,6 +539,15 @@ static NTSTATUS sdl_device_haptics_stop(struct unix_device *iface)
     return STATUS_SUCCESS;
 }
 
+static void wake_effect_polling(void)
+{
+    SDL_Event event = {.type = effect_event};
+
+    InterlockedIncrement(&effects_generation);
+    if (pSDL_PushEvent(&event) != 1)
+        WARN("failed to wake SDL effect polling: %s\n", pSDL_GetError());
+}
+
 static NTSTATUS sdl_device_physical_device_control(struct unix_device *iface, USAGE control)
 {
     struct sdl_device *impl = impl_from_unix_device(iface);
@@ -543,6 +567,7 @@ static NTSTATUS sdl_device_physical_device_control(struct unix_device *iface, US
         return STATUS_SUCCESS;
     case PID_USAGE_DC_STOP_ALL_EFFECTS:
         pSDL_HapticStopAll(impl->sdl_haptic);
+        wake_effect_polling();
         return STATUS_SUCCESS;
     case PID_USAGE_DC_DEVICE_RESET:
         pSDL_HapticStopAll(impl->sdl_haptic);
@@ -552,14 +577,17 @@ static NTSTATUS sdl_device_physical_device_control(struct unix_device *iface, US
             pSDL_HapticDestroyEffect(impl->sdl_haptic, impl->effect_ids[i]);
             impl->effect_ids[i] = -1;
         }
+        wake_effect_polling();
         return STATUS_SUCCESS;
     case PID_USAGE_DC_DEVICE_PAUSE:
         pSDL_HapticPause(impl->sdl_haptic);
         InterlockedOr(&impl->effect_flags, EFFECT_STATE_DEVICE_PAUSED);
+        wake_effect_polling();
         return STATUS_SUCCESS;
     case PID_USAGE_DC_DEVICE_CONTINUE:
         pSDL_HapticUnpause(impl->sdl_haptic);
         InterlockedAnd(&impl->effect_flags, ~EFFECT_STATE_DEVICE_PAUSED);
+        wake_effect_polling();
         return STATUS_SUCCESS;
     }
 
@@ -600,6 +628,7 @@ static NTSTATUS sdl_device_physical_effect_control(struct unix_device *iface, BY
         break;
     }
 
+    wake_effect_polling();
     return STATUS_SUCCESS;
 }
 
@@ -776,41 +805,53 @@ static const struct hid_device_vtbl sdl_device_vtbl =
     sdl_device_physical_effect_update,
 };
 
-static void check_device_effects_state(struct sdl_device *impl)
+static BOOL check_device_effects_state(struct sdl_device *impl)
 {
     struct unix_device *iface = &impl->unix_device;
     struct hid_effect_state *effect_state = &iface->hid_physical.effect_state;
     ULONG effect_flags = InterlockedOr(&impl->effect_flags, 0);
+    BOOL active = FALSE;
     unsigned int i, ret;
 
-    if (!impl->sdl_haptic) return;
-    if (!(impl->effect_support & EFFECT_SUPPORT_PHYSICAL)) return;
+    if (!impl->sdl_haptic) return FALSE;
+    if (!(impl->effect_support & EFFECT_SUPPORT_PHYSICAL)) return FALSE;
 
     for (i = 0; i < ARRAY_SIZE(impl->effect_ids); ++i)
     {
         if (impl->effect_ids[i] == -1) continue;
         if (!(impl->effect_support & SDL_HAPTIC_STATUS)) ret = 1;
-        else ret = pSDL_HapticGetEffectStatus(impl->sdl_haptic, impl->effect_ids[i]);
+        else
+        {
+            ret = pSDL_HapticGetEffectStatus(impl->sdl_haptic, impl->effect_ids[i]);
+            if (ret == 1 && !(effect_flags & EFFECT_STATE_DEVICE_PAUSED)) active = TRUE;
+        }
         if (impl->effect_state[i] == ret) continue;
         impl->effect_state[i] = ret;
         hid_device_set_effect_state(iface, i, effect_flags | (ret == 1 ? EFFECT_STATE_EFFECT_PLAYING : 0));
         bus_event_queue_input_report(&event_queue, iface, effect_state->report_buf, effect_state->report_len);
     }
+    return active;
 }
 
 static void check_all_devices_effects_state(void)
 {
     static UINT last_ticks = 0;
+    LONG generation = InterlockedOr(&effects_generation, 0);
     UINT ticks = pSDL_GetTicks();
     struct sdl_device *impl;
+    BOOL active = FALSE;
 
     if (ticks - last_ticks < 10) return;
     last_ticks = ticks;
 
     pthread_mutex_lock(&sdl_cs);
     LIST_FOR_EACH_ENTRY(impl, &device_list, struct sdl_device, unix_device.entry)
-        check_device_effects_state(impl);
+        active |= check_device_effects_state(impl);
     pthread_mutex_unlock(&sdl_cs);
+
+    InterlockedExchange(&effects_active, active);
+    if (generation == InterlockedOr(&effects_generation, 0))
+        InterlockedExchange(&effects_checked_generation, generation);
 }
 
 static BOOL set_report_from_joystick_event(struct sdl_device *impl, SDL_Event *event)
@@ -860,7 +901,7 @@ static BOOL set_report_from_joystick_event(struct sdl_device *impl, SDL_Event *e
             ERR("TODO: Process Report (0x%x)\n",event->type);
     }
 
-    check_device_effects_state(impl);
+    if (check_device_effects_state(impl)) InterlockedExchange(&effects_active, TRUE);
     return FALSE;
 }
 
@@ -921,7 +962,7 @@ static BOOL set_report_from_controller_event(struct sdl_device *impl, SDL_Event 
             ERR("TODO: Process Report (%x)\n",event->type);
     }
 
-    check_device_effects_state(impl);
+    if (check_device_effects_state(impl)) InterlockedExchange(&effects_active, TRUE);
     return FALSE;
 }
 
@@ -1000,7 +1041,15 @@ static void sdl_add_device(unsigned int index)
 
         TRACE("%s id %d, axis_offset %u, desc %s.\n", controller ? "controller" : "joystick", id, axis_offset, debugstr_device_desc(&desc));
 
-        if (!(impl = hid_device_create(&sdl_device_vtbl, sizeof(struct sdl_device)))) return;
+        if (!(impl = hid_device_create(&sdl_device_vtbl, sizeof(struct sdl_device))))
+        {
+            if (!axis_offset)
+            {
+                if (controller) pSDL_GameControllerClose(controller);
+                pSDL_JoystickClose(joystick);
+            }
+            return;
+        }
         list_add_tail(&device_list, &impl->unix_device.entry);
         impl->sdl_joystick = joystick;
         impl->sdl_controller = controller;
@@ -1013,10 +1062,17 @@ static void sdl_add_device(unsigned int index)
         {
             list_remove(&impl->unix_device.entry);
             impl->unix_device.vtbl->destroy(&impl->unix_device);
+            free(impl);
             return;
         }
 
-        bus_event_queue_device_created(&event_queue, &impl->unix_device, &desc);
+        if (!bus_event_queue_device_created(&event_queue, &impl->unix_device, &desc))
+        {
+            list_remove(&impl->unix_device.entry);
+            impl->unix_device.vtbl->destroy(&impl->unix_device);
+            free(impl);
+            return;
+        }
         axis_offset += (options->split_controllers ? 6 : axis_count);
     }
     while (axis_offset < axis_count);
@@ -1075,6 +1131,7 @@ static void process_device_event(SDL_Event *event)
 NTSTATUS sdl_bus_init(void *args)
 {
     const char *mapping;
+    BOOL initialized = FALSE;
     int i;
 
     TRACE("args %p\n", args);
@@ -1094,10 +1151,9 @@ NTSTATUS sdl_bus_init(void *args)
     }
     LOAD_FUNCPTR(SDL_GetError);
     LOAD_FUNCPTR(SDL_Init);
+    LOAD_FUNCPTR(SDL_Quit);
     LOAD_FUNCPTR(SDL_JoystickClose);
     LOAD_FUNCPTR(SDL_JoystickEventState);
-    LOAD_FUNCPTR(SDL_JoystickGetGUID);
-    LOAD_FUNCPTR(SDL_JoystickGetGUIDString);
     LOAD_FUNCPTR(SDL_JoystickInstanceID);
     LOAD_FUNCPTR(SDL_JoystickName);
     LOAD_FUNCPTR(SDL_JoystickNumAxes);
@@ -1153,12 +1209,14 @@ NTSTATUS sdl_bus_init(void *args)
         ERR("could not init SDL: %s\n", pSDL_GetError());
         goto failed;
     }
+    initialized = TRUE;
 
-    if ((quit_event = pSDL_RegisterEvents(1)) == -1)
+    if ((quit_event = pSDL_RegisterEvents(2)) == -1)
     {
-        ERR("error registering quit event\n");
+        ERR("error registering internal events\n");
         goto failed;
     }
+    effect_event = quit_event + 1;
 
     pSDL_JoystickEventState(SDL_ENABLE);
     pSDL_GameControllerEventState(SDL_ENABLE);
@@ -1183,6 +1241,7 @@ NTSTATUS sdl_bus_init(void *args)
     return STATUS_SUCCESS;
 
 failed:
+    if (initialized) pSDL_Quit();
     dlclose(sdl_handle);
     sdl_handle = NULL;
     return STATUS_UNSUCCESSFUL;
@@ -1196,15 +1255,26 @@ NTSTATUS sdl_bus_wait(void *args)
     /* cleanup previously returned event */
     bus_event_cleanup(result);
 
-    do
+    for (;;)
     {
+        int timeout;
+
         if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;
-        if (pSDL_WaitEventTimeout(&event, 10) != 0) process_device_event(&event);
-        else check_all_devices_effects_state();
-    } while (event.type != quit_event);
+        timeout = (InterlockedOr(&effects_active, 0) ||
+                   InterlockedOr(&effects_generation, 0) != InterlockedOr(&effects_checked_generation, 0)) ? 10 : -1;
+        if (!pSDL_WaitEventTimeout(&event, timeout))
+        {
+            check_all_devices_effects_state();
+            continue;
+        }
+        if (event.type == quit_event) break;
+        if (event.type == effect_event) check_all_devices_effects_state();
+        else process_device_event(&event);
+    }
 
     TRACE("SDL main loop exiting\n");
     bus_event_queue_destroy(&event_queue);
+    pSDL_Quit();
     dlclose(sdl_handle);
     sdl_handle = NULL;
     return STATUS_SUCCESS;

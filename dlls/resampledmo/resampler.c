@@ -131,6 +131,30 @@ static int audio_frame_wrap_buffer(AVFrame *frame, const WAVEFORMATEXTENSIBLE *f
     return size;
 }
 
+static int ensure_audio_frame_buffer(AVFrame *frame, const WAVEFORMATEXTENSIBLE *format,
+        int samples, int *capacity)
+{
+    int ret;
+
+    if (frame->buf[0] && *capacity >= samples)
+    {
+        frame->nb_samples = samples;
+        return 0;
+    }
+
+    av_frame_unref(frame);
+    audio_frame_init_from_format(frame, format);
+    frame->nb_samples = samples;
+    if ((ret = av_frame_get_buffer(frame, 0)) < 0)
+    {
+        *capacity = 0;
+        return ret;
+    }
+
+    *capacity = samples;
+    return 0;
+}
+
 static int audio_frame_copy_from_buffer(AVFrame *frame, const WAVEFORMATEXTENSIBLE *format, AVBufferRef *buffer)
 {
     UINT8 *input_planes[4];
@@ -203,6 +227,8 @@ struct resampler
     AVFrame input_frame;
     AVFrame output_frame;
     AVFrame current_frame;
+    int input_frame_capacity;
+    int output_frame_capacity;
     INT64 time_den;
 };
 
@@ -228,7 +254,17 @@ static HRESULT resampler_process_frame(struct resampler *impl, AVFrame *input_fr
     if (!(buffer = buffer_from_media_buffer(output->pBuffer, 0)))
         return E_OUTOFMEMORY;
     if ((ret = audio_frame_wrap_buffer(&output_frame, &impl->output_format, buffer)) < 0)
+    {
+        int samples = buffer->size / impl->output_format.Format.nBlockAlign;
+
+        if ((ret = ensure_audio_frame_buffer(&impl->output_frame, &impl->output_format,
+                samples, &impl->output_frame_capacity)) < 0)
+        {
+            av_buffer_unref(&buffer);
+            return E_OUTOFMEMORY;
+        }
         av_frame_move_ref(&output_frame, &impl->output_frame);
+    }
 
     pts = swr_next_pts(impl->context, input_frame->pts);
     if ((ret = swr_convert(impl->context, output_frame.data, buffer->size / impl->output_format.Format.nBlockAlign,
@@ -299,6 +335,14 @@ static HRESULT resampler_process_input(struct resampler *impl, const DMO_OUTPUT_
         return E_OUTOFMEMORY;
     if ((ret = audio_frame_wrap_buffer(&impl->current_frame, &impl->input_format, buffer)) < 0)
     {
+        int samples = buffer->size / impl->input_format.Format.nBlockAlign;
+
+        if ((ret = ensure_audio_frame_buffer(&impl->input_frame, &impl->input_format,
+                samples, &impl->input_frame_capacity)) < 0)
+        {
+            av_buffer_unref(&buffer);
+            return E_OUTOFMEMORY;
+        }
         ret = audio_frame_copy_from_buffer(&impl->input_frame, &impl->input_format, buffer);
         av_frame_move_ref(&impl->current_frame, &impl->input_frame);
     }
@@ -345,6 +389,8 @@ static void resampler_cleanup(struct resampler *impl)
     av_frame_unref(&impl->current_frame);
     av_frame_unref(&impl->output_frame);
     av_frame_unref(&impl->input_frame);
+    impl->input_frame_capacity = 0;
+    impl->output_frame_capacity = 0;
     swr_free(&impl->context);
 }
 
@@ -386,13 +432,7 @@ static HRESULT resampler_init(struct resampler *impl)
     }
 
     audio_frame_init_from_format(&impl->input_frame, &impl->input_format);
-    impl->input_frame.nb_samples = impl->input_format.Format.nSamplesPerSec;
-    if ((ret = av_frame_get_buffer(&impl->input_frame, 0)) < 0)
-        goto failed;
     audio_frame_init_from_format(&impl->output_frame, &impl->output_format);
-    impl->output_frame.nb_samples = impl->output_format.Format.nSamplesPerSec;
-    if ((ret = av_frame_get_buffer(&impl->output_frame, 0)) < 0)
-        goto failed;
 
     av_opt_set_chlayout(impl->context, "in_chlayout", &impl->input_frame.ch_layout, 0);
     av_opt_set_int(impl->context, "in_sample_rate", impl->input_frame.sample_rate, 0);
@@ -412,6 +452,26 @@ failed:
     ERR("ret %d\n", ret);
     resampler_cleanup(impl);
     return E_FAIL;
+}
+
+static HRESULT resampler_flush(struct resampler *impl)
+{
+    int ret;
+
+    av_frame_unref(&impl->current_frame);
+    if (!impl->input_frame.buf[0])
+        impl->input_frame_capacity = 0;
+
+    if (!impl->context)
+        return S_OK;
+
+    if ((ret = swr_init(impl->context)) < 0)
+    {
+        ERR("Failed to reset resampler, ret %d (%s).\n", -ret, av_err2str(ret));
+        return E_FAIL;
+    }
+
+    return S_OK;
 }
 
 static struct resampler *impl_from_IUnknown(IUnknown *iface)
@@ -705,7 +765,13 @@ static HRESULT WINAPI transform_ProcessEvent(IMFTransform *iface, DWORD id, IMFM
 
 static HRESULT WINAPI transform_ProcessMessage(IMFTransform *iface, MFT_MESSAGE_TYPE message, ULONG_PTR param)
 {
-    FIXME("iface %p, message %#x, param %p stub!\n", iface, message, (void *)param);
+    struct resampler *impl = impl_from_IMFTransform(iface);
+
+    TRACE("iface %p, message %#x, param %p.\n", iface, message, (void *)param);
+
+    if (message == MFT_MESSAGE_COMMAND_FLUSH)
+        return resampler_flush(impl);
+
     return S_OK;
 }
 
@@ -1044,8 +1110,10 @@ static HRESULT WINAPI media_object_SetInputMaxLatency(IMediaObject *iface, DWORD
 
 static HRESULT WINAPI media_object_Flush(IMediaObject *iface)
 {
-    FIXME("iface %p stub!\n", iface);
-    return E_NOTIMPL;
+    struct resampler *impl = impl_from_IMediaObject(iface);
+
+    TRACE("iface %p.\n", iface);
+    return resampler_flush(impl);
 }
 
 static HRESULT WINAPI media_object_Discontinuity(IMediaObject *iface, DWORD index)

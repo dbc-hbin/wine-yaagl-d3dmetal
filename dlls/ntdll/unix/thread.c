@@ -76,6 +76,7 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include "msync.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(thread);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
@@ -1116,11 +1117,22 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
 static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
 {
     struct thread_data *data = get_thread_data();
-    close( data->alert_fd );
+    /* With MSync alert_fd is a borrowed shared-memory index, not a Unix fd. */
+    if (!do_msync()) close( data->alert_fd );
     close( data->wait_fd[0] );
     close( data->wait_fd[1] );
     close( data->reply_fd );
     close( data->request_fd );
+
+#if defined(__APPLE__) && defined(__x86_64__)
+    /* Remove the PEB from the localtime field in %gs, or MacOS might try
+     * to free() the pointer and crash. That happens for processes that are
+     * using the alt loader for dock integration. */
+    __asm__ volatile (".byte 0x65\n\tmovq %q0,%c1"
+                      :
+                      : "r" ((void *)0), "n" (FIELD_OFFSET(TEB, Peb)));
+#endif
+
     pthread_exit( UIntToPtr(status) );
 }
 

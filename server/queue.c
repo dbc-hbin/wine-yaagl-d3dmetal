@@ -505,13 +505,13 @@ static struct thread_input *get_desktop_cursor_thread_input( struct desktop *des
     return input;
 }
 
-static int update_desktop_cursor_window( struct desktop *desktop, user_handle_t win )
+static int update_desktop_cursor_window( struct desktop *desktop, user_handle_t win, int notify )
 {
     int updated = win != desktop->cursor_win;
     struct thread_input *input;
     desktop->cursor_win = win;
 
-    if (updated && (input = get_desktop_cursor_thread_input( desktop )))
+    if ((updated || notify) && (input = get_desktop_cursor_thread_input( desktop )))
     {
         input_shm_t *input_shm = input->shared;
         user_handle_t handle = input_shm->cursor_count < 0 ? 0 : input_shm->cursor;
@@ -543,7 +543,7 @@ static int update_desktop_cursor_pos( struct desktop *desktop, user_handle_t win
 
     if (!win || !is_window_visible( win ) || is_window_transparent( win ))
         win = shallow_window_from_point( desktop, x, y );
-    if (update_desktop_cursor_window( desktop, win )) updated = 1;
+    if (update_desktop_cursor_window( desktop, win, 0 )) updated = 1;
 
     return updated;
 }
@@ -4022,6 +4022,12 @@ DECL_HANDLER(set_cursor)
         set_win32_error( ERROR_INVALID_CURSOR_HANDLE );
         return;
     }
+    if ((req->flags & SET_CURSOR_OWNER) && req->win &&
+        !is_native_cursor_window( req->win, desktop, current->process ))
+    {
+        set_error( STATUS_INVALID_HANDLE );
+        return;
+    }
 
     SHARED_WRITE_BEGIN( input_shm, input_shm_t )
     {
@@ -4036,6 +4042,8 @@ DECL_HANDLER(set_cursor)
     SHARED_WRITE_END;
 
     if (req->flags & SET_CURSOR_POS) set_cursor_pos( desktop, req->x, req->y );
+    if (req->flags & SET_CURSOR_OWNER)
+        update_desktop_cursor_window( desktop, req->win, 1 );
     if (req->flags & SET_CURSOR_CLIP) set_clip_rectangle( desktop, &req->clip, req->flags, 0 );
     if (req->flags & SET_CURSOR_NOCLIP) set_clip_rectangle( desktop, NULL, SET_CURSOR_NOCLIP, 0 );
 

@@ -196,6 +196,9 @@ uint32_t FAudio_Release(FAudio *audio)
 			destroy_voice(audio->master);
 		FAudio_OPERATIONSET_ClearAll(audio);
 		FAudio_StopEngine(audio);
+		while (audio->callbacks)
+			LinkedList_RemoveEntry(&audio->callbacks, audio->callbacks->entry,
+				audio->callbackLock, audio->pFree);
 		audio->pFree(audio->decoded_audio);
 		audio->pFree(audio->resampled_audio);
 		audio->pFree(audio->effect_output);

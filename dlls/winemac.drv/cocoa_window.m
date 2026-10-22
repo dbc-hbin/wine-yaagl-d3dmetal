@@ -32,6 +32,8 @@
 #import "cocoa_event.h"
 #import "cocoa_opengl.h"
 
+#import "d3dmetal_objc.h" /* CW HACK 22435 */
+
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
 WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
@@ -243,6 +245,8 @@ static inline BOOL stage_manager_enabled(void)
 
     WineMetalView *_metalView;
     NSMutableDictionary<NSNumber*, CALayerHost*>* _caLayerHosts;
+
+@public void *d3dmetal_client_surface;   /* CW HACK 22435 */
 }
 
 @property (readonly, nonatomic) BOOL everHadGLContext;
@@ -268,7 +272,7 @@ static inline BOOL stage_manager_enabled(void)
 @property (readwrite, nonatomic) BOOL preventsAppActivation;
 @property (readwrite, nonatomic) BOOL floating;
 @property (readwrite, nonatomic) BOOL drawnSinceShown;
-@property (readwrite, nonatomic) BOOL closing;
+@property (readwrite, getter=isClosing, nonatomic) BOOL closing;
 @property (readwrite, getter=isFakingClose, nonatomic) BOOL fakingClose;
 @property (retain, nonatomic) NSWindow* latentParentWindow;
 
@@ -295,6 +299,12 @@ static inline BOOL stage_manager_enabled(void)
     - (void) becameIneligibleChild;
 
     - (void) windowDidDrawContent;
+    - (void) postNativeCursorSyncEvent;
+
+    - (void) queueColorImage:(CGImageRef)image rect:(CGRect)rect dirty:(CGRect)dirty;
+    - (void) queueShapeImage:(CGImageRef)image;
+    - (void) applyPendingSurfaceUpdates;
+    - (void) discardPendingSurfaceUpdates;
 
 @end
 
@@ -402,10 +412,16 @@ static inline BOOL stage_manager_enabled(void)
         imageRect.size.width *= layer.contentsScale;
         imageRect.size.height *= layer.contentsScale;
 
-        maskedImage = shapeImage ? CGImageCreateWithMask(colorImage, shapeImage)
-                                 : CGImageRetain(colorImage);
-        image = CGImageCreateWithImageInRect(maskedImage, imageRect);
-        CGImageRelease(maskedImage);
+        if (!shapeImage && colorImage &&
+            CGRectEqualToRect(imageRect, CGRectMake(0, 0, CGImageGetWidth(colorImage), CGImageGetHeight(colorImage))))
+            image = CGImageRetain(colorImage);
+        else
+        {
+            maskedImage = shapeImage ? CGImageCreateWithMask(colorImage, shapeImage)
+                                     : CGImageRetain(colorImage);
+            image = maskedImage ? CGImageCreateWithImageInRect(maskedImage, imageRect) : NULL;
+            CGImageRelease(maskedImage);
+        }
 
         if (image)
         {
@@ -849,7 +865,11 @@ static inline BOOL stage_manager_enabled(void)
 
     - (CALayer*) makeBackingLayer
     {
+#if defined(__x86_64__)
+        CAMetalLayer *layer = [WineMetalLayer layer];   /* CW HACK 22435 */
+#else
         CAMetalLayer *layer = [CAMetalLayer layer];
+#endif
         layer.device = _device;
         layer.framebufferOnly = YES;
         layer.magnificationFilter = kCAFilterNearest;
@@ -869,6 +889,13 @@ static inline BOOL stage_manager_enabled(void)
 @implementation WineWindow
 
     static WineWindow* causing_becomeKeyWindow;
+
+    /* Scheduling state for the main-queue blocks that publish
+       WINDOW_NATIVE_CURSOR_SYNC.  Only the window whose block is still waiting
+       is coalesced, so requests for distinct windows keep their relative order.
+       Every caller runs on the main thread, so no locking is needed. */
+    static WineWindow* pendingNativeCursorSyncWindow;
+    static uint64_t nativeCursorSyncSerial;
 
     @synthesize disabled, noForeground, preventsAppActivation, floating, fullscreen, fakingClose, closing, latentParentWindow, hwnd, queue;
     @synthesize drawnSinceShown;
@@ -895,6 +922,9 @@ static inline BOOL stage_manager_enabled(void)
                                               defer:YES] autorelease];
 
         if (!window) return nil;
+
+        window->surfaceUpdateLock = [[NSLock alloc] init];
+        if (!window->surfaceUpdateLock) return nil;
 
         /* Standardize windows to eliminate differences between titled and
            borderless windows and between NSWindow and NSPanel. */
@@ -924,6 +954,7 @@ static inline BOOL stage_manager_enabled(void)
            because they give us mouse moves in the background. */
         trackingArea = [[[NSTrackingArea alloc] initWithRect:[contentView bounds]
                                                      options:(NSTrackingMouseMoved |
+                                                              NSTrackingCursorUpdate |
                                                               NSTrackingActiveAlways |
                                                               NSTrackingInVisibleRect)
                                                        owner:window
@@ -963,6 +994,9 @@ static inline BOOL stage_manager_enabled(void)
         [latentChildWindows release];
         [latentParentWindow release];
         [contentViewMaskLayer release];
+        CGImageRelease(pendingColorImage);
+        CGImageRelease(pendingShapeImage);
+        [surfaceUpdateLock release];
         [super dealloc];
     }
 
@@ -1130,6 +1164,33 @@ static inline BOOL stage_manager_enabled(void)
         }
 
         return level;
+    }
+
+    - (void) postNativeCursorSyncEvent
+    {
+        /* Coalesce only consecutive requests for the same window; that block runs
+           after this request and publishes the same event, while requests for
+           distinct windows are always queued so their order is preserved
+           (A, B, A stays A, B, A).  The newest block clears the pending window as
+           it begins, before publishing, so a reentrant request still schedules
+           another block.  Main thread only; the queued block retains the window. */
+        if (pendingNativeCursorSyncWindow == self)
+            return;
+
+        uint64_t serial = ++nativeCursorSyncSerial;
+
+        pendingNativeCursorSyncWindow = self;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (nativeCursorSyncSerial == serial)
+                pendingNativeCursorSyncWindow = nil;
+
+            macdrv_event *event = macdrv_create_event(WINDOW_NATIVE_CURSOR_SYNC, self);
+
+            [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_NATIVE_CURSOR_SYNC) forWindow:self];
+            [queue postEvent:event];
+            macdrv_release_event(event);
+        });
     }
 
     - (void) postDidUnminimizeEvent
@@ -1701,6 +1762,10 @@ static inline BOOL stage_manager_enabled(void)
 
             if (![self isExcludedFromWindowsMenu])
                 [NSApp addWindowsItem:self title:[self title] filename:NO];
+
+            [controller reconcileCursorForCurrentMouseLocation];
+            if (!wasVisible && [self isVisible])
+                [self postNativeCursorSyncEvent];
         }
     }
 
@@ -1752,6 +1817,9 @@ static inline BOOL stage_manager_enabled(void)
             [controller updateFullscreenWindows];
         [controller adjustWindowLevels];
         [NSApp removeWindowsItem:self];
+
+        if (wasVisible && ![self isVisible])
+            [self postNativeCursorSyncEvent];
 
         [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_BROUGHT_FORWARD) |
                                          event_mask_for_type(WINDOW_GOT_FOCUS) |
@@ -2446,6 +2514,7 @@ static inline BOOL stage_manager_enabled(void)
         if (!drawnSinceShown)
         {
             drawnSinceShown = YES;
+            [self postNativeCursorSyncEvent];
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self checkTransparency];
             });
@@ -2670,6 +2739,16 @@ static inline BOOL stage_manager_enabled(void)
         if (proposedSize.height < size.height)
             size.height = proposedSize.height;
         return size;
+    }
+
+    - (void)cursorUpdate:(NSEvent*)event
+    {
+        /* AppKit routed this event to the authoritative window after updating tracking state. */
+        if (event.window == self)
+        {
+            [[WineApplicationController sharedController] applyCursorForWindow:self];
+            [self postNativeCursorSyncEvent];
+        }
     }
 
     - (void)windowDidBecomeKey:(NSNotification *)notification
@@ -3086,6 +3165,102 @@ static inline BOOL stage_manager_enabled(void)
         return NO;
     }
 
+    - (void) queueColorImage:(CGImageRef)image rect:(CGRect)rect dirty:(CGRect)dirty
+    {
+        BOOL schedule;
+
+        [surfaceUpdateLock lock];
+        if (surfaceUpdatesClosed)
+        {
+            [surfaceUpdateLock unlock];
+            return;
+        }
+        CGImageRelease(pendingColorImage);
+        pendingColorImage = CGImageRetain(image);
+        pendingSurfaceRect = rect;
+        pendingDirtyRect = pendingColorUpdate ? CGRectUnion(pendingDirtyRect, dirty) : dirty;
+        pendingColorUpdate = TRUE;
+        schedule = !surfaceUpdateScheduled;
+        surfaceUpdateScheduled = TRUE;
+        [surfaceUpdateLock unlock];
+
+        if (schedule)
+            OnMainThreadAsync(^{ [self applyPendingSurfaceUpdates]; });
+    }
+
+    - (void) queueShapeImage:(CGImageRef)image
+    {
+        BOOL schedule;
+
+        [surfaceUpdateLock lock];
+        if (surfaceUpdatesClosed)
+        {
+            [surfaceUpdateLock unlock];
+            return;
+        }
+        CGImageRelease(pendingShapeImage);
+        pendingShapeImage = CGImageRetain(image);
+        pendingShapeUpdate = TRUE;
+        schedule = !surfaceUpdateScheduled;
+        surfaceUpdateScheduled = TRUE;
+        [surfaceUpdateLock unlock];
+
+        if (schedule)
+            OnMainThreadAsync(^{ [self applyPendingSurfaceUpdates]; });
+    }
+
+    - (void) applyPendingSurfaceUpdates
+    {
+        CGImageRef color, shape;
+        CGRect rect, dirty;
+        BOOL updateColor, updateShape;
+
+        [surfaceUpdateLock lock];
+        color = pendingColorImage;
+        pendingColorImage = NULL;
+        shape = pendingShapeImage;
+        pendingShapeImage = NULL;
+        rect = pendingSurfaceRect;
+        dirty = pendingDirtyRect;
+        updateColor = pendingColorUpdate;
+        updateShape = pendingShapeUpdate;
+        pendingColorUpdate = pendingShapeUpdate = surfaceUpdateScheduled = FALSE;
+        [surfaceUpdateLock unlock];
+
+        if (!self.closing)
+        {
+            WineContentView *view = [self contentView];
+
+            if (updateColor)
+            {
+                [view setColorImage:color];
+                [view setSurfaceRect:cgrect_mac_from_win(rect)];
+                [view setNeedsDisplayInRect:NSRectFromCGRect(cgrect_mac_from_win(dirty))];
+            }
+            if (updateShape)
+            {
+                [view setShapeImage:shape];
+                [view setNeedsDisplay:true];
+                [self checkTransparency];
+            }
+        }
+
+        CGImageRelease(color);
+        CGImageRelease(shape);
+    }
+
+    - (void) discardPendingSurfaceUpdates
+    {
+        [surfaceUpdateLock lock];
+        surfaceUpdatesClosed = TRUE;
+        CGImageRelease(pendingColorImage);
+        pendingColorImage = NULL;
+        CGImageRelease(pendingShapeImage);
+        pendingShapeImage = NULL;
+        pendingColorUpdate = pendingShapeUpdate = FALSE;
+        [surfaceUpdateLock unlock];
+    }
+
 @end
 
 
@@ -3110,6 +3285,16 @@ WineWindow *macdrv_create_cocoa_window(const struct macdrv_window_features* wf,
     return window;
 }
 
+WineWindow *macdrv_retain_cocoa_window(WineWindow *window)
+{
+    return [window retain];
+}
+
+void macdrv_release_cocoa_window(WineWindow *window)
+{
+    [window release];
+}
+
 /***********************************************************************
  *              macdrv_destroy_cocoa_window
  *
@@ -3121,6 +3306,7 @@ void macdrv_destroy_cocoa_window(WineWindow *window)
 {
     OnMainThread(^{
         window.closing = TRUE;
+        [window discardPendingSurfaceUpdates];
         [window doOrderOut];
         [window close];
     });
@@ -3275,17 +3461,7 @@ void macdrv_window_set_color_image(WineWindow *window, CGImageRef image, CGRect 
 {
 @autoreleasepool
 {
-    CGImageRetain(image);
-
-    OnMainThreadAsync(^{
-        WineContentView *view = [window contentView];
-
-        [view setColorImage:image];
-        [view setSurfaceRect:cgrect_mac_from_win(rect)];
-        [view setNeedsDisplayInRect:NSRectFromCGRect(cgrect_mac_from_win(dirty))];
-
-        CGImageRelease(image);
-    });
+    [window queueColorImage:image rect:rect dirty:dirty];
 }
 }
 
@@ -3297,17 +3473,7 @@ void macdrv_window_set_shape_image(WineWindow *window, CGImageRef image)
 {
 @autoreleasepool
 {
-    CGImageRetain(image);
-
-    OnMainThreadAsync(^{
-        WineContentView *view = [window contentView];
-
-        [view setShapeImage:image];
-        [view setNeedsDisplay:true];
-        [window checkTransparency];
-
-        CGImageRelease(image);
-    });
+    [window queueShapeImage:image];
 }
 }
 
@@ -3853,6 +4019,20 @@ void macdrv_set_view_backing_size(WineContentView *view, const int backing_size[
 {
     if ([view isKindOfClass:[WineContentView class]])
         [view wine_setBackingSize:backing_size];
+}
+
+/* CW HACK 22435 */
+void *macdrv_get_view_d3dmetal_client_surface(WineContentView *view)
+{
+    if ([view isKindOfClass:[WineContentView class]])
+        return view->d3dmetal_client_surface;
+    return NULL;
+}
+
+void macdrv_set_view_d3dmetal_client_surface(WineContentView *view, void *client_surface)
+{
+    if ([view isKindOfClass:[WineContentView class]])
+        view->d3dmetal_client_surface = client_surface;
 }
 
 /***********************************************************************

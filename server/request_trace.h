@@ -3251,6 +3251,7 @@ static void dump_set_cursor_request( const struct set_cursor_request *req )
     fprintf( stderr, ", show_count=%d", req->show_count );
     fprintf( stderr, ", x=%d", req->x );
     fprintf( stderr, ", y=%d", req->y );
+    fprintf( stderr, ", win=%08x", req->win );
     dump_rectangle( ", clip=", &req->clip );
 }
 
@@ -3419,6 +3420,7 @@ static void dump_get_inproc_sync_fd_reply( const struct get_inproc_sync_fd_reply
 {
     fprintf( stderr, " type=%d", req->type );
     fprintf( stderr, ", access=%08x", req->access );
+    fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
 }
 
 static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_request *req )

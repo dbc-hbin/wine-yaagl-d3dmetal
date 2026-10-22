@@ -20,11 +20,13 @@
 
 #include <stdarg.h>
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "ntgdi.h"
 #include "macdrv_res.h"
 #include "shellapi.h"
+#include "winreg.h"
 #include "unixlib.h"
 #include "wine/debug.h"
 
@@ -368,6 +370,73 @@ cleanup:
     return NtCallbackReturn(entries, count * sizeof(entries[0]), 0);
 }
 
+static NTSTATUS WINAPI macdrv_regcreateopenkeyexa(void *arg, ULONG size)
+{
+    struct regcreateopenkeyexa_params *params = arg;
+    LONG result;
+
+    TRACE("()\n");
+
+    if (params->create)
+    {
+        result = RegCreateKeyExA(UlongToHandle(params->hkey),
+                                 param_ptr(params->name),
+                                 params->reserved,
+                                 param_ptr(params->class),
+                                 params->options,
+                                 params->access,
+                                 param_ptr(params->security),
+                                 param_ptr(params->retkey),
+                                 param_ptr(params->disposition));
+    }
+    else
+    {
+        result = RegOpenKeyExA(UlongToHandle(params->hkey),
+                               param_ptr(params->name),
+                               params->options,
+                               params->access,
+                               param_ptr(params->retkey));
+    }
+    *(LONG *)param_ptr(params->result) = result;
+    return 0;
+}
+
+static NTSTATUS WINAPI macdrv_regqueryvalueexa(void *arg, ULONG size)
+{
+    struct regqueryvalueexa_params *params = arg;
+    LONG result;
+
+    TRACE("()\n");
+
+    result = RegQueryValueExA(UlongToHandle(params->hkey),
+                              param_ptr(params->name),
+                              param_ptr(params->reserved),
+                              param_ptr(params->type),
+                              param_ptr(params->data),
+                              param_ptr(params->count));
+
+    *(LONG *)param_ptr(params->result) = result;
+    return 0;
+}
+
+static NTSTATUS WINAPI macdrv_regsetvalueexa(void *arg, ULONG size)
+{
+    struct regsetvalueexa_params *params = arg;
+    LONG result;
+
+    TRACE("()\n");
+
+    result = RegSetValueExA(UlongToHandle(params->hkey),
+                            param_ptr(params->name),
+                            params->reserved,
+                            params->type,
+                            param_ptr(params->data),
+                            params->count);
+
+    *(LONG *)param_ptr(params->result) = result;
+    return 0;
+}
+
 
 static BOOL process_attach(void)
 {
@@ -399,6 +468,9 @@ static BOOL process_attach(void)
     params.strings = strings;
     params.app_icon_callback = (UINT_PTR)macdrv_app_icon;
     params.app_quit_request_callback = (UINT_PTR)macdrv_app_quit_request;
+    params.regcreateopenkeyexa_callback = (UINT_PTR)macdrv_regcreateopenkeyexa;
+    params.regsetvalueexa_callback = (UINT_PTR)macdrv_regsetvalueexa;
+    params.regqueryvalueexa_callback = (UINT_PTR)macdrv_regqueryvalueexa;
 
     if (MACDRV_CALL(init, &params)) return FALSE;
 

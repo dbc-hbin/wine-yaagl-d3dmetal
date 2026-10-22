@@ -47,6 +47,19 @@ struct inflight_fd
 };
 #define MAX_INFLIGHT_FDS 16  /* max number of fds in flight per thread */
 
+/*
+ * Most variable request data consists of a short name or object attributes.
+ * Two 512-byte buffers avoid allocator churn for those common requests and
+ * their replies at a fixed 1 KiB per server thread, while the 8 KiB protocol
+ * limit continues to use heap storage when needed.
+ */
+#define INLINE_REQUEST_DATA_SIZE 512
+union inline_request_data
+{
+    client_ptr_t align;
+    unsigned char data[INLINE_REQUEST_DATA_SIZE];
+};
+
 struct thread
 {
     struct object          obj;           /* object header */
@@ -68,8 +81,10 @@ struct thread
     unsigned int           error;         /* current error code */
     union generic_request  req;           /* current request */
     void                  *req_data;      /* variable-size data for request */
+    union inline_request_data req_buffer; /* inline storage for small request data */
     unsigned int           req_toread;    /* amount of data still to read in request */
     void                  *reply_data;    /* variable-size data for reply */
+    union inline_request_data reply_buffer; /* inline storage for small reply data */
     unsigned int           reply_size;    /* size of reply data */
     unsigned int           reply_towrite; /* amount of data still to write in reply */
     struct fd             *request_fd;    /* fd for receiving client requests */

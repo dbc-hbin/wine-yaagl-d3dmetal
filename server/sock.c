@@ -164,11 +164,22 @@ union unix_sockaddr
 #endif
 };
 
-static struct list poll_list = LIST_INIT( poll_list );
+struct poll_req;
+
+struct poll_req_socket
+{
+    struct list entry;
+    struct poll_req *req;
+    struct sock *sock;
+    int mask;
+    obj_handle_t handle;
+    int flags;
+    unsigned int status;
+};
 
 struct poll_req
 {
-    struct list entry;
+    struct list owner_entry;
     struct async *async;
     struct iosb *iosb;
     struct timeout_user *timeout;
@@ -176,14 +187,7 @@ struct poll_req
     int exclusive;
     int pending;
     unsigned int count;
-    struct
-    {
-        struct sock *sock;
-        int mask;
-        obj_handle_t handle;
-        int flags;
-        unsigned int status;
-    } sockets[1];
+    struct poll_req_socket sockets[1];
 };
 
 struct accept_req
@@ -266,6 +270,8 @@ struct sock
     struct async_queue  accept_q;    /* queue for asynchronous accepts */
     struct async_queue  connect_q;   /* queue for asynchronous connects */
     struct async_queue  poll_q;      /* queue for asynchronous polls */
+    struct list         poll_memberships; /* poll requests containing this socket */
+    struct list         poll_requests; /* poll requests issued on this socket */
     struct object      *ifchange_obj; /* the interface change notification object */
     struct list         ifchange_entry; /* entry in ifchange notification list */
     struct list         accept_list; /* list of pending accept requests */
@@ -1088,11 +1094,15 @@ static void free_poll_req( void *private )
 
     if (req->timeout) remove_timeout_user( req->timeout );
 
+    list_remove( &req->owner_entry );
+    list_init( &req->owner_entry );
     for (i = 0; i < req->count; ++i)
+    {
+        list_remove( &req->sockets[i].entry );
         release_object( req->sockets[i].sock );
+    }
     release_object( req->async );
     release_object( req->iosb );
-    list_remove( &req->entry );
     free( req );
 }
 
@@ -1211,18 +1221,25 @@ static void complete_async_poll( struct poll_req *req, unsigned int status )
 static void complete_async_polls( struct sock *sock, int event, int error )
 {
     int flags = get_poll_flags( sock, event );
-    struct poll_req *req, *next;
+    struct list *cursor = sock->poll_memberships.next;
 
-    LIST_FOR_EACH_ENTRY_SAFE( req, next, &poll_list, struct poll_req, entry )
+    while (cursor != &sock->poll_memberships)
     {
+        struct poll_req_socket *member = LIST_ENTRY( cursor, struct poll_req_socket, entry );
+        struct poll_req *req = member->req;
+        struct list *next = cursor->next;
+        BOOL signaled = FALSE;
         unsigned int i;
 
-        if (req->iosb->status != STATUS_PENDING) continue;
+        if (req->iosb->status != STATUS_PENDING)
+        {
+            cursor = next;
+            continue;
+        }
 
         for (i = 0; i < req->count; ++i)
         {
-            if (req->sockets[i].sock != sock) continue;
-            if (!(req->sockets[i].mask & flags)) continue;
+            if (req->sockets[i].sock != sock || !(req->sockets[i].mask & flags)) continue;
 
             if (debug_level)
                 fprintf( stderr, "completing poll for socket %p, wanted %#x got %#x\n",
@@ -1230,13 +1247,15 @@ static void complete_async_polls( struct sock *sock, int event, int error )
 
             req->sockets[i].flags = req->sockets[i].mask & flags;
             req->sockets[i].status = sock_get_ntstatus( error );
-
-            if (req->pending)
-            {
-                complete_async_poll( req, STATUS_SUCCESS );
-                break;
-            }
+            signaled = TRUE;
         }
+
+        if (signaled && req->pending)
+        {
+            complete_async_poll( req, STATUS_SUCCESS );
+            cursor = sock->poll_memberships.next;
+        }
+        else cursor = next;
     }
 }
 
@@ -1521,7 +1540,7 @@ static int sock_get_poll_events( struct fd *fd )
 {
     struct sock *sock = get_fd_user( fd );
     unsigned int mask = sock->mask & ~sock->reported_events;
-    struct poll_req *req;
+    struct poll_req_socket *member;
     int ev = 0;
 
     assert( sock->obj.ops == &sock_ops );
@@ -1529,18 +1548,10 @@ static int sock_get_poll_events( struct fd *fd )
     if (!sock->type) /* not initialized yet */
         return -1;
 
-    LIST_FOR_EACH_ENTRY( req, &poll_list, struct poll_req, entry )
+    LIST_FOR_EACH_ENTRY( member, &sock->poll_memberships, struct poll_req_socket, entry )
     {
-        unsigned int i;
-
-        if (req->iosb->status != STATUS_PENDING) continue;
-
-        for (i = 0; i < req->count; ++i)
-        {
-            if (req->sockets[i].sock != sock) continue;
-
-            ev |= poll_flags_from_afd( sock, req->sockets[i].mask );
-        }
+        if (member->req->iosb->status != STATUS_PENDING) continue;
+        ev |= poll_flags_from_afd( sock, member->mask );
     }
 
     switch (sock->state)
@@ -1639,9 +1650,10 @@ static enum server_fd_type sock_get_fd_type( struct fd *fd )
 
 static void sock_cancel_async( struct fd *fd, struct async *async )
 {
+    struct sock *poll_sock = get_fd_user( fd );
     struct poll_req *req;
 
-    LIST_FOR_EACH_ENTRY( req, &poll_list, struct poll_req, entry )
+    LIST_FOR_EACH_ENTRY( req, &poll_sock->poll_requests, struct poll_req, owner_entry )
     {
         unsigned int i;
 
@@ -1655,6 +1667,7 @@ static void sock_cancel_async( struct fd *fd, struct async *async )
             if (sock->main_poll == req)
                 sock->main_poll = NULL;
         }
+        break;
     }
 
     async_terminate( async, STATUS_CANCELLED );
@@ -1690,7 +1703,6 @@ static int sock_close_handle( struct object *obj, struct process *process, obj_h
     if (sock->obj.handle_count == 1) /* last handle */
     {
         struct accept_req *accept_req, *accept_next;
-        struct poll_req *poll_req, *poll_next;
 
         if (sock->accept_recv_req)
             async_terminate( sock->accept_recv_req->async, STATUS_CANCELLED );
@@ -1701,25 +1713,34 @@ static int sock_close_handle( struct object *obj, struct process *process, obj_h
         if (sock->connect_req)
             async_terminate( sock->connect_req->async, STATUS_CANCELLED );
 
-        LIST_FOR_EACH_ENTRY_SAFE( poll_req, poll_next, &poll_list, struct poll_req, entry )
         {
-            struct iosb *iosb = poll_req->iosb;
-            BOOL signaled = FALSE;
-            unsigned int i;
+            struct list *cursor = sock->poll_memberships.next;
 
-            if (iosb->status != STATUS_PENDING) continue;
-
-            for (i = 0; i < poll_req->count; ++i)
+            while (cursor != &sock->poll_memberships)
             {
-                if (poll_req->sockets[i].sock == sock)
-                {
-                    signaled = TRUE;
-                    poll_req->sockets[i].flags = AFD_POLL_CLOSE;
-                    poll_req->sockets[i].status = 0;
-                }
-            }
+                struct poll_req_socket *member = LIST_ENTRY( cursor, struct poll_req_socket, entry );
+                struct poll_req *poll_req = member->req;
+                struct list *next = cursor->next;
+                unsigned int i;
 
-            if (signaled) complete_async_poll( poll_req, STATUS_SUCCESS );
+                if (poll_req->iosb->status != STATUS_PENDING)
+                {
+                    cursor = next;
+                    continue;
+                }
+
+                for (i = 0; i < poll_req->count; ++i)
+                {
+                    if (poll_req->sockets[i].sock == sock)
+                    {
+                        poll_req->sockets[i].flags = AFD_POLL_CLOSE;
+                        poll_req->sockets[i].status = 0;
+                    }
+                }
+
+                complete_async_poll( poll_req, STATUS_SUCCESS );
+                cursor = sock->poll_memberships.next;
+            }
         }
     }
     return async_close_obj_handle( obj, process, handle );
@@ -1731,6 +1752,19 @@ static void sock_destroy( struct object *obj )
     unsigned int i;
 
     assert( obj->ops == &sock_ops );
+
+    while (!list_empty( &sock->poll_requests ))
+    {
+        struct poll_req *req = LIST_ENTRY( list_head( &sock->poll_requests ), struct poll_req, owner_entry );
+
+        list_remove( &req->owner_entry );
+        list_init( &req->owner_entry );
+        for (i = 0; i < req->count; ++i)
+        {
+            if (req->sockets[i].sock->main_poll == req)
+                req->sockets[i].sock->main_poll = NULL;
+        }
+    }
 
     /* FIXME: special socket shutdown stuff? */
 
@@ -1809,6 +1843,8 @@ static struct sock *create_socket(void)
     init_async_queue( &sock->poll_q );
     memset( sock->errors, 0, sizeof(sock->errors) );
     list_init( &sock->accept_list );
+    list_init( &sock->poll_memberships );
+    list_init( &sock->poll_requests );
     return sock;
 }
 
@@ -3566,7 +3602,7 @@ static void handle_exclusive_poll(struct poll_req *req)
         struct sock *sock = req->sockets[i].sock;
         struct poll_req *main_poll = sock->main_poll;
 
-        if (main_poll && main_poll->exclusive && req->exclusive)
+        if (main_poll && main_poll != req && main_poll->exclusive && req->exclusive)
         {
             complete_async_poll( main_poll, STATUS_SUCCESS );
             main_poll = NULL;
@@ -3593,6 +3629,7 @@ static void poll_socket( struct sock *poll_sock, struct async *async, int exclus
     if (!(req = mem_alloc( offsetof( struct poll_req, sockets[count] ) )))
         return;
 
+    list_init( &req->owner_entry );
     req->timeout = NULL;
     req->pending = 0;
     if (timeout && timeout != TIMEOUT_INFINITE &&
@@ -3613,6 +3650,8 @@ static void poll_socket( struct sock *poll_sock, struct async *async, int exclus
             free( req );
             return;
         }
+        list_init( &req->sockets[i].entry );
+        req->sockets[i].req = req;
         req->sockets[i].handle = sockets[i].socket;
         req->sockets[i].mask = sockets[i].flags;
         req->sockets[i].flags = 0;
@@ -3625,7 +3664,9 @@ static void poll_socket( struct sock *poll_sock, struct async *async, int exclus
 
     handle_exclusive_poll(req);
 
-    list_add_tail( &poll_list, &req->entry );
+    list_add_tail( &poll_sock->poll_requests, &req->owner_entry );
+    for (i = 0; i < count; ++i)
+        list_add_tail( &req->sockets[i].sock->poll_memberships, &req->sockets[i].entry );
     async_set_completion_callback( async, free_poll_req, req );
     queue_async( &poll_sock->poll_q, async );
 

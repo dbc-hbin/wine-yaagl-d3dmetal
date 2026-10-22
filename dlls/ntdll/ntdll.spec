@@ -1776,6 +1776,7 @@
 @ extern -private __wine_syscall_dispatcher
 @ extern -private __wine_unix_call_dispatcher
 @ extern -private -arch=arm64ec __wine_unix_call_dispatcher_arm64ec
+@ stdcall __wine_unix_call(int64 long ptr) __wine_unix_call_exported
 @ extern -private __wine_unixlib_handle
 
 # Debugging

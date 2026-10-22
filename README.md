@@ -1,168 +1,101 @@
-## INTRODUCTION
+# Wine 11.20 D3DMetal (GPTK 4.0b3)
 
-Wine is a program which allows running Microsoft Windows programs
-(including DOS, Windows 3.x, Win32, and Win64 executables) on Unix.
-It consists of a program loader which loads and executes a Microsoft
-Windows binary, and a library (called Winelib) that implements Windows
-API calls using their Unix, X11 or Mac equivalents.  The library may also
-be used for porting Windows code into native Unix executables.
+[한국어](README.ko.md)
 
-Wine is free software, released under the GNU LGPL; see the file
-LICENSE for the details.
+Yaagl runtime source for Apple Silicon and Rosetta 2, targeting GPTK 4.0 beta 3 exclusively. Wine host, msync, input, media, audio, window and resource fixes are retained. The native sidecar supplies display routing, video-memory policy and FSR-to-MetalFX translation. GPTK's native caches remain responsible for shader, library, PSO and RT function reuse.
 
+DLSS uses Apple's stock `nvngx-on-metalfx.dll` and Unix module. This tree does not include the experimental DLSS translator, Streamline interception or NPC-nameplate composition. No nameplate fix is claimed.
 
-## QUICK START
+## Current source and patch policy
 
-From the top-level directory of the Wine source (which contains this file),
-run:
+This tree starts at the official `wine-11.20` tag and ports the selected runtime changes from verified source `1846c16674b`. The Wine sources in `dlls/`, `server/` and `include/` are the build inputs. See [the migration record](documentation/WINE-REBASE.md) for retained contracts and upstream overlap decisions. Historical P3/tuned patch queues remain in the source commit as reference material; they are not reapplied or copied into this tree.
 
-```
-./configure
-make
-```
+`d3dmetal-sidecar/layout.json` defines the beta3 hook contract: format 27, marker `YAAGLB3SIDEcar\x1b`, four compact dispatch slots and no additional `binaryPatches`. The entry hooks, in dispatch order, are `GetContainingOutput`, `SetFullscreenState`, `QueryVideoMemoryInfo` and `ReplayTemporalScale`. They cover display routing, video-memory queries and FSR replay only. `ngx-hooks.mm` dispatches recorded FSR commands through `ReplayTemporalScale`; other commands use Apple's original replay. FSR SR/FG uses the Metal4/MPL transport.
 
-Then either install Wine:
+All 13 custom cache-related hooks are removed, including PSO/function caching, RT provenance tracking, cache-context/lifetime hooks and library singleflight. Their native entry bytes stay pristine; no forwarding wrappers replace the removed hooks. Native GPTK shader/stage and disk caches, library publication/reuse, owner-local graphics/compute PSOs and RT function reuse remain in place. This does not claim cross-owner reuse equivalent to the removed custom caches or measured performance parity.
 
-```
-make install
-```
+DXGI video-memory queries, containing-output queries, fullscreen entry points and output enumeration use the Windows x64 calling convention, including calls back to the original methods. Native helper methods retain the host ABI. Mixing these conventions causes Unity startup crashes before rendering.
 
-Or run Wine directly from the build directory:
+The converter stays pristine. The preparation pipeline runs `native-sidecar-patch`, `native-sidecar-module`, then `final-framework-reseal`. The four-hook sidecar lives in `d3dmetal-sidecar/`, is built by `scripts/build-d3dmetal-sidecar.mjs` as `libD3DMetalSidecar.dylib`, and uses `scripts/d3dmetal-sidecar-patch.mjs` for patching. Packaging uses `--sidecar-module` and `--sidecar-manifest`, manifest fields `nativeSidecarBuild` and `nativeSidecar`, and recipe field `patches.nativeSidecar`. These names replace the cache-era interfaces without compatibility aliases; the internal C++ namespace `yaagl::pso` and public FSR C APIs remain unchanged. Excluded patches have different reasons:
 
-```
-./wine notepad
-```
+| Excluded patch | Reason for the current policy |
+|---|---|
+| FP64 codec recipe | The known failing codec fixture compiles with the stock beta3 converter, and its cast implementation differs from the old recipe. This does not establish correctness for every FP64/constrained-cast input. |
+| Stage-lock and compute-loser cleanup | Beta3 `CompileCompute` already holds the stage-cache lock and releases a duplicate allocation. |
+| CacheFile close/munmap | Beta3 closes the file, unmaps the payload and header, and resets its state. |
+| CacheFile publication-order | The reader rejects incomplete records and closes or reopens the cache. No reproduced correctness or cache-reuse failure justifies changing the writer order in the default configuration. |
+| Legacy fullscreen null/forward call sites | Beta3 forwards the native output itself. Yaagl monitor routing remains a separate sidecar responsibility. |
+| Scoped present-residency cleanup | This shortens post-submit association lifetime, rather than repairing submission. It is excluded without measured residency growth or a driver-memory failure. |
+| Persistent-cache read-ahead | File warmup is not shader compilation. The game and D3DMetal own shader/PSO precompilation and their on-disk caches. |
+| Custom DLSS/Streamline processing | This runtime uses the stock NGX pair; experimental nameplate processing is outside its scope. |
 
-Run programs as `wine program`. For more information and problem
-resolution, read the rest of this file, the Wine man page, and
-especially the wealth of information found at https://www.winehq.org.
+Cursor handling uses the current `cocoa_app.m` and `cocoa_warpconsumption.h` implementation. These policies should not be described as identical to every change in a separate runtime branch.
 
+## Build Wine and the sidecar
 
-## REQUIREMENTS
+Maintainers need Xcode, Node.js, Python, LLVM MinGW, Bison and x86_64 TLS/font/media dependencies. Set `WINE_DEPS_ENV` to the dependency environment and `WINE_MINGW_ROOT` to the installed LLVM MinGW toolchain. The build consumes this worktree, including local changes, rather than fetching a different source checkout.
 
-To compile and run Wine, you must have one of the following:
-
-- Linux version 2.6.22 or later
-- FreeBSD 12.4 or later
-- Solaris x86 9 or later
-- NetBSD-current
-- macOS 10.15 or later
-
-As Wine requires kernel-level thread support to run, only the operating
-systems mentioned above are supported.  Other operating systems which
-support kernel threads may be supported in the future.
-
-**FreeBSD info**:
-  See https://wiki.freebsd.org/Wine for more information.
-
-**Solaris info**:
-  You will most likely need to build Wine with the GNU toolchain
-  (gcc, gas, etc.). Warning : installing gas does *not* ensure that it
-  will be used by gcc. Recompiling gcc after installing gas or
-  symlinking cc, as and ld to the gnu tools is said to be necessary.
-
-**NetBSD info**:
-  Make sure you have the USER_LDT, SYSVSHM, SYSVSEM, and SYSVMSG options
-  turned on in your kernel.
-
-**macOS info**:
-  You need Xcode/Xcode Command Line Tools or Apple cctools.
-
-**Supported file systems**:
-  Wine should run on most file systems. A few compatibility problems
-  have also been reported using files accessed through Samba. Also,
-  NTFS does not provide all the file system features needed by some
-  applications.  Using a native Unix file system is recommended.
-
-**Basic requirements**:
-  You need to have the X11 development include files installed
-  (called xorg-dev in Debian and libX11-devel in Red Hat).
-  Of course you also need make (most likely GNU make).
-  You also need flex version 2.5.33 or later and bison.
-
-**Optional support libraries**:
-  Configure will display notices when optional libraries are not found
-  on your system. See https://gitlab.winehq.org/wine/wine/-/wikis/Building-Wine
-  for hints about the packages you should install. On 64-bit
-  platforms, you have to make sure to install the 32-bit versions of
-  these libraries.
-
-
-## COMPILATION
-
-To build Wine, do:
-
-```
-./configure
-make
+```sh
+WINE_NATIVE_SERVER=yes scripts/build-wine-p3.sh all
+node scripts/build-d3dmetal-sidecar.mjs build/native-sidecar
 ```
 
-This will build the program "wine" and numerous support libraries/binaries.
-The program "wine" will load and run Windows executables.
-The library "libwine" ("Winelib") can be used to compile and link
-Windows source code under Unix.
+`WINE_P3_ROOT` selects a fresh build directory; the default is `build/wine-p3-current`. Its `host/` and provenance describe the actual Wine source. Sidecar output includes the dylib and a source-hash manifest. Existing build directories are not evidence that current sources were built.
 
-To see compile configuration options, do `./configure --help`.
+## Prepare the Apple framework locally
 
-For more information, see https://gitlab.winehq.org/wine/wine/-/wikis/Building-Wine
+No remote redistributable is assumed. Supply the pristine beta3 framework when building the native preparation bundle:
 
-
-## SETUP
-
-Once Wine has been built correctly, you can do `make install`; this
-will install the wine executable and libraries, the Wine man page, and
-other needed files.
-
-Don't forget to uninstall any conflicting previous Wine installation
-first.  Try either `dpkg -r wine` or `rpm -e wine` or `make uninstall`
-before installing.
-
-Once installed, you can run the `winecfg` configuration tool. See the
-Support area at https://www.winehq.org/ for configuration hints.
-
-
-## RUNNING PROGRAMS
-
-When invoking Wine, you may specify the entire path to the executable,
-or a filename only.
-
-For example, to run Notepad:
-
-```
-wine notepad            (using the search Path as specified in
-wine notepad.exe         the registry to locate the file)
-
-wine c:\\windows\\notepad.exe      (using DOS filename syntax)
-
-wine ~/.wine/drive_c/windows/notepad.exe  (using Unix filename syntax)
-
-wine notepad.exe readme.txt          (calling program with parameters)
+```sh
+node scripts/build-d3dmetal-autopatch.mjs build/d3dmetal-autopatch \
+  --framework "$GPTK_FRAMEWORK" --accept-apple-license \
+  --sidecar-module build/native-sidecar/libD3DMetalSidecar.dylib \
+  --sidecar-manifest build/native-sidecar/build-manifest.json
 ```
 
-Wine is not perfect, so some programs may crash. If that happens you
-will get a crash log that you should attach to your report when filing
-a bug.
+The resulting helper uses a local Apple beta3 disk image and the bundled sidecar:
 
+```sh
+build/d3dmetal-autopatch/prepare-d3dmetal-runtime \
+  --dmg "$GPTK_DMG" --output build/prepared-d3dmetal \
+  --accept-apple-license
+```
 
-## GETTING MORE INFORMATION
+The helper verifies the input, patch and signatures before publishing output. Disk images are mounted read-only. Direct framework input is also supported with explicit `--framework`, `--license` and `--acknowledgements` paths. Yaagl must obtain Apple license consent before passing the acceptance flag. Preparing local artifacts does not install or replace a live Yaagl runtime.
 
-- **WWW**: A great deal of information about Wine is available from WineHQ at
-	https://www.winehq.org/ : various Wine Guides, application database,
-	bug tracking. This is probably the best starting point.
+## Stage a complete local runtime
 
-- **FAQ**: The Wine FAQ is located at https://gitlab.winehq.org/wine/wine/-/wikis/FAQ
+`GPTK_RUNTIME` is a pristine beta3 Wine graphics distribution containing `lib/external` and the stock PE/Unix graphics modules. It is separate from the Wine host just built. Supply the dependency library directory, GStreamer framework and original native FSR frame-generation DLL:
 
-- **Wiki**: The Wine Wiki is located at https://gitlab.winehq.org/wine/wine/-/wikis/
+```sh
+python3 scripts/stage-full-wine-runtime.py \
+  build/wine-p3-current/host "$GPTK_RUNTIME" build/native-sidecar build/staged/wine \
+  --dependency-lib "$DEPENDENCY_LIB" \
+  --gstreamer-framework "$GSTREAMER_FRAMEWORK" \
+  --native-fg "$FSR_NATIVE_FG_DLL" --accept-apple-license
+python3 scripts/stage-runtime.py --verify-runtime build/staged/wine --current-sources
+```
 
-- **Gitlab**: Wine development is hosted at https://gitlab.winehq.org
+The staged launcher uses `yaagl-d3dmetal-runtime.json`, enables Metal4/MetalFX, and selects the RTX 4060 adapter identity. `YAAGL_FSR_UPSCALER=metalfx` selects the translated upscaler; `native` retains the native upscaler while using the packaged frame-generation bridge. The stock NGX pair remains the DLSS route.
 
-- **Mailing lists**:
-	There are several mailing lists for Wine users and developers; see
-	https://gitlab.winehq.org/wine/wine/-/wikis/Forums for more
-	information.
+`package-wine-p3-runtime.sh` packages the complete local runtime. `package-yaagl-runtime.py STAGED_WINE_ROOT AUTOPATCH_DIR OUTPUT_DIR` instead packages a verified staged runtime with the native preparation helper and omits the Apple framework. The split-package entrypoint uses the same beta3 contracts. Apple framework redistribution remains subject to Apple's license.
 
-- **Bugs**: Report bugs to Wine Bugzilla at https://bugs.winehq.org
-	Please search the bugzilla database to check whether your
-	problem is already known or fixed before posting a bug report.
+## Verification
 
-- **IRC**: Online help is available at channel `#WineHQ` on irc.libera.chat.
+Run the owner tests for the changed native transport, patcher, preparation helper, staging and launcher. A successful build or CPU fixture does not prove game image quality or FSR frame-generation behavior. Report the exact runtime scenario separately from static and unit checks.
+
+`python3 scripts/test-fg-normalization.py` checks FG dispatch and ownership, plus actual Metal4 motion-texture readback for jitter cancellation. The translator keeps per-frame normalized jitter history so omitted motion dimensions, render-size changes, reset boundaries and queued snapshots use the correct motion-vector domain.
+
+Synthesized FG camera projections use MetalFX's reversed working-depth coordinates for both normal and reversed raw depth, including finite and infinite far planes. The raw-depth flag and explicitly supplied projection matrices are preserved. The camera regression exercises both public camera-packet producers over 56 native frames, checking emitted matrices, GPU-normalized inputs and final pixels. `FG_CAMERA_NATIVE_MASK=1` additionally reads the actual mover mask, gated to the reviewed MetalFX binary UUID. The comparison keeps its textured object within the view; a separate full-screen-plane experiment found native normal/reversed-depth differences at the outer image boundary, which this camera fix does not address.
+
+`python3 scripts/test-fsr-native.py` exercises production SR and reads its intermediate and final GPU textures. Nonlinear color conversion uses floating-point working textures without reducing existing higher precision; hardware sRGB decoding remains owned by the texture format. When the requested output exceeds the temporal scaler's limit, display-resolution motion is resampled over its entire active region and its scale is converted per axis to the actual temporal output size. Render-resolution motion, uncapped motion, camera jitter and centered output placement keep their existing conventions. Tests cover dark sRGB ramps, hardware sRGB, BGRA, PQ, nonuniform motion, subrects, history and capped/uncapped transitions.
+
+Depth and render-resolution motion are also sampled at `outputUV + currentJitter/renderSize` to align their jittered grids with stabilized color. Display-resolution motion remains on its stabilized grid. This spatial correction is independent of the flag describing jitter in motion-vector values. Nonuniform GPU readbacks cover both signs and clamped edges; the same suite reads final MetalFX output to check explicit UI composition, inferred HUDless/present composition, and no-UI color. Explicit premultiplied UI is composed once, after color encoding. These controlled inputs do not establish whole-game image quality.
+
+History continuity also requires the same MetalFX interpolator instance: replacing an evicted instance resets history and the GPU-written interpolation-disable hint. GPU regressions cover that cache boundary, transparent/translucent alpha-mask reconstruction with independent origins, and generated output placement without touching surrounding pixels. Resource aliases share one transition/restoration pair; contradictory initial states or access roles are rejected before recording barriers.
+
+The same suite checks SDK-enum-based FFX-to-D3D12 state conversion, native-provider passthrough, and forward/reverse barriers from the production recorder. Barrier capture exercises rejected transport; it is not a successful Wine/GPU submission test.
+
+## Licenses
+
+See [COPYING.LIB](COPYING.LIB) and [NOTICES.md](NOTICES.md). Apple GPTK has separate license terms.

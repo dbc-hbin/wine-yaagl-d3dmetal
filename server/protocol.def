@@ -4073,6 +4073,7 @@ struct handle_info
     int            show_count;    /* show count increment/decrement */
     int            x;             /* cursor position */
     int            y;
+    user_handle_t  win;            /* authoritative native cursor window */
     struct rectangle clip;        /* cursor clip rectangle */
 @REPLY
     user_handle_t  prev_handle;   /* previous handle */
@@ -4090,6 +4091,7 @@ struct handle_info
 #define SET_CURSOR_CLIP   0x08
 #define SET_CURSOR_NOCLIP 0x10
 #define SET_CURSOR_FSCLIP 0x20
+#define SET_CURSOR_OWNER    0x40  /* native cursor window */
 
 /* Get the history of the 64 last cursor positions */
 @REQ(get_cursor_history)
@@ -4238,6 +4240,7 @@ enum inproc_sync_type
 @REPLY
     int           type;         /* inproc sync type */
     unsigned int access;        /* handle access rights */
+    unsigned int shm_idx;       /* optional for index-based sync implementations */
 @END
 
 
