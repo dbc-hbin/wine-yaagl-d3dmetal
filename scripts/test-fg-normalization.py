@@ -5,6 +5,8 @@ Metal4/MetalFX objects and exact GPU completion callbacks without Wine or a game
 The camera fixture links both public camera packet producers to native encoding,
 checking emitted matrices and final pixels. FG_CAMERA_NATIVE_MASK=1 additionally
 reads the mover mask only on the UUID-pinned, reviewed MetalFX implementation.
+The history fixture feeds public producer packets through the native registry
+and real Metal4 consumption, substituting COM/D3DMetal transport and context setup.
 The barrier fixture exercises real native recording with deliberately invalid
 transport, not successful Wine/GPU submission.
 """
@@ -110,6 +112,9 @@ static struct ffxDispatchDescFrameGenerationPrepareV2 last_native_prepare;
 static ffxDispatchDescFrameGeneration last_native_generation;
 static struct ffxConfigureDescFrameGeneration last_native_config;
 static int configure_calls;
+#ifdef FG_HISTORY_FIXTURE
+extern ffxReturnCode_t fg_native_packet(void *packet);
+#endif
 #ifdef FG_RECORD_OBSERVER
 extern void fg_observe_packet(const struct yaagl_fsr_fg_packet_header *packet);
 static bool observe_recording;
@@ -157,7 +162,11 @@ static ffxReturnCode_t bridge_call(void *packet)
 #ifdef FG_RECORD_OBSERVER
     if (observe_recording) fg_observe_packet(header);
 #endif
+#ifdef FG_HISTORY_FIXTURE
+    return fg_native_packet(packet);
+#else
     return bridge_result;
+#endif
 }
 static ffxReturnCode_t native_dispatch(ffxContext *original,
                                         const ffxDispatchDescHeader *desc)
@@ -247,6 +256,50 @@ static ffxReturnCode_t mutate_and_dispatch(ffxDispatchDescFrameGeneration *desc,
     desc->outputs[1].state = FFX_API_RESOURCE_STATE_UNORDERED_ACCESS;
     return ffxDispatch(&handle, &desc->header);
 }
+#ifdef FG_HISTORY_FIXTURE
+void fg_history_begin(void)
+{
+    reset_state(CONTEXT_METALFX);
+    ctx.display_width = ctx.display_height = 128;
+}
+int fg_history_prepare(unsigned frame, unsigned width, float jitter, bool reset,
+                       void *list, void *depth, void *motion)
+{
+    struct ffxDispatchDescFrameGenerationPrepareV2 desc = valid_prepare(frame);
+    desc.commandList = list;
+    desc.depth.resource = depth;
+    desc.motionVectors.resource = motion;
+    desc.renderSize.width = width;
+    desc.renderSize.height = 32;
+    desc.jitterOffset.x = jitter;
+    desc.jitterOffset.y = -.25f;
+    desc.motionVectorScale.x = 8;
+    desc.motionVectorScale.y = 4;
+    desc.cameraRight[0] = desc.cameraUp[1] = desc.cameraForward[2] = 1;
+    desc.reset = reset;
+    return DISPATCH(desc);
+}
+static ffxReturnCode_t history_reentry(ffxDispatchDescFrameGeneration *desc, void *user)
+{
+    (void)user;
+    assert(in_context_callback(&ctx));
+    return DISPATCH(*desc);
+}
+int fg_history_generate(unsigned frame, unsigned route, bool reset,
+                        void *list, void *color, void *output)
+{
+    ffxDispatchDescFrameGeneration desc = valid_generation(frame);
+    struct callback_binding binding = {0};
+    desc.commandList = list;
+    desc.presentColor.resource = color;
+    desc.outputs[0].resource = output;
+    desc.reset = reset;
+    if (!route) return DISPATCH(desc);
+    binding.context = &ctx;
+    if (route == 2) binding.generate = history_reentry;
+    return generation_callback(&desc, &binding);
+}
+#endif
 /* Also linked into the native camera fixture: these packets come from the
  * actual public normalizer, not a second implementation of its camera copy. */
 void fg_camera_packet(struct yaagl_fsr_fg_prepare_packet *packet,
@@ -384,17 +437,23 @@ static void check_prepare(void)
 static void check_generation(void)
 {
     ffxDispatchDescFrameGeneration desc = valid_generation(20);
+    struct ffxDispatchDescFrameGenerationPrepareV2 prepare = valid_prepare(20);
     ffxApiHeader extension = {123456, NULL};
     struct callback_binding binding = {0};
     int start;
 
     reset_state(CONTEXT_METALFX);
-    ctx.have_last_prepare_frame_id = true;
-    ctx.last_prepare_frame_id = 20;
-    assert(DISPATCH(desc) == FFX_API_RETURN_OK && bridge_calls == 1 && !last_generation.reset);
+    assert(DISPATCH(prepare) == FFX_API_RETURN_OK);
+    assert(DISPATCH(desc) == FFX_API_RETURN_OK && bridge_calls == 2 && !last_generation.reset);
     assert(last_generation.present_color == 2 && last_generation.output == 3);
+    /* An older, still-pending ID is legal. Missing/consumed IDs are rejected
+     * by the real native registry in test_producer_native_history. */
+    prepare.frameID = 21;
+    assert(DISPATCH(prepare) == FFX_API_RETURN_OK);
+    prepare.frameID = 22;
+    assert(DISPATCH(prepare) == FFX_API_RETURN_OK);
     desc.frameID = 21;
-    assert(DISPATCH(desc) == FFX_API_RETURN_OK && last_generation.reset);
+    assert(DISPATCH(desc) == FFX_API_RETURN_OK && !last_generation.reset);
     desc.reset = true;
     desc.frameID = 20;
     assert(DISPATCH(desc) == FFX_API_RETURN_OK && last_generation.reset);
@@ -1981,10 +2040,12 @@ extern "C" void fg_camera_packet(yaagl_fsr_fg_prepare_packet*, unsigned, unsigne
 static IMP nativeCameraEncode = nullptr;
 static id encodedCamera = nil;
 static bool encodedCameraReset = false;
+static id encodedPreviousColor = nil;
 static unsigned cameraEncodeCount = 0;
 static void observeCameraEncode(id effect, SEL selector, id<MTL4CommandBuffer> command) {
     encodedCamera = effect;
     encodedCameraReset = [(id<MTLFXFrameInterpolatorBase>)effect shouldResetHistory];
+    encodedPreviousColor = [(id<MTLFXFrameInterpolatorBase>)effect prevColorTexture];
     ++cameraEncodeCount;
     reinterpret_cast<void (*)(id, SEL, id<MTL4CommandBuffer>)>(nativeCameraEncode)(
         effect, selector, command);
@@ -2249,7 +2310,247 @@ int main() {
 '''
 
 
+NATIVE_HISTORY = r'''
+// Substitute only Wine/D3DMetal transport. Compile the unchanged native api(),
+// registry, snapshot capture, configuration selection and encoder in this TU.
+#define FG_CAMERA_FIXTURE 1
+#define unwrapCommandList historyUnwrap
+#define releaseCommandList historyReleaseCommand
+#define mapResource historyMap
+#define releaseResource historyReleaseResource
+#define record historyRecord
+''' + NATIVE_CAMERA[:NATIVE_CAMERA.index("// Optional retained-binary instrumentation")] + r'''
+#undef unwrapCommandList
+#undef releaseCommandList
+#undef mapResource
+#undef releaseResource
+#undef record
+
+extern "C" void fg_history_begin(void);
+extern "C" int fg_history_prepare(unsigned, unsigned, float, bool, void*, void*, void*);
+extern "C" int fg_history_generate(unsigned, unsigned, bool, void*, void*, void*);
+
+static JitterRunner* historyRunner;
+static std::shared_ptr<const PreparedFrame> recordedHistory;
+struct HistoryResource {
+    void** vtable;
+    id texture = nil;
+};
+static std::array<void*, 44> historyVtable{};
+static HistoryResource historyDevice{historyVtable.data()};
+static std::uint32_t __attribute__((ms_abi)) historyRelease(void*) { return 1; }
+static std::int32_t __attribute__((ms_abi)) historyGetDevice(void*, const Guid*, void** out) {
+    *out = &historyDevice;
+    return 0;
+}
+static Luid* __attribute__((ms_abi)) historyLuid(void*, Luid* out) {
+    *out = {};
+    return out;
+}
+static void __attribute__((ms_abi)) historyBarrier(void*, std::uint32_t, const Barrier*) {}
+
+namespace yaagl::pso::d3dmetal {
+bool historyUnwrap(void*, NativeCommandList& out) noexcept {
+    out.kind = CommandListKind::mpl;
+    out.device = historyRunner->device;
+    out.compiler = historyRunner->compiler;
+    return true;
+}
+void historyReleaseCommand(NativeCommandList& out) noexcept { out = {}; }
+ResourceMapResult historyMap(void* resource, MetalResource& out,
+                            ResourceAccess, ResourceViewPolicy) noexcept {
+    out.texture = [static_cast<HistoryResource*>(resource)->texture retain];
+    out.view.mipCount = out.view.sliceCount = out.view.planes = 1;
+    return ResourceMapResult::mapped;
+}
+void historyReleaseResource(MetalResource& out) noexcept {
+    [(id)out.texture release];
+    out = {};
+}
+bool historyRecord(NativeCommandList&, const RecordRequest& request) noexcept {
+    recordedHistory = std::get<std::shared_ptr<const
+        fsr::framegeneration::PreparedFrame>>(request.prepared.value);
+    return bool(recordedHistory);
+}
+}
+
+extern "C" int fg_native_packet(void* packet) {
+    auto* header = static_cast<yaagl_fsr_fg_packet_header*>(packet);
+    return api(header->operation, packet);
+}
+
+// Prepare's real GPU copy must finish before generation consumes its private
+// textures. Use the same exact completion signal as JitterRunner, never a sleep.
+static void completeHistoryPrepare(JitterRunner& runner) {
+    assert(recordedHistory);
+    auto allocator = [runner.device newCommandAllocator];
+    auto buffer = [runner.device newCommandBuffer];
+    auto fence = [runner.device newFence];
+    [buffer beginCommandBufferWithAllocator:allocator];
+    auto initialization = [buffer computeCommandEncoder];
+    [initialization updateFence:fence afterEncoderStages:MTLStageDispatch];
+    [initialization endEncoding];
+    std::shared_ptr<const ExecutionLease> lease;
+    assert(recordedHistory->encode(buffer, fence, lease) && lease);
+    [buffer endCommandBuffer];
+    auto completed = dispatch_semaphore_create(0);
+    auto options = [MTL4CommitOptions new];
+    [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+        assert(!feedback.error);
+        dispatch_semaphore_signal(completed);
+    }];
+    [runner.queue commit:&buffer count:1 options:options];
+    assert(dispatch_semaphore_wait(completed,
+        dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
+    lease.reset();
+    recordedHistory.reset();
+    [options release]; dispatch_release(completed);
+    [fence release]; [buffer release]; [allocator release];
+}
+
+static void producerHistory(JitterRunner& runner, unsigned route,
+                            bool ahead, unsigned resetCase) {
+    // resetCase: none, explicit Dispatch101, explicit Prepare101, future
+    // Prepare102 reset + render configuration change (must not leak into 101).
+    fg_history_begin();
+    auto state = std::make_shared<State>();
+    state->creation.flags = YAAGL_FSR_FG_MOTION_VECTORS_JITTERED;
+    state->creation.display_width = state->creation.display_height = 128;
+    state->creation.max_render_width = state->creation.max_render_height = 128;
+    contexts.emplace(17, state);
+    auto depth = uniformTexture(runner.device, MTLPixelFormatR32Float, 64, 32, .5f);
+    auto motion = uniformTexture(runner.device, MTLPixelFormatRG16Float, 64, 32,
+        std::array<std::uint16_t, 2>{0x3400, 0xb800});
+    auto color = uniformTexture(runner.device, MTLPixelFormatRGBA16Float, 128, 128,
+        std::array<std::uint16_t, 4>{0x3400, 0x3800, 0x3a00, 0x3c00});
+    auto output = privateTexture(runner.device, MTLPixelFormatRGBA16Float, 128, 128,
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+    HistoryResource list{historyVtable.data()};
+    HistoryResource resources[] = {
+        {historyVtable.data(), depth.get()}, {historyVtable.data(), motion.get()},
+        {historyVtable.data(), color.get()}, {historyVtable.data(), output.get()}
+    };
+    auto prepare = [&](unsigned frame) {
+        const bool future = frame == 102 && resetCase == 3;
+        assert(fg_history_prepare(frame, future ? 32 : 64,
+            frame == 101 ? -.5f : .5f,
+            future || (frame == 101 && resetCase == 2),
+            &list, &resources[0], &resources[1]) == Ok);
+        completeHistoryPrepare(runner);
+        assert(state->frames.at(frame)->production->produced);
+    };
+    auto generate = [&](unsigned frame) {
+        const auto pending = state->frames.at(frame);
+        const auto history = state->history;
+        if (frame == 101) {
+            assert(state->historyFrame == 100 && history);
+            assert(pending->parameters.frame_id == 101);
+            assert(pending->parameters.render_width == 64);
+            assert(pending->hasPreviousJitter == (resetCase != 2));
+            assert(pending->previousJitterUvX == .5f / 64);
+            assert(pending->parameters.jitter_x == -.5f);
+        }
+        assert(fg_history_generate(frame, route, frame == 101 && resetCase == 1,
+            &list, &resources[2], &resources[3]) == Ok);
+        assert(recordedHistory && !state->frames.count(frame));
+        auto work = std::const_pointer_cast<PreparedFrame>(recordedHistory);
+        assert(work->impl_->snapshot->production == pending->production);
+        assert(work->impl_->snapshot->parameters.frame_id == frame);
+        const bool reset = frame == 100 || (frame == 101 &&
+            (resetCase == 1 || resetCase == 2)) ||
+            (frame == 102 && resetCase == 3);
+        const float cancellation = reset ? 0 : frame == 101 ? 1 : -1;
+        const unsigned width = frame == 102 && resetCase == 3 ? 32 : 64;
+        JitterFrame test{
+            .name = ahead ? "producer prepare-ahead" : "producer in-order",
+            .frame = frame, .renderWidth = width, .renderHeight = 32,
+            .jitterX = frame == 101 ? -.5f : .5f, .jitterY = -.25f,
+            .cancellationX = cancellation, .cancellationY = 0,
+            .pixelsX = (2 - cancellation) * 128 / width, .pixelsY = -8
+        };
+        runner.encode(work, test);
+        assert(cameraEncodeCount == 1);
+        assert(encodedCameraReset == reset &&
+            "older pending producer frame must retain native temporal history");
+        if (!reset)
+            assert(encodedPreviousColor == history.get());
+        assert(state->historyFrame == frame);
+        recordedHistory.reset();
+    };
+    prepare(100); generate(100);
+    prepare(101);
+    if (ahead) prepare(102);
+    generate(101);
+    if (!ahead) prepare(102);
+    generate(102);
+    // Real registry rejection, not the packet-capture fixture accepting a
+    // fabricated unprepared Generate and pinning its forced-reset bit.
+    assert(fg_history_generate(102, route, false, &list,
+        &resources[2], &resources[3]) == Parameter);
+    assert(fg_history_generate(103, route, false, &list,
+        &resources[2], &resources[3]) == Parameter);
+    assert(!recordedHistory && state->frames.empty());
+    yaagl_fsr_fg_destroy_packet destroy{};
+    destroy.header.size = sizeof(destroy);
+    destroy.header.version = YAAGL_FSR_FG_BRIDGE_VERSION;
+    destroy.header.operation = YAAGL_FSR_FG_DESTROY;
+    destroy.header.context = 17;
+    assert(api(YAAGL_FSR_FG_DESTROY, &destroy) == Ok);
+    assert(!lookup(17));
+}
+
+int main() {
+    @autoreleasepool {
+        JitterRunner runner;
+        historyRunner = &runner;
+        // Runtime discovery is substituted together with the transport boundary.
+        ready.store(true, std::memory_order_release);
+        historyVtable[2] = reinterpret_cast<void*>(&historyRelease);
+        historyVtable[7] = reinterpret_cast<void*>(&historyGetDevice);
+        historyVtable[43] = reinterpret_cast<void*>(&historyLuid);
+        historyVtable[26] = reinterpret_cast<void*>(&historyBarrier);
+        for (unsigned route = 0; route != 3; ++route) {
+            producerHistory(runner, route, false, 0);
+            producerHistory(runner, route, true, 0);
+            for (unsigned reset = 1; reset != 4; ++reset)
+                producerHistory(runner, route, true, reset);
+        }
+        std::fprintf(stderr, "FG producer/native history: %u frames, %u failed\n",
+                     runner.frames, runner.failures);
+        assert(runner.failures == 0);
+    }
+}
+'''
+
+
 class FrameGenerationNormalizationTest(unittest.TestCase):
+    def test_producer_native_history(self):
+        native = ROOT / "d3dmetal-sidecar"
+        kernels = (native / "fsr-kernels.metal").read_text()
+        with tempfile.TemporaryDirectory(prefix="yaagl-fg-history-") as directory:
+            directory = pathlib.Path(directory)
+            producer = directory / "fg-producer.c"
+            producer_object = directory / "fg-producer.o"
+            source = directory / "fg-history.mm"
+            binary = directory / "fg-history"
+            producer.write_text(dispatch_source())
+            source.write_text(NATIVE_HISTORY)
+            (directory / "fsr-kernels.inc").write_text(
+                'static const char kFsrKernelsSource[] = R"YAAGL_METAL(' + kernels + ')YAAGL_METAL";\n')
+            subprocess.run(("xcrun", "clang", "-arch", "x86_64", "-std=c11",
+                            "-Wno-deprecated-declarations", "-Wall", "-Wextra", "-Werror",
+                            "-DFG_HISTORY_FIXTURE=1", "-Dmain=fg_dispatch_main",
+                            "-I", str(SDK), "-I", str(ROOT / "include"),
+                            "-c", str(producer), "-o", str(producer_object)), check=True)
+            subprocess.run(("xcrun", "clang++", "-arch", "x86_64", "-std=c++20", "-fno-objc-arc",
+                            "-I", str(native), "-I", str(directory), str(source),
+                            str(producer_object),
+                            *(str(native / file) for file in ("metalfx-backend.mm",
+                              "d3dmetal-transport.mm")),
+                            "-framework", "Foundation", "-framework", "Metal",
+                            "-framework", "MetalFX", "-o", str(binary)), check=True)
+            subprocess.run((str(binary),), check=True)
+
     def test_native_camera_depth_domain(self):
         native = ROOT / "d3dmetal-sidecar"
         kernels = (native / "fsr-kernels.metal").read_text()

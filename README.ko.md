@@ -86,6 +86,8 @@ python3 scripts/stage-runtime.py --verify-runtime build/staged/wine --current-so
 
 `python3 scripts/test-fg-normalization.py`는 FG dispatch와 소유권뿐 아니라 실제 Metal4 motion texture를 읽어 jitter 보정을 검증합니다. 번역기는 프레임별 정규화된 jitter history를 보관하여 motion 크기 생략, 렌더 해상도 변경, reset 경계와 미리 준비한 snapshot에서도 올바른 MV 좌표계를 사용합니다.
 
+생성 시에는 해당 프레임의 Prepare snapshot과 실제 생성 이력의 연속성을 사용하며, 더 최신인 Prepare가 대기 중이라는 이유만으로 이전의 유효한 프레임을 reset하지 않습니다. Producer→native 회귀 검사는 direct·callback 경로의 패킷을 native 프레임 레지스트리와 실제 Metal4 인코딩·GPU readback에 연결하여 명시적 reset, 미래 프레임과의 격리, 누락·소비된 snapshot의 거부를 확인합니다. COM/D3DMetal transport와 context 초기화는 대체하므로 실제 Wine·게임 실행 검사는 아닙니다.
+
 합성하는 FG 카메라 투영행렬은 일반·역방향 원본 깊이 모두에서 MetalFX의 역방향 작업 깊이 좌표계를 사용하며, 유한·무한 far plane을 처리합니다. 원본 깊이 플래그와 직접 전달된 투영행렬은 보존합니다. 카메라 회귀 검증은 두 공개 카메라 packet 생산자를 통해 native 56프레임을 실행하고, 전달된 행렬·GPU 정규화 입력·최종 픽셀을 검사합니다. `FG_CAMERA_NATIVE_MASK=1`은 검토한 MetalFX 바이너리 UUID에 한해 실제 mover mask도 읽습니다. 비교 장면의 텍스처 물체는 화면 안에 유지합니다. 별도의 전체 화면 평면 실험에서 확인한 원본 MetalFX의 화면 바깥 경계 normal/reversed-depth 차이는 이번 카메라 수정에 포함하지 않습니다.
 
 `python3 scripts/test-fsr-native.py`는 production SR의 중간·최종 GPU 텍스처를 읽습니다. 비선형 색상 변환은 기존 고정밀 입력의 정밀도를 낮추지 않는 부동소수점 작업 텍스처를 사용하며, 하드웨어 sRGB 디코딩은 텍스처 포맷이 담당합니다. 요청 출력이 temporal scaler의 한도를 넘으면 표시 해상도 motion의 활성 영역 전체를 재표본화하고, 축별 scale을 실제 temporal 출력 크기로 변환합니다. 렌더 해상도 motion, 한도 이내 motion, 카메라 jitter와 중앙 출력 배치는 기존 규약을 유지합니다. 검증에는 어두운 sRGB 그라데이션, 하드웨어 sRGB, BGRA, PQ, 비균일 motion, 부분 영역, history와 배율 제한 전환이 포함됩니다.

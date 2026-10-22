@@ -847,10 +847,6 @@ static ffxReturnCode_t translated_dispatch(struct fg_context *context,
          !convert_resource_state_dx12(&packet->hudless_color_state)))
         return FFX_API_RETURN_ERROR_PARAMETER;
 
-    packet->reset = packet->reset ||
-        (context->have_last_prepare_frame_id &&
-         packet->frame_id != context->last_prepare_frame_id);
-
     /*
      * A dispatch error, including result 4, is an error in this already
      * selected mode.  Never run native interpolation for the same frame.
