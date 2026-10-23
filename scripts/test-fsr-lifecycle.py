@@ -241,6 +241,8 @@ struct Object {
     unsigned references = 1, queries = 0, gets = 0, releases = 0, luids = 0;
     int query_result = 0;
     bool null_result = false, bad_luid = false;
+    Object* returned_device = nullptr;
+    std::uint32_t adapter_low = 73;
 };
 static Object device{};
 static std::int32_t __attribute__((ms_abi)) query(
@@ -253,8 +255,9 @@ static std::int32_t __attribute__((ms_abi)) query(
     assert(!std::memcmp(guid, &expected, sizeof(expected)));
     *output = nullptr;
     if (object.query_result < 0 || object.null_result) return object.query_result;
-    ++device.references;
-    *output = &device;
+    auto* result = object.returned_device ? object.returned_device : &device;
+    ++result->references;
+    *output = result;
     return object.query_result;
 }
 static std::int32_t __attribute__((ms_abi)) get(
@@ -275,7 +278,7 @@ static TestLuid* __attribute__((ms_abi)) luid(void* value, TestLuid* output)
 {
     auto& object = *static_cast<Object*>(value);
     ++object.luids;
-    *output = {73, -12};
+    *output = {object.adapter_low, -12};
     return object.bad_luid ? nullptr : output;
 }
 int main()
@@ -447,6 +450,161 @@ int main(void)
 '''
 
 
+SNAPSHOT = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <time.h>
+#define __declspec(value)
+#include "d3dmetal-sidecar/third-party/fidelityfx/Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h"
+#define TRUE 1
+#define FALSE 0
+#define ARRAY_SIZE(value) (sizeof(value) / sizeof((value)[0]))
+typedef int BOOL;
+static unsigned lock_depth, allocations, frees, fail_allocation;
+typedef struct { unsigned references; } IUnknown;
+static unsigned IUnknown_AddRef(IUnknown *object) { return ++object->references; }
+static unsigned IUnknown_Release(IUnknown *object)
+{
+    assert(!lock_depth && object->references > 1);
+    return --object->references;
+}
+static void EnterCriticalSection(pthread_mutex_t *lock)
+{
+    assert(!pthread_mutex_lock(lock));
+    ++lock_depth;
+}
+static void LeaveCriticalSection(pthread_mutex_t *lock)
+{
+    --lock_depth;
+    assert(!pthread_mutex_unlock(lock));
+}
+static void *fixture_alloc(void *user, uint64_t size)
+{
+    assert(user == &allocations && !lock_depth);
+    ++allocations;
+    return fail_allocation ? NULL : malloc(size);
+}
+static void fixture_free(void *user, void *pointer)
+{
+    assert(user == &allocations && !lock_depth);
+    ++frees;
+    free(pointer);
+}
+static uint64_t pending_frame;
+static BOOL pending;
+static ffxReturnCode_t retire_result;
+static ffxReturnCode_t retire_translation_frame(uint64_t context, uint64_t frame,
+                                               uint64_t *oldest, BOOL *has_pending)
+{
+    (void)context;
+    (void)frame;
+    assert(lock_depth == 1);
+    *oldest = pending_frame;
+    *has_pending = pending;
+    return retire_result;
+}
+'''
+
+SNAPSHOT_CONTEXT = r'''
+struct fg_context {
+    ffxAllocationCallbacks allocation;
+    BOOL custom_allocation;
+    pthread_mutex_t dispatch_lock;
+    FRAME_CONFIG_STORAGE
+    uint64_t translated;
+    BOOL have_last_prepare_frame_id;
+};
+'''
+
+
+def snapshot_fixture(source):
+    storage = section(source, "    struct frame_config_snapshot frame_configs[",
+                      "    uint32_t display_width;")
+    context = SNAPSHOT_CONTEXT.replace("    FRAME_CONFIG_STORAGE", storage)
+    return (SNAPSHOT
+            + section(source, "struct frame_config_snapshot\n", "struct prepare_desc_prefix\n")
+            + context
+            + section(source, "static void *allocate_memory(", "static BOOL matching_allocator(")
+            + section(source, "static void release_resource(", "static void store_native_config("))
+
+
+SNAPSHOT_MAIN = r'''
+int main(void)
+{
+    struct fg_context context = {
+        .allocation = {&allocations, fixture_alloc, fixture_free},
+        .custom_allocation = TRUE, .dispatch_lock = PTHREAD_MUTEX_INITIALIZER
+    };
+    IUnknown first = {1}, second = {1};
+    struct ffxConfigureDescFrameGeneration desc = {0};
+    fail_allocation = TRUE;
+    assert(!allocate_memory(context_allocator(&context), sizeof(context)));
+    fail_allocation = FALSE;
+    void *memory = allocate_memory(context_allocator(&context), sizeof(context));
+    assert(memory);
+    free_memory(context_allocator(&context), memory);
+    allocations = frees = 0;
+    assert(snapshot_frame_config(&context, &desc) == FFX_API_RETURN_OK);
+    assert(!allocations);
+    desc.frameGenerationEnabled = true;
+    desc.HUDLessColor.resource = &first;
+    /* Sparse, nonmonotonic IDs with exact collisions under modulo-64 indexing. */
+    for (unsigned i = 0; i < 64; ++i) {
+        desc.frameID = 64 * ((i * 17) % 64) + 64;
+        assert(snapshot_frame_config(&context, &desc) == FFX_API_RETURN_OK);
+    }
+    assert(first.references == 65);
+    assert(!find_frame_config(&context, 63));
+    assert(find_frame_config(&context, 191)->frame_id == 128);
+    desc.frameID = 4097;
+    assert(snapshot_frame_config(&context, &desc) == FFX_API_RETURN_ERROR_RUNTIME_ERROR);
+    assert(first.references == 65);
+    desc.frameID = 128;
+    desc.HUDLessColor.resource = &second;
+    desc.HUDLessColor.state = 23;
+    desc.HUDLessColor.description.width = 1920;
+    fail_allocation = TRUE;
+    /* No allocation can fail during replacement after context creation. */
+    assert(snapshot_frame_config(&context, &desc) == FFX_API_RETURN_OK);
+    assert(find_frame_config(&context, 128)->hudless.resource == &second);
+    assert(!allocations && !frees);
+    fail_allocation = FALSE;
+    assert(snapshot_frame_config(&context, &desc) == FFX_API_RETURN_OK);
+    assert(first.references == 64 && second.references == 2);
+    assert(find_frame_config(&context, 191)->hudless.state == 23);
+    assert(find_frame_config(&context, 191)->hudless.description.width == 1920);
+    pending = TRUE;
+    pending_frame = 191;
+    retire_frame_configs(&context, 4096);
+    assert(!find_frame_config(&context, 127));
+    assert(find_frame_config(&context, 191)->frame_id == 128);
+    assert(find_frame_config(&context, 4096)->frame_id == 4096);
+    retire_result = FFX_API_RETURN_ERROR_RUNTIME_ERROR;
+    pending = FALSE;
+    retire_frame_configs(&context, 4096);
+    assert(find_frame_config(&context, 191)->frame_id == 128);
+    retire_result = FFX_API_RETURN_OK;
+    retire_frame_configs(&context, 4096);
+    assert(!find_frame_config(&context, 4095));
+    assert(second.references == 1 && first.references == 2);
+    /* An older callback must not discard the newer retained fallback. */
+    retire_frame_configs(&context, 64);
+    assert(find_frame_config(&context, 4096)->frame_id == 4096);
+    context.have_last_prepare_frame_id = TRUE;
+    clear_frame_configs(&context);
+    assert(!find_frame_config(&context, UINT64_MAX) && !context.have_last_prepare_frame_id);
+    assert(first.references == 1 && second.references == 1);
+    assert(!allocations && !frees);
+    assert(!pthread_mutex_destroy(&context.dispatch_lock));
+}
+'''
+
+
 def compile_and_run(code, cxx=False):
     with tempfile.TemporaryDirectory(prefix="yaagl-fsr-lifecycle-") as directory:
         source = pathlib.Path(directory) / ("lifecycle.cpp" if cxx else "lifecycle.c")
@@ -461,6 +619,78 @@ def compile_and_run(code, cxx=False):
 
 
 class FsrLifecycleTest(unittest.TestCase):
+    def test_sr_dispatch_device_validation(self):
+        source = (ROOT / "d3dmetal-sidecar/fsr-translator.mm").read_text()
+        ownership = section(source, "struct ComGuid {", "struct State {")
+        command = section(source, "    auto commandDevice = deviceOwner(commandList, true);",
+                          "    const auto mode = metalfx::CommandMode::Metal4;")
+        resource = section(source, "        auto resourceDevice = deviceOwner(resources[i], true);",
+                           "        const auto access = i == 3")
+        fixture = section(COM_MAIN, "struct Object {", "int main()")
+        compile_and_run(COM + ownership + '''
+using TestGuid = ComGuid;
+using TestLuid = AdapterLuid;
+''' + fixture + '''
+constexpr unsigned kParameter = 6, kOk = 0;
+struct DispatchState {
+    AdapterLuid adapter{73, -12};
+    std::shared_ptr<void> executionDevice;
+};
+static unsigned validate(DispatchState* state, void* commandList, void* input) {
+''' + command + '''
+    void* resources[]{input};
+    unsigned i = 0;
+''' + resource + '''
+    return kOk;
+}
+int main() {
+    void* table[44]{};
+    table[0] = reinterpret_cast<void*>(query);
+    table[2] = reinterpret_cast<void*>(release);
+    table[7] = reinterpret_cast<void*>(get);
+    table[43] = reinterpret_cast<void*>(luid);
+    device.table = table;
+    Object command{table}, resource{table}, other{table};
+    DispatchState state;
+    assert(validate(&state, &command, &resource) == kOk);
+    assert(state.executionDevice.get() == &device);
+    assert(device.luids == 1 && device.references == 2 && device.releases == 1);
+    assert(command.gets == 1 && resource.gets == 1);
+    // Exercise the path where commandDevice is not moved into persistent state.
+    assert(validate(&state, &command, &resource) == kOk);
+    assert(device.luids == 2 && device.references == 2 && device.releases == 3);
+    resource.returned_device = &other;
+    assert(validate(&state, &command, &resource) == kOk);
+    assert(other.luids == 1 && other.references == 1 && other.releases == 1);
+    other.adapter_low = 74;
+    assert(validate(&state, &command, &resource) == kParameter);
+    assert(other.luids == 2 && other.references == 1 && other.releases == 2);
+    other.adapter_low = 73;
+    other.bad_luid = true;
+    assert(validate(&state, &command, &resource) == kParameter);
+    assert(other.luids == 3 && other.references == 1 && other.releases == 3);
+    resource.query_result = -1;
+    assert(validate(&state, &command, &resource) == kParameter);
+    resource.query_result = 0;
+    resource.null_result = true;
+    assert(validate(&state, &command, &resource) == kParameter);
+    assert(other.luids == 3 && other.references == 1 && other.releases == 3);
+    unsigned resourceGets = resource.gets;
+    command.query_result = -1;
+    assert(validate(&state, &command, &resource) == kParameter);
+    command.query_result = 0;
+    device.adapter_low = 74;
+    assert(validate(&state, &command, &resource) == kParameter);
+    assert(resource.gets == resourceGets && device.references == 2);
+    state.executionDevice.reset();
+    assert(device.references == 1);
+}
+''', cxx=True)
+
+    def test_frame_configuration_snapshots(self):
+        source = (ROOT / "dlls/amd_fidelityfx_framegeneration_dx12/main.c").read_text()
+        compile_and_run(snapshot_fixture(source) + SNAPSHOT_MAIN)
+
     def test_scoped_com_ownership(self):
         for fg in (False, True):
             with self.subTest(framegeneration=fg):
@@ -493,7 +723,7 @@ static bool testMatches(void* object, bool child, const TestLuid& expected)
 
     def test_hud_configuration_retention(self):
         source = (ROOT / "dlls/amd_fidelityfx_framegeneration_dx12/main.c").read_text()
-        resources = section(source, "static void release_resource(", "static void release_frame_config(")
+        resources = section(source, "static void release_resource(", "static ffxReturnCode_t snapshot_frame_config(")
         store = section(source, "static void store_native_config(", "static struct fg_context *acquire_context(")
         compile_and_run(HUD + resources + store + HUD_MAIN)
 

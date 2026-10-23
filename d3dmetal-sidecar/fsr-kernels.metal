@@ -89,14 +89,25 @@ kernel void yaagl_fsr_combine_masks(
     texture2d<float, access::write> destination [[texture(2)]],
     constant YaaglFsrParams& params [[buffer(0)]],
     uint2 tid [[thread_position_in_grid]]) {
-    if (any(tid >= params.extent)) return;
-    uint2 sourcePosition = params.sourceOrigin + tid;
+    if (any(tid >= params.dispatchExtent)) return;
+    uint2 sourceOffset = min(tid, params.extent - 1u);
+    uint2 sourcePosition = params.sourceOrigin + sourceOffset;
     uint2 destinationPosition = params.destinationOrigin + tid;
     float r = (params.flags & YaaglFsrHasReactive) ? reactive.read(sourcePosition).r : 0.0f;
     float c = (params.flags & YaaglFsrHasComposition)
-        ? composition.read(params.compositionOrigin + tid).r : 0.0f;
+        ? composition.read(params.compositionOrigin + sourceOffset).r : 0.0f;
     destination.write(float4(max(clamp(r, 0.0f, 1.0f), clamp(c, 0.0f, 1.0f))),
                       destinationPosition);
+}
+
+kernel void yaagl_fsr_extend_edges(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<float, access::write> destination [[texture(1)]],
+    constant YaaglFsrParams& params [[buffer(0)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid >= params.dispatchExtent) || all(tid < params.extent)) return;
+    // Source and destination alias, but active source pixels are never written.
+    destination.write(source.read(min(tid, params.extent - 1u)), tid);
 }
 
 kernel void yaagl_sr_resample_motion(
@@ -120,11 +131,11 @@ static float3 rcas_load(texture2d<float, access::read> source, int2 position,
 }
 
 static float3 rcas(texture2d<float, access::read> source, uint2 position,
-                   uint2 lower, uint2 upper, float sharpness, float exposure) {
+                   uint2 lower, uint2 upper, float sharpness, float exposure, float3 center) {
     int2 p = int2(position);
     float3 b = rcas_load(source, p + int2(0, -1), lower, upper, exposure);
     float3 d = rcas_load(source, p + int2(-1, 0), lower, upper, exposure);
-    float3 e = rcas_load(source, p, lower, upper, exposure);
+    float3 e = center * exposure;
     float3 f = rcas_load(source, p + int2(1, 0), lower, upper, exposure);
     float3 h = rcas_load(source, p + int2(0, 1), lower, upper, exposure);
 
@@ -175,7 +186,7 @@ kernel void yaagl_fsr_finish(
         exposure = max(exposureTexture.read(uint2(0)).r, 1.0e-7f);
     if (params.flags & YaaglFsrSharpen)
         color.rgb = rcas(source, sourcePosition, params.sourceOrigin,
-                         params.sourceOrigin + params.extent, params.sharpness, exposure);
+                         params.sourceOrigin + params.extent, params.sharpness, exposure, color.rgb);
     color.rgb = forward_transfer(color.rgb, params.transfer);
     destination.write(color, destinationPosition);
 }
@@ -319,15 +330,24 @@ kernel void yaagl_fg_decode_distortion(
     destination.write(source.read(uint2(params.sourceOrigin) + tid) * params.motionScale.x + params.motionScale.y, tid);
 }
 
-kernel void yaagl_fg_normalize_motion(
-    texture2d<float, access::read> source [[texture(0)]],
-    texture2d<float, access::write> destination [[texture(1)]],
-    texture2d<float, access::read> depth [[texture(2)]],
-    constant YaaglFgParams& params [[buffer(0)]],
+kernel void yaagl_fg_decode_scene_ui(
+    texture2d<float, access::read> scene [[texture(0)]],
+    texture2d<float, access::write> color [[texture(1)]],
+    texture2d<float, access::read> present [[texture(2)]],
+    texture2d<float, access::write> ui [[texture(3)]],
+    constant YaaglFgParams* params [[buffer(0)]],
     uint2 tid [[thread_position_in_grid]]) {
-    if (any(tid >= params.extent)) return;
-    uint2 sourcePosition = fg_source_position(tid, params);
-    float2 value = source.read(sourcePosition).xy;
+    if (any(tid >= params[0].extent)) return;
+    float4 sceneColor = scene.read(uint2(params[0].sourceOrigin) + tid);
+    sceneColor.rgb = fg_decode(sceneColor.rgb, params[0]);
+    color.write(sceneColor, tid);
+    float4 uiColor = present.read(uint2(params[1].sourceOrigin) + tid);
+    uiColor.rgb = fg_decode(uiColor.rgb, params[1]);
+    ui.write(uiColor, tid);
+}
+
+static float2 fg_motion(float2 value, float depth,
+                        constant YaaglFgParams& params, uint2 tid) {
     // Either invalid component invalidates the object vector; camera reprojection is still applied below.
     if (params.motionVectorsInvalidValuePresent &&
         (value.x == params.motionVectorsInvalidValue || value.y == params.motionVectorsInvalidValue))
@@ -336,13 +356,43 @@ kernel void yaagl_fg_normalize_motion(
                     float2(params.outputExtent) / float2(params.motionTargetExtent);
     if (params.reconstructCameraMotion) {
         float2 uv = (float2(tid) + 0.5f) / float2(params.extent);
-        float4 clip = float4(uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), depth.read(tid).r, 1.0f);
+        float4 clip = float4(uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), depth, 1.0f);
         // NGX rows occupy Metal columns: this is the public row-vector transform.
         float4 previous = params.clipToPreviousClip * clip;
         if (all(isfinite(previous)) && abs(previous.w) > 1.0e-6f)
             pixels += (previous.xy / previous.w - clip.xy) * float2(0.5f, -0.5f) * float2(params.outputExtent);
     }
+    return pixels;
+}
+
+kernel void yaagl_fg_normalize_motion(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<float, access::write> destination [[texture(1)]],
+    texture2d<float, access::read> depth [[texture(2)]],
+    constant YaaglFgParams& params [[buffer(0)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid >= params.extent)) return;
+    float2 value = source.read(fg_source_position(tid, params)).xy;
+    float2 pixels = fg_motion(value, params.reconstructCameraMotion ? depth.read(tid).r : 0.0f,
+                             params, tid);
     destination.write(float4(pixels, 0.0f, 0.0f), tid);
+}
+
+// R32Float only: source and normalized depth have the same stored float format.
+// Each input retains its own sampling grid and jitter offset.
+kernel void yaagl_fg_normalize_depth_motion_r32(
+    texture2d<float, access::read> motion [[texture(0)]],
+    texture2d<float, access::write> normalizedMotion [[texture(1)]],
+    texture2d<float, access::read> depth [[texture(2)]],
+    texture2d<float, access::write> normalizedDepth [[texture(3)]],
+    constant YaaglFgParams* params [[buffer(0)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid >= params[0].extent)) return;
+    float4 storedDepth = depth.read(fg_source_position(tid, params[0]));
+    normalizedDepth.write(storedDepth, tid);
+    float2 value = motion.read(fg_source_position(tid, params[1])).xy;
+    float2 pixels = fg_motion(value, storedDepth.r, params[1], tid);
+    normalizedMotion.write(float4(pixels, 0.0f, 0.0f), tid);
 }
 
 kernel void yaagl_fg_encode_scatter(

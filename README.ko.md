@@ -100,11 +100,29 @@ python3 scripts/stage-runtime.py --verify-runtime build/staged/wine --current-so
 
 변경한 native transport, 패처, 준비 도구, staging, 런처의 관련 테스트를 실행합니다. 빌드나 CPU fixture 통과는 게임 화질이나 FSR 프레임 생성 동작의 증명이 아닙니다. 실제 런타임 시나리오 결과는 정적 검사·단위 테스트와 구분해 기록합니다.
 
-FSR 오버헤드 최적화는 셰이더 소스, GPU 패스, 입력 리소스, fence와 history/reset 결정을 보존합니다. SR은 feature 안에서 내장 셰이더 library를 공유하고, FG는 같은 context·device의 configuration 사이에서 library와 불변 compute pipeline을 공유하되 interpolator와 history identity는 분리합니다. Unix API 주소는 성공한 경우 acquire/release 방식으로 게시하여 이후 호출의 로더 mutex를 생략하며, 조회 실패는 다시 시도할 수 있습니다. FG는 closing context의 마지막 참조가 반환될 때만 파괴 대기자를 깨우고, 실제 실행 리소스·패스 수로 객체 보관 공간을 GPU 인코딩 전에 예약합니다.
+FSR 오버헤드 최적화는 번역 입력, 정밀도, 소유권과 history/reset 결정을 보존합니다. 패스 통합에는 명시적인 Metal4 visibility barrier와 형식별 GPU 비교를 사용합니다. SR은 feature 안에서 내장 셰이더 library를 공유하고, FG는 같은 context·device의 configuration 사이에서 library와 불변 compute pipeline을 공유하되 interpolator와 history identity는 분리합니다. Unix API 주소는 성공한 경우 acquire/release 방식으로 게시하여 이후 호출의 로더 mutex를 생략하며, 조회 실패는 다시 시도할 수 있습니다. FG는 closing context의 마지막 참조가 반환될 때만 파괴 대기자를 깨우고, 객체 보관 공간을 GPU 인코딩 전에 예약합니다.
 
 임시 COM 장치 참조는 shared control block 없이 scoped 소유권으로 관리하며 장기 보관 참조는 유지합니다. SR은 검증한 출력 layout을 재사용합니다. FG는 configure 잠금 안에서 mode 조회를 재사용하되 native 선택 뒤에 갱신하고, 동일 HUD-less 참조는 유지하면서 metadata를 갱신합니다. 같은 scene/present texture는 한 실행 안에서 raw view를 공유합니다. FG 상수는 실행별 불변 buffer 하나로 묶으며 GPU가 쓰는 disable hint의 복사 offset도 함께 반영합니다. SR argument table은 execution lease와 함께 보관하고 lease 반환 뒤에만 재사용합니다. 크기가 제한된 idle pool로 다른 프레임에서도 재사용하되 선택적 binding을 지우고 dormant feature에는 반환하지 않습니다. 사용 중인 lease끼리는 가변 table이나 상수 저장 공간을 공유하지 않습니다.
 
-FG는 execution별 argument table 하나를 모든 번역 패스에 사용합니다. Dispatch마다 모든 binding을 갱신한 뒤 snapshot하며, 서로 다른 execution의 table과 기존 encoder·fence 순서는 유지합니다. SR은 현재 연산과 depth 형식에 필요한 pipeline만 만들고 이후 프레임이 다른 연산을 요청하면 추가합니다. Transport는 비어 있거나 실패한 시도를 포함해 첫 replay lease를 inline으로 보관하고, 후속 replay의 lease는 별도 vector에 유지합니다. C++ owner state는 Objective-C recorded owner 안에 두며, 자동 소멸로 allocator 반환까지 리소스와 lease의 소유권을 보존합니다.
+FG는 execution별 argument table 하나를 모든 번역 패스에 사용합니다. Dispatch마다 모든 binding을 갱신한 뒤 snapshot하며, 동시 execution은 별도의 table을 유지합니다. SR은 현재 연산과 depth 형식에 필요한 pipeline만 만들고 이후 프레임이 다른 연산을 요청하면 추가하며, debug 출력은 쓰지 않는 일반 finish 상수를 할당하지 않습니다. Transport는 비어 있거나 실패한 시도를 포함해 첫 replay lease를 inline으로 보관하고, 후속 replay의 lease는 별도 vector에 유지합니다. C++ owner state는 Objective-C recorded owner 안에 두며, 자동 소멸로 allocator 반환까지 리소스와 lease의 소유권을 보존합니다.
+
+Metal4 SR은 독립적인 exposure·motion·color·mask 전처리를 encoder 하나로 묶습니다. 생성 색상의 padding은 dispatch visibility barrier 뒤에서 이미 변환된 활성 영역의 가장자리 값을 복사하므로 비선형 transfer 연산을 반복하지 않습니다. Mask는 생성할 때 clamp된 padding까지 채웁니다. 입력별 원점, 부동소수점 정밀도, high-water 입력 용량과 Legacy padding은 유지합니다.
+
+Metal4 FG는 baseline 복사와 전처리를 묶고 blit→dispatch visibility 및 MetalFX 앞의 fence를 유지합니다. R32Float depth/motion 정규화는 서로 다른 샘플 격자·jitter 보정·상수 블록을 유지하면서 dispatch 하나로 처리하며, 다른 depth 형식은 저장된 depth를 읽는 경로를 사용합니다. 추론용 scene/UI decode도 각 원점을 유지하면서 통합합니다. 명시적 UI 합성과 최종 출력 scatter는 별도로 유지합니다.
+
+FG context는 반환된 scratch 묶음을 하나만 보관합니다. 정규화 입력, 생성 출력, 선택적인 추론 UI·distortion, 상수, argument table과 비운 residency set이 대상이며 입력 snapshot과 현재·이전 scene history는 제외합니다. 사용 중인 lease가 묶음을 독점하고, OFF/DESTROY는 idle slot을 비우며 epoch 검사로 늦은 반환이나 stale replay가 다시 채우지 못하게 합니다. Native 대기 프레임과 PE configuration snapshot은 64칸의 고정 저장소를 사용해 프레임별 컨테이너 할당을 제거합니다. 전체 frame ID, backpressure, 가장 가까운 이전 configuration 선택과 순서가 바뀐 반환을 보존하며, PE 리소스는 dispatch lock 밖에서 해제합니다. Texture ancestry는 한 dispatch 안에서만 재사용하고 역할별 mapping과 alias 거부는 유지합니다.
+
+GPU 회귀 검사는 분리·결합 전처리의 33개 비트 단위 비교, 생성 padding readback, 겹치는 lease, configuration 변경과 OFF/DESTROY 후 반환을 포함합니다. 레지스트리 검사는 64/65개 경계, 드문 frame ID, 기록 실패와 리소스 alias를 다룹니다. 생성 출력 baseline 복사, direct-output 정책, SR high-water generation과 Configure 동기화는 제거하면 실패 결과·픽셀·동기화 의미가 바뀌므로 유지합니다.
+
+Native FG 회귀 검사는 실제 Metal4 encoder의 첫 prepass pipeline binding과 종료 fence 갱신에 예외를 주입합니다. 부분 기록된 command buffer를 제출한 뒤 baseline 픽셀, history 불변, lease 유지, scratch 반환과 동일 prepared frame의 정상 재시도를 확인합니다.
+
+FG Prepare와 Generate는 입력 snapshot과 생산 상태를 공유하고 각 recorded execution이 configuration을 소유하여 snapshot 복제와 별도 생산 상태 할당을 없앱니다. R32Float는 결합 depth/motion pipeline만 요구하고 다른 depth 형식은 분리 pipeline을 요구합니다. 필수 shader가 없으면 configuration을 거부하며 이후 재시도할 수 있습니다. 이름 있는 compute texture binding은 기존 Metal4 슬롯 초기화와 Legacy binding을 유지합니다.
+
+Metal4 FG는 측정한 렌더 1920x1080 → 출력 2560x1440 조합에서만 16x8 threadgroup을 사용하고, 다른 조합과 Legacy는 8x8을 유지합니다. Context별 별도 idle slot에 depth snapshot, motion snapshot, scene texture를 각각 최대 하나 보관하며 device·format·크기·usage가 정확히 일치해야 재사용합니다. 공유 소유자가 기록된 producer·consumer와 execution lease 동안 snapshot을 유지하고, scene history는 현재 writer와 이전 history를 읽는 모든 reader가 소유합니다. 마지막 소유자가 해제된 뒤에만 반환하며 OFF/DESTROY 이전 세대의 늦은 반환은 epoch로 차단합니다.
+
+SR RCAS는 finish pass가 이미 읽은 중심 색상을 다시 사용하여 중복 읽기를 제거합니다. 이웃 픽셀의 가장자리 clamp, exposure 곱셈, sharpening 계산, transfer 변환과 출력 alpha는 유지합니다. Native 검사는 원점이 다른 활성 crop과 중앙 배치 padding을 float32 출력으로 비교하며 exposure, 모든 transfer 함수와 sharpness 양 끝값을 포함합니다.
+
+SR은 residency를 비운 뒤 하나의 pool 잠금에서 완료된 묶음의 scratch를 반환하며 기존 메모리 상한과 퇴출 순서를 유지합니다. Dispatch 안에서 resource의 device pointer가 검증된 command device와 같으면 adapter 검증을 재사용하고, 다른 pointer이면 기존 LUID 검사를 수행합니다. 회귀 검사는 지연된 Prepare 실행, shader 실패와 depth 형식 전환, pool 상한과 dormant 전환, device 소유권과 거부 경계를 포함합니다.
 
 `python3 scripts/test-fsr-lifecycle.py`는 동시 초기화, 실패 후 재시도, 초기화 완료 후 빠른 경로, 파괴 대기자 알림, 임시·장기 COM 소유권과 HUD-less 교체·비활성화를 검사합니다. Native SR 회귀 검사는 유지 중인 lease의 격리, 반환된 table의 재사용, 노출 texture 재바인딩, dormant 정리와 연산 변경 후 새 feature와의 출력 비교를 확인합니다. FG 회귀 검사는 동일 texture의 sRGB 출력, context 파괴 이후 공유 pipeline의 수명, UI·distortion을 사용하는 반복 실행의 table 격리를 확인합니다. `node --test scripts/test-native-contract.mjs`는 backend 경계를 제어하면서 production recorded-owner 정의의 retain 실패, 부분·빈 encode 실패와 allocator 반환 시 소멸을 검사합니다. 이 검사만으로 게임 성능 향상이나 게임 전체 화면의 동일성이 입증되는 것은 아닙니다.
 

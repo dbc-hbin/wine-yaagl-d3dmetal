@@ -178,6 +178,7 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
         !sameAdapter(commandAdapter, state->adapter)) {
         return kParameter;
     }
+    void* const validatedCommandDevice = commandDevice.get();
     if (!state->executionDevice) state->executionDevice = std::move(commandDevice);
     const auto mode = metalfx::CommandMode::Metal4;
     const bool newGeneration = !state->backend ||
@@ -214,8 +215,10 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
         if (i == 2 && resources[i] == resources[3]) return kParameter;
         auto resourceDevice = deviceOwner(resources[i], true);
         AdapterLuid resourceAdapter{};
-        if (!resourceDevice || !adapterLuid(resourceDevice.get(), resourceAdapter) ||
-            !sameAdapter(resourceAdapter, state->adapter)) {
+        if (!resourceDevice ||
+            (resourceDevice.get() != validatedCommandDevice &&
+             (!adapterLuid(resourceDevice.get(), resourceAdapter) ||
+              !sameAdapter(resourceAdapter, state->adapter)))) {
             return kParameter;
         }
         const auto access = i == 3 ? d3dmetal::ResourceAccess::write : d3dmetal::ResourceAccess::read;

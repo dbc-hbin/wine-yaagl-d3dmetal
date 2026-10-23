@@ -158,7 +158,6 @@ static BOOL binding_matches(
 
 struct frame_config_snapshot
 {
-    struct frame_config_snapshot *next;
     uint64_t frame_id;
     struct FfxApiResource hudless;
 };
@@ -195,7 +194,8 @@ struct fg_context
     BOOL native_config_valid;
 
     struct FfxApiResource hudless;
-    struct frame_config_snapshot *frame_configs;
+    struct frame_config_snapshot frame_configs[64];
+    unsigned frame_config_count;
     uint32_t display_width;
     uint32_t display_height;
     uint32_t max_render_width;
@@ -385,52 +385,40 @@ static void retain_resource(struct FfxApiResource *output,
     if (output->resource) IUnknown_AddRef((IUnknown *)output->resource);
 }
 
-static void release_frame_config(struct fg_context *context,
-                                 struct frame_config_snapshot *snapshot)
-{
-    release_resource(&snapshot->hudless);
-    free_memory(context_allocator(context), snapshot);
-}
-
-/* dispatch_lock protects this list and the prepare frame history. */
+/* Storage is part of the callback-allocated context. dispatch_lock protects
+ * the occupied prefix and prepare history; detached resources release outside it. */
 static ffxReturnCode_t snapshot_frame_config(
     struct fg_context *context, const struct ffxConfigureDescFrameGeneration *desc)
 {
-    struct frame_config_snapshot *snapshot, **link;
-    unsigned count = 0;
+    struct frame_config_snapshot snapshot = {0}, old = {0};
+    unsigned i;
 
     if (!desc->frameGenerationEnabled) return FFX_API_RETURN_OK;
 
-    snapshot = allocate_memory(context_allocator(context), sizeof(*snapshot));
-    if (!snapshot) return FFX_API_RETURN_ERROR_MEMORY;
-    memset(snapshot, 0, sizeof(*snapshot));
-    snapshot->frame_id = desc->frameID;
-    retain_resource(&snapshot->hudless, &desc->HUDLessColor);
+    snapshot.frame_id = desc->frameID;
+    retain_resource(&snapshot.hudless, &desc->HUDLessColor);
 
     EnterCriticalSection(&context->dispatch_lock);
-    for (link = &context->frame_configs; *link; link = &(*link)->next)
+    for (i = 0; i < context->frame_config_count; ++i)
     {
-        if ((*link)->frame_id == snapshot->frame_id)
+        if (context->frame_configs[i].frame_id == snapshot.frame_id)
         {
-            struct frame_config_snapshot *old = *link;
-            snapshot->next = old->next;
-            *link = snapshot;
+            old = context->frame_configs[i];
+            context->frame_configs[i] = snapshot;
             LeaveCriticalSection(&context->dispatch_lock);
-            release_frame_config(context, old);
+            release_resource(&old.hudless);
             return FFX_API_RETURN_OK;
         }
-        ++count;
     }
     /* Without a generation callback, future frame IDs have no safe retirement
      * point. Reject growth rather than silently remapping them. */
-    if (count >= 64)
+    if (context->frame_config_count == ARRAY_SIZE(context->frame_configs))
     {
         LeaveCriticalSection(&context->dispatch_lock);
-        release_frame_config(context, snapshot);
+        release_resource(&snapshot.hudless);
         return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
     }
-    snapshot->next = context->frame_configs;
-    context->frame_configs = snapshot;
+    context->frame_configs[context->frame_config_count++] = snapshot;
     LeaveCriticalSection(&context->dispatch_lock);
     return FFX_API_RETURN_OK;
 }
@@ -439,9 +427,11 @@ static struct frame_config_snapshot *find_frame_config(
     struct fg_context *context, uint64_t frame_id)
 {
     struct frame_config_snapshot *snapshot, *best = NULL;
+    unsigned i;
 
-    for (snapshot = context->frame_configs; snapshot; snapshot = snapshot->next)
+    for (i = 0; i < context->frame_config_count; ++i)
     {
+        snapshot = &context->frame_configs[i];
         if (snapshot->frame_id == frame_id) return snapshot;
         if (snapshot->frame_id < frame_id &&
             (!best || snapshot->frame_id > best->frame_id))
@@ -454,7 +444,9 @@ static struct frame_config_snapshot *find_frame_config(
  * future configuration. A newer callback may finish before an older one. */
 static void retire_frame_configs(struct fg_context *context, uint64_t completed_frame)
 {
-    struct frame_config_snapshot **link, *snapshot, *floor = NULL, *discard = NULL;
+    struct frame_config_snapshot *snapshot, *floor = NULL,
+        discard[ARRAY_SIZE(context->frame_configs)];
+    unsigned i, count = 0, kept = 0;
     uint64_t oldest_pending = 0, boundary = completed_frame;
     BOOL has_pending = FALSE;
 
@@ -467,8 +459,9 @@ static void retire_frame_configs(struct fg_context *context, uint64_t completed_
         return;
     }
     if (has_pending && oldest_pending < boundary) boundary = oldest_pending;
-    for (snapshot = context->frame_configs; snapshot; snapshot = snapshot->next)
+    for (i = 0; i < context->frame_config_count; ++i)
     {
+        snapshot = &context->frame_configs[i];
         if (snapshot->frame_id <= boundary &&
             (!floor || snapshot->frame_id > floor->frame_id))
             floor = snapshot;
@@ -476,45 +469,40 @@ static void retire_frame_configs(struct fg_context *context, uint64_t completed_
 
     if (floor)
     {
-        for (link = &context->frame_configs; *link;)
+        uint64_t floor_id = floor->frame_id;
+        for (i = 0; i < context->frame_config_count; ++i)
         {
-            if ((*link)->frame_id >= floor->frame_id)
-            {
-                link = &(*link)->next;
-                continue;
-            }
-            snapshot = *link;
-            *link = snapshot->next;
-            snapshot->next = discard;
-            discard = snapshot;
+            snapshot = &context->frame_configs[i];
+            if (snapshot->frame_id >= floor_id)
+                context->frame_configs[kept++] = *snapshot;
+            else
+                discard[count++] = *snapshot;
         }
+        memset(context->frame_configs + kept, 0,
+               (context->frame_config_count - kept) * sizeof(*snapshot));
+        context->frame_config_count = kept;
     }
     LeaveCriticalSection(&context->dispatch_lock);
 
-    while (discard)
-    {
-        snapshot = discard;
-        discard = discard->next;
-        release_frame_config(context, snapshot);
-    }
+    for (i = 0; i < count; ++i)
+        release_resource(&discard[i].hudless);
 }
 
 static void clear_frame_configs(struct fg_context *context)
 {
-    struct frame_config_snapshot *snapshot, *next;
+    struct frame_config_snapshot discard[ARRAY_SIZE(context->frame_configs)];
+    unsigned i, count;
 
     EnterCriticalSection(&context->dispatch_lock);
-    snapshot = context->frame_configs;
-    context->frame_configs = NULL;
+    count = context->frame_config_count;
+    memcpy(discard, context->frame_configs, count * sizeof(*discard));
+    memset(context->frame_configs, 0, count * sizeof(*discard));
+    context->frame_config_count = 0;
     context->have_last_prepare_frame_id = FALSE;
     LeaveCriticalSection(&context->dispatch_lock);
 
-    while (snapshot)
-    {
-        next = snapshot->next;
-        release_frame_config(context, snapshot);
-        snapshot = next;
-    }
+    for (i = 0; i < count; ++i)
+        release_resource(&discard[i].hudless);
 }
 
 static void store_native_config(struct fg_context *context,

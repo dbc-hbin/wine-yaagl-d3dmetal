@@ -2,11 +2,13 @@
 """Exercise production FG dispatch, camera depth, jitter history, and ownership.
 Dispatch tests capture the bridge/native DLL boundaries; native tests use real
 Metal4/MetalFX objects and exact GPU completion callbacks without Wine or a game.
+The jitter fixture also submits partial prepasses after injected encoder exceptions.
 The camera fixture links both public camera packet producers to native encoding,
 checking emitted matrices and final pixels. FG_CAMERA_NATIVE_MASK=1 additionally
 reads the mover mask only on the UUID-pinned, reviewed MetalFX implementation.
 The history fixture feeds public producer packets through the native registry
 and real Metal4 consumption, substituting COM/D3DMetal transport and context setup.
+It also checks bounded pending metadata, sparse IDs, rollback and queued ownership.
 The barrier fixture exercises real native recording with deliberately invalid
 transport, not successful Wine/GPU submission.
 """
@@ -262,7 +264,7 @@ void fg_history_begin(void)
     reset_state(CONTEXT_METALFX);
     ctx.display_width = ctx.display_height = 128;
 }
-int fg_history_prepare(unsigned frame, unsigned width, float jitter, bool reset,
+int fg_history_prepare(uint64_t frame, unsigned width, float jitter, bool reset,
                        void *list, void *depth, void *motion)
 {
     struct ffxDispatchDescFrameGenerationPrepareV2 desc = valid_prepare(frame);
@@ -285,7 +287,7 @@ static ffxReturnCode_t history_reentry(ffxDispatchDescFrameGeneration *desc, voi
     assert(in_context_callback(&ctx));
     return DISPATCH(*desc);
 }
-int fg_history_generate(unsigned frame, unsigned route, bool reset,
+int fg_history_generate(uint64_t frame, unsigned route, bool reset,
                         void *list, void *color, void *output)
 {
     ffxDispatchDescFrameGeneration desc = valid_generation(frame);
@@ -1078,31 +1080,33 @@ int main() {
         parameters.render_width = 0;
         assert(!validParameters(parameters, 0));
         parameters.render_width = 64;
-        snapshot->depth = privateTexture(device, MTLPixelFormatR32Float, 64, 64, MTLTextureUsageShaderRead);
-        snapshot->motion = privateTexture(device, MTLPixelFormatRG16Float, 64, 64, MTLTextureUsageShaderRead);
+        snapshot->depth = acquireTexture(state->snapshotDepth, true, device,
+            MTLPixelFormatR32Float, 64, 64, MTLTextureUsageShaderRead);
+        snapshot->motion = acquireTexture(state->snapshotMotion, true, device,
+            MTLPixelFormatRG16Float, 64, 64, MTLTextureUsageShaderRead);
         snapshot->depthWidth = snapshot->depthHeight = snapshot->motionWidth = snapshot->motionHeight = 64;
         for (unsigned i = 0; i < 2; ++i) {
             auto configuration = configure(*state, command, parameters,
-                (id<MTLTexture>)snapshot->depth.get(), MTLPixelFormatRGBA16Float,
+                (id<MTLTexture>)snapshot->depth->texture.get(), MTLPixelFormatRGBA16Float,
                 MTLPixelFormatInvalid, 128 + i * 8, 128 + i * 8,
                 FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
             assert(configuration);
             if (i == 0) objc_initWeak(&weak[0], configuration->factory.get());
-            snapshot->configuration = configuration;
         }
         auto distortionConfiguration = configure(*state, command, parameters,
-            (id<MTLTexture>)snapshot->depth.get(), MTLPixelFormatRGBA16Float,
+            (id<MTLTexture>)snapshot->depth->texture.get(), MTLPixelFormatRGBA16Float,
             MTLPixelFormatRGBA16Float, 136, 136,
             FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, true);
         assert(distortionConfiguration);
         objc_initWeak(&weak[1], distortionConfiguration->factory.get());
         objc_initWeak(&weak[3], distortionConfiguration->decodePipeline.get());
-        snapshot->configuration = distortionConfiguration;
         state->historyConfiguration = state->configurations.front();
-        state->history = privateTexture(device, MTLPixelFormatRGBA16Float, 128, 128, MTLTextureUsageShaderRead);
-        objc_initWeak(&weak[2], state->history.get());
+        state->history = acquireTexture(state->scene, true, device,
+            MTLPixelFormatRGBA16Float, 128, 128, MTLTextureUsageShaderRead);
+        objc_initWeak(&weak[2], state->history->texture.get());
         auto impl = std::make_shared<PreparedFrame::Impl>();
         impl->state = state; impl->snapshot = snapshot;
+        impl->configuration = distortionConfiguration;
         impl->kind = PreparedFrame::Impl::Kind::Generate;
         impl->generationEpoch = state->generationEpoch;
         impl->first = privateTexture(device, MTLPixelFormatRGBA16Float, 136, 136, MTLTextureUsageShaderRead);
@@ -1125,7 +1129,7 @@ int main() {
         impl->dispatch.distortion_low_precision = 1;
         impl->dispatch.distortion_scale = 1.0f;
         impl->dispatch.distortion_bias = 0.0f;
-        snapshot->production->produced = true;
+        snapshot->produced = true;
         recorded = std::shared_ptr<const PreparedFrame>(new PreparedFrame(impl));
         // Install native ownership directly; this test does not need COM or transport mapping.
         { std::lock_guard lock(registryMutex); contexts.emplace(1, state); }
@@ -1171,6 +1175,10 @@ int main() {
             assert(dispatch_semaphore_wait(completed, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
             [options release]; dispatch_release(completed);
             lease.reset();
+            assert(!recorded->impl_->state->scratch->idle &&
+                   "a post-DESTROY replay must not refill idle scratch");
+            assert(!recorded->impl_->state->scene->idle &&
+                   "a post-DESTROY replay must not refill idle scene storage");
             [buffer release]; [fence release]; [allocator release];
         }
         firstLease.reset(); recorded.reset(); [queue release];
@@ -1190,6 +1198,7 @@ NATIVE_JITTER = r'''
 #include <array>
 #include <algorithm>
 #include <atomic>
+#include <objc/runtime.h>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1304,10 +1313,12 @@ struct JitterRunner {
             displayMotion ? state->creation.display_width : test.renderWidth;
         snapshot->motionHeight = test.motionHeight ? test.motionHeight :
             displayMotion ? state->creation.display_height : test.renderHeight;
-        snapshot->depth = uniformTexture(device, MTLPixelFormatR32Float,
+        snapshot->depth = std::make_shared<TextureOwner>();
+        snapshot->motion = std::make_shared<TextureOwner>();
+        snapshot->depth->texture = uniformTexture(device, MTLPixelFormatR32Float,
             snapshot->depthWidth, snapshot->depthHeight, 0.5f);
         // Binary16 (+0.25, -0.5): exact, uniform object motion, no camera term.
-        snapshot->motion = uniformTexture(device, MTLPixelFormatRG16Float,
+        snapshot->motion->texture = uniformTexture(device, MTLPixelFormatRG16Float,
             snapshot->motionWidth, snapshot->motionHeight,
             std::array<std::uint16_t, 2>{0x3400, 0xb800});
         Command command;
@@ -1317,22 +1328,23 @@ struct JitterRunner {
             // Real Prepare inserts a render-sized configuration before Dispatch
             // selects the output-sized one. Both share the FIFO cache.
             auto renderConfiguration = configure(*state, command, p,
-                (id<MTLTexture>)snapshot->depth.get(), MTLPixelFormatRGBA16Float,
+                (id<MTLTexture>)snapshot->depth->texture.get(), MTLPixelFormatRGBA16Float,
                 MTLPixelFormatInvalid, p.render_width, p.render_height,
                 FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
             assert(renderConfiguration);
         }
-        snapshot->configuration = configure(*state, command, p,
-            (id<MTLTexture>)snapshot->depth.get(), MTLPixelFormatRGBA16Float,
+        auto configuration = configure(*state, command, p,
+            (id<MTLTexture>)snapshot->depth->texture.get(), MTLPixelFormatRGBA16Float,
             MTLPixelFormatInvalid, test.outputWidth, 128,
             FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
-        assert(snapshot->configuration);
+        assert(configuration);
         // Exercise production history capture with raw public jitter and sizes.
         state->capturePreparedJitter(*snapshot, test.frame);
         assert(snapshot->hasPreviousJitter == test.previousValid);
-        snapshot->production->produced = true;
+        snapshot->produced = true;
         auto impl = std::make_shared<PreparedFrame::Impl>();
         impl->state = state; impl->snapshot = snapshot;
+        impl->configuration = configuration;
         impl->kind = PreparedFrame::Impl::Kind::Generate;
         impl->generationEpoch = state->generationEpoch;
         impl->reset = test.dispatchReset;
@@ -1356,7 +1368,8 @@ struct JitterRunner {
                 const std::vector<std::array<__fp16, 2>>* expectedMotion = nullptr,
                 const std::vector<float>* expectedDepth = nullptr,
                 std::vector<std::array<__fp16, 4>>* capturedOutput = nullptr,
-                int expectedDisable = -1) {
+                int expectedDisable = -1,
+                std::shared_ptr<const ExecutionLease>* retainedExecution = nullptr) {
         auto allocator = [device newCommandAllocator];
         auto buffer = [device newCommandBuffer];
         auto fence = [device newFence];
@@ -1367,9 +1380,22 @@ struct JitterRunner {
         [initialization endEncoding];
         std::shared_ptr<const ExecutionLease> lease;
 #ifdef FG_CAMERA_FIXTURE
-        fg_camera_before_encode(prepared->impl_->snapshot->configuration->factory.get());
+        fg_camera_before_encode(prepared->impl_->configuration->factory.get());
 #endif
+        auto& slot = *prepared->impl_->state->scratch;
+        Object reusableOutput;
+        if (prepared->impl_->generationEpoch == prepared->impl_->state->generationEpoch &&
+            prepared->impl_->state->generationEnabled && slot.idle &&
+            slot.idle->configuration == prepared->impl_->configuration &&
+            slot.idle->inferUi == (prepared->impl_->configuration->ui !=
+                MTLPixelFormatInvalid && !prepared->impl_->ui))
+            reusableOutput = slot.idle->output;
         assert(prepared->encode(buffer, fence, lease) && lease);
+        assert(lease->impl_->scratch);
+        if (reusableOutput)
+            assert(lease->impl_->scratch->output.get() == reusableOutput.get());
+        assert(lease->impl_->scratch->output.get() != lease->impl_->currentScene->texture.get());
+        assert(lease->impl_->scratch->depth.get() != prepared->impl_->snapshot->depth->texture.get());
 
         id<MTLTexture> motion = nil, depth = nil;
         const FgParams* parameters = nullptr;
@@ -1472,7 +1498,7 @@ struct JitterRunner {
         assert(dispatch_semaphore_wait(completed,
             dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
 #ifdef FG_CAMERA_FIXTURE
-        fg_camera_after_completion(prepared->impl_->snapshot->configuration->factory.get());
+        fg_camera_after_completion(prepared->impl_->configuration->factory.get());
 #endif
 
         bool good = near(test.name, "cancellation.x", parameters->jitterCancellation[0],
@@ -1552,9 +1578,441 @@ struct JitterRunner {
         failures += !(good && pixelsGood && colorGood); ++frames;
         [options release]; dispatch_release(completed);
         // The execution lease and readback allocation outlive completion and all reads.
+        if (retainedExecution) *retainedExecution = lease;
         lease.reset();
+        if (slot.idle) {
+            assert(((id<MTLResidencySet>)slot.idle->residency.get()).allocationCount == 0);
+            assert(!prepared->impl_->state->history ||
+                slot.idle->output.get() != prepared->impl_->state->history->texture.get());
+        }
         [colorReadback release];
         [readback release]; [buffer release]; [fence release]; [allocator release];
+    }
+
+    void pipelineRequirements() {
+        Command command;
+        command.value.kind = transport::CommandListKind::mpl;
+        command.value.device = device; command.value.compiler = compiler;
+        yaagl_fsr_fg_prepare_packet parameters{};
+        parameters.render_width = parameters.render_height = 64;
+        parameters.camera_near = .1f; parameters.camera_far = 1000;
+        parameters.camera_fov_vertical_radians = 1;
+        parameters.view_space_to_meters = 1; parameters.frame_time_delta_ms = 16;
+        assert(validParameters(parameters, 0));
+        auto depth32 = uniformTexture(device, MTLPixelFormatR32Float, 64, 64, .5f);
+        auto depth16 = uniformTexture(device, MTLPixelFormatR16Float, 64, 64, std::uint16_t(0x3800));
+        NSError* error = nil;
+        auto library = [device newLibraryWithSource:[NSString stringWithUTF8String:kFsrKernelsSource]
+                                           options:nil error:&error];
+        assert(library && !error);
+        const SEL selector = @selector(newFunctionWithName:);
+        const Method method = class_getInstanceMethod(object_getClass(library), selector);
+        assert(method);
+        const IMP original = method_getImplementation(method);
+        for (NSString* unavailable : {@"yaagl_fg_resample_depth", @"yaagl_fg_normalize_motion",
+                                      @"yaagl_fg_normalize_depth_motion_r32"}) {
+            State state;
+            state.kernels.library = Object(library);
+            const bool fusedUnavailable = [unavailable isEqualToString:@"yaagl_fg_normalize_depth_motion_r32"];
+            __block bool injected = false;
+            const IMP replacement = imp_implementationWithBlock(^id<MTLFunction>(id target, NSString* name) {
+                if (target == library && [name isEqualToString:unavailable]) {
+                    injected = true;
+                    return nil;
+                }
+                return reinterpret_cast<id<MTLFunction> (*)(id, SEL, NSString*)>(
+                    original)(target, selector, name);
+            });
+            assert(replacement);
+            auto configurationFor = [&](Object& depth) {
+                return configure(state, command, parameters, (id<MTLTexture>)depth.get(),
+                    MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 128, 128,
+                    FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
+            };
+            @try {
+                method_setImplementation(method, replacement);
+                // A missing shader rejects only the depth format that requires it.
+                assert(bool(configurationFor(depth32)) == !fusedUnavailable);
+                assert(bool(configurationFor(depth16)) == fusedUnavailable);
+                assert(injected);
+            } @finally {
+                method_setImplementation(method, original);
+                imp_removeBlock(replacement);
+            }
+            // A failed creation must not poison either route's later configuration.
+            assert(configurationFor(depth32) && configurationFor(depth16));
+        }
+        [library release];
+        command.value = {};
+    }
+
+    void prepassFailures() {
+        auto state = std::make_shared<State>();
+        state->creation.display_width = state->creation.display_height = 128;
+        JitterFrame test{.name = "prepass failure seed", .frame = 1,
+            .renderWidth = 64, .renderHeight = 64, .jitterX = 0, .jitterY = 0,
+            .cancellationX = 0, .cancellationY = 0, .pixelsX = 4, .pixelsY = -4,
+            .previousValid = false};
+        encode(prepare(state, test), test);
+        assert(state->history && state->scratch->idle && state->historyFrame == 1);
+
+        for (bool failFinish : {false, true}) {
+            test.name = failFinish ? "prepass finish exception" : "prepass pipeline exception";
+            ++test.frame;
+            test.previousValid = true;
+            auto prepared = prepare(state, test);
+            // Shared output permits CPU readback after the partial buffer completes,
+            // even when the injected finish exception prevents its fence update.
+            const std::array<std::uint16_t, 4> sentinel{0x3c00, 0, 0, 0};
+            auto presentTexture = (id<MTLTexture>)prepared->impl_->first.get();
+            const auto width = presentTexture.width, height = presentTexture.height;
+            std::vector<std::array<std::uint16_t, 4>> presentPixels(width * height);
+            [presentTexture getBytes:presentPixels.data()
+                bytesPerRow:width * sizeof(presentPixels[0])
+                fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
+            prepared->impl_->second = uniformTexture(device, MTLPixelFormatRGBA16Float,
+                width, height, sentinel, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+            const auto history = state->history;
+            const auto historyFrame = state->historyFrame;
+            const auto historyConfiguration = state->historyConfiguration;
+            const auto historyDispatch = state->historyDispatch;
+            auto* retiredScratch = state->scratch->idle.get();
+            assert(retiredScratch);
+            assert(((id<MTLResidencySet>)retiredScratch->residency.get()).allocationCount == 0);
+
+            auto allocator = [device newCommandAllocator];
+            auto buffer = [device newCommandBuffer];
+            auto fence = [device newFence];
+            assert(allocator && buffer && fence);
+            [buffer beginCommandBufferWithAllocator:allocator];
+            auto initialization = [buffer computeCommandEncoder];
+            [initialization updateFence:fence afterEncoderStages:MTLStageDispatch];
+            [initialization endEncoding];
+
+            const SEL pipelineSelector = @selector(setComputePipelineState:);
+            const SEL fenceSelector = @selector(updateFence:afterEncoderStages:);
+            const SEL endSelector = @selector(endEncoding);
+            const Class encoderClass = object_getClass(initialization);
+            const Method pipelineMethod = class_getInstanceMethod(encoderClass, pipelineSelector);
+            const Method fenceMethod = class_getInstanceMethod(encoderClass, fenceSelector);
+            const Method endMethod = class_getInstanceMethod(encoderClass, endSelector);
+            assert(pipelineMethod && fenceMethod && endMethod);
+            const IMP originalPipeline = method_getImplementation(pipelineMethod);
+            const IMP originalFence = method_getImplementation(fenceMethod);
+            const IMP originalEnd = method_getImplementation(endMethod);
+            __block id target = nil;
+            __block unsigned pipelines = 0, closes = 0, fenceAttempts = 0;
+            __block NSUInteger fenceStages = 0;
+            __block bool injected = false;
+            const IMP pipelineReplacement = imp_implementationWithBlock(
+                ^(id encoder, id<MTLComputePipelineState> pipeline) {
+                    if (!target) target = encoder;
+                    if (encoder == target) {
+                        ++pipelines;
+                        if (!failFinish && pipelines == 1) {
+                            injected = true;
+                            @throw [NSException exceptionWithName:@"FGPrepassFixture"
+                                reason:@"injected first prepass pipeline failure" userInfo:nil];
+                        }
+                    }
+                    reinterpret_cast<void (*)(id, SEL, id<MTLComputePipelineState>)>(
+                        originalPipeline)(encoder, pipelineSelector, pipeline);
+                });
+            const IMP fenceReplacement = imp_implementationWithBlock(
+                ^(id encoder, id<MTLFence> value, NSUInteger stages) {
+                    if (encoder == target) {
+                        ++fenceAttempts;
+                        fenceStages = stages;
+                        assert(value == fence);
+                        if (failFinish) {
+                            injected = true;
+                            @throw [NSException exceptionWithName:@"FGPrepassFixture"
+                                reason:@"injected prepass finish failure" userInfo:nil];
+                        }
+                    }
+                    reinterpret_cast<void (*)(id, SEL, id<MTLFence>, NSUInteger)>(
+                        originalFence)(encoder, fenceSelector, value, stages);
+                });
+            const IMP endReplacement = imp_implementationWithBlock(^(id encoder) {
+                if (encoder == target) ++closes;
+                reinterpret_cast<void (*)(id, SEL)>(originalEnd)(encoder, endSelector);
+            });
+            assert(pipelineReplacement && fenceReplacement && endReplacement);
+            std::shared_ptr<const ExecutionLease> lease;
+            bool encoded = true;
+            @try {
+                method_setImplementation(pipelineMethod, pipelineReplacement);
+                method_setImplementation(fenceMethod, fenceReplacement);
+                method_setImplementation(endMethod, endReplacement);
+                encoded = prepared->encode(buffer, fence, lease);
+            } @finally {
+                method_setImplementation(pipelineMethod, originalPipeline);
+                method_setImplementation(fenceMethod, originalFence);
+                method_setImplementation(endMethod, originalEnd);
+                imp_removeBlock(pipelineReplacement);
+                imp_removeBlock(fenceReplacement);
+                imp_removeBlock(endReplacement);
+            }
+            assert(!encoded && injected && target && lease);
+            assert(failFinish ? pipelines > 1 : pipelines == 1);
+            assert(closes == 1 && fenceAttempts == 1);
+            assert(fenceStages == (MTLStageBlit | MTLStageDispatch));
+            assert(lease->impl_->prepared == prepared->impl_);
+            assert(lease->impl_->scratch.get() == retiredScratch && !state->scratch->idle);
+            assert(lease->impl_->currentScene && lease->impl_->previousScene == history);
+            const Object failedScene = lease->impl_->currentScene->texture;
+            assert(!state->scene->idle);
+            const id recordedEncoder = target;
+            assert(std::any_of(lease->impl_->objects.begin(), lease->impl_->objects.end(),
+                [recordedEncoder](const Object& object) { return object.get() == recordedEncoder; }));
+            assert(state->history.get() == history.get() && state->historyFrame == historyFrame);
+            assert(state->historyConfiguration == historyConfiguration);
+            assert(state->historyDispatch.frame_id == historyDispatch.frame_id);
+            assert(sameHistoryValues(state->historyDispatch, historyDispatch));
+            auto residency = (id<MTLResidencySet>)lease->impl_->residency.get();
+            assert(residency && residency.allocationCount != 0);
+
+            [buffer endCommandBuffer];
+            auto options = [MTL4CommitOptions new];
+            auto completed = dispatch_semaphore_create(0);
+            [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+                if (feedback.error)
+                    std::fprintf(stderr, "%s: GPU error: %s\n", test.name,
+                                 feedback.error.description.UTF8String);
+                assert(!feedback.error);
+                dispatch_semaphore_signal(completed);
+            }];
+            [queue commit:&buffer count:1 options:options];
+            assert(dispatch_semaphore_wait(completed,
+                dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
+            std::vector<std::array<std::uint16_t, 4>> pixels(width * height);
+            [(id<MTLTexture>)prepared->impl_->second.get()
+                getBytes:pixels.data() bytesPerRow:width * sizeof(pixels[0])
+                fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
+            for (std::size_t i = 0; i < pixels.size(); ++i)
+                assert(pixels[i] == presentPixels[i] && pixels[i] != sentinel);
+            assert(!state->scratch->idle && residency.allocationCount != 0);
+            assert(!state->scene->idle &&
+                "partial encoding returned a scene before its execution lease retired");
+            lease.reset();
+            assert(state->scene->idle.get() == failedScene.get());
+            assert(state->scratch->idle.get() == retiredScratch);
+            assert(((id<MTLResidencySet>)retiredScratch->residency.get()).allocationCount == 0);
+            ++frames;
+            [options release]; dispatch_release(completed);
+            [buffer release]; [fence release]; [allocator release];
+
+            encode(prepared, test);
+            assert(state->history->texture.get() == failedScene.get());
+            assert(state->history.get() != history.get() && state->historyFrame == test.frame);
+            assert(state->historyConfiguration == prepared->impl_->configuration);
+            assert(state->scratch->idle.get() == retiredScratch);
+        }
+        releaseHudRow(state->hudCounted);
+    }
+
+    void profileThreadgroups() {
+        NSError* error = nil;
+        auto library = [device newLibraryWithSource:[NSString stringWithUTF8String:kFsrKernelsSource]
+                                          options:nil error:&error];
+        assert(library && !error);
+        auto pipeline = makePipeline(device, library, @"yaagl_fg_decode_crop");
+        assert(pipeline);
+        [library release];
+        const unsigned profiles[][5] = {
+            {1920, 1080, 2560, 1440, 16}, {1280, 720, 1920, 1080, 8},
+            {1280, 720, 2560, 1440, 8}, {1920, 1080, 3840, 2160, 8}
+        };
+        for (const auto& profile : profiles) {
+            auto configuration = std::make_shared<Configuration>();
+            configuration->device = Object(device);
+            configuration->mode = Mode::Metal4;
+            configuration->outputWidth = profile[2];
+            configuration->outputHeight = profile[3];
+            yaagl_fsr_fg_prepare_packet parameters{};
+            parameters.render_width = profile[0]; parameters.render_height = profile[1];
+            assert(configuration->threadgroupWidth(parameters) == profile[4]);
+            configuration->mode = Mode::Legacy;
+            assert(configuration->threadgroupWidth(parameters) == 8);
+            configuration->mode = Mode::Metal4;
+            // Include an odd-sized pass under the same profile: dispatch shape
+            // is configuration-wide, not selected from each pass's extent.
+            for (bool fullExtent : {true, false}) {
+                const unsigned width = fullExtent ? profile[2] : 17;
+                const unsigned height = fullExtent ? profile[3] : 13;
+                using Pixel = std::array<__fp16, 4>;
+                std::vector<Pixel> pixels(width * height);
+                for (unsigned i = 0; i < pixels.size(); ++i)
+                    pixels[i] = {__fp16(float(i % 31) / 32), __fp16(float(i % 17) / 16),
+                                 __fp16(float(i % 7) / 8), __fp16(1)};
+                auto source = pixelTexture(device, MTLPixelFormatRGBA16Float, width, height, pixels);
+                const auto usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+                auto baseline = uniformTexture(device, MTLPixelFormatRGBA16Float,
+                    width, height, Pixel{-1, -1, -1, -1}, usage);
+                auto selected = uniformTexture(device, MTLPixelFormatRGBA16Float,
+                    width, height, Pixel{-2, -2, -2, -2}, usage);
+                FgParams params{};
+                params.extent[0] = params.sourceExtent[0] = params.outputExtent[0] = width;
+                params.extent[1] = params.sourceExtent[1] = params.outputExtent[1] = height;
+                params.maxLuminance = 1;
+                auto constants = [device newBufferWithBytes:&params length:sizeof(params)
+                                                   options:MTLResourceStorageModeShared];
+                auto descriptor = [MTL4ArgumentTableDescriptor new];
+                descriptor.maxBufferBindCount = 1; descriptor.maxTextureBindCount = 7;
+                descriptor.initializeBindings = YES;
+                auto table = [device newArgumentTableWithDescriptor:descriptor error:&error];
+                [descriptor release];
+                auto allocator = [device newCommandAllocator];
+                auto buffer = [device newCommandBuffer];
+                auto fence = [device newFence];
+                assert(constants && table && allocator && buffer && fence && !error);
+                [buffer beginCommandBufferWithAllocator:allocator];
+                auto execution = std::make_shared<ExecutionLease::Impl>();
+                execution->prepared = std::make_shared<PreparedFrame::Impl>();
+                execution->prepared->configuration = configuration;
+                execution->objects = {source, baseline, selected, Object(constants)};
+                assert(execution->makeResident(buffer, Mode::Metal4));
+                auto initial = [buffer computeCommandEncoder];
+                [initial updateFence:fence afterEncoderStages:MTLStageDispatch];
+                [initial endEncoding];
+                for (unsigned variant = 0; variant != 2; ++variant) {
+                    assert(computePass(buffer, fence, Mode::Metal4, table,
+                        variant ? configuration->threadgroupWidth(parameters) : 8,
+                        (id<MTLComputePipelineState>)pipeline.get(),
+                        {.source = (id<MTLTexture>)source.get(),
+                         .destination = (id<MTLTexture>)(variant ? selected : baseline).get()},
+                        constants, 0, params, execution->objects));
+                }
+                [buffer endCommandBuffer];
+                auto completed = dispatch_semaphore_create(0);
+                auto options = [MTL4CommitOptions new];
+                [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+                    assert(!feedback.error);
+                    dispatch_semaphore_signal(completed);
+                }];
+                [queue commit:&buffer count:1 options:options];
+                assert(dispatch_semaphore_wait(completed,
+                    dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
+                std::vector<Pixel> reference(pixels.size()), actual(pixels.size());
+                [(id<MTLTexture>)baseline.get() getBytes:reference.data()
+                    bytesPerRow:width * sizeof(Pixel) fromRegion:MTLRegionMake2D(0, 0, width, height)
+                    mipmapLevel:0];
+                [(id<MTLTexture>)selected.get() getBytes:actual.data()
+                    bytesPerRow:width * sizeof(Pixel) fromRegion:MTLRegionMake2D(0, 0, width, height)
+                    mipmapLevel:0];
+                assert(!std::memcmp(reference.data(), actual.data(), actual.size() * sizeof(Pixel)));
+                execution.reset();
+                [options release]; dispatch_release(completed);
+                [constants release]; [table release]; [fence release]; [buffer release]; [allocator release];
+            }
+        }
+    }
+
+    void sceneLifecycle() {
+        auto state = std::make_shared<State>();
+        state->creation.display_width = state->creation.display_height = 128;
+        JitterFrame test{.name = "scene owner retirement", .frame = 1,
+            .renderWidth = 64, .renderHeight = 64, .jitterX = 0, .jitterY = 0,
+            .cancellationX = 0, .cancellationY = 0, .pixelsX = 4, .pixelsY = -4,
+            .previousValid = false};
+        std::shared_ptr<const ExecutionLease> writer, reader;
+        encode(prepare(state, test), test, nullptr, nullptr, nullptr, nullptr, -1, &writer);
+        const Object first = state->history->texture;
+        ++test.frame; test.previousValid = true;
+        encode(prepare(state, test), test, nullptr, nullptr, nullptr, nullptr, -1, &reader);
+        assert(reader->impl_->previousScene == writer->impl_->currentScene);
+        assert(!state->scene->idle);
+        writer.reset();
+        assert(!state->scene->idle && "reader must hold the previous writer's scene");
+        // A second overlapping reader is an independent lease, as on a retry
+        // after partially encoded work. Neither can retire the other's texture.
+        auto secondReader = std::make_shared<ExecutionLease::Impl>();
+        secondReader->previousScene = reader->impl_->previousScene;
+        reader.reset();
+        assert(!state->scene->idle);
+        secondReader.reset();
+        assert(state->scene->idle.get() == first.get());
+        ++test.frame;
+        encode(prepare(state, test), test);
+        assert(state->history->texture.get() == first.get());
+        releaseHudRow(state->hudCounted);
+
+        // Descriptor changes cannot consume an incompatible idle allocation.
+        const auto usage = MTLTextureUsageShaderRead;
+        for (unsigned field = 0; field != 4; ++field) {
+            auto slot = std::make_shared<TextureSlot>();
+            auto owner = acquireTexture(slot, true, device, MTLPixelFormatR32Float, 64, 64, usage);
+            const Object original = owner->texture;
+            owner.reset();
+            auto changed = acquireTexture(slot, true, device,
+                field == 0 ? MTLPixelFormatR16Float : MTLPixelFormatR32Float,
+                field == 1 ? 32 : 64, field == 2 ? 32 : 64,
+                field == 3 ? usage | MTLTextureUsageShaderWrite : usage);
+            assert(changed->texture && changed->texture.get() != original.get());
+            const Object replacement = changed->texture;
+            changed.reset();
+            auto reused = acquireTexture(slot, true, device,
+                field == 0 ? MTLPixelFormatR16Float : MTLPixelFormatR32Float,
+                field == 1 ? 32 : 64, field == 2 ? 32 : 64,
+                field == 3 ? usage | MTLTextureUsageShaderWrite : usage);
+            assert(reused->texture.get() == replacement.get());
+        }
+    }
+
+    void scratchLifecycle() {
+        auto state = std::make_shared<State>();
+        state->creation.display_width = state->creation.display_height = 128;
+        JitterFrame test{.name = "scratch retirement", .frame = 1,
+            .renderWidth = 64, .renderHeight = 64, .jitterX = 0, .jitterY = 0,
+            .cancellationX = 0, .cancellationY = 0, .pixelsX = 4, .pixelsY = -4,
+            .previousValid = false};
+        auto prepared = prepare(state, test);
+        std::shared_ptr<const ExecutionLease> outstanding;
+        encode(prepared, test, nullptr, nullptr, nullptr, nullptr, -1, &outstanding);
+        assert(!state->scratch->idle);
+        encode(prepared, test);
+        assert(state->scratch->idle);
+        assert(state->scratch->idle->output.get() != outstanding->impl_->scratch->output.get());
+        assert(state->scratch->idle->parameters.get() != outstanding->impl_->scratch->parameters.get());
+        contexts.emplace(99, state);
+        yaagl_fsr_fg_configure_packet config{};
+        config.header = {sizeof(config), YAAGL_FSR_FG_BRIDGE_VERSION, YAAGL_FSR_FG_CONFIGURE, 0, 99};
+        assert(api(YAAGL_FSR_FG_CONFIGURE, &config) == Ok);
+        assert(!state->scratch->idle && !state->history);
+        outstanding.reset();
+        assert(!state->scratch->idle && "late retirement after OFF repopulated scratch");
+        assert(!state->scene->idle && "late retirement after OFF repopulated scene");
+        encode(prepared, test);
+        assert(!state->scratch->idle && "stale replay after OFF repopulated scratch");
+        assert(!state->scene->idle && "stale replay after OFF repopulated scene");
+        encode(prepared, test, nullptr, nullptr, nullptr, nullptr, -1, &outstanding);
+        config.enabled = 1;
+        assert(api(YAAGL_FSR_FG_CONFIGURE, &config) == Ok);
+        outstanding.reset();
+        assert(!state->scene->idle && "stale OFF work retired after ON");
+        test.frame = 2;
+        prepared = prepare(state, test);
+        encode(prepared, test);
+        Object oldDepth = state->scratch->idle->depth;
+        auto& snapshot = *prepared->impl_->snapshot;
+        snapshot.depth->texture = uniformTexture(device, MTLPixelFormatR16Float, 64, 64,
+                                        std::uint16_t(0x3800));
+        Command command;
+        command.value.kind = transport::CommandListKind::mpl;
+        command.value.device = device; command.value.compiler = compiler;
+        prepared->impl_->configuration = configure(*state, command, snapshot.parameters,
+            (id<MTLTexture>)snapshot.depth->texture.get(), MTLPixelFormatRGBA16Float,
+            MTLPixelFormatInvalid, 128, 128, FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
+        assert(prepared->impl_->configuration);
+        encode(prepared, test);
+        assert(((id<MTLTexture>)state->scratch->idle->depth.get()).pixelFormat == MTLPixelFormatR16Float);
+        assert(state->scratch->idle->depth.get() != oldDepth.get());
+        command.value = {};
+        yaagl_fsr_fg_destroy_packet destroy{};
+        destroy.header = {sizeof(destroy), YAAGL_FSR_FG_BRIDGE_VERSION, YAAGL_FSR_FG_DESTROY, 0, 99};
+        assert(api(YAAGL_FSR_FG_DESTROY, &destroy) == Ok);
+        assert(!state->scratch->idle);
+        assert(!state->scene->idle);
     }
 
     void spatialJitter(bool displayMotion) {
@@ -1584,10 +2042,10 @@ struct JitterRunner {
                 };
                 auto prepared = prepare(state, test);
                 auto& snapshot = *prepared->impl_->snapshot;
-                [(id<MTLTexture>)snapshot.depth.get()
+                [(id<MTLTexture>)snapshot.depth->texture.get()
                     replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0
                     withBytes:depths.data() bytesPerRow:64 * sizeof(float)];
-                [(id<MTLTexture>)snapshot.motion.get()
+                [(id<MTLTexture>)snapshot.motion->texture.get()
                     replaceRegion:MTLRegionMake2D(0, 0, motionSize, motionSize) mipmapLevel:0
                     withBytes:motions.data() bytesPerRow:motionSize * sizeof(motions[0])];
                 std::vector<float> expectedDepth(128 * 128);
@@ -1655,7 +2113,7 @@ struct JitterRunner {
                 };
                 auto prepared = prepare(state, test);
                 auto& impl = *prepared->impl_;
-                impl.snapshot->motion = uniformTexture(device, MTLPixelFormatRG16Float,
+                impl.snapshot->motion->texture = uniformTexture(device, MTLPixelFormatRG16Float,
                     128, 128, std::array<std::uint16_t, 2>{0, 0});
                 if (explicitUi || inferredUi) {
                     impl.third = impl.first; // HUDless scene.
@@ -1676,11 +2134,11 @@ struct JitterRunner {
                     command.value.device = device; command.value.compiler = compiler;
                     // Public dispatch selects the explicit d.ui texture format;
                     // Invalid here would hide the erroneous native UI allocation.
-                    impl.snapshot->configuration = configure(*state, command,
-                        impl.snapshot->parameters, (id<MTLTexture>)impl.snapshot->depth.get(),
+                    impl.configuration = configure(*state, command,
+                        impl.snapshot->parameters, (id<MTLTexture>)impl.snapshot->depth->texture.get(),
                         MTLPixelFormatRGBA16Float, MTLPixelFormatRGBA16Float,
                         128, 128, FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
-                    assert(impl.snapshot->configuration);
+                    assert(impl.configuration);
                 }
                 encode(prepared, test, frame >= 3 ? &expected : nullptr);
             }
@@ -1708,16 +2166,16 @@ struct JitterRunner {
                 impl.second = uniformTexture(device, MTLPixelFormatRGBA8Unorm_sRGB,
                     128, 128, std::array<std::uint8_t, 4>{0, 0, 0, 0},
                     MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView);
-                impl.snapshot->motion = uniformTexture(device, MTLPixelFormatRG16Float,
+                impl.snapshot->motion->texture = uniformTexture(device, MTLPixelFormatRG16Float,
                     128, 128, std::array<__fp16, 2>{0, 0});
                 Command command;
                 command.value.kind = transport::CommandListKind::mpl;
                 command.value.device = device; command.value.compiler = compiler;
-                impl.snapshot->configuration = configure(*state, command,
-                    impl.snapshot->parameters, (id<MTLTexture>)impl.snapshot->depth.get(),
+                impl.configuration = configure(*state, command,
+                    impl.snapshot->parameters, (id<MTLTexture>)impl.snapshot->depth->texture.get(),
                     MTLPixelFormatRGBA8Unorm_sRGB, MTLPixelFormatInvalid,
                     128, 128, FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
-                assert(impl.snapshot->configuration);
+                assert(impl.configuration);
                 encode(prepared, test);
                 std::vector<std::array<std::uint8_t, 4>> pixels(128 * 128);
                 [(id<MTLTexture>)impl.second.get() getBytes:pixels.data()
@@ -1774,7 +2232,7 @@ struct JitterRunner {
                     auto prepared = prepare(states[mode], test);
                     auto& impl = *prepared->impl_;
                     impl.first = pixelTexture(device, MTLPixelFormatRGBA16Float, 128, 128, scene);
-                    impl.snapshot->motion = uniformTexture(device, MTLPixelFormatRG16Float,
+                    impl.snapshot->motion->texture = uniformTexture(device, MTLPixelFormatRG16Float,
                         128, 128, std::array<__fp16, 2>{.25f, 0});
                     if (mode != 0) impl.third = impl.first;
                     if (mode == 1) {
@@ -1785,11 +2243,11 @@ struct JitterRunner {
                         Command command;
                         command.value.kind = transport::CommandListKind::mpl;
                         command.value.device = device; command.value.compiler = compiler;
-                        impl.snapshot->configuration = configure(*states[mode], command,
-                            impl.snapshot->parameters, (id<MTLTexture>)impl.snapshot->depth.get(),
+                        impl.configuration = configure(*states[mode], command,
+                            impl.snapshot->parameters, (id<MTLTexture>)impl.snapshot->depth->texture.get(),
                             MTLPixelFormatRGBA16Float, MTLPixelFormatRGBA16Float,
                             128, 128, FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
-                        assert(impl.snapshot->configuration);
+                        assert(impl.configuration);
                     } else if (mode == 2) {
                         // Distinct alpha/present origins; pad both inputs so a
                         // wrong present binding still reads defined texels.
@@ -1872,7 +2330,7 @@ struct JitterRunner {
                     impl.second = uniformTexture(device, MTLPixelFormatRGBA16Float,
                         width, height, sentinel,
                         MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
-                    impl.snapshot->motion = uniformTexture(device, MTLPixelFormatRG16Float,
+                    impl.snapshot->motion->texture = uniformTexture(device, MTLPixelFormatRG16Float,
                         64, 128, std::array<__fp16, 2>{0, 0});
                     auto& d = impl.dispatch;
                     d.generation_rect_width = activeWidth; d.generation_rect_height = 128;
@@ -1912,9 +2370,9 @@ struct JitterRunner {
                 };
                 auto prepared = prepare(state, test, true);
                 auto& impl = *prepared->impl_;
-                impl.snapshot->motion = uniformTexture(device, MTLPixelFormatRG16Float,
+                impl.snapshot->motion->texture = uniformTexture(device, MTLPixelFormatRG16Float,
                     renderSize, renderSize, std::array<__fp16, 2>{0, 0});
-                const auto factory = impl.snapshot->configuration->factory;
+                const auto factory = impl.configuration->factory;
                 assert(factory);
                 const bool changed = previousFactory && previousFactory.get() != factory.get();
                 const int expectedDisable = frame == 1 || changed ? 1 : 0;
@@ -2105,6 +2563,11 @@ int main() {
         runner.cacheHistory();
         runner.spatialJitter(false);
         runner.spatialJitter(true);
+        runner.pipelineRequirements();
+        runner.prepassFailures();
+        runner.profileThreadgroups();
+        runner.sceneLifecycle();
+        runner.scratchLifecycle();
         std::fprintf(stderr, "FG native jitter: %u frames, %u failed\n", runner.frames, runner.failures);
         assert(runner.failures == 0 && "production jitter cancellation / GPU motion regression");
     }
@@ -2296,9 +2759,9 @@ static void cameraSequence(JitterRunner& runner, unsigned producer,
                         __fp16(aperture * (movingObject ? .8f : .15f)), __fp16(1)};
                 }
             }
-            impl.snapshot->depth = pixelTexture(runner.device, MTLPixelFormatR32Float,
+            impl.snapshot->depth->texture = pixelTexture(runner.device, MTLPixelFormatR32Float,
                                                  width, height, depth);
-            impl.snapshot->motion = pixelTexture(runner.device, MTLPixelFormatRG16Float,
+            impl.snapshot->motion->texture = pixelTexture(runner.device, MTLPixelFormatRG16Float,
                                                   width, height, motion);
             impl.first = pixelTexture(runner.device, MTLPixelFormatRGBA16Float,
                                        width, height, scene);
@@ -2306,16 +2769,16 @@ static void cameraSequence(JitterRunner& runner, unsigned producer,
             command.value.kind = transport::CommandListKind::mpl;
             command.value.device = runner.device; command.value.compiler = runner.compiler;
             // Match production Dispatch's camera-present configuration key.
-            impl.snapshot->configuration = configure(*states[reversed], command, p,
-                (id<MTLTexture>)impl.snapshot->depth.get(), MTLPixelFormatRGBA16Float,
+            impl.configuration = configure(*states[reversed], command, p,
+                (id<MTLTexture>)impl.snapshot->depth->texture.get(), MTLPixelFormatRGBA16Float,
                 MTLPixelFormatInvalid, width, height,
                 FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
-            assert(impl.snapshot->configuration);
+            assert(impl.configuration);
             std::fprintf(stderr, "CAMERA producer=%u infinite=%u control=%u reversed=%u frame=%u\n",
                          producer, infinite, control, reversed, frame);
             runner.encode(prepared, test, reversed ? &colors[0] : nullptr,
                           &motion, &depth, &colors[reversed]);
-            auto effect = (id<MTLFXFrameInterpolatorBase>)impl.snapshot->configuration->factory.get();
+            auto effect = (id<MTLFXFrameInterpolatorBase>)impl.configuration->factory.get();
             assert(effect.depthReversed == bool(reversed));
             // MetalFX consumes and clears shouldResetHistory during encode.
             // Assert the value at its actual entry, not the post-encode property.
@@ -2409,11 +2872,12 @@ NATIVE_HISTORY = r'''
 #undef record
 
 extern "C" void fg_history_begin(void);
-extern "C" int fg_history_prepare(unsigned, unsigned, float, bool, void*, void*, void*);
-extern "C" int fg_history_generate(unsigned, unsigned, bool, void*, void*, void*);
+extern "C" int fg_history_prepare(uint64_t, unsigned, float, bool, void*, void*, void*);
+extern "C" int fg_history_generate(uint64_t, unsigned, bool, void*, void*, void*);
 
 static JitterRunner* historyRunner;
 static bool historyCompilerAvailable = true;
+static bool historyRecordAvailable = true;
 static std::shared_ptr<const PreparedFrame> recordedHistory;
 struct HistoryResource {
     void** vtable;
@@ -2451,6 +2915,7 @@ void historyReleaseResource(MetalResource& out) noexcept {
     out = {};
 }
 bool historyRecord(NativeCommandList&, const RecordRequest& request) noexcept {
+    if (!historyRecordAvailable) return false;
     recordedHistory = std::get<std::shared_ptr<const
         fsr::framegeneration::PreparedFrame>>(request.prepared.value);
     return bool(recordedHistory);
@@ -2464,7 +2929,8 @@ extern "C" int fg_native_packet(void* packet) {
 
 // Prepare's real GPU copy must finish before generation consumes its private
 // textures. Use the same exact completion signal as JitterRunner, never a sleep.
-static void completeHistoryPrepare(JitterRunner& runner) {
+static void completeHistoryPrepare(JitterRunner& runner,
+    std::shared_ptr<const ExecutionLease>* retainedExecution = nullptr) {
     assert(recordedHistory);
     auto allocator = [runner.device newCommandAllocator];
     auto buffer = [runner.device newCommandBuffer];
@@ -2485,6 +2951,7 @@ static void completeHistoryPrepare(JitterRunner& runner) {
     [runner.queue commit:&buffer count:1 options:options];
     assert(dispatch_semaphore_wait(completed,
         dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
+    if (retainedExecution) *retainedExecution = lease;
     lease.reset();
     recordedHistory.reset();
     [options release]; dispatch_release(completed);
@@ -2513,15 +2980,16 @@ static void producerHistory(JitterRunner& runner, unsigned route,
         {historyVtable.data(), depth.get()}, {historyVtable.data(), motion.get()},
         {historyVtable.data(), color.get()}, {historyVtable.data(), output.get()}
     };
+    std::shared_ptr<const PreparedFrame> deferredPrepare;
     auto prepare = [&](unsigned frame) {
         const bool future = frame == 102 && resetCase == 3;
         if (!route && !ahead && !resetCase && frame != 102) {
-            const auto pendingCount = state->frames.size();
+            const auto pendingCount = state->frameCount;
             const auto configurationCount = state->configurations.size();
             historyCompilerAvailable = false;
             assert(fg_history_prepare(frame, 64, frame == 101 ? -.5f : .5f, false,
                 &list, &resources[0], &resources[1]) == Unsupported);
-            assert(!recordedHistory && state->frames.size() == pendingCount &&
+            assert(!recordedHistory && state->frameCount == pendingCount &&
                    state->configurations.size() == configurationCount);
             historyCompilerAvailable = true;
         }
@@ -2529,21 +2997,72 @@ static void producerHistory(JitterRunner& runner, unsigned route,
             frame == 101 ? -.5f : .5f,
             future || (frame == 101 && resetCase == 2),
             &list, &resources[0], &resources[1]) == Ok);
-        completeHistoryPrepare(runner);
-        assert(state->frames.at(frame)->production->produced);
+        if (!route && !ahead && !resetCase && frame == 100) {
+            deferredPrepare = std::move(recordedHistory);
+            assert(!(*state->findFrame(frame))->produced);
+        } else {
+            completeHistoryPrepare(runner);
+            assert((*state->findFrame(frame))->produced);
+        }
     };
     auto generate = [&](unsigned frame) {
-        const auto pending = state->frames.at(frame);
+        const auto pending = *state->findFrame(frame);
         const auto history = state->history;
+        if (!route && !ahead && !resetCase && frame == 100) {
+            yaagl_fsr_fg_dispatch_packet packet{};
+            packet.header = {sizeof(packet), YAAGL_FSR_FG_BRIDGE_VERSION,
+                YAAGL_FSR_FG_DISPATCH, 0, 17};
+            packet.command_list = reinterpret_cast<std::uint64_t>(&list);
+            packet.frame_id = frame;
+            packet.num_generated_frames = 1;
+            packet.present_color = reinterpret_cast<std::uint64_t>(&resources[2]);
+            packet.output = reinterpret_cast<std::uint64_t>(&resources[3]);
+            packet.backbuffer_transfer_function = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+            packet.max_luminance = 1;
+            historyRecordAvailable = false;
+            assert(api(YAAGL_FSR_FG_DISPATCH, &packet) == Runtime);
+            historyRecordAvailable = true;
+            auto firstView = [(id<MTLTexture>)output.get()
+                newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Float];
+            auto nestedView = [firstView newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Float];
+            assert(firstView && nestedView);
+            HistoryResource alias{historyVtable.data(), nestedView};
+            for (unsigned role = 0; role < 5; ++role) {
+                auto invalid = packet;
+                const auto address = reinterpret_cast<std::uint64_t>(&alias);
+                if (role == 0) invalid.present_color = address;
+                if (role == 1) invalid.hudless_color = address;
+                if (role == 2) invalid.real_output = address;
+                if (role == 3) {
+                    invalid.hudless_color = packet.present_color;
+                    invalid.ui = address;
+                }
+                if (role == 4) {
+                    invalid.distortion = address;
+                    invalid.distortion_width = invalid.distortion_height = 128;
+                }
+                assert(api(YAAGL_FSR_FG_DISPATCH, &invalid) ==
+                    (role == 0 ? Unsupported : Parameter));
+                assert(!recordedHistory && *state->findFrame(frame) == pending &&
+                       state->history.get() == history.get());
+            }
+            [nestedView release]; [firstView release];
+        }
         if (!route && !ahead && !resetCase && frame != 102) {
             const auto configurationCount = state->configurations.size();
             historyCompilerAvailable = false;
             assert(fg_history_generate(frame, route, false,
                 &list, &resources[2], &resources[3]) == Unsupported);
-            assert(!recordedHistory && state->frames.at(frame) == pending &&
+            assert(!recordedHistory && *state->findFrame(frame) == pending &&
                    state->history.get() == history.get() &&
                    state->configurations.size() == configurationCount);
             historyCompilerAvailable = true;
+            historyRecordAvailable = false;
+            assert(fg_history_generate(frame, route, false,
+                &list, &resources[2], &resources[3]) == Runtime);
+            assert(!recordedHistory && *state->findFrame(frame) == pending &&
+                   state->history.get() == history.get());
+            historyRecordAvailable = true;
         }
         if (frame == 101) {
             assert(state->historyFrame == 100 && history);
@@ -2555,9 +3074,26 @@ static void producerHistory(JitterRunner& runner, unsigned route,
         }
         assert(fg_history_generate(frame, route, frame == 101 && resetCase == 1,
             &list, &resources[2], &resources[3]) == Ok);
-        assert(recordedHistory && !state->frames.count(frame));
+        assert(recordedHistory && !state->findFrame(frame));
         auto work = std::const_pointer_cast<PreparedFrame>(recordedHistory);
-        assert(work->impl_->snapshot->production == pending->production);
+        if (deferredPrepare) {
+            // Generate can be recorded before Prepare executes, but cannot consume
+            // its inputs until that queued Prepare publishes successful production.
+            auto allocator = [runner.device newCommandAllocator];
+            auto buffer = [runner.device newCommandBuffer];
+            auto fence = [runner.device newFence];
+            assert(allocator && buffer && fence);
+            [buffer beginCommandBufferWithAllocator:allocator];
+            std::shared_ptr<const ExecutionLease> lease;
+            assert(!work->encode(buffer, fence, lease) && lease);
+            assert(!pending->produced && state->history.get() == history.get());
+            [buffer endCommandBuffer];
+            lease.reset();
+            [buffer release]; [fence release]; [allocator release];
+            recordedHistory = std::move(deferredPrepare);
+            completeHistoryPrepare(runner);
+            assert(pending->produced);
+        }
         assert(work->impl_->snapshot->parameters.frame_id == frame);
         const bool reset = frame == 100 || (frame == 101 &&
             (resetCase == 1 || resetCase == 2)) ||
@@ -2576,7 +3112,7 @@ static void producerHistory(JitterRunner& runner, unsigned route,
         assert(encodedCameraReset == reset &&
             "older pending producer frame must retain native temporal history");
         if (!reset)
-            assert(encodedPreviousColor == history.get());
+            assert(encodedPreviousColor == history->texture.get());
         assert(state->historyFrame == frame);
         recordedHistory.reset();
     };
@@ -2592,7 +3128,7 @@ static void producerHistory(JitterRunner& runner, unsigned route,
         &resources[2], &resources[3]) == Parameter);
     assert(fg_history_generate(103, route, false, &list,
         &resources[2], &resources[3]) == Parameter);
-    assert(!recordedHistory && state->frames.empty());
+    assert(!recordedHistory && !state->frameCount);
     yaagl_fsr_fg_destroy_packet destroy{};
     destroy.header.size = sizeof(destroy);
     destroy.header.version = YAAGL_FSR_FG_BRIDGE_VERSION;
@@ -2600,6 +3136,165 @@ static void producerHistory(JitterRunner& runner, unsigned route,
     destroy.header.context = 17;
     assert(api(YAAGL_FSR_FG_DESTROY, &destroy) == Ok);
     assert(!lookup(17));
+}
+
+static void inputOwnership(JitterRunner& runner) {
+    fg_history_begin();
+    auto state = std::make_shared<State>();
+    state->creation.display_width = state->creation.display_height = 128;
+    state->creation.max_render_width = state->creation.max_render_height = 128;
+    contexts.emplace(17, state);
+    auto depth = uniformTexture(runner.device, MTLPixelFormatR32Float, 64, 32, .5f);
+    auto motion = uniformTexture(runner.device, MTLPixelFormatRG16Float, 64, 32,
+        std::array<std::uint16_t, 2>{0, 0});
+    auto color = uniformTexture(runner.device, MTLPixelFormatRGBA16Float, 128, 128,
+        std::array<__fp16, 4>{.25f, .5f, .75f, 1});
+    auto output = privateTexture(runner.device, MTLPixelFormatRGBA16Float, 128, 128,
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+    HistoryResource list{historyVtable.data()};
+    HistoryResource resources[] = {
+        {historyVtable.data(), depth.get()}, {historyVtable.data(), motion.get()},
+        {historyVtable.data(), color.get()}, {historyVtable.data(), output.get()}
+    };
+    auto prepare = [&](std::uint64_t frame) {
+        assert(fg_history_prepare(frame, 64, 0, false,
+            &list, &resources[0], &resources[1]) == Ok);
+    };
+    prepare(1);
+    auto producer = recordedHistory;
+    const Object firstDepth = producer->impl_->snapshot->depth->texture;
+    const Object firstMotion = producer->impl_->snapshot->motion->texture;
+    std::shared_ptr<const ExecutionLease> producerLease, consumerLease;
+    completeHistoryPrepare(runner, &producerLease);
+    assert(fg_history_generate(1, 0, false, &list, &resources[2], &resources[3]) == Ok);
+    auto consumer = std::const_pointer_cast<PreparedFrame>(recordedHistory);
+    assert(consumer->impl_->snapshot == producer->impl_->snapshot);
+    recordedHistory.reset();
+    producer.reset();
+    assert(!state->snapshotDepth->idle && !state->snapshotMotion->idle);
+    JitterFrame test{.name = "input producer consumer retirement", .frame = 1,
+        .renderWidth = 64, .renderHeight = 32, .jitterX = 0, .jitterY = -.25f,
+        .cancellationX = 0, .cancellationY = 0, .pixelsX = 0, .pixelsY = 0};
+    runner.encode(consumer, test, nullptr, nullptr, nullptr, nullptr, -1, &consumerLease);
+    consumer.reset();
+    producerLease.reset();
+    assert(!state->snapshotDepth->idle && !state->snapshotMotion->idle &&
+        "consumer execution still owns the immutable input snapshot");
+    consumerLease.reset();
+    assert(state->snapshotDepth->idle.get() == firstDepth.get());
+    assert(state->snapshotMotion->idle.get() == firstMotion.get());
+    prepare(2);
+    assert(recordedHistory->impl_->snapshot->depth->texture.get() == firstDepth.get());
+    assert(recordedHistory->impl_->snapshot->motion->texture.get() == firstMotion.get());
+    completeHistoryPrepare(runner, &producerLease);
+    yaagl_fsr_fg_configure_packet config{};
+    config.header = {sizeof(config), YAAGL_FSR_FG_BRIDGE_VERSION,
+        YAAGL_FSR_FG_CONFIGURE, 0, 17};
+    assert(api(YAAGL_FSR_FG_CONFIGURE, &config) == Ok);
+    config.enabled = 1;
+    assert(api(YAAGL_FSR_FG_CONFIGURE, &config) == Ok);
+    producerLease.reset();
+    assert(!state->snapshotDepth->idle && !state->snapshotMotion->idle);
+    prepare(3);
+    completeHistoryPrepare(runner, &producerLease);
+    yaagl_fsr_fg_destroy_packet destroy{};
+    destroy.header = {sizeof(destroy), YAAGL_FSR_FG_BRIDGE_VERSION,
+        YAAGL_FSR_FG_DESTROY, 0, 17};
+    assert(api(YAAGL_FSR_FG_DESTROY, &destroy) == Ok);
+    producerLease.reset();
+    assert(!state->snapshotDepth->idle && !state->snapshotMotion->idle);
+}
+
+static void pendingFrameMetadata(JitterRunner& runner) {
+    fg_history_begin();
+    auto state = std::make_shared<State>();
+    state->creation.display_width = state->creation.display_height = 128;
+    state->creation.max_render_width = state->creation.max_render_height = 128;
+    contexts.emplace(17, state);
+    auto depth = uniformTexture(runner.device, MTLPixelFormatR32Float, 64, 32, .5f);
+    auto motion = uniformTexture(runner.device, MTLPixelFormatRG16Float, 64, 32,
+        std::array<std::uint16_t, 2>{0, 0});
+    HistoryResource list{historyVtable.data()};
+    HistoryResource resources[] = {
+        {historyVtable.data(), depth.get()}, {historyVtable.data(), motion.get()}
+    };
+    auto prepare = [&](std::uint64_t id) {
+        return fg_history_prepare(id, 64, .5f, false,
+            &list, &resources[0], &resources[1]);
+    };
+    std::array<std::uint64_t, 64> ids{};
+    for (unsigned i = 0; i < ids.size(); ++i) {
+        ids[i] = i == 63 ? UINT64_MAX : std::uint64_t(i) << 56;
+        assert(prepare(ids[i]) == Ok);
+        assert(state->frameCount == i + 1 && state->findFrame(ids[i]));
+        recordedHistory.reset();
+    }
+    // The first 63 IDs share their low six bits; zero and UINT64_MAX are valid IDs.
+    // Duplicate rejection precedes capacity, while a distinct 65th ID is backpressure.
+    assert(prepare(ids[32]) == Parameter && !recordedHistory);
+    assert(prepare(12345) == Runtime && !recordedHistory && state->frameCount == 64);
+    assert(fg_history_prepare(12345, 129, .5f, false,
+        &list, &resources[0], &resources[1]) == Parameter);
+    yaagl_fsr_fg_retire_frame_packet retire{};
+    retire.header = {sizeof(retire), YAAGL_FSR_FG_BRIDGE_VERSION,
+        YAAGL_FSR_FG_RETIRE_FRAME, 0, 17};
+    std::array<bool, 64> pending;
+    pending.fill(true);
+    for (unsigned i = 0; i < ids.size(); ++i) {
+        const unsigned index = (i * 17 + 31) % ids.size();
+        retire.frame_id = ids[index];
+        assert(api(YAAGL_FSR_FG_RETIRE_FRAME, &retire) == Ok);
+        pending[index] = false;
+        assert(!state->findFrame(ids[index]) && state->frameCount == 63 - i);
+        assert(bool(retire.has_pending_frame) == (i != 63));
+        if (i != 63) {
+            unsigned first = 0;
+            while (!pending[first]) ++first;
+            assert(retire.oldest_pending_frame_id == ids[first]);
+        }
+    }
+    historyRecordAvailable = false;
+    assert(prepare(71) == Runtime && !state->frameCount && !recordedHistory);
+    historyRecordAvailable = true;
+    assert(prepare(71) == Ok);
+    const auto retained = *state->findFrame(71);
+    retire.frame_id = 71;
+    assert(api(YAAGL_FSR_FG_RETIRE_FRAME, &retire) == Ok);
+    assert(!retire.has_pending_frame && !state->frameCount);
+    assert(recordedHistory->impl_->snapshot == retained);
+    const auto retiredWork = recordedHistory;
+    assert(prepare(72) == Ok);
+    assert(*state->findFrame(72) != retained);
+    recordedHistory = retiredWork;
+    completeHistoryPrepare(runner);
+    assert(retained->produced && retained->parameters.frame_id == 71);
+    retire.frame_id = 72;
+    assert(api(YAAGL_FSR_FG_RETIRE_FRAME, &retire) == Ok);
+    assert(prepare(73) == Ok);
+    const auto offSnapshot = recordedHistory->impl_->snapshot;
+    yaagl_fsr_fg_configure_packet config{};
+    config.header = {sizeof(config), YAAGL_FSR_FG_BRIDGE_VERSION,
+        YAAGL_FSR_FG_CONFIGURE, 0, 17};
+    config.enabled = 0;
+    assert(api(YAAGL_FSR_FG_CONFIGURE, &config) == Ok && !state->frameCount);
+    completeHistoryPrepare(runner);
+    assert(offSnapshot->produced);
+    for (unsigned i = 0; i != 65; ++i) {
+        assert(prepare(1000 + i) == Ok && !state->frameCount);
+        recordedHistory.reset();
+    }
+    config.enabled = 1;
+    assert(api(YAAGL_FSR_FG_CONFIGURE, &config) == Ok);
+    assert(prepare(UINT64_MAX) == Ok);
+    const auto destroyedSnapshot = recordedHistory->impl_->snapshot;
+    yaagl_fsr_fg_destroy_packet destroy{};
+    destroy.header = {sizeof(destroy), YAAGL_FSR_FG_BRIDGE_VERSION,
+        YAAGL_FSR_FG_DESTROY, 0, 17};
+    assert(api(YAAGL_FSR_FG_DESTROY, &destroy) == Ok);
+    assert(!lookup(17) && !state->frameCount);
+    completeHistoryPrepare(runner);
+    assert(destroyedSnapshot->produced &&
+        destroyedSnapshot->parameters.frame_id == UINT64_MAX);
 }
 
 int main() {
@@ -2612,6 +3307,8 @@ int main() {
         historyVtable[7] = reinterpret_cast<void*>(&historyGetDevice);
         historyVtable[43] = reinterpret_cast<void*>(&historyLuid);
         historyVtable[26] = reinterpret_cast<void*>(&historyBarrier);
+        inputOwnership(runner);
+        pendingFrameMetadata(runner);
         for (unsigned route = 0; route != 3; ++route) {
             producerHistory(runner, route, false, 0);
             producerHistory(runner, route, true, 0);
@@ -2626,7 +3323,196 @@ int main() {
 '''
 
 
+NATIVE_FUSION = r'''
+static void complete(id<MTLCommandBuffer> buffer) {
+    auto done = dispatch_semaphore_create(0);
+    [buffer addCompletedHandler:^(id<MTLCommandBuffer> result) {
+        assert(result.status == MTLCommandBufferStatusCompleted && !result.error);
+        dispatch_semaphore_signal(done);
+    }];
+    [buffer commit];
+    assert(dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
+    dispatch_release(done);
+}
+template<class Pixel>
+static void equalPixels(Object a, Object b) {
+    auto left = (id<MTLTexture>)a.get(), right = (id<MTLTexture>)b.get();
+    assert(left.width == right.width && left.height == right.height);
+    std::vector<Pixel> x(left.width * left.height), y(x.size());
+    auto region = MTLRegionMake2D(0, 0, left.width, left.height);
+    [left getBytes:x.data() bytesPerRow:left.width * sizeof(Pixel) fromRegion:region mipmapLevel:0];
+    [right getBytes:y.data() bytesPerRow:right.width * sizeof(Pixel) fromRegion:region mipmapLevel:0];
+    assert(!std::memcmp(x.data(), y.data(), x.size() * sizeof(Pixel)));
+}
+int main() {
+    @autoreleasepool {
+        auto device = MTLCreateSystemDefaultDevice(); auto queue = [device newCommandQueue];
+        NSError* error = nil;
+        auto library = [device newLibraryWithSource:[NSString stringWithUTF8String:kFsrKernelsSource]
+                                          options:nil error:&error];
+        assert(library && !error);
+        auto depthPipeline = makePipeline(device, library, @"yaagl_fg_resample_depth");
+        auto motionPipeline = makePipeline(device, library, @"yaagl_fg_normalize_motion");
+        auto fusedPipeline = makePipeline(device, library, @"yaagl_fg_normalize_depth_motion_r32");
+        auto decodePipeline = makePipeline(device, library, @"yaagl_fg_decode_crop");
+        auto decodePair = makePipeline(device, library, @"yaagl_fg_decode_scene_ui");
+        assert(depthPipeline && motionPipeline && fusedPipeline && decodePipeline && decodePair);
+        const auto usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        const std::uint32_t bits[]{0, 0x80000000u, 1, 0x80000001u, 0x007fffffu,
+            0x00800000u, 0x00800001u, 0x33800000u, 0x3f000000u, 0x3f800000u, 0xbf000000u};
+        std::vector<float> depths(7 * 5);
+        for (unsigned i = 0; i < depths.size(); ++i)
+            std::memcpy(&depths[i], &bits[i % std::size(bits)], 4);
+        auto sourceDepth = pixelTexture(device, MTLPixelFormatR32Float, 7, 5, depths);
+        std::vector<std::array<float, 2>> vectors(11 * 9);
+        for (unsigned i = 0; i < vectors.size(); ++i)
+            vectors[i] = {i % 3 == 0 ? -.5f : float(i % 11) / 16,
+                          i % 5 == 0 ? -.5f : -float(i % 9) / 16};
+        auto sourceMotion = pixelTexture(device, MTLPixelFormatRG32Float, 11, 9, vectors);
+        auto splitDepth = uniformTexture(device, MTLPixelFormatR32Float, 17, 13, 0.f, usage);
+        auto fusedDepth = uniformTexture(device, MTLPixelFormatR32Float, 17, 13, 0.f, usage);
+        auto splitMotion = uniformTexture(device, MTLPixelFormatRG16Float, 17, 13,
+            std::array<std::uint16_t, 2>{}, usage);
+        auto fusedMotion = uniformTexture(device, MTLPixelFormatRG16Float, 17, 13,
+            std::array<std::uint16_t, 2>{}, usage);
+        unsigned cases = 0;
+        for (unsigned camera = 0; camera < 5; ++camera)
+            for (unsigned invalid = 0; invalid < 2; ++invalid)
+                for (unsigned grid = 0; grid < 3; ++grid) {
+                    FgParams parameters[2]{};
+                    auto& depth = parameters[0]; auto& motion = parameters[1];
+                    depth.extent[0] = motion.extent[0] = 17;
+                    depth.extent[1] = motion.extent[1] = 13;
+                    depth.sourceExtent[0] = 7; depth.sourceExtent[1] = 5;
+                    motion.sourceExtent[0] = 11; motion.sourceExtent[1] = 9;
+                    depth.sourceJitterUv[0] = grid == 1 ? .5f / 7 : -.5f / 7;
+                    depth.sourceJitterUv[1] = grid == 2 ? -.5f / 5 : .5f / 5;
+                    motion.sourceJitterUv[0] = grid == 0 ? 0 : depth.sourceJitterUv[0];
+                    motion.sourceJitterUv[1] = grid == 0 ? 0 : depth.sourceJitterUv[1];
+                    motion.motionTargetExtent[0] = 11; motion.motionTargetExtent[1] = 9;
+                    motion.outputExtent[0] = 17; motion.outputExtent[1] = 13;
+                    motion.motionScale[0] = 11; motion.motionScale[1] = 9;
+                    motion.jitterCancellation[0] = grid == 2 ? -.375f : 0;
+                    motion.jitterCancellation[1] = grid == 2 ? .25f : 0;
+                    motion.motionVectorsInvalidValuePresent = invalid;
+                    motion.motionVectorsInvalidValue = -.5f;
+                    motion.reconstructCameraMotion = camera != 0;
+                    for (unsigned i = 0; i < 16; ++i) motion.clipToPreviousClip[i] = i % 5 == 0 ? 1 : 0;
+                    if (camera >= 2) {
+                        motion.clipToPreviousClip[8] = .375f;
+                        motion.clipToPreviousClip[9] = -.25f;
+                        motion.clipToPreviousClip[11] = .5f;
+                    }
+                    if (camera == 3) motion.clipToPreviousClip[15] = 1.e-7f;
+                    if (camera == 4) {
+                        // Amplify subnormal depth into visible half-float motion.
+                        motion.clipToPreviousClip[8] = 1.e38f;
+                        motion.clipToPreviousClip[9] = -1.e38f;
+                        motion.clipToPreviousClip[11] = 0;
+                    }
+                    auto constants = [device newBufferWithBytes:parameters length:sizeof(parameters)
+                                                        options:MTLResourceStorageModeShared];
+                    auto buffer = [queue commandBuffer]; auto fence = [device newFence];
+                    auto initial = [buffer computeCommandEncoder]; [initial updateFence:fence]; [initial endEncoding];
+                    std::vector<Object> retained;
+                    assert(computePass(buffer, fence, Mode::Legacy, nil, 8,
+                        (id<MTLComputePipelineState>)depthPipeline.get(),
+                        {.source = (id<MTLTexture>)sourceDepth.get(),
+                         .destination = (id<MTLTexture>)splitDepth.get()},
+                        constants, 0, depth, retained));
+                    assert(computePass(buffer, fence, Mode::Legacy, nil, 8,
+                        (id<MTLComputePipelineState>)motionPipeline.get(),
+                        {.source = (id<MTLTexture>)sourceMotion.get(),
+                         .destination = (id<MTLTexture>)splitMotion.get(),
+                         .auxiliary0 = (id<MTLTexture>)splitDepth.get()},
+                        constants, sizeof(FgParams), motion, retained));
+                    assert(computePass(buffer, fence, Mode::Legacy, nil, 8,
+                        (id<MTLComputePipelineState>)fusedPipeline.get(),
+                        {.source = (id<MTLTexture>)sourceMotion.get(),
+                         .destination = (id<MTLTexture>)fusedMotion.get(),
+                         .auxiliary0 = (id<MTLTexture>)sourceDepth.get(),
+                         .auxiliary1 = (id<MTLTexture>)fusedDepth.get()},
+                        constants, 0, depth, retained));
+                    complete(buffer);
+                    equalPixels<std::uint32_t>(splitDepth, fusedDepth);
+                    equalPixels<std::array<std::uint16_t, 2>>(splitMotion, fusedMotion);
+                    ++cases; [constants release]; [fence release];
+                }
+        std::vector<std::array<__fp16, 4>> colors(23 * 17);
+        for (unsigned i = 0; i < colors.size(); ++i)
+            colors[i] = {__fp16((i % 23) / 24.f), __fp16((i % 17) / 18.f), __fp16(.25f), __fp16(.5f)};
+        auto sourceScene = pixelTexture(device, MTLPixelFormatRGBA16Float, 23, 17, colors);
+        std::reverse(colors.begin(), colors.end());
+        auto sourceUi = pixelTexture(device, MTLPixelFormatRGBA16Float, 23, 17, colors);
+        auto splitScene = uniformTexture(device, MTLPixelFormatRGBA16Float, 17, 13,
+            std::array<std::uint16_t, 4>{}, usage);
+        auto fusedScene = uniformTexture(device, MTLPixelFormatRGBA16Float, 17, 13,
+            std::array<std::uint16_t, 4>{}, usage);
+        auto splitUi = uniformTexture(device, MTLPixelFormatRGBA16Float, 17, 13,
+            std::array<std::uint16_t, 4>{}, usage);
+        auto fusedUi = uniformTexture(device, MTLPixelFormatRGBA16Float, 17, 13,
+            std::array<std::uint16_t, 4>{}, usage);
+        for (unsigned transfer = 0; transfer < 3; ++transfer) {
+            FgParams parameters[2]{};
+            for (auto& p : parameters) {
+                p.extent[0] = 17; p.extent[1] = 13; p.transfer = transfer;
+                p.minLuminance = 1; p.maxLuminance = 1000;
+            }
+            parameters[0].sourceOrigin[0] = 2; parameters[0].sourceOrigin[1] = 1;
+            parameters[1].sourceOrigin[0] = 5; parameters[1].sourceOrigin[1] = 3;
+            auto constants = [device newBufferWithBytes:parameters length:sizeof(parameters)
+                                                options:MTLResourceStorageModeShared];
+            auto buffer = [queue commandBuffer]; auto fence = [device newFence];
+            auto initial = [buffer computeCommandEncoder]; [initial updateFence:fence]; [initial endEncoding];
+            std::vector<Object> retained;
+            assert(computePass(buffer, fence, Mode::Legacy, nil, 8,
+                (id<MTLComputePipelineState>)decodePipeline.get(),
+                {.source = (id<MTLTexture>)sourceScene.get(),
+                 .destination = (id<MTLTexture>)splitScene.get()},
+                constants, 0, parameters[0], retained));
+            assert(computePass(buffer, fence, Mode::Legacy, nil, 8,
+                (id<MTLComputePipelineState>)decodePipeline.get(),
+                {.source = (id<MTLTexture>)sourceUi.get(),
+                 .destination = (id<MTLTexture>)splitUi.get()},
+                constants, sizeof(FgParams), parameters[1], retained));
+            assert(computePass(buffer, fence, Mode::Legacy, nil, 8,
+                (id<MTLComputePipelineState>)decodePair.get(),
+                {.source = (id<MTLTexture>)sourceScene.get(),
+                 .destination = (id<MTLTexture>)fusedScene.get(),
+                 .auxiliary0 = (id<MTLTexture>)sourceUi.get(),
+                 .auxiliary1 = (id<MTLTexture>)fusedUi.get()},
+                constants, 0, parameters[0], retained));
+            complete(buffer);
+            equalPixels<std::array<std::uint16_t, 4>>(splitScene, fusedScene);
+            equalPixels<std::array<std::uint16_t, 4>>(splitUi, fusedUi);
+            ++cases; [constants release]; [fence release];
+        }
+        std::printf("FG fused preprocessing: %u cases, all pixels bitwise equal\n", cases);
+        [library release]; [queue release]; [device release];
+    }
+}
+'''
+
+
 class FrameGenerationNormalizationTest(unittest.TestCase):
+    def test_native_fused_preprocessing(self):
+        native = ROOT / "d3dmetal-sidecar"
+        kernels = (native / "fsr-kernels.metal").read_text()
+        with tempfile.TemporaryDirectory(prefix="yaagl-fg-fusion-") as directory:
+            directory = pathlib.Path(directory)
+            source = directory / "fg-fusion.mm"
+            binary = directory / "fg-fusion"
+            source.write_text(NATIVE_JITTER.split("\nstruct JitterRunner {", 1)[0] + NATIVE_FUSION)
+            (directory / "fsr-kernels.inc").write_text(
+                'static const char kFsrKernelsSource[] = R"YAAGL_METAL(' + kernels + ')YAAGL_METAL";\n')
+            subprocess.run(("xcrun", "clang++", "-arch", "x86_64", "-O2", "-std=c++20", "-fno-objc-arc",
+                            "-I", str(native), "-I", str(directory), str(source),
+                            *(str(native / file) for file in ("metalfx-backend.mm",
+                              "d3dmetal-transport.mm")),
+                            "-framework", "Foundation", "-framework", "Metal",
+                            "-framework", "MetalFX", "-o", str(binary)), check=True)
+            subprocess.run((str(binary),), check=True)
+
     def test_producer_native_history(self):
         native = ROOT / "d3dmetal-sidecar"
         kernels = (native / "fsr-kernels.metal").read_text()
