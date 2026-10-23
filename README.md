@@ -44,6 +44,18 @@ node scripts/build-d3dmetal-sidecar.mjs build/native-sidecar
 
 `WINE_P3_ROOT` selects a fresh build directory; the default is `build/wine-p3-current`. Its `host/` and provenance describe the actual Wine source. Sidecar output includes the dylib and a source-hash manifest. Existing build directories are not evidence that current sources were built.
 
+### ZZZ Game Mode host
+
+The full-source build also links `libexec/yaagl-game-mode/ZZZ.app/Contents/MacOS/wine` from that build's existing `loader/main.o`. `scripts/game-mode-host.py` reuses the generated loader link recipe, changing only the output and embedded plist; it does not copy a loader implementation or assume an older Wine address-reservation layout. Wine 11.20's low-8GB reservation and configured flags remain authoritative. The loader resolves this fixed bundle location to the same runtime's `lib/wine/x86_64-unix/ntdll.so`, without an environment-selected library or an external symlink inside the signed app.
+
+The embedded and bundle plists are identical: `io.github.yaagl.zzz-game-host`, Games category, `LSSupportsGameMode=true`, `WineApplication`, and no `LSUIElement`. Install and staging sign the bundle, and staging checks its executable, both plists, relative ntdll resolution and signature before inventorying final bytes. Both local and framework-free package manifests advertise `gameMode: {"version":1,"host":"libexec/yaagl-game-mode/ZZZ.app/Contents/MacOS/wine","target":"zzz"}`; their existing hashes and symlink inventories remain authoritative.
+
+The launcher opt-in is for ZZZ on Apple Silicon/macOS 26 or later. `YAAGL_GAME_MODE_TARGET` is the absolute Unix path of the selected game executable; only the matching opened Windows image is routed to the host. `YAAGL_GAME_MODE_ACTIVE=1` is internal to that selected process, not a launcher-wide switch. The normal renderer wrapper still runs first. Off uses ordinary Wine without forcing macOS policy off, and explicit windowed settings are preserved. Host entry is not proof that macOS activated Game Mode: macOS retains that decision. No global `gamepolicyctl`, ForgePlay code, or additional Apple framework distribution is involved.
+
+Native fullscreen preserves the latest Wine frame request across transitions. A different destination monitor causes an exit, applies the requested frame through the existing exit callback, and re-enters fullscreen; a user-requested exit still suppresses automatic re-entry. The existing display-change reassertion hook also discards stale frame events while application is deferred. `python3 scripts/test-game-mode-fullscreen.py` executes the production Objective-C methods against synthetic screens without changing desktop Spaces. It covers transition ordering and failure paths, but does not replace physical multi-monitor QA.
+
+After a complete build/stage, maintainers can check the host with `python3 scripts/game-mode-host.py validate build/staged/wine` and `codesign --verify --strict build/staged/wine/libexec/yaagl-game-mode/ZZZ.app`. Runtime verification below includes the same metadata and signature checks. Actual Game Mode activation still requires the Steam → ZZZ fullscreen scenario and observation of macOS's Game Mode UI.
+
 ## Prepare the Apple framework locally
 
 No remote redistributable is assumed. Supply the pristine beta3 framework when building the native preparation bundle:

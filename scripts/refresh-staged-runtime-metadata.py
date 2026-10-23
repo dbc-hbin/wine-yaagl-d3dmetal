@@ -21,6 +21,7 @@ loader.loader.exec_module(stage)
 def derived_metadata(tree: Path, record: dict) -> tuple[dict, dict, str]:
     hashes = stage.load_spec()['hashes']
     graphics = {'schemaVersion': 2, 'gptkVersion': '4.0b3',
+                'gameMode': record['gameMode'],
                 'stageManifestSha256': stage.digest(tree / stage.STAGE_MANIFEST),
                 'ngxProvider': 'stock-gptk-ngx-to-metalfx',
                 'licenseAcceptance': record['licenseAcceptance'],

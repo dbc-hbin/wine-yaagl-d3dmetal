@@ -472,12 +472,58 @@ static void preloader_exec( char **argv, WORD machine )
         execv( argv[1], argv + 1 );
 }
 
+static void report_game_mode( const char *state, const char *reason )
+{
+    const char *path = getenv( "YAAGL_GAME_MODE_REPORT" );
+    struct stat st;
+    char record[256];
+    int fd, length;
+
+    fprintf( stderr, "wine: game mode host %s%s%s (pid %ld)\n",
+             state, reason ? ": " : "", reason ? reason : "", (long)getpid() );
+    if (!path || path[0] != '/') return;
+    fd = open( path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600 );
+    if (fd == -1) return;
+    if (!fstat( fd, &st ) && S_ISREG( st.st_mode ) && st.st_uid == geteuid() && st.st_nlink == 1 &&
+        !ftruncate( fd, 0 ))
+    {
+        /* State and reason are fixed internal tokens, never user text. */
+        length = snprintf( record, sizeof(record), "{\"state\":\"%s\",\"pid\":%ld,\"reason\":\"%s\"}\n",
+                           state, (long)getpid(), reason ? reason : "" );
+        if (write( fd, record, length ) != length)
+            fprintf( stderr, "wine: could not write game mode launch result\n" );
+    }
+    close( fd );
+}
+
 /* exec the appropriate wine loader for the specified machine */
-static NTSTATUS loader_exec( char **argv, WORD machine )
+static NTSTATUS loader_exec( char **argv, WORD machine, BOOL game_mode )
 {
     static char noexec[] = "WINELOADERNOEXEC=1";
 
     putenv( noexec );
+    unsetenv( "YAAGL_GAME_MODE_ACTIVE" );
+
+    if (game_mode)
+    {
+        if (machine != IMAGE_FILE_MACHINE_AMD64 || build_dir)
+        {
+            report_game_mode( "failed", "unsupported-runtime" );
+            return STATUS_NOT_SUPPORTED;
+        }
+        argv[1] = build_path( bin_dir, "../libexec/yaagl-game-mode/ZZZ.app/Contents/MacOS/wine" );
+        if (!argv[1] || setenv( "YAAGL_GAME_MODE_ACTIVE", "1", 1 ))
+        {
+            free( argv[1] );
+            report_game_mode( "failed", "out-of-memory" );
+            return STATUS_NO_MEMORY;
+        }
+        preloader_exec( argv, machine );
+        report_game_mode( "failed", "host-exec-failed" );
+        free( argv[1] );
+        unsetenv( "YAAGL_GAME_MODE_ACTIVE" );
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
 
     /* CW/Yaagl HACK: keep primary loader path for Rosetta x87 helper. */
     //if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv );
@@ -493,7 +539,7 @@ static NTSTATUS loader_exec( char **argv, WORD machine )
  *
  * argv[0] and argv[1] must be reserved for the preloader and loader respectively.
  */
-NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info )
+NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info, BOOL game_mode )
 {
     WORD machine = pe_info->machine;
     ULONGLONG res_start = pe_info->base;
@@ -513,7 +559,7 @@ NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info 
     putenv( preloader_reserve );
     putenv( socket_env );
 
-    return loader_exec( argv, machine );
+    return loader_exec( argv, machine, game_mode );
 }
 
 
@@ -2172,7 +2218,7 @@ static void reexec_loader( int argc, char *argv[], char *extra_arg )
     /* CW/Yaagl HACK: do not force 32-bit loader; ROSETTA_X87_PATH handles i386. */
     //if (machine == IMAGE_FILE_MACHINE_AMD64) machine = IMAGE_FILE_MACHINE_I386;
 
-    loader_exec( new_argv, machine );
+    loader_exec( new_argv, machine, FALSE );
     fatal_error( "could not exec the wine loader\n" );
 }
 
@@ -2260,6 +2306,9 @@ DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
 
     virtual_init();
     init_environment();
+
+    if (getenv( "YAAGL_GAME_MODE_ACTIVE" ) && !strcmp( getenv( "YAAGL_GAME_MODE_ACTIVE" ), "1" ))
+        report_game_mode( "host-started", NULL );
 
 #ifdef __APPLE__
     apple_main_thread();

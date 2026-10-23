@@ -228,16 +228,22 @@ static NSString* WineLocalizedString(unsigned int stringID)
     {
         if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
         {
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+            if (activateIfTransformed)
+                [self tryToActivateIgnoringOtherApps:YES];
+        }
+
+        /* Bundled hosts can start Regular, without an activation conversion. */
+        if (!foregroundInitialized && [NSApp activationPolicy] == NSApplicationActivationPolicyRegular)
+        {
             NSMenu* mainMenu;
             NSMenu* submenu;
             NSString* bundleName;
             NSString* title;
             NSMenuItem* item;
 
-            [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-
-            if (activateIfTransformed)
-                [self tryToActivateIgnoringOtherApps:YES];
+            foregroundInitialized = TRUE;
 
             if (!enable_app_nap)
             {

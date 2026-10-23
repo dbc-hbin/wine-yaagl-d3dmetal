@@ -160,6 +160,7 @@ build() {
     rm -f "$root/build-complete.marker"
     source_identity > "$root/build-source.json"
     /usr/bin/arch -x86_64 /usr/bin/make -C "$build_dir" -j"$jobs"
+    /usr/bin/python3 "$source_dir/scripts/game-mode-host.py" build "$build_dir"
     if [ "$native_server" = yes ]; then
         require_file "$native_dir/Makefile"
         (native_env; /usr/bin/arch -arm64 /usr/bin/make -C "$native_dir" -j"$jobs" server/wineserver)
@@ -186,6 +187,7 @@ install_host() {
         cp "$native_dir/server/wineserver" "$host_dir/bin/wineserver"
     fi
     [ -x "$host_dir/bin/wine" ] || die 'Wine install failed'
+    /usr/bin/python3 "$source_dir/scripts/game-mode-host.py" install "$build_dir" --tree "$host_dir"
     /usr/bin/python3 - "$root" "$source_dir" "$native_server" <<'PY'
 import datetime, hashlib, json, os, pathlib, subprocess, sys
 root, source = map(pathlib.Path, sys.argv[1:3])

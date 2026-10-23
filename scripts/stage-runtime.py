@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,9 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+host_loader = importlib.util.spec_from_file_location('game_mode_host', ROOT / 'scripts/game-mode-host.py')
+game_mode = importlib.util.module_from_spec(host_loader)
+host_loader.loader.exec_module(game_mode)
 REL = Path('lib/external/D3DMetal.framework/Versions/A')
 IMAGE = str(REL / 'D3DMetal')
 CONVERTER = str(REL / 'Resources/libmetalirconverter.dylib')
@@ -42,7 +46,8 @@ FSR_POLICY = {'implementation': 'builtin-fsr-api-to-metalfx-with-metalfx-frame-i
 NGX_POLICY = {'implementation': 'stock-gptk-ngx-to-metalfx', 'aliases': NGX_ALIASES}
 REQUIRED_HOST = ('bin/wine', 'bin/wineserver', 'lib/wine/x86_64-unix/ntdll.so',
                  'lib/wine/x86_64-unix/win32u.so', 'lib/wine/x86_64-unix/winemac.so',
-                 'lib/wine/x86_64-unix/winegstreamer.so') + FSR_ARTIFACT_PATHS
+                 'lib/wine/x86_64-unix/winegstreamer.so', game_mode.HOST,
+                 game_mode.BUNDLE + '/Contents/Info.plist') + FSR_ARTIFACT_PATHS
 
 
 def digest(path: Path) -> str:
@@ -215,8 +220,10 @@ def validate_stage(runtime: Path, current_sources=False) -> dict:
     stage = json.loads((runtime / STAGE_MANIFEST).read_text())
     assert_tree_untouched(runtime, stage)
     if (stage.get('gptk_version') != '4.0b3' or stage.get('ngx_policy') != NGX_POLICY or
-            stage.get('fsr_translator') != FSR_POLICY or stage.get('licenseAcceptance') != 'explicit-cli-flag'):
+            stage.get('fsr_translator') != FSR_POLICY or stage.get('licenseAcceptance') != 'explicit-cli-flag' or
+            stage.get('gameMode') != game_mode.CAPABILITY):
         raise ValueError('unsupported beta3 stage policy or missing Apple license acceptance')
+    game_mode.validate(runtime)
     build = stage['source_build']
     validate_source_build(build)
     if json.loads((runtime / SOURCE_MANIFEST).read_text()) != build:
@@ -242,7 +249,7 @@ def validate_stage(runtime: Path, current_sources=False) -> dict:
     if stage.get('display_bridge') != display_bridge_provenance(runtime):
         raise ValueError('Wine display bridge identity mismatch')
     inspect_image(runtime)
-    for path in (runtime / SIDECAR, runtime / 'lib/external/D3DMetal.framework'):
+    for path in (runtime / SIDECAR, runtime / 'lib/external/D3DMetal.framework', runtime / game_mode.BUNDLE):
         subprocess.run(['codesign', '--verify', '--strict', str(path)], check=True)
     if current_sources:
         check_sources(stage['native_build_manifest'])
@@ -258,6 +265,7 @@ def verify_runtime(runtime: Path, current_sources=False) -> list[tuple[str, str]
         stage = validate_stage(runtime, current_sources)
         graphics = json.loads((runtime / GRAPHICS_MANIFEST).read_text())
         if (graphics.get('schemaVersion') != 2 or graphics.get('gptkVersion') != '4.0b3' or
+                graphics.get('gameMode') != game_mode.CAPABILITY or
                 graphics.get('stageManifestSha256') != digest(runtime / STAGE_MANIFEST) or
                 graphics.get('files') != stage['signed_artifacts'] or graphics.get('symlinks') != stage['symlinks']):
             raise ValueError('graphics metadata does not match immutable stage record')

@@ -39,6 +39,7 @@
 # include <sys/times.h>
 #endif
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #ifdef HAVE_SYS_SYSCTL_H
 # include <sys/sysctl.h>
@@ -400,12 +401,24 @@ static BOOL is_unix_console_handle( HANDLE handle )
  *           spawn_process
  */
 static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int socketfd,
-                               int unixdir, char *winedebug, const struct pe_image_info *pe_info )
+                               int unixdir, char *winedebug, const struct pe_image_info *pe_info,
+                               const char *unix_name )
 {
     NTSTATUS status = STATUS_SUCCESS;
     int stdin_fd = -1, stdout_fd = -1;
     pid_t pid;
     char **argv;
+    BOOL game_mode = FALSE;
+#ifdef __APPLE__
+    const char *target = getenv( "YAAGL_GAME_MODE_TARGET" );
+    struct stat target_stat, image_stat;
+
+    /* Match the resolved image, not the command line supplied by a launcher.
+     * File identity also handles drive aliases and case-insensitive paths. */
+    if (target && target[0] == '/' && unix_name &&
+        !stat( target, &target_stat ) && !stat( unix_name, &image_stat ))
+        game_mode = target_stat.st_dev == image_stat.st_dev && target_stat.st_ino == image_stat.st_ino;
+#endif
 
     if (wine_server_handle_to_fd( params->hStdInput, FILE_READ_DATA, &stdin_fd, NULL ) &&
         isatty(0) && is_unix_console_handle( params->hStdInput ))
@@ -441,7 +454,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
             }
             argv = build_argv( &params->CommandLine, 2 );
 
-            exec_wineloader( argv, socketfd, pe_info );
+            exec_wineloader( argv, socketfd, pe_info, game_mode );
             _exit(1);
         }
 
@@ -894,7 +907,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
 
     /* create the child process */
 
-    if ((status = spawn_process( params, socketfd[0], unixdir, winedebug, &pe_info ))) goto done;
+    if ((status = spawn_process( params, socketfd[0], unixdir, winedebug, &pe_info, unix_name ))) goto done;
 
     close( socketfd[0] );
     socketfd[0] = -1;

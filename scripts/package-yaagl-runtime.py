@@ -107,6 +107,7 @@ def main():
         (wine / name).unlink(missing_ok=True)
     manifest = {
         'schemaVersion': 2, 'runtimeId': runtime_id,
+        'gameMode': stage_manifest['gameMode'],
         'archive': archive_name, 'archiveRoot': 'wine', 'wineVersion': 'wine-' + version,
         'framework': {'version': '4.0b3', 'destination': 'lib/external/D3DMetal.framework',
                       'installation': 'native helper with local Apple beta3 input and explicit license acceptance before loading Wine',

@@ -25,6 +25,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #include <dlfcn.h>
+#include <sys/sysctl.h>
 
 #import "cocoa_window.h"
 
@@ -37,6 +38,9 @@
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
 WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
+
+/* Non-owning, main-thread-only selection: helper windows must not get their own Space. */
+static WineWindow* gameModeWindow;
 
 @interface NSWindow (PrivatePreventsActivation)
 
@@ -943,6 +947,15 @@ static inline BOOL stage_manager_enabled(void)
         window->savedContentMinSize = NSZeroSize;
         window->savedContentMaxSize = NSMakeSize(FLT_MAX, FLT_MAX);
         window->resizable = wf->resizable;
+        const char* gameModeActive = getenv("YAAGL_GAME_MODE_ACTIVE");
+        int appleSilicon = 0;
+        size_t appleSiliconSize = sizeof(appleSilicon);
+        window->gameModeHost = gameModeActive && !strcmp(gameModeActive, "1") &&
+                              [[NSProcessInfo processInfo] operatingSystemVersion].majorVersion >= 26 &&
+                              !sysctlbyname("hw.optional.arm64", &appleSilicon, &appleSiliconSize, NULL, 0) &&
+                              appleSilicon;
+        window->gameModeFullscreenRequested = window->gameModeHost &&
+                                             screen_covered_by_rect(window_frame, [NSScreen screens]);
 
         [window registerForDraggedTypes:@[@"public.data" /* UTTypeData */, @"public.content" /* UTTypeContent */]];
 
@@ -988,6 +1001,8 @@ static inline BOOL stage_manager_enabled(void)
 
     - (void) dealloc
     {
+        [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(reconcileGameModeFullscreen) object:nil];
+        if (gameModeWindow == self) gameModeWindow = nil;
         [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
         [[NSNotificationCenter defaultCenter] removeObserver:self];
         [queue release];
@@ -1002,6 +1017,7 @@ static inline BOOL stage_manager_enabled(void)
 
     - (BOOL) preventResizing
     {
+        if (gameModeNativeFullscreen) return NO;
         BOOL preventForClipping = cursor_clipping_locks_windows && [[WineApplicationController sharedController] clippingCursor];
         return ([self styleMask] & NSWindowStyleMaskResizable) && (disabled || !resizable || preventForClipping);
     }
@@ -1029,7 +1045,12 @@ static inline BOOL stage_manager_enabled(void)
         if ([self collectionBehavior] & NSWindowCollectionBehaviorFullScreenPrimary)
             [[self standardWindowButton:NSWindowFullScreenButton] setEnabled:!self.disabled];
 
-        if ([self preventResizing])
+        if (gameModeNativeFullscreen)
+        {
+            [self setContentMinSize:NSZeroSize];
+            [self setContentMaxSize:NSMakeSize(FLT_MAX, FLT_MAX)];
+        }
+        else if ([self preventResizing])
         {
             NSSize size = [self contentRectForFrameRect:self.wine_fractionalFrame].size;
             [self setContentMinSize:size];
@@ -1045,13 +1066,64 @@ static inline BOOL stage_manager_enabled(void)
             [self setMovable:[self allowsMovingWithMaximized:maximized]];
     }
 
+    - (BOOL) isGameModeFullscreenCandidate
+    {
+        NSUInteger style = [self styleMask];
+        return gameModeHost && !disabled && !noForeground && !preventsAppActivation &&
+               !self.parentWindow && !self.latentParentWindow &&
+               !(style & (NSWindowStyleMaskTitled | NSWindowStyleMaskUtilityWindow |
+                          NSWindowStyleMaskNonactivatingPanel)) &&
+               ([self collectionBehavior] & NSWindowCollectionBehaviorParticipatesInCycle);
+    }
+
+    - (void) scheduleGameModeFullscreen
+    {
+        if (!gameModeHost || gameModeFullscreenPending || closing) return;
+        gameModeFullscreenPending = TRUE;
+        [self performSelector:@selector(reconcileGameModeFullscreen) withObject:nil afterDelay:0];
+    }
+
+    - (void) reconcileGameModeFullscreen
+    {
+        gameModeFullscreenPending = FALSE;
+        if (enteringFullScreen || exitingFullScreen || closing || pendingOrderOut) return;
+
+        if (gameModeNativeFullscreen)
+        {
+            if (gameModeFramePending && ([self styleMask] & NSWindowStyleMaskFullScreen))
+            {
+                gameModeFullscreenExitRequested = TRUE;
+                [super toggleFullScreen:nil];
+            }
+            return;
+        }
+
+        if (gameModeFullscreenRequested && !gameModeFullscreenSuppressed &&
+            [self isGameModeFullscreenCandidate] && [self isVisible] && [self isKeyWindow] &&
+            ![self isMiniaturized] && (!gameModeWindow || gameModeWindow == self) &&
+            !([self styleMask] & NSWindowStyleMaskFullScreen))
+        {
+            gameModeWindow = self;
+            gameModeNativeFullscreen = TRUE;
+            [self setContentMinSize:NSZeroSize];
+            [self setContentMaxSize:NSMakeSize(FLT_MAX, FLT_MAX)];
+            [self adjustFullScreenBehavior:[self collectionBehavior]];
+            [super toggleFullScreen:nil];
+        }
+    }
+
     - (void) adjustFullScreenBehavior:(NSWindowCollectionBehavior)behavior
     {
         NSUInteger style = [self styleMask];
 
-        if (behavior & NSWindowCollectionBehaviorParticipatesInCycle &&
+        if (gameModeNativeFullscreen ||
+            (gameModeHost && gameModeFullscreenRequested &&
+             (behavior & NSWindowCollectionBehaviorParticipatesInCycle) &&
+             !(style & (NSWindowStyleMaskTitled | NSWindowStyleMaskUtilityWindow | NSWindowStyleMaskNonactivatingPanel)) &&
+             !self.parentWindow && !self.latentParentWindow) ||
+            (behavior & NSWindowCollectionBehaviorParticipatesInCycle &&
             style & NSWindowStyleMaskResizable && !(style & NSWindowStyleMaskUtilityWindow) && !maximized &&
-            !(self.parentWindow || self.latentParentWindow))
+            !(self.parentWindow || self.latentParentWindow)))
         {
             behavior |= NSWindowCollectionBehaviorFullScreenPrimary;
             behavior &= ~NSWindowCollectionBehaviorFullScreenAuxiliary;
@@ -1069,6 +1141,7 @@ static inline BOOL stage_manager_enabled(void)
             [self setCollectionBehavior:behavior];
             [self adjustFeaturesForState];
         }
+        [self scheduleGameModeFullscreen];
     }
 
     - (void) setWindowFeatures:(const struct macdrv_window_features*)wf
@@ -1845,6 +1918,7 @@ static inline BOOL stage_manager_enabled(void)
 
             [controller adjustWindowLevels];
         }
+        [self scheduleGameModeFullscreen];
     }
 
     - (void) setFrameAndWineFrame:(NSRect)frame
@@ -1879,11 +1953,31 @@ static inline BOOL stage_manager_enabled(void)
            (left, bottom) in a bottom-up space. */
         [[WineApplicationController sharedController] flipRect:&contentRect];
 
-        /* The back end is establishing a new window size and position.  It's
-           not interested in any stale events regarding those that may be sitting
-           in the queue. */
+        /* Reassertions also invalidate stale Cocoa events when applying the
+           requested frame has to wait for a native fullscreen transition. */
         [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_FRAME_CHANGED)
                                forWindow:self];
+
+        if (gameModeHost && !NSIsEmptyRect(contentRect))
+        {
+            NSScreen* requestedScreen = screen_covered_by_rect(contentRect, [NSScreen screens]);
+            gameModeFullscreenRequested = requestedScreen != nil;
+            if (!gameModeFullscreenRequested)
+                gameModeFullscreenSuppressed = FALSE;
+            [self scheduleGameModeFullscreen];
+
+            /* AppKit owns geometry throughout the transition and the native Space.
+               Keep the latest request for the existing exit callback, including
+               fullscreen requests whose destination is a different monitor. */
+            if (gameModeNativeFullscreen &&
+                (enteringFullScreen || exitingFullScreen || ([self styleMask] & NSWindowStyleMaskFullScreen)))
+            {
+                nonFullscreenFrame = [self frameRectForContentRect:contentRect];
+                gameModeFramePending = exitingFullScreen || !requestedScreen ||
+                                       !NSEqualRects([requestedScreen frame], [[self screen] frame]);
+                return;
+            }
+        }
 
         if (!NSIsEmptyRect(contentRect))
         {
@@ -2082,7 +2176,7 @@ static inline BOOL stage_manager_enabled(void)
     {
         savedContentMinSize = minSize;
         savedContentMaxSize = maxSize;
-        if (![self preventResizing])
+        if (!gameModeNativeFullscreen && ![self preventResizing])
         {
             [self setContentMinSize:minSize];
             [self setContentMaxSize:maxSize];
@@ -2727,6 +2821,10 @@ static inline BOOL stage_manager_enabled(void)
         macdrv_query* query;
         NSSize size;
 
+        /* The borderless game can report fixed Windows min/max constraints.
+           AppKit, not those constraints, owns the native fullscreen Space. */
+        if (gameModeNativeFullscreen) return proposedSize;
+
         query = macdrv_create_query();
         query->type = QUERY_MIN_MAX_INFO;
         query->window = [self retain];
@@ -2753,6 +2851,7 @@ static inline BOOL stage_manager_enabled(void)
 
     - (void)windowDidBecomeKey:(NSNotification *)notification
     {
+        [self scheduleGameModeFullscreen];
         WineApplicationController* controller = [WineApplicationController sharedController];
         NSEvent* event = [controller lastFlagsChanged];
         if (event)
@@ -2805,6 +2904,7 @@ static inline BOOL stage_manager_enabled(void)
     {
         enteringFullScreen = FALSE;
         enteredFullScreenTime = [[NSProcessInfo processInfo] systemUptime];
+        [self scheduleGameModeFullscreen];
         if (pendingOrderOut)
             [self doOrderOut];
     }
@@ -2812,8 +2912,13 @@ static inline BOOL stage_manager_enabled(void)
     - (void) windowDidExitFullScreen:(NSNotification*)notification
     {
         exitingFullScreen = FALSE;
+        gameModeNativeFullscreen = FALSE;
+        gameModeFullscreenExitRequested = FALSE;
+        gameModeFramePending = FALSE;
+        [self adjustFeaturesForState];
         [self setFrameAndWineFrame:nonFullscreenFrame];
         [self windowDidResize:nil];
+        [self adjustFullScreenBehavior:[self collectionBehavior]];
         if (pendingOrderOut)
             [self doOrderOut];
     }
@@ -2822,6 +2927,16 @@ static inline BOOL stage_manager_enabled(void)
     {
         enteringFullScreen = FALSE;
         enteredFullScreenTime = 0;
+        if (gameModeNativeFullscreen)
+        {
+            gameModeNativeFullscreen = FALSE;
+            gameModeFullscreenSuppressed = gameModeFullscreenRequested;
+            gameModeFramePending = FALSE;
+            [self setFrameAndWineFrame:nonFullscreenFrame];
+            [self windowDidResize:nil skipSizeMove:FALSE];
+            [self adjustFeaturesForState];
+            [self adjustFullScreenBehavior:[self collectionBehavior]];
+        }
         if (pendingOrderOut)
             [self doOrderOut];
     }
@@ -2829,6 +2944,9 @@ static inline BOOL stage_manager_enabled(void)
     - (void) windowDidFailToExitFullScreen:(NSWindow*)window
     {
         exitingFullScreen = FALSE;
+        /* Do not retry a rejected AppKit transition on every frame notification. */
+        gameModeFramePending = FALSE;
+        gameModeFullscreenExitRequested = FALSE;
         [self windowDidResize:nil];
         if (pendingOrderOut)
             [self doOrderOut];
@@ -2930,6 +3048,9 @@ static inline BOOL stage_manager_enabled(void)
         WineWindow* child;
 
         if (fakingClose) return;
+        [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(reconcileGameModeFullscreen) object:nil];
+        gameModeFullscreenPending = FALSE;
+        if (gameModeWindow == self) gameModeWindow = nil;
         if (latentParentWindow)
         {
             [latentParentWindow->latentChildWindows removeObjectIdenticalTo:self];
@@ -2953,6 +3074,10 @@ static inline BOOL stage_manager_enabled(void)
     - (void) windowWillExitFullScreen:(NSNotification*)notification
     {
         exitingFullScreen = TRUE;
+        /* An AppKit/user exit must not immediately re-enter on the restored
+           screen-sized borderless frame. Rearm only after a windowed request. */
+        if (gameModeNativeFullscreen && gameModeFullscreenRequested && !gameModeFullscreenExitRequested)
+            gameModeFullscreenSuppressed = TRUE;
         [self postWindowFrameChanged:nonFullscreenFrame fullscreen:FALSE resizing:FALSE skipSizeMove:FALSE];
     }
 

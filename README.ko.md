@@ -44,6 +44,18 @@ node scripts/build-d3dmetal-sidecar.mjs build/native-sidecar
 
 `WINE_P3_ROOT`로 새 빌드 디렉터리를 지정할 수 있으며 기본값은 `build/wine-p3-current`입니다. `host/`와 provenance에는 실제 Wine 소스가 기록됩니다. sidecar 산출물에는 dylib과 소스 해시 manifest가 포함됩니다. 기존 빌드 디렉터리가 있다는 사실만으로 현재 소스의 빌드가 검증되지는 않습니다.
 
+### ZZZ 게임 모드 호스트
+
+전체 소스 빌드는 해당 빌드의 기존 `loader/main.o`로 `libexec/yaagl-game-mode/ZZZ.app/Contents/MacOS/wine`도 링크합니다. `scripts/game-mode-host.py`는 생성된 loader 링크 규칙에서 출력 경로와 내장 plist만 바꿉니다. loader 구현을 복제하거나 구버전 Wine의 주소 공간 예약을 가정하지 않으며, Wine 11.20의 low-8GB 예약과 실제 빌드 플래그를 그대로 사용합니다. 로더가 고정 번들 위치에서 같은 런타임의 `lib/wine/x86_64-unix/ntdll.so`를 찾습니다. 환경 변수로 라이브러리를 선택하거나 서명된 앱 내부에서 외부 심볼릭 링크를 사용하지 않습니다.
+
+내장 plist와 번들 plist는 동일하며 `io.github.yaagl.zzz-game-host`, Games 분류, `LSSupportsGameMode=true`, `WineApplication`을 사용하고 `LSUIElement`는 없습니다. 설치와 staging에서 번들을 서명하고, staging은 실행 파일·양쪽 plist·상대 ntdll 경로·서명을 검사한 뒤 최종 바이트를 inventory에 기록합니다. 로컬 및 framework 제외 패키지 manifest 모두 `gameMode: {"version":1,"host":"libexec/yaagl-game-mode/ZZZ.app/Contents/MacOS/wine","target":"zzz"}`를 제공하며 기존 해시와 심볼릭 링크 inventory가 무결성 기준입니다.
+
+런처의 선택적 기능은 Apple Silicon/macOS 26 이상에서 ZZZ만 대상으로 합니다. `YAAGL_GAME_MODE_TARGET`은 선택한 게임 실행 파일의 절대 Unix 경로이며, 실제 열린 Windows 이미지가 일치할 때만 호스트로 라우팅합니다. `YAAGL_GAME_MODE_ACTIVE=1`은 해당 프로세스 전용 내부 표시이지 런처 전체 스위치가 아닙니다. 기존 renderer wrapper를 먼저 실행합니다. 끄면 일반 Wine 경로를 사용하고 macOS 정책을 강제로 끄지 않으며, 명시적인 창 모드 설정을 유지합니다. 호스트 진입은 macOS의 게임 모드 활성화 증명이 아니고 최종 판단은 macOS가 합니다. 전역 `gamepolicyctl`, ForgePlay 코드, Apple framework 추가 배포를 사용하지 않습니다.
+
+네이티브 전체 화면 전환 중에는 Wine의 최신 위치 요청을 보존합니다. 대상 모니터가 바뀌면 전체 화면을 해제하고 기존 종료 콜백에서 요청한 위치를 적용한 뒤 재진입합니다. 사용자가 직접 전체 화면을 종료하면 자동 재진입은 계속 억제됩니다. 기존 디스플레이 변경 보정 훅은 위치 적용이 지연되는 동안에도 오래된 프레임 이벤트를 폐기합니다. `python3 scripts/test-game-mode-fullscreen.py`는 실제 Objective-C 메서드를 합성 화면에서 실행해 전환 순서와 실패 경로를 검사하며 데스크톱 Space를 변경하지 않습니다. 물리적인 다중 모니터 검증을 대신하지는 않습니다.
+
+전체 빌드와 staging 이후 `python3 scripts/game-mode-host.py validate build/staged/wine` 및 `codesign --verify --strict build/staged/wine/libexec/yaagl-game-mode/ZZZ.app`으로 호스트를 검사할 수 있습니다. 아래 런타임 검증에도 같은 메타데이터와 서명 검사가 포함됩니다. 실제 활성화는 Steam → ZZZ 전체 화면 시나리오에서 macOS 게임 모드 UI를 관찰해야 합니다.
+
 ## Apple framework 로컬 준비
 
 원격 재배포 파일을 가정하지 않습니다. 네이티브 준비 도구를 만들 때 beta3 원본 framework를 지정합니다.

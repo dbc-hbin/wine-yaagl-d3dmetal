@@ -236,7 +236,7 @@ class PackageVersionTests(unittest.TestCase):
             'schema': 2, 'gptkVersion': '4.0b3', 'sources': sources,
             'nativeBuildManifest': native, 'artifacts': artifacts,
         })
-        self.record = {'native_build_manifest': native}
+        self.record = {'native_build_manifest': native, 'gameMode': stage.game_mode.CAPABILITY}
         self.set_version('11.17')
 
     def write_json(self, path, value):
@@ -281,6 +281,7 @@ class PackageVersionTests(unittest.TestCase):
                     self.assertFalse(any('D3DMetal.framework' in name for name in stream.getnames()))
                 self.assertEqual(manifest['runtimeId'], runtime_id)
                 self.assertEqual(manifest['wineVersion'], 'wine-' + version)
+                self.assertEqual(manifest['gameMode'], stage.game_mode.CAPABILITY)
                 self.assertEqual(manifest['archive'], name)
                 self.assertEqual(manifest['entries'], package.inventory(
                     output / 'wine', ('yaagl-d3dmetal-runtime.json',)))

@@ -202,6 +202,7 @@ def main() -> int:
     files, links = stage.inventory(host, excluded=set())
     if files != build['hostArtifacts'] or links != build['hostSymlinks']:
         raise ValueError('installed host differs from the build provenance')
+    stage.game_mode.validate(host)
     for relative in stage.REQUIRED_HOST:
         if relative not in files:
             raise ValueError(f'full source host is missing: {relative}')
@@ -256,7 +257,8 @@ def main() -> int:
         (temporary / 'bin/wine').chmod(0o755)
         # The Apple bridge/converter must not be rewritten; their load paths are already portable.
         relocations = relocate_runtime(temporary)
-        for path in (temporary / stage.SIDECAR, temporary / framework_relative):
+        for path in (temporary / stage.SIDECAR, temporary / framework_relative,
+                     temporary / stage.game_mode.BUNDLE):
             subprocess.run(['codesign', '--force', '--sign', '-', str(path)], check=True)
             subprocess.run(['codesign', '--verify', '--strict', str(path)], check=True)
         stage.check_stock(temporary, spec)
@@ -268,6 +270,7 @@ def main() -> int:
                     'source_launcher': {'path': 'scripts/wine-launch-wrapper.sh',
                                         'sha256': stage.digest(ROOT / 'scripts/wine-launch-wrapper.sh')},
                     'ngx_policy': stage.NGX_POLICY, 'fsr_translator': stage.FSR_POLICY,
+                    'gameMode': stage.game_mode.CAPABILITY,
                     'native_fg_fallback': fg, 'binary_inspection': inspection,
                     'display_bridge': stage.display_bridge_provenance(temporary),
                     'dependency_inputs': {'libraryDirectory': str(dependency), 'gstreamerFramework': str(gstreamer)},

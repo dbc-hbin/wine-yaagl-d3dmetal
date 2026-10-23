@@ -82,6 +82,7 @@ enum {
     NSMutableDictionary* originalDisplayModes;
     NSMutableDictionary* latentDisplayModes;
     BOOL displaysCapturedForFullscreen;
+    BOOL foregroundInitialized;
 
     NSArray*    cursorFrames;
     int         cursorFrame;
