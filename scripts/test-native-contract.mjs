@@ -7,6 +7,31 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
+test("production transport owner retains inline and overflow leases until allocator retirement", () => {
+  const transport = readFileSync(join(root, "d3dmetal-sidecar/d3dmetal-transport.mm"), "utf8");
+  const capacity = transport.match(/^constexpr std::size_t kMaxResources = [^\n]+;/m)?.[0];
+  const uses = transport.match(/^struct UseEntry \{[\s\S]*?^\};/m)?.[0];
+  const owner = transport.match(/^template<class PreparedType>\nusing ExecutionLeaseFor =[\s\S]*?^@implementation YAAGLMetalFXRecordedOwner[\s\S]*?^@end/m)?.[0];
+  assert.ok(capacity && uses && owner, "Cannot extract production transport ownership definitions");
+  const output = mkdtempSync(join(tmpdir(), "yaagl-transport-owner-"));
+  try {
+    // Compile the exact production bodies, including the Objective-C++ ivar,
+    // rather than a model of optional initialization or .cxx_destruct.
+    writeFileSync(join(output, "transport-owner-production.inc"),
+      `namespace yaagl::pso::d3dmetal {\nnamespace {\n${capacity}\n${uses}\n${owner}\n`);
+    const executable = join(output, "transport-owner");
+    const build = spawnSync("xcrun", ["clang++", "-arch", "x86_64", "-std=c++20",
+      "-fno-objc-arc", "-fobjc-exceptions", "-fblocks", "-Wall", "-Wextra", "-Werror",
+      "-framework", "Foundation", "-framework", "Metal",
+      "-I", output, "-I", join(root, "d3dmetal-sidecar"),
+      join(root, "scripts/native-transport-owner-test.mm"), "-o", executable],
+      { encoding: "utf8", timeout: 120000 });
+    assert.equal(build.status, 0, build.stderr || build.error?.message);
+    const run = spawnSync(executable, [], { encoding: "utf8", timeout: 30000 });
+    assert.equal(run.status, 0, run.stdout + run.stderr || run.error?.message);
+  } finally { rmSync(output, { recursive: true, force: true }); }
+});
+
 test("beta3 symbols, mixed ABI, native getters and allocator ownership", async () => {
   const output = mkdtempSync(join(tmpdir(), "yaagl-native-contract-"));
   try {

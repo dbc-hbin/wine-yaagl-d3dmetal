@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace yaagl::pso::d3dmetal {
@@ -352,6 +353,7 @@ struct OwnerState {
     // Each replay owns distinct GPU resources until the native allocator resets.
     // ExtendResourceLifetime transfers the recorded owner's +1; Reset releases
     // it only when the application's command-allocator lifetime permits reuse.
+    std::optional<Lease> firstLease;
     std::vector<Lease> leases;
     std::mutex leaseLock;
     std::array<id, kMaxResources> textures{};
@@ -398,18 +400,23 @@ struct OwnerState {
                 using T = std::decay_t<decltype(frame)>;
                 if constexpr (std::is_same_v<T, std::monostate>) return false;
                 else {
-                    using Lease = ExecutionLeaseFor<T>;
-                    leases.emplace_back(Lease{});
-                    Lease& lease = std::get<Lease>(leases.back());
+                    using FrameLease = ExecutionLeaseFor<T>;
+                    Lease* slot;
+                    if (!firstLease)
+                        slot = &firstLease.emplace(FrameLease{});
+                    else {
+                        leases.emplace_back(FrameLease{});
+                        slot = &leases.back();
+                    }
+                    FrameLease& lease = std::get<FrameLease>(*slot);
+                    bool result;
                     if constexpr (std::is_same_v<T, std::shared_ptr<const metalfx::PreparedFrame>>)
-                        return frame && frame->encode(commandBuffer, fence, lease, &error);
+                        result = frame && frame->encode(commandBuffer, fence, lease, &error);
                     else
-                        return frame && frame->encode(commandBuffer, fence, lease);
+                        result = frame && frame->encode(commandBuffer, fence, lease);
+                    return result && static_cast<bool>(lease);
                 }
             }, prepared.value);
-            if (leases.empty() || !std::visit(
-                    [](const auto& lease) { return static_cast<bool>(lease); }, leases.back()))
-                return false;
         } catch (...) {
             return false;
         }
@@ -422,23 +429,11 @@ struct OwnerState {
 
 @interface YAAGLMetalFXRecordedOwner : NSObject {
 @public
-    void* _state;
+    std::optional<yaagl::pso::d3dmetal::OwnerState> _state;
 }
-- (instancetype)initWithState:(void*)state;
 @end
 
 @implementation YAAGLMetalFXRecordedOwner
-- (instancetype)initWithState:(void*)state {
-    self = [super init];
-    if (!self) return nil;
-    _state = state;
-    return self;
-}
-
-- (void)dealloc {
-    delete reinterpret_cast<yaagl::pso::d3dmetal::OwnerState*>(_state);
-    [super dealloc];
-}
 @end
 
 namespace yaagl::pso::d3dmetal {
@@ -580,20 +575,15 @@ bool record(NativeCommandList& commandList, const RecordRequest& request) noexce
     const auto extendLifetime = gRuntime.api.extendResourceLifetime;
 
     YAAGLMetalFXRecordedOwner* owner = nil;
-    OwnerState* unownedState = nullptr;
     std::size_t begun = 0;
     bool transferred = false;
     bool success = false;
 
     try {
         @try {
-            unownedState = new OwnerState(request.prepared, uses, useCount);
-            owner = [[YAAGLMetalFXRecordedOwner alloc] initWithState:unownedState];
-            if (!owner) {
-                delete unownedState;
-                return false;
-            }
-            unownedState = nullptr; // initWithState transferred ownership to -dealloc.
+            owner = [[YAAGLMetalFXRecordedOwner alloc] init];
+            if (!owner) return false;
+            owner->_state.emplace(request.prepared, uses, useCount);
 
             // Transfer the +1 from alloc/init to the native command allocator.
             // ExtendResourceLifetime itself does not retain; allocator Reset is
@@ -661,8 +651,6 @@ bool record(NativeCommandList& commandList, const RecordRequest& request) noexce
     } catch (...) {
         success = false;
     }
-    delete unownedState;
-
     if (!success && begun) {
         @try {
             while (begun) {
@@ -699,7 +687,7 @@ ReplayResult replay(void* mplReplayer, const void* command) noexcept {
         return ReplayResult::Failed;
     }
     auto* owner = reinterpret_cast<YAAGLMetalFXRecordedOwner*>(value.owner);
-    auto* state = reinterpret_cast<OwnerState*>(owner->_state);
+    auto* state = owner->_state ? &*owner->_state : nullptr;
     void* commandBufferOwner = loadAt<void*>(mplReplayer, kReplayerCommandBufferOwner);
     void* commandBuffer = loadAt<void*>(
         commandBufferOwner, kCommandBufferOwnerCommandBuffer);

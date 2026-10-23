@@ -1092,7 +1092,7 @@ int main() {
         }
         auto distortionConfiguration = configure(*state, command, parameters,
             (id<MTLTexture>)snapshot->depth.get(), MTLPixelFormatRGBA16Float,
-            MTLPixelFormatInvalid, 136, 136,
+            MTLPixelFormatRGBA16Float, 136, 136,
             FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, true);
         assert(distortionConfiguration);
         objc_initWeak(&weak[1], distortionConfiguration->factory.get());
@@ -1146,26 +1146,34 @@ int main() {
         id requiredPipeline = objc_loadWeakRetained(&weak[3]);
         assert(requiredPipeline && "recorded snapshot lost its shared pipeline");
         auto queue = [device newMTL4CommandQueue];
-        auto allocator = [device newCommandAllocator];
-        auto buffer = [device newCommandBuffer];
-        auto fence = [device newFence];
-        [buffer beginCommandBufferWithAllocator:allocator];
-        auto initialization = [buffer computeCommandEncoder];
-        [initialization updateFence:fence afterEncoderStages:MTLStageDispatch];
-        [initialization endEncoding];
-        std::shared_ptr<const ExecutionLease> lease;
-        assert(recorded->encode(buffer, fence, lease) && lease);
-        [buffer endCommandBuffer];
-        auto options = [MTL4CommitOptions new];
-        auto completed = dispatch_semaphore_create(0);
-        [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
-            assert(!feedback.error); dispatch_semaphore_signal(completed);
-        }];
-        [queue commit:&buffer count:1 options:options];
-        assert(dispatch_semaphore_wait(completed, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
-        [options release]; dispatch_release(completed);
-        lease.reset(); recorded.reset();
-        [buffer release]; [fence release]; [allocator release]; [queue release];
+        std::shared_ptr<const ExecutionLease> firstLease;
+        for (unsigned replay = 0; replay < 2; ++replay) {
+            auto allocator = [device newCommandAllocator];
+            auto buffer = [device newCommandBuffer];
+            auto fence = [device newFence];
+            [buffer beginCommandBufferWithAllocator:allocator];
+            auto initialization = [buffer computeCommandEncoder];
+            [initialization updateFence:fence afterEncoderStages:MTLStageDispatch];
+            [initialization endEncoding];
+            std::shared_ptr<const ExecutionLease> lease;
+            assert(recorded->encode(buffer, fence, lease) && lease);
+            if (firstLease)
+                assert(lease->impl_->argumentTable.get() != firstLease->impl_->argumentTable.get());
+            else
+                firstLease = lease;
+            [buffer endCommandBuffer];
+            auto options = [MTL4CommitOptions new];
+            auto completed = dispatch_semaphore_create(0);
+            [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+                assert(!feedback.error); dispatch_semaphore_signal(completed);
+            }];
+            [queue commit:&buffer count:1 options:options];
+            assert(dispatch_semaphore_wait(completed, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
+            [options release]; dispatch_release(completed);
+            lease.reset();
+            [buffer release]; [fence release]; [allocator release];
+        }
+        firstLease.reset(); recorded.reset(); [queue release];
         [required release]; [requiredPipeline release];
         [device release];
     }

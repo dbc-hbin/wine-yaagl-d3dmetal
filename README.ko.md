@@ -104,7 +104,9 @@ FSR 오버헤드 최적화는 셰이더 소스, GPU 패스, 입력 리소스, fe
 
 임시 COM 장치 참조는 shared control block 없이 scoped 소유권으로 관리하며 장기 보관 참조는 유지합니다. SR은 검증한 출력 layout을 재사용합니다. FG는 configure 잠금 안에서 mode 조회를 재사용하되 native 선택 뒤에 갱신하고, 동일 HUD-less 참조는 유지하면서 metadata를 갱신합니다. 같은 scene/present texture는 한 실행 안에서 raw view를 공유합니다. FG 상수는 실행별 불변 buffer 하나로 묶으며 GPU가 쓰는 disable hint의 복사 offset도 함께 반영합니다. SR argument table은 execution lease와 함께 보관하고 lease 반환 뒤에만 재사용합니다. 크기가 제한된 idle pool로 다른 프레임에서도 재사용하되 선택적 binding을 지우고 dormant feature에는 반환하지 않습니다. 사용 중인 lease끼리는 가변 table이나 상수 저장 공간을 공유하지 않습니다.
 
-`python3 scripts/test-fsr-lifecycle.py`는 동시 초기화, 실패 후 재시도, 초기화 완료 후 빠른 경로, 파괴 대기자 알림, 임시·장기 COM 소유권과 HUD-less 교체·비활성화를 검사합니다. Native SR 회귀 검사는 유지 중인 lease의 격리, 반환된 table의 재사용, 노출 texture 재바인딩과 dormant 정리를 확인합니다. FG 회귀 검사는 동일 texture의 sRGB 출력과 context 파괴 이후 공유 pipeline의 수명을 확인합니다. 이 검사만으로 게임 성능 향상이나 게임 전체 화면의 동일성이 입증되는 것은 아닙니다.
+FG는 execution별 argument table 하나를 모든 번역 패스에 사용합니다. Dispatch마다 모든 binding을 갱신한 뒤 snapshot하며, 서로 다른 execution의 table과 기존 encoder·fence 순서는 유지합니다. SR은 현재 연산과 depth 형식에 필요한 pipeline만 만들고 이후 프레임이 다른 연산을 요청하면 추가합니다. Transport는 비어 있거나 실패한 시도를 포함해 첫 replay lease를 inline으로 보관하고, 후속 replay의 lease는 별도 vector에 유지합니다. C++ owner state는 Objective-C recorded owner 안에 두며, 자동 소멸로 allocator 반환까지 리소스와 lease의 소유권을 보존합니다.
+
+`python3 scripts/test-fsr-lifecycle.py`는 동시 초기화, 실패 후 재시도, 초기화 완료 후 빠른 경로, 파괴 대기자 알림, 임시·장기 COM 소유권과 HUD-less 교체·비활성화를 검사합니다. Native SR 회귀 검사는 유지 중인 lease의 격리, 반환된 table의 재사용, 노출 texture 재바인딩, dormant 정리와 연산 변경 후 새 feature와의 출력 비교를 확인합니다. FG 회귀 검사는 동일 texture의 sRGB 출력, context 파괴 이후 공유 pipeline의 수명, UI·distortion을 사용하는 반복 실행의 table 격리를 확인합니다. `node --test scripts/test-native-contract.mjs`는 backend 경계를 제어하면서 production recorded-owner 정의의 retain 실패, 부분·빈 encode 실패와 allocator 반환 시 소멸을 검사합니다. 이 검사만으로 게임 성능 향상이나 게임 전체 화면의 동일성이 입증되는 것은 아닙니다.
 
 FG는 Prepare/Dispatch 호출마다 configuration 조회·생성 전에 Metal4 지원 여부를 한 번 검사하고, configuration은 같은 검증된 command를 사용하여 중복 조회를 생략합니다. 이 검사는 configuration 캐시 밖에 있어 캐시 적중 시에도 유지됩니다. Producer→native 회귀 검사는 캐시 생성 전후에 compiler가 없으면 대기 프레임을 소비하거나 history를 바꾸지 않고 거부하는지, 이후 정상 재시도가 성공하는지 확인합니다.
 

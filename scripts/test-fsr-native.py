@@ -427,6 +427,67 @@ static void tableOwnershipRegression(id<MTLDevice> device, id<MTL4Compiler> comp
     puts("SR_TABLE_OWNERSHIP_PASS: retained leases isolated; retired tables reused; exposure rebound; dormant pools empty");
 }
 
+static void pipelineTransitionRegression(id<MTLDevice> device, id<MTL4Compiler> compiler) {
+    auto feature=makeFeature(device,compiler,true);
+    auto color=sharedTexture(device,MTLPixelFormatRGBA16Float,64,64);
+    auto depth=sharedTexture(device,MTLPixelFormatR32Float,64,64);
+    auto motion=sharedTexture(device,MTLPixelFormatRG16Float,64,64);
+    auto mask=sharedTexture(device,MTLPixelFormatR8Unorm,64,64);
+    auto output=texture(device,MTLPixelFormatRGBA16Float,128,128,
+        MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite);
+    std::vector<_Float16> colors(64*64*4,.25f), motions(64*64*2,0);
+    for (std::size_t i=3;i<colors.size();i+=4) colors[i]=1;
+    std::vector<float> depths(64*64,.5f);
+    std::vector<unsigned char> masks(64*64,64);
+    [color replaceRegion:MTLRegionMake2D(0,0,64,64) mipmapLevel:0 withBytes:colors.data() bytesPerRow:64*8];
+    [depth replaceRegion:MTLRegionMake2D(0,0,64,64) mipmapLevel:0 withBytes:depths.data() bytesPerRow:64*4];
+    [motion replaceRegion:MTLRegionMake2D(0,0,64,64) mipmapLevel:0 withBytes:motions.data() bytesPerRow:64*4];
+    [mask replaceRegion:MTLRegionMake2D(0,0,64,64) mipmapLevel:0 withBytes:masks.data() bytesPerRow:64];
+    FrameInfo frame{};
+    frame.color=color; frame.depth=depth; frame.motionVectors=motion; frame.output=output;
+    frame.inputContent={64,64}; frame.colorRect={0,0,64,64};
+    frame.depthRect=frame.motionRect=frame.reactiveRect=frame.compositionRect=frame.colorRect;
+    frame.outputRect={0,0,128,128}; frame.resetHistory=true;
+    for (unsigned mode=0;mode<4;++mode) {
+        FrameOperations ops{};
+        ops.sharpening=mode==0;
+        ops.sharpness=.5f;
+        ops.combineCompositionMask=mode==1 || mode==2;
+        ops.colorTransfer=mode==2 ? ColorTransfer::SRGB : ColorTransfer::Linear;
+        ops.drawDebugView=mode==3;
+        frame.compositionMask=ops.combineCompositionMask ? mask : nullptr;
+        TextureSet textures{color,depth,motion,output,nullptr,nullptr,frame.compositionMask};
+        Error error;
+        auto prepared=feature->prepare(frame,textures,&error,ops);
+        if (!prepared) std::fprintf(stderr,"pipeline transition: %s\n",error.message.c_str());
+        assert(prepared);
+        if (mode==0)
+            assert(feature->impl_->finishPipeline && !feature->impl_->linearizePipeline &&
+                   !feature->impl_->combineMaskPipeline);
+        if (mode==1)
+            assert(feature->impl_->combineMaskPipeline && !feature->impl_->linearizePipeline);
+        if (mode==3)
+            assert(feature->impl_->debugPipeline && !feature->impl_->debugDepthPipeline);
+        auto lease=execute(device,prepared);
+        auto actual=pixels<_Float16>(device,output,4);
+        if (ops.combineCompositionMask) {
+            auto combined=pixels<unsigned char>(device,lease->impl_->combinedMask,1);
+            assert(combined==masks);
+        }
+        auto reference=makeFeature(device,compiler,true);
+        auto referenceFrame=reference->prepare(frame,textures,&error,ops);
+        assert(referenceFrame);
+        auto referenceLease=execute(device,referenceFrame);
+        auto expected=pixels<_Float16>(device,output,4);
+        for (std::size_t i=0;i<actual.size();++i)
+            assert(std::isfinite(float(actual[i])) &&
+                   std::fabs(float(actual[i])-float(expected[i]))<.003f);
+    }
+    feature.reset();
+    [output release]; [mask release]; [motion release]; [depth release]; [color release];
+    puts("SR_PIPELINE_TRANSITIONS_PASS: finish-only, masks, transfer and debug match fresh features");
+}
+
 int main() {
     @autoreleasepool {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -444,6 +505,7 @@ int main() {
         motionRegression(device,compiler,true,true,true,false);
         motionRegression(device,compiler,false,false,true,false);
         tableOwnershipRegression(device,compiler);
+        pipelineTransitionRegression(device,compiler);
 
         CreateContext context{device, compiler, CommandMode::Metal4};
         CreateInfo creation{};

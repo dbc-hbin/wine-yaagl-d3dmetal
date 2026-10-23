@@ -1118,8 +1118,15 @@ bool ensureExposurePipeline(Feature::Impl& feature, Error* error) noexcept {
     return true;
 }
 
-bool ensureFsrPipelines(Feature::Impl& feature, Error* error, bool debug = false,
-                        bool resampleMotion = false) noexcept {
+bool ensureFsrPipelines(Feature::Impl& feature, const FrameOperations& operations,
+                        const TemporalOutputLayout& temporal, MTLPixelFormat depthFormat,
+                        Error* error) noexcept {
+    const bool linearize = operations.colorTransfer != ColorTransfer::Linear;
+    const bool combineMasks = operations.combineCompositionMask;
+    const bool debug = operations.drawDebugView;
+    const bool debugDepth = debug && isDepthFormat(depthFormat);
+    const bool finish = !debug && (linearize || operations.sharpening || temporal.capped);
+    const bool resampleMotion = temporal.capped && !feature.create.lowResolutionMotionVectors();
     if (!feature.fsrLibrary) {
         @try {
             NSError* libraryError = nil;
@@ -1130,28 +1137,30 @@ bool ensureFsrPipelines(Feature::Impl& feature, Error* error, bool debug = false
             feature.fsrLibrary = nil;
         }
     }
-    if (!feature.linearizePipeline)
+    if (linearize && !feature.linearizePipeline)
         feature.linearizePipeline = makePipeline(feature.device, feature.fsrLibrary,
                                                  @"yaagl_fsr_linearize");
-    if (!feature.combineMaskPipeline)
+    if (combineMasks && !feature.combineMaskPipeline)
         feature.combineMaskPipeline = makePipeline(feature.device, feature.fsrLibrary,
                                                    @"yaagl_fsr_combine_masks");
-    if (!feature.finishPipeline)
+    if (finish && !feature.finishPipeline)
         feature.finishPipeline = makePipeline(feature.device, feature.fsrLibrary,
                                               @"yaagl_fsr_finish");
-    if (debug && !feature.debugPipeline)
+    if (debug && !debugDepth && !feature.debugPipeline)
         feature.debugPipeline = makePipeline(feature.device, feature.fsrLibrary,
                                              @"yaagl_sr_debug_view");
-    if (debug && !feature.debugDepthPipeline)
+    if (debugDepth && !feature.debugDepthPipeline)
         feature.debugDepthPipeline = makePipeline(feature.device, feature.fsrLibrary,
                                                   @"yaagl_sr_debug_depth_view");
     if (resampleMotion && !feature.motionResamplePipeline)
         feature.motionResamplePipeline = makePipeline(feature.device, feature.fsrLibrary,
                                                       @"yaagl_sr_resample_motion");
-    if (!feature.linearizePipeline || !feature.combineMaskPipeline || !feature.finishPipeline ||
+    if ((linearize && !feature.linearizePipeline) ||
+        (combineMasks && !feature.combineMaskPipeline) ||
+        (finish && !feature.finishPipeline) ||
         (resampleMotion && !feature.motionResamplePipeline) ||
-        (debug &&
-         (!feature.debugPipeline || !feature.debugDepthPipeline))) {
+        (debugDepth && !feature.debugDepthPipeline) ||
+        (debug && !debugDepth && !feature.debugPipeline)) {
         setError(error, ErrorCode::ResourceCreationFailed,
                  "failed to create FSR translation compute pipelines");
         return false;
@@ -2189,8 +2198,8 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(
                                        operations.combineCompositionMask || operations.sharpening ||
                                        temporal.capped || operations.drawDebugView;
         if (needsFsrPipelines &&
-            !ensureFsrPipelines(*impl_, error, operations.drawDebugView,
-                                resampleDisplayMotion)) return {};
+            !ensureFsrPipelines(*impl_, operations, temporal,
+                                asTexture(textures.depth).pixelFormat, error)) return {};
         std::shared_ptr<ScalerGeneration> generation =
             ensureScaler(*impl_, info, textures, operations, temporal, error);
         if (!generation) return {};

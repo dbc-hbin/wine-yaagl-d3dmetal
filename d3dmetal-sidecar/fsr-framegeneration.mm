@@ -797,7 +797,7 @@ struct alignas(16) FgParams {
 };
 static_assert(sizeof(FgParams) == 192);
 
-bool computePass(id buffer, id fence, Mode mode, id<MTLDevice> device,
+bool computePass(id buffer, id fence, Mode mode, id argumentTable,
                  id<MTLComputePipelineState> pipeline, id<MTLTexture> source,
                  id<MTLTexture> destination, id<MTLBuffer> parameterBuffer,
                  NSUInteger parameterOffset, const FgParams& params,
@@ -808,27 +808,17 @@ bool computePass(id buffer, id fence, Mode mode, id<MTLDevice> device,
     if (!pipeline || !source || !destination || !parameterBuffer) return false;
     if (@available(macOS 26.0, *)) {
         if (mode == Mode::Metal4) {
-            MTL4ArgumentTableDescriptor* descriptor = [MTL4ArgumentTableDescriptor new];
-            descriptor.maxBufferBindCount = 1;
-            descriptor.maxTextureBindCount = depth ? 7 : 2;
-            descriptor.initializeBindings = YES;
-            NSError* error = nil;
-            id<MTL4ArgumentTable> table =
-                [device newArgumentTableWithDescriptor:descriptor error:&error];
-            [descriptor release];
+            id<MTL4ArgumentTable> table = (id<MTL4ArgumentTable>)argumentTable;
             if (!table) return false;
-            retained.emplace_back(table);
-            [table release];
             [table setAddress:parameterBuffer.gpuAddress + parameterOffset atIndex:0];
-            [table setTexture:source.gpuResourceID atIndex:0];
-            [table setTexture:destination.gpuResourceID atIndex:1];
-            if (depth) {
-                [table setTexture:depth.gpuResourceID atIndex:2];
-                if (motion) [table setTexture:motion.gpuResourceID atIndex:3];
-                [table setTexture:(ui ? ui : source).gpuResourceID atIndex:4];
-                [table setTexture:(scene ? scene : source).gpuResourceID atIndex:5];
-                [table setTexture:(present ? present : source).gpuResourceID atIndex:6];
-            }
+            const id<MTLTexture> textures[]{
+                source, destination, depth, depth ? motion : nil,
+                depth ? (ui ? ui : source) : nil,
+                depth ? (scene ? scene : source) : nil,
+                depth ? (present ? present : source) : nil};
+            for (NSUInteger i = 0; i < std::size(textures); ++i)
+                [table setTexture:(textures[i] ? textures[i].gpuResourceID : MTLResourceID{})
+                          atIndex:i];
             id<MTL4ComputeCommandEncoder> encoder =
                 [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
             if (!encoder) return false;
@@ -920,6 +910,7 @@ struct ExecutionLease::Impl {
     std::shared_ptr<PreparedFrame::Impl> prepared;
     std::vector<Object> objects;
     Object residency;
+    Object argumentTable;
 
     ~Impl() {
         if (residency) {
@@ -1250,12 +1241,27 @@ bool PreparedFrame::encode(
                 const auto passCount = std::count_if(std::begin(passOutputs), std::end(passOutputs),
                                                      [](id object) { return object != nil; });
                 const bool retainUiView = uiSourceView && uiSourceView.get() != presentView.get();
-                // Each compute pass retains an encoder and, on Metal4, an
-                // argument table. Include the constant block, baseline
+                id<MTL4ArgumentTable> argumentTable = nil;
+                if (configuration.mode == Mode::Metal4) {
+                    MTL4ArgumentTableDescriptor* descriptor = [MTL4ArgumentTableDescriptor new];
+                    @try {
+                        descriptor.maxBufferBindCount = 1;
+                        descriptor.maxTextureBindCount = 7;
+                        descriptor.initializeBindings = YES;
+                        NSError* error = nil;
+                        argumentTable = [device newArgumentTableWithDescriptor:descriptor error:&error];
+                    } @finally {
+                        [descriptor release];
+                    }
+                    execution->argumentTable = Object(argumentTable);
+                    [argumentTable release];
+                    if (!argumentTable) return fail("encode_argument_table");
+                }
+                // Metal snapshots the execution-local table at each dispatch.
+                // Each pass retains its encoder. Include the constant block, baseline
                 // copy encoder and optional disable-hint encoder before any GPU work.
                 execution->objects.reserve(std::size(inputs) + std::size(generated) +
                     retainUiView + bool(distortionView) + 1 + passCount +
-                    (configuration.mode == Mode::Metal4 ? passCount : 0) +
                     1 + bool(impl_->disableInterpolation));
                 for (id object : inputs) execution->objects.emplace_back(object);
                 for (id object : generated) execution->objects.emplace_back(object);
@@ -1299,14 +1305,14 @@ bool PreparedFrame::encode(
                 if (!copyTextures(buffer, (id)fence, configuration.mode,
                                   baselines.data(), baselineCount, execution->objects))
                     return fail("encode_baseline_copy");
-                if (!computePass(buffer, (id)fence, configuration.mode, device,
+                if (!computePass(buffer, (id)fence, configuration.mode, argumentTable,
                                  (id<MTLComputePipelineState>)configuration.decodePipeline.get(),
                                  (id<MTLTexture>)sceneView.get(),
                                  (id<MTLTexture>)current.get(),
                                  parameterBuffer, offsetof(ParameterBlock, scene), sceneParams,
                                  execution->objects))
                     return fail("encode_scene_decode");
-                if (ui && !computePass(buffer, (id)fence, configuration.mode, device,
+                if (ui && !computePass(buffer, (id)fence, configuration.mode, argumentTable,
                                       (id<MTLComputePipelineState>)configuration.decodePipeline.get(),
                                       (id<MTLTexture>)uiSourceView.get(),
                                       (id<MTLTexture>)ui.get(),
@@ -1314,20 +1320,20 @@ bool PreparedFrame::encode(
                                       execution->objects))
                     return fail("encode_ui_decode");
                 if (decodeDistortion && !computePass(
-                        buffer, (id)fence, configuration.mode, device,
+                        buffer, (id)fence, configuration.mode, argumentTable,
                         (id<MTLComputePipelineState>)configuration.distortionPipeline.get(),
                         distortionSource, (id<MTLTexture>)distortion.get(),
                         parameterBuffer, offsetof(ParameterBlock, distortion), distortionParams,
                         execution->objects))
                     return fail("encode_distortion_decode");
-                if (!computePass(buffer, (id)fence, configuration.mode, device,
+                if (!computePass(buffer, (id)fence, configuration.mode, argumentTable,
                                  (id<MTLComputePipelineState>)configuration.depthPipeline.get(),
                                  (id<MTLTexture>)impl_->snapshot->depth.get(),
                                  (id<MTLTexture>)normalizedDepth.get(),
                                  parameterBuffer, offsetof(ParameterBlock, depth), depthParams,
                                  execution->objects))
                     return fail("encode_depth_normalize");
-                if (!computePass(buffer, (id)fence, configuration.mode, device,
+                if (!computePass(buffer, (id)fence, configuration.mode, argumentTable,
                                  (id<MTLComputePipelineState>)configuration.motionPipeline.get(),
                                  (id<MTLTexture>)impl_->snapshot->motion.get(),
                                  (id<MTLTexture>)normalizedMotion.get(),
@@ -1444,7 +1450,7 @@ bool PreparedFrame::encode(
                     [(id<MTLFXFrameInterpolator>)interpolator.get()
                         encodeToCommandBuffer:(id<MTLCommandBuffer>)buffer];
 
-                if (!computePass(buffer, (id)fence, configuration.mode, device,
+                if (!computePass(buffer, (id)fence, configuration.mode, argumentTable,
                                  (id<MTLComputePipelineState>)configuration.encodePipeline.get(),
                                  (id<MTLTexture>)output.get(),
                                  (id<MTLTexture>)outputView.get(),
