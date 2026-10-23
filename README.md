@@ -12,6 +12,8 @@ This tree starts at the official `wine-11.20` tag and ports the selected runtime
 
 `d3dmetal-sidecar/layout.json` defines the beta3 hook contract: format 27, marker `YAAGLB3SIDEcar\x1b`, four compact dispatch slots and no additional `binaryPatches`. The entry hooks, in dispatch order, are `GetContainingOutput`, `SetFullscreenState`, `QueryVideoMemoryInfo` and `ReplayTemporalScale`. They cover display routing, video-memory queries and FSR replay only. `ngx-hooks.mm` dispatches recorded FSR commands through `ReplayTemporalScale`; other commands use Apple's original replay. FSR SR/FG uses the Metal4/MPL transport.
 
+The current Wine FSR entrypoints and native regression callers select Metal4; no in-repository caller selects the backend's Legacy command mode. The SR C++ interface still accepts Legacy with an ordinary `MTLCommandBuffer`, and the sidecar exports its C++ factory/encode symbols, so repository usage alone does not prove external callers absent. Legacy is retained pending an explicit interface cutover. It is separate from AMD native-provider passthrough: `YAAGL_FSR_UPSCALER=native` and FG native fallback do not select MetalFX Legacy.
+
 All 13 custom cache-related hooks are removed, including PSO/function caching, RT provenance tracking, cache-context/lifetime hooks and library singleflight. Their native entry bytes stay pristine; no forwarding wrappers replace the removed hooks. Native GPTK shader/stage and disk caches, library publication/reuse, owner-local graphics/compute PSOs and RT function reuse remain in place. This does not claim cross-owner reuse equivalent to the removed custom caches or measured performance parity.
 
 DXGI video-memory queries, containing-output queries, fullscreen entry points and output enumeration use the Windows x64 calling convention, including calls back to the original methods. Native helper methods retain the host ABI. Mixing these conventions causes Unity startup crashes before rendering.
@@ -85,6 +87,12 @@ Explicit `wineboot` and `wineboot.exe` launches skip optional Mono/Gecko install
 ## Verification
 
 Run the owner tests for the changed native transport, patcher, preparation helper, staging and launcher. A successful build or CPU fixture does not prove game image quality or FSR frame-generation behavior. Report the exact runtime scenario separately from static and unit checks.
+
+FSR's first-stage overhead reduction preserves shader source, GPU passes, resource bindings, fences and history/reset decisions. SR shares its embedded shader library within a feature; FG creates one library for each configuration's existing pipeline group. Successful Unix-side API resolution uses acquire/release publication without taking the loader mutex again, while failed resolution remains retryable. FG wakes destruction waiters only on the final closing-context reference and reserves retained-object storage from the actual execution resources and passes before GPU encoding. `python3 scripts/test-fsr-lifecycle.py` exercises concurrent loader publication, failure/retry, the warm fast path and destruction wakeups. These changes do not establish a measured game-performance gain.
+
+FG checks Metal4 support once per Prepare/Dispatch invocation before configuration lookup or creation; configuration reuses that same validated command without a second capability query. The support check remains outside the configuration cache, including cache hits. The producer/native regression rejects a missing compiler before and after cache population without consuming pending frames or changing history, then verifies successful retry.
+
+The FG callback-wait guard checks the descriptor type before reading TLS, so ordinary Prepare/Generate calls skip that lookup. WAIT_FOR_PRESENTS remains rejected inside callbacks, and the separate context-specific callback check remains in place. Dispatch regressions cover waiting outside callbacks and rejection inside them, plus ordinary callback Prepare/Generate.
 
 `python3 scripts/test-fg-normalization.py` checks FG dispatch and ownership, plus actual Metal4 motion-texture readback for jitter cancellation. The translator keeps per-frame normalized jitter history so omitted motion dimensions, render-size changes, reset boundaries and queued snapshots use the correct motion-vector domain.
 

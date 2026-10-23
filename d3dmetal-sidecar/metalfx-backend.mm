@@ -34,10 +34,7 @@ void releaseObject(T& object) noexcept {
 void clearError(Error* error) noexcept {
     if (!error) return;
     error->code = ErrorCode::None;
-    try {
-        error->message.clear();
-    } catch (...) {
-    }
+    error->message.clear();
 }
 
 void setError(Error* error, ErrorCode code, const char* message) noexcept {
@@ -46,10 +43,7 @@ void setError(Error* error, ErrorCode code, const char* message) noexcept {
     try {
         error->message = message ? message : "";
     } catch (...) {
-        try {
-            error->message.clear();
-        } catch (...) {
-        }
+        error->message.clear();
     }
 }
 
@@ -144,14 +138,11 @@ kernel void yaagl_metalfx_exposure_r_to_r16(
 }
 )METAL";
 
-id<MTLComputePipelineState> makePipeline(id<MTLDevice> device, const char* sourceText,
+id<MTLComputePipelineState> makePipeline(id<MTLDevice> device, id<MTLLibrary> library,
                                                  NSString* functionName) noexcept {
-    id<MTLLibrary> library = nil;
     id<MTLFunction> function = nil;
     @try {
         NSError* error = nil;
-        NSString* source = [NSString stringWithUTF8String:sourceText];
-        library = [device newLibraryWithSource:source options:nil error:&error];
         if (!library) return nil;
         function = [library newFunctionWithName:functionName];
         if (!function) return nil;
@@ -160,12 +151,21 @@ id<MTLComputePipelineState> makePipeline(id<MTLDevice> device, const char* sourc
         return nil;
     } @finally {
         [function release];
-        [library release];
     }
 }
 
 id<MTLComputePipelineState> makeExposurePipeline(id<MTLDevice> device) noexcept {
-    return makePipeline(device, kExposureKernel, @"yaagl_metalfx_exposure_r_to_r16");
+    id<MTLLibrary> library = nil;
+    @try {
+        NSError* error = nil;
+        library = [device newLibraryWithSource:[NSString stringWithUTF8String:kExposureKernel]
+                                      options:nil error:&error];
+        return makePipeline(device, library, @"yaagl_metalfx_exposure_r_to_r16");
+    } @catch (id) {
+        return nil;
+    } @finally {
+        [library release];
+    }
 }
 
 bool isSrgbFormat(MTLPixelFormat format) noexcept {
@@ -435,6 +435,7 @@ struct Feature::Impl {
     CommandMode commandMode = CommandMode::Metal4;
     id<MTLDevice> device = nil;
     id compiler = nil;
+    id<MTLLibrary> fsrLibrary = nil;
     id<MTLComputePipelineState> exposurePipeline = nil;
     id<MTLComputePipelineState> linearizePipeline = nil;
     id<MTLComputePipelineState> combineMaskPipeline = nil;
@@ -682,6 +683,7 @@ struct Feature::Impl {
         releaseObject(combineMaskPipeline);
         releaseObject(linearizePipeline);
         releaseObject(exposurePipeline);
+        releaseObject(fsrLibrary);
         releaseObject(compiler);
         releaseObject(device);
     }
@@ -863,10 +865,8 @@ TemporalOutputLayout temporalOutputLayout(const Feature::Impl& feature,
     layout.height = static_cast<NSUInteger>(std::floor(
         static_cast<double>(frame.inputContent.height) * uniformScale));
     layout.capped = true;
-    if (layout.capped) {
-        layout.placementX = (frame.outputRect.width - layout.width) / 2;
-        layout.placementY = (frame.outputRect.height - layout.height) / 2;
-    }
+    layout.placementX = (frame.outputRect.width - layout.width) / 2;
+    layout.placementY = (frame.outputRect.height - layout.height) / 2;
     return layout;
 }
 
@@ -1086,23 +1086,33 @@ bool ensureExposurePipeline(Feature::Impl& feature, Error* error) noexcept {
 
 bool ensureFsrPipelines(Feature::Impl& feature, Error* error, bool debug = false,
                         bool resampleMotion = false) noexcept {
+    if (!feature.fsrLibrary) {
+        @try {
+            NSError* libraryError = nil;
+            feature.fsrLibrary = [feature.device
+                newLibraryWithSource:[NSString stringWithUTF8String:kFsrKernelsSource]
+                             options:nil error:&libraryError];
+        } @catch (id) {
+            feature.fsrLibrary = nil;
+        }
+    }
     if (!feature.linearizePipeline)
-        feature.linearizePipeline = makePipeline(feature.device, kFsrKernelsSource,
+        feature.linearizePipeline = makePipeline(feature.device, feature.fsrLibrary,
                                                  @"yaagl_fsr_linearize");
     if (!feature.combineMaskPipeline)
-        feature.combineMaskPipeline = makePipeline(feature.device, kFsrKernelsSource,
+        feature.combineMaskPipeline = makePipeline(feature.device, feature.fsrLibrary,
                                                    @"yaagl_fsr_combine_masks");
     if (!feature.finishPipeline)
-        feature.finishPipeline = makePipeline(feature.device, kFsrKernelsSource,
+        feature.finishPipeline = makePipeline(feature.device, feature.fsrLibrary,
                                               @"yaagl_fsr_finish");
     if (debug && !feature.debugPipeline)
-        feature.debugPipeline = makePipeline(feature.device, kFsrKernelsSource,
+        feature.debugPipeline = makePipeline(feature.device, feature.fsrLibrary,
                                              @"yaagl_sr_debug_view");
     if (debug && !feature.debugDepthPipeline)
-        feature.debugDepthPipeline = makePipeline(feature.device, kFsrKernelsSource,
+        feature.debugDepthPipeline = makePipeline(feature.device, feature.fsrLibrary,
                                                   @"yaagl_sr_debug_depth_view");
     if (resampleMotion && !feature.motionResamplePipeline)
-        feature.motionResamplePipeline = makePipeline(feature.device, kFsrKernelsSource,
+        feature.motionResamplePipeline = makePipeline(feature.device, feature.fsrLibrary,
                                                       @"yaagl_sr_resample_motion");
     if (!feature.linearizePipeline || !feature.combineMaskPipeline || !feature.finishPipeline ||
         (resampleMotion && !feature.motionResamplePipeline) ||

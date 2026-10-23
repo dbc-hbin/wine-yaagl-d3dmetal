@@ -12,6 +12,8 @@ DLSS는 Apple 원본 `nvngx-on-metalfx.dll`과 Unix 모듈을 사용합니다. �
 
 beta3 훅 계약은 `d3dmetal-sidecar/layout.json`에 정의되어 있습니다. format 27, marker `YAAGLB3SIDEcar\x1b`, 빈 슬롯 없이 배치한 dispatch 슬롯 4개이며 추가 `binaryPatches`는 없습니다. 진입점 훅은 dispatch 순서대로 `GetContainingOutput`, `SetFullscreenState`, `QueryVideoMemoryInfo`, `ReplayTemporalScale`입니다. 디스플레이 라우팅, 비디오 메모리 조회와 FSR replay만 담당합니다. `ngx-hooks.mm`은 `ReplayTemporalScale`에서 기록된 FSR 명령을 처리하고, 나머지는 Apple 원본 replay로 전달합니다. FSR SR/FG는 Metal4/MPL transport를 사용합니다.
 
+현재 Wine FSR 진입점과 native 회귀 검사의 호출처는 Metal4를 선택하며, 저장소 안에서 backend의 Legacy command mode를 선택하는 호출처는 없습니다. SR C++ 인터페이스는 여전히 일반 `MTLCommandBuffer`를 사용하는 Legacy를 받으며 sidecar가 C++ factory/encode 심볼도 export하므로, 저장소 조사만으로 외부 호출자가 없다고 확정할 수는 없습니다. Legacy는 명시적인 인터페이스 전환 전까지 유지합니다. AMD native provider로의 원본 전달과는 별개이며, `YAAGL_FSR_UPSCALER=native`나 FG native fallback은 MetalFX Legacy를 선택하지 않습니다.
+
 PSO/function 캐시, RT 출처 정보 추적, 캐시 문맥·수명 관리 훅과 라이브러리 singleflight를 포함한 커스텀 캐시 관련 훅 13개를 모두 제거했습니다. 해당 네이티브 진입점 바이트는 원본 그대로이며 전달용 wrapper로 대체하지 않습니다. GPTK 자체 셰이더/stage·디스크 캐시, 라이브러리 게시·재사용, owner별 graphics/compute PSO와 RT 함수 재사용은 유지합니다. 제거한 커스텀 캐시와 같은 owner 간 재사용이나 측정된 성능 동등성을 주장하지는 않습니다.
 
 DXGI 비디오 메모리 조회, 출력 모니터 조회, 전체 화면 진입점과 출력 열거는 원본 메서드를 호출할 때도 Windows x64 호출 규약을 사용합니다. 네이티브 내부 헬퍼는 호스트 ABI를 유지합니다. 이 규약이 섞이면 렌더링 전 Unity 기동 단계에서 크래시가 발생합니다.
@@ -85,6 +87,12 @@ python3 scripts/stage-runtime.py --verify-runtime build/staged/wine --current-so
 ## 검증
 
 변경한 native transport, 패처, 준비 도구, staging, 런처의 관련 테스트를 실행합니다. 빌드나 CPU fixture 통과는 게임 화질이나 FSR 프레임 생성 동작의 증명이 아닙니다. 실제 런타임 시나리오 결과는 정적 검사·단위 테스트와 구분해 기록합니다.
+
+FSR 1차 오버헤드 최적화는 셰이더 소스, GPU 패스, 리소스 바인딩, fence와 history/reset 결정을 보존합니다. SR은 feature 안에서 내장 셰이더 library를 공유하고, FG는 configuration의 기존 pipeline 묶음마다 library를 한 번 생성합니다. Unix API 주소는 성공한 경우 acquire/release 방식으로 게시하여 이후 호출의 로더 mutex를 생략하며, 조회 실패는 다시 시도할 수 있습니다. FG는 closing context의 마지막 참조가 반환될 때만 파괴 대기자를 깨우고, 실제 실행 리소스·패스 수로 객체 보관 공간을 GPU 인코딩 전에 예약합니다. `python3 scripts/test-fsr-lifecycle.py`는 동시 초기화, 실패 후 재시도, 초기화 완료 후 빠른 경로와 파괴 대기자 알림을 검사합니다. 이 변경만으로 게임 성능 향상이 실측됐다는 뜻은 아닙니다.
+
+FG는 Prepare/Dispatch 호출마다 configuration 조회·생성 전에 Metal4 지원 여부를 한 번 검사하고, configuration은 같은 검증된 command를 사용하여 중복 조회를 생략합니다. 이 검사는 configuration 캐시 밖에 있어 캐시 적중 시에도 유지됩니다. Producer→native 회귀 검사는 캐시 생성 전후에 compiler가 없으면 대기 프레임을 소비하거나 history를 바꾸지 않고 거부하는지, 이후 정상 재시도가 성공하는지 확인합니다.
+
+FG의 callback 대기 방지 조건은 descriptor 종류를 먼저 확인하여 일반 Prepare/Generate의 불필요한 TLS 조회를 생략합니다. Callback 내부의 WAIT_FOR_PRESENTS 거부와 별도의 context별 callback 검사는 유지합니다. Dispatch 회귀 검사는 callback 밖의 대기 허용, 내부의 대기 거부, 일반 callback Prepare/Generate 처리를 확인합니다.
 
 `python3 scripts/test-fg-normalization.py`는 FG dispatch와 소유권뿐 아니라 실제 Metal4 motion texture를 읽어 jitter 보정을 검증합니다. 번역기는 프레임별 정규화된 jitter history를 보관하여 motion 크기 생략, 렌더 해상도 변경, reset 경계와 미리 준비한 snapshot에서도 올바른 MV 좌표계를 사용합니다.
 

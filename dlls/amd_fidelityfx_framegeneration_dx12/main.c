@@ -556,7 +556,8 @@ static void release_context(struct fg_context *context)
 {
     AcquireSRWLockExclusive(&contexts_lock);
     --context->references;
-    WakeAllConditionVariable(&contexts_changed);
+    if (context->closing && context->references == 1)
+        WakeAllConditionVariable(&contexts_changed);
     ReleaseSRWLockExclusive(&contexts_lock);
 }
 
@@ -1189,8 +1190,8 @@ static ffxReturnCode_t dispatch_validated(struct fg_context *context,
     ffxReturnCode_t result = validate_public_dispatch(context, desc, &normalized);
 
     if (result != FFX_API_RETURN_OK) return result;
-    if (in_callback() &&
-        desc->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WAIT_FOR_PRESENTS_DX12)
+    if (desc->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WAIT_FOR_PRESENTS_DX12 &&
+        in_callback())
         return FFX_API_RETURN_ERROR_PARAMETER;
     return dispatch_context(context, desc, &normalized);
 }
@@ -1754,9 +1755,6 @@ ffxReturnCode_t ffxCreateContext(ffxContext *output,
                            FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE |
                            FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING)))
             return FFX_API_RETURN_ERROR_PARAMETER;
-
-        /* The native bridge validates actual HUD-less texture metadata. */
-        (void)hudless;
     }
 
     context = allocate_memory(callbacks, sizeof(*context));
@@ -1788,6 +1786,7 @@ ffxReturnCode_t ffxCreateContext(ffxContext *output,
         context->display_height = fg->displaySize.height;
         context->max_render_width = fg->maxRenderSize.width;
         context->max_render_height = fg->maxRenderSize.height;
+        /* The native bridge validates actual HUD-less texture metadata. */
         context->hudless_format = hudless && hudless->hudlessBackBufferFormat ?
             hudless->hudlessBackBufferFormat : fg->backBufferFormat;
         context->debug_checking = !!(fg->flags & FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING);
@@ -1993,9 +1992,8 @@ ffxReturnCode_t ffxConfigure(ffxContext *handle,
     else
     {
         /*
-         * No configure packet exists in version 1 of this bridge.
-         * In particular, do not claim native debug-view or distortion
-         * support for a translated context.
+         * These configure descriptor types have no translated mapping.
+         * Do not claim native debug-view or distortion configuration support.
          */
         result = FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
     }

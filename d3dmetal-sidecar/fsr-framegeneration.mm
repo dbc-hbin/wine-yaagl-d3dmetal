@@ -265,13 +265,9 @@ private:
     id<MTLFXFrameInterpolatorBase> effect_;
 };
 
-Object makePipeline(id<MTLDevice> device, NSString* name) {
+Object makePipeline(id<MTLDevice> device, id<MTLLibrary> library, NSString* name) {
     NSError* error = nil;
-    NSString* source = [NSString stringWithUTF8String:kFsrKernelsSource];
-    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
-    if (!library) return {};
     id<MTLFunction> function = [library newFunctionWithName:name];
-    [library release];
     if (!function) return {};
     id<MTLComputePipelineState> pipeline =
         [device newComputePipelineStateWithFunction:function error:&error];
@@ -392,8 +388,6 @@ bool supported(id<MTLDevice> device, Mode mode, void* compiler) {
     return false;
 }
 
-bool sameConfiguration(const Configuration& a, const Configuration& b);
-
 std::shared_ptr<Configuration> configure(
     State& state, const Command& command,
     const yaagl_fsr_fg_prepare_packet& packet,
@@ -403,7 +397,7 @@ std::shared_ptr<Configuration> configure(
     if (@available(macOS 26.0, *)) {
         const Mode mode = Mode::Metal4;
         auto device = (id<MTLDevice>)command.value.device;
-        if (!supported(device, mode, command.value.compiler)) return {};
+        // api() already validated Metal4 support for this same retained command.
         const MTLPixelFormat color = MTLPixelFormatRGBA16Float;
         const MTLPixelFormat ui = sourceUi == MTLPixelFormatInvalid
                                 ? MTLPixelFormatInvalid : MTLPixelFormatRGBA16Float;
@@ -465,12 +459,19 @@ std::shared_ptr<Configuration> configure(
 
         result->factory = result->makeInterpolator();
         if (!result->factory) return {};
-        result->decodePipeline = makePipeline(device, @"yaagl_fg_decode_crop");
-        result->depthPipeline = makePipeline(device, @"yaagl_fg_resample_depth");
-        result->motionPipeline = makePipeline(device, @"yaagl_fg_normalize_motion");
-        result->encodePipeline = makePipeline(device, @"yaagl_fg_encode_scatter");
+        NSError* libraryError = nil;
+        id<MTLLibrary> library = [device
+            newLibraryWithSource:[NSString stringWithUTF8String:kFsrKernelsSource]
+                         options:nil error:&libraryError];
+        Object retainedLibrary(library);
+        [library release];
+        if (!retainedLibrary) return {};
+        result->decodePipeline = makePipeline(device, library, @"yaagl_fg_decode_crop");
+        result->depthPipeline = makePipeline(device, library, @"yaagl_fg_resample_depth");
+        result->motionPipeline = makePipeline(device, library, @"yaagl_fg_normalize_motion");
+        result->encodePipeline = makePipeline(device, library, @"yaagl_fg_encode_scatter");
         if (distortionEnabled)
-            result->distortionPipeline = makePipeline(device, @"yaagl_fg_decode_distortion");
+            result->distortionPipeline = makePipeline(device, library, @"yaagl_fg_decode_distortion");
         if (!result->decodePipeline || !result->depthPipeline || !result->motionPipeline ||
             !result->encodePipeline || (distortionEnabled && !result->distortionPipeline))
             return {};
@@ -980,18 +981,11 @@ bool PreparedFrame::encode(
                 }
                 auto execution = std::make_shared<ExecutionLease::Impl>();
                 execution->prepared = impl_;
-                execution->objects.reserve(16);
-                execution->objects.emplace_back((id)fence);
-                execution->objects.push_back(impl_->first);
-                execution->objects.push_back(impl_->second);
-                execution->objects.push_back(impl_->third);
-                execution->objects.push_back(impl_->fourth);
-                execution->objects.push_back(impl_->ui);
-                execution->objects.push_back(impl_->uiAlpha);
-                execution->objects.push_back(impl_->distortion);
-                execution->objects.push_back(impl_->disableInterpolation);
-                execution->objects.push_back(impl_->snapshot->depth);
-                execution->objects.push_back(impl_->snapshot->motion);
+                const id inputs[]{
+                    (id)fence, impl_->first.get(), impl_->second.get(), impl_->third.get(),
+                    impl_->fourth.get(), impl_->ui.get(), impl_->uiAlpha.get(),
+                    impl_->distortion.get(), impl_->disableInterpolation.get(),
+                    impl_->snapshot->depth.get(), impl_->snapshot->motion.get()};
 
                 auto retainedLease = std::shared_ptr<const ExecutionLease>(
                     new ExecutionLease(execution));
@@ -1000,6 +994,9 @@ bool PreparedFrame::encode(
 
                 std::lock_guard executionLock(impl_->state->executionMutex);
                 if (impl_->kind == Impl::Kind::Snapshot) {
+                    // Input ownership plus the single snapshot copy encoder.
+                    execution->objects.reserve(std::size(inputs) + 1);
+                    for (id object : inputs) execution->objects.emplace_back(object);
                     if (!execution->makeResident(buffer, configuration.mode))
                         return fail("snapshot_residency");
                     const std::array<Copy, 2> copies{{
@@ -1080,14 +1077,6 @@ bool PreparedFrame::encode(
                     !sameHistoryValues(impl_->dispatch, state.historyDispatch) ||
                     state.historyFrame + 1 != frame;
                 Object previous = reset ? current : state.history;
-                execution->objects.push_back(interpolator);
-                execution->objects.push_back(current);
-                execution->objects.push_back(ui);
-                execution->objects.push_back(normalizedDepth);
-                execution->objects.push_back(normalizedMotion);
-                execution->objects.push_back(output);
-                execution->objects.push_back(previous);
-                execution->objects.push_back(distortion);
 
                 id<MTLTexture> present = (id<MTLTexture>)impl_->first.get();
                 id<MTLTexture> scene = impl_->third
@@ -1115,13 +1104,6 @@ bool PreparedFrame::encode(
                     (configuration.ui != MTLPixelFormatInvalid && !uiSourceView) ||
                     (configuration.distortionEnabled && !distortionView))
                     return fail("encode_texture_views");
-                execution->objects.push_back(sceneView);
-                execution->objects.push_back(presentView);
-                execution->objects.push_back(outputView);
-                if (uiSourceView && uiSourceView.get() != presentView.get())
-                    execution->objects.push_back(uiSourceView);
-                if (distortionView) execution->objects.push_back(distortionView);
-
                 const bool currentGeneration =
                     impl_->generationEpoch == state.generationEpoch &&
                     state.generationEnabled;
@@ -1239,12 +1221,29 @@ bool PreparedFrame::encode(
                     (decodeDistortion && !distortionParameters) ||
                     !depthParameters || !motionParameters)
                     return fail("encode_parameter_buffers");
-                execution->objects.push_back(colorParameters);
-                execution->objects.push_back(sceneParameters);
-                if (ui) execution->objects.push_back(uiParameters);
-                if (decodeDistortion) execution->objects.push_back(distortionParameters);
-                execution->objects.push_back(depthParameters);
-                execution->objects.push_back(motionParameters);
+                const id generated[]{
+                    interpolator.get(), current.get(), ui.get(), normalizedDepth.get(),
+                    normalizedMotion.get(), output.get(), previous.get(), distortion.get(),
+                    sceneView.get(), presentView.get(), outputView.get()};
+                const id parameters[]{
+                    colorParameters.get(), sceneParameters.get(), uiParameters.get(),
+                    distortionParameters.get(), depthParameters.get(), motionParameters.get()};
+                const auto passCount = std::count_if(std::begin(parameters), std::end(parameters),
+                                                     [](id object) { return object != nil; });
+                const bool retainUiView = uiSourceView && uiSourceView.get() != presentView.get();
+                // Each parameter buffer feeds one compute pass, which retains an
+                // encoder and, on Metal4, an argument table. Include the baseline
+                // copy encoder and optional disable-hint encoder before any GPU work.
+                execution->objects.reserve(std::size(inputs) + std::size(generated) +
+                    retainUiView + bool(distortionView) + passCount + passCount +
+                    (configuration.mode == Mode::Metal4 ? passCount : 0) +
+                    1 + bool(impl_->disableInterpolation));
+                for (id object : inputs) execution->objects.emplace_back(object);
+                for (id object : generated) execution->objects.emplace_back(object);
+                if (retainUiView) execution->objects.push_back(uiSourceView);
+                if (distortionView) execution->objects.push_back(distortionView);
+                for (id object : parameters)
+                    if (object) execution->objects.emplace_back(object);
                 // Metal4 GPU addresses must be admitted before the residency set commits.
                 if (!execution->makeResident(buffer, configuration.mode))
                     return fail("encode_residency");

@@ -164,10 +164,8 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
     auto state = find(packet.header.context);
     if (!state) return kParameter;
     FrameContract frame;
-    const auto validation = validateFrame(state->create, packet, frame);
-    if (validation != ContractStatus::Ok) {
-        return validation == ContractStatus::Unsupported ? kNoProvider : kParameter;
-    }
+    if (validateFrame(state->create, packet, frame) != ContractStatus::Ok)
+        return kParameter;
 
     std::lock_guard stateLock(state->mutex);
     if (state->retired) return kParameter;
@@ -189,12 +187,10 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
         return kParameter;
     }
     if (newGeneration) {
-        auto createInfo = state->create.backend;
-        createInfo.dynamicOutput = true;
         metalfx::CreateContext context{command.native.device, command.native.compiler, mode};
         metalfx::Error backendError;
         std::shared_ptr<metalfx::Feature> backend =
-            metalfx::Feature::create(context, createInfo, &backendError);
+            metalfx::Feature::create(context, state->create.backend, &backendError);
         if (!backend) {
             return backendResult(backendError.code);
         }

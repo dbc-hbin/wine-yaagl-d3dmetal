@@ -11,7 +11,6 @@ namespace yaagl::pso::fsr {
 enum class ContractStatus : std::uint8_t {
     Ok,
     InvalidParameter,
-    Unsupported,
 };
 
 struct CreateContract {

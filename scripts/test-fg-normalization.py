@@ -532,6 +532,29 @@ static void check_generation(void)
     assert(generation_callback(&desc, &binding) == FFX_API_RETURN_OK);
     assert(desc.numGeneratedFrames == 1 && bridge_calls == 1 && retired == 1);
 }
+static void check_callback_wait(void)
+{
+    ffxDispatchDescHeader wait = {
+        FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WAIT_FOR_PRESENTS_DX12, NULL};
+    struct callback_scope scope;
+    struct ffxDispatchDescFrameGenerationPrepareV2 prepare = valid_prepare(40);
+    ffxDispatchDescFrameGeneration generate = valid_generation(40);
+
+    reset_state(CONTEXT_SWAPCHAIN);
+    assert(ffxDispatch(&handle, &wait) == FFX_API_RETURN_OK && native_calls == 1);
+    enter_callback(&scope, &ctx);
+    assert(ffxDispatch(&handle, &wait) == FFX_API_RETURN_ERROR_PARAMETER);
+    assert(native_calls == 1 && bridge_calls == 0);
+    leave_callback(&scope);
+    assert(ffxDispatch(&handle, &wait) == FFX_API_RETURN_OK && native_calls == 2);
+
+    reset_state(CONTEXT_METALFX);
+    enter_callback(&scope, &ctx);
+    assert(DISPATCH(prepare) == FFX_API_RETURN_OK);
+    assert(DISPATCH(generate) == FFX_API_RETURN_OK);
+    assert(bridge_calls == 2 && native_calls == 0 && last_generation.frame_id == 40);
+    leave_callback(&scope);
+}
 struct state_case { uint32_t ffx, d3d12; };
 static const struct state_case state_cases[] =
 {
@@ -801,6 +824,7 @@ int main(void)
 #endif
     check_prepare();
     check_generation();
+    check_callback_wait();
     check_state_mappings();
     check_invalid_prepare_states();
     check_invalid_generation_states();
@@ -2331,6 +2355,7 @@ extern "C" int fg_history_prepare(unsigned, unsigned, float, bool, void*, void*,
 extern "C" int fg_history_generate(unsigned, unsigned, bool, void*, void*, void*);
 
 static JitterRunner* historyRunner;
+static bool historyCompilerAvailable = true;
 static std::shared_ptr<const PreparedFrame> recordedHistory;
 struct HistoryResource {
     void** vtable;
@@ -2353,7 +2378,7 @@ namespace yaagl::pso::d3dmetal {
 bool historyUnwrap(void*, NativeCommandList& out) noexcept {
     out.kind = CommandListKind::mpl;
     out.device = historyRunner->device;
-    out.compiler = historyRunner->compiler;
+    out.compiler = historyCompilerAvailable ? historyRunner->compiler : nil;
     return true;
 }
 void historyReleaseCommand(NativeCommandList& out) noexcept { out = {}; }
@@ -2432,6 +2457,16 @@ static void producerHistory(JitterRunner& runner, unsigned route,
     };
     auto prepare = [&](unsigned frame) {
         const bool future = frame == 102 && resetCase == 3;
+        if (!route && !ahead && !resetCase && frame != 102) {
+            const auto pendingCount = state->frames.size();
+            const auto configurationCount = state->configurations.size();
+            historyCompilerAvailable = false;
+            assert(fg_history_prepare(frame, 64, frame == 101 ? -.5f : .5f, false,
+                &list, &resources[0], &resources[1]) == Unsupported);
+            assert(!recordedHistory && state->frames.size() == pendingCount &&
+                   state->configurations.size() == configurationCount);
+            historyCompilerAvailable = true;
+        }
         assert(fg_history_prepare(frame, future ? 32 : 64,
             frame == 101 ? -.5f : .5f,
             future || (frame == 101 && resetCase == 2),
@@ -2442,6 +2477,16 @@ static void producerHistory(JitterRunner& runner, unsigned route,
     auto generate = [&](unsigned frame) {
         const auto pending = state->frames.at(frame);
         const auto history = state->history;
+        if (!route && !ahead && !resetCase && frame != 102) {
+            const auto configurationCount = state->configurations.size();
+            historyCompilerAvailable = false;
+            assert(fg_history_generate(frame, route, false,
+                &list, &resources[2], &resources[3]) == Unsupported);
+            assert(!recordedHistory && state->frames.at(frame) == pending &&
+                   state->history.get() == history.get() &&
+                   state->configurations.size() == configurationCount);
+            historyCompilerAvailable = true;
+        }
         if (frame == 101) {
             assert(state->historyFrame == 100 && history);
             assert(pending->parameters.frame_id == 101);

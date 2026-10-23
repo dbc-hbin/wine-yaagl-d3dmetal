@@ -11,12 +11,9 @@
 
 #include <array>
 #include <atomic>
-#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
-#include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace yaagl::pso::d3dmetal {
