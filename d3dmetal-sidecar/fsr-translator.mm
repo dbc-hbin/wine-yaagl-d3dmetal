@@ -55,14 +55,14 @@ bool sameAdapter(const AdapterLuid& a, const AdapterLuid& b) noexcept {
     return a.low == b.low && a.high == b.high;
 }
 
-std::shared_ptr<void> deviceOwner(void* object, bool child) {
-    if (!object) return {};
+std::unique_ptr<void, decltype(&releaseCom)> deviceOwner(void* object, bool child) {
+    if (!object) return {nullptr, &releaseCom};
     using Query = std::int32_t (__attribute__((ms_abi)) *)(void*, const ComGuid*, void**);
     void* identity = nullptr;
     const auto table = *static_cast<void***>(object);
     const auto status = reinterpret_cast<Query>(table[child ? 7 : 0])(object, &kD3D12Device, &identity);
-    if (status < 0 || !identity) return {};
-    return std::shared_ptr<void>(identity, &releaseCom);
+    if (status < 0 || !identity) return {nullptr, &releaseCom};
+    return {identity, &releaseCom};
 }
 
 struct State {
@@ -178,7 +178,7 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
         !sameAdapter(commandAdapter, state->adapter)) {
         return kParameter;
     }
-    if (!state->executionDevice) state->executionDevice = commandDevice;
+    if (!state->executionDevice) state->executionDevice = std::move(commandDevice);
     const auto mode = metalfx::CommandMode::Metal4;
     const bool newGeneration = !state->backend ||
                                state->generationDevice != command.native.device ||

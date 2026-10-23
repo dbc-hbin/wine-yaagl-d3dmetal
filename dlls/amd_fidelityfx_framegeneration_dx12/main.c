@@ -522,10 +522,16 @@ static void store_native_config(struct fg_context *context,
 {
     struct FfxApiResource hudless;
 
-    memset(&hudless, 0, sizeof(hudless));
-    if (desc->frameGenerationEnabled)
-        retain_resource(&hudless, &desc->HUDLessColor);
-    release_resource(&context->hudless);
+    if (desc->frameGenerationEnabled &&
+        desc->HUDLessColor.resource == context->hudless.resource)
+        hudless = desc->HUDLessColor;
+    else
+    {
+        memset(&hudless, 0, sizeof(hudless));
+        if (desc->frameGenerationEnabled)
+            retain_resource(&hudless, &desc->HUDLessColor);
+        release_resource(&context->hudless);
+    }
     context->hudless = hudless;
     context->native_config = *desc;
     context->native_config.header.pNext = NULL;
@@ -1360,6 +1366,7 @@ static ffxReturnCode_t configure_frame_generation(
     struct callback_binding *binding = NULL, *old_binding;
     FfxFrameGenerationConfig config;
     ffxReturnCode_t result;
+    enum context_mode mode;
     BOOL newly_claimed = FALSE, binding_changed = FALSE;
     const uint32_t known_flags = FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES |
         FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_RESET_INDICATORS |
@@ -1389,12 +1396,14 @@ static ffxReturnCode_t configure_frame_generation(
             return FFX_API_RETURN_ERROR_PARAMETER;
     }
 
-    if (context_mode(context) == MODE_PENDING)
+    mode = context_mode(context);
+    if (mode == MODE_PENDING)
     {
         if (desc->header.pNext || (desc->flags & unsupported_generation_flags))
         {
             result = select_native(context);
             if (result != FFX_API_RETURN_OK) return result;
+            mode = context_mode(context);
         }
         else
         {
@@ -1408,16 +1417,16 @@ static ffxReturnCode_t configure_frame_generation(
         }
     }
 
-    if (context_mode(context) == CONTEXT_METALFX && desc->header.pNext)
+    if (mode == CONTEXT_METALFX && desc->header.pNext)
         return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
 
-    if (context_mode(context) == CONTEXT_METALFX &&
+    if (mode == CONTEXT_METALFX &&
         (desc->flags & unsupported_generation_flags))
         return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
 
     if (!notify)
     {
-        if (context_mode(context) == CONTEXT_NATIVE)
+        if (mode == CONTEXT_NATIVE)
         {
             result = configure_native_callbacks(context, desc);
             if (result == FFX_API_RETURN_OK) store_native_config(context, desc);
@@ -1469,7 +1478,7 @@ static ffxReturnCode_t configure_frame_generation(
         }
     }
 
-    if (context_mode(context) == CONTEXT_METALFX)
+    if (mode == CONTEXT_METALFX)
     {
         binding_changed = !binding_matches(context->binding, desc);
         if (binding_changed)
@@ -1511,7 +1520,7 @@ static ffxReturnCode_t configure_frame_generation(
         swapchain = context->swapchain;
     }
 
-    if (context_mode(context) == CONTEXT_NATIVE)
+    if (mode == CONTEXT_NATIVE)
     {
         result = configure_native_callbacks(context, desc);
         if (result == FFX_API_RETURN_OK)

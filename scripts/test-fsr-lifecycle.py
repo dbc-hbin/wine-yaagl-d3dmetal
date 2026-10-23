@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise production FSR loader publication/retry and FG destruction wakeups."""
+"""Exercise production FSR loader, COM ownership and FG configuration lifetimes."""
 
 import pathlib
 import subprocess
@@ -217,18 +217,286 @@ int main(void)
 '''
 
 
-def compile_and_run(code):
+COM = r'''
+#include <cassert>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <new>
+#include <utility>
+static unsigned allocations;
+void* operator new(std::size_t size)
+{
+    ++allocations;
+    if (void* value = std::malloc(size)) return value;
+    throw std::bad_alloc();
+}
+void operator delete(void* value) noexcept { std::free(value); }
+'''
+
+COM_MAIN = r'''
+struct Object {
+    void** table;
+    unsigned references = 1, queries = 0, gets = 0, releases = 0, luids = 0;
+    int query_result = 0;
+    bool null_result = false, bad_luid = false;
+};
+static Object device{};
+static std::int32_t __attribute__((ms_abi)) query(
+    void* value, const TestGuid* guid, void** output)
+{
+    auto& object = *static_cast<Object*>(value);
+    ++object.queries;
+    const TestGuid expected{0x189819f1, 0x1db6, 0x4b57,
+        {0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7}};
+    assert(!std::memcmp(guid, &expected, sizeof(expected)));
+    *output = nullptr;
+    if (object.query_result < 0 || object.null_result) return object.query_result;
+    ++device.references;
+    *output = &device;
+    return object.query_result;
+}
+static std::int32_t __attribute__((ms_abi)) get(
+    void* value, const TestGuid* guid, void** output)
+{
+    auto& object = *static_cast<Object*>(value);
+    ++object.gets;
+    return query(value, guid, output);
+}
+static std::uint32_t __attribute__((ms_abi)) release(void* value)
+{
+    auto& object = *static_cast<Object*>(value);
+    assert(object.references > 1);
+    ++object.releases;
+    return --object.references;
+}
+static TestLuid* __attribute__((ms_abi)) luid(void* value, TestLuid* output)
+{
+    auto& object = *static_cast<Object*>(value);
+    ++object.luids;
+    *output = {73, -12};
+    return object.bad_luid ? nullptr : output;
+}
+int main()
+{
+    void* table[44]{};
+    table[0] = reinterpret_cast<void*>(query);
+    table[2] = reinterpret_cast<void*>(release);
+    table[7] = reinterpret_cast<void*>(get);
+    table[43] = reinterpret_cast<void*>(luid);
+    device.table = table;
+    Object child{table};
+    const TestLuid expected{73, -12}, wrong{74, -12};
+    assert(!testOwner(nullptr, false));
+    releaseCom(nullptr);
+    TestLuid value{};
+    assert(!testLuid(nullptr, value));
+    unsigned before = allocations;
+    for (unsigned i = 0; i < 32; ++i)
+    {
+        auto temporary = testOwner(&child, true);
+        assert(temporary.get() == &device && device.references == 2);
+        assert(testLuid(temporary.get(), value));
+        assert(value.low == expected.low && value.high == expected.high);
+    }
+    assert(allocations == before);
+    assert(child.gets == 32 && child.queries == 32);
+    assert(device.releases == 32 && device.references == 1 && device.luids == 32);
+    assert(testMatches(&child, true, expected));
+    assert(!testMatches(&child, true, wrong));
+    device.bad_luid = true;
+    unsigned released = device.releases;
+    assert(!testMatches(&child, true, expected));
+    assert(device.references == 1 && device.releases == released + 1);
+    device.bad_luid = false;
+    for (bool is_child : {false, true})
+    {
+        Object& object = is_child ? child : device;
+        unsigned queries = object.queries, gets = object.gets;
+        released = device.releases;
+        object.query_result = -1;
+        assert(!testOwner(&object, is_child));
+        object.query_result = 0;
+        object.null_result = true;
+        assert(!testOwner(&object, is_child));
+        object.null_result = false;
+        assert(object.queries == queries + 2 && object.gets == gets + (is_child ? 2 : 0));
+        assert(device.references == 1 && device.releases == released);
+        std::shared_ptr<void> persistent;
+        {
+            auto temporary = testOwner(&object, is_child);
+            assert(device.references == 2);
+            persistent = std::move(temporary);
+            assert(!temporary && persistent.get() == &device);
+        }
+        assert(device.references == 2 && device.releases == released);
+        auto copy = persistent;
+        persistent.reset();
+        assert(device.references == 2 && device.releases == released);
+        copy.reset();
+        assert(device.references == 1 && device.releases == released + 1);
+    }
+}
+'''
+
+HUD = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <string.h>
+/* Only the Windows export annotation is irrelevant to this native fixture. */
+#define __declspec(value)
+#include "d3dmetal-sidecar/third-party/fidelityfx/Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h"
+#define TRUE 1
+typedef struct { unsigned references, adds, releases; } IUnknown;
+static IUnknown *replacement;
+static unsigned IUnknown_AddRef(IUnknown *object)
+{
+    ++object->adds;
+    return ++object->references;
+}
+static unsigned IUnknown_Release(IUnknown *object)
+{
+    assert(object->references > 1);
+    if (replacement) assert(replacement->references == 2);
+    ++object->releases;
+    return --object->references;
+}
+struct fg_context {
+    struct FfxApiResource hudless;
+    struct ffxConfigureDescFrameGeneration native_config;
+    int native_config_valid;
+};
+'''
+
+HUD_MAIN = r'''
+int main(void)
+{
+    IUnknown first = {1, 0, 0}, second = {1, 0, 0};
+    struct fg_context context = {0};
+    struct ffxConfigureDescFrameGeneration desc = {0};
+    ffxApiHeader extension = {0};
+    desc.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    desc.header.pNext = &extension;
+    desc.frameGenerationEnabled = true;
+    desc.HUDLessColor.resource = &first;
+    desc.HUDLessColor.description.width = 1920;
+    desc.frameID = 1;
+    store_native_config(&context, &desc);
+    assert(first.references == 2 && first.adds == 1 && !first.releases);
+    assert(context.native_config_valid && !context.native_config.header.pNext);
+    assert(desc.header.pNext == &extension);
+
+    desc.HUDLessColor.description.width = 2560;
+    desc.HUDLessColor.description.height = 1440;
+    desc.HUDLessColor.description.format = FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT;
+    desc.HUDLessColor.description.usage = 17;
+    desc.HUDLessColor.state = 23;
+    desc.frameID = 2;
+    desc.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+    desc.allowAsyncWorkloads = true;
+    desc.onlyPresentGenerated = true;
+    desc.generationRect.width = 2560;
+    desc.generationRect.height = 1440;
+    desc.presentCallbackUserContext = &first;
+    desc.frameGenerationCallbackUserContext = &second;
+    store_native_config(&context, &desc);
+    assert(first.references == 2 && first.adds == 1 && !first.releases);
+    assert(context.hudless.resource == &first && context.hudless.state == 23);
+    assert(!memcmp(&context.hudless.description, &desc.HUDLessColor.description,
+                   sizeof(context.hudless.description)));
+    assert(context.native_config.HUDLessColor.state == 23);
+    assert(context.native_config.HUDLessColor.description.width == 2560);
+    assert(context.native_config.frameID == 2 && context.native_config.flags == desc.flags);
+    assert(context.native_config.allowAsyncWorkloads && context.native_config.onlyPresentGenerated);
+    assert(context.native_config.generationRect.width == 2560);
+    assert(context.native_config.generationRect.height == 1440);
+    assert(context.native_config.presentCallbackUserContext == &first);
+    assert(context.native_config.frameGenerationCallbackUserContext == &second);
+    assert(!context.native_config.header.pNext && desc.header.pNext == &extension);
+
+    replacement = &second;
+    desc.HUDLessColor.resource = &second;
+    store_native_config(&context, &desc);
+    replacement = NULL;
+    assert(first.references == 1 && first.releases == 1);
+    assert(second.references == 2 && second.adds == 1 && !second.releases);
+    assert(context.hudless.resource == &second);
+    /* Replay may alias the saved configuration itself. */
+    store_native_config(&context, &context.native_config);
+    assert(second.references == 2 && second.adds == 1 && !second.releases);
+
+    desc.frameGenerationEnabled = false;
+    desc.frameID = 3;
+    store_native_config(&context, &desc);
+    assert(second.references == 1 && second.releases == 1);
+    assert(!context.hudless.resource && !context.hudless.description.width && !context.hudless.state);
+    assert(!context.native_config.HUDLessColor.resource);
+    assert(!context.native_config.frameGenerationEnabled && context.native_config.frameID == 3);
+    store_native_config(&context, &desc);
+    assert(second.adds == 1 && second.releases == 1);
+    desc.frameGenerationEnabled = true;
+    store_native_config(&context, &desc);
+    assert(second.references == 2 && second.adds == 2);
+    desc.HUDLessColor.resource = NULL;
+    store_native_config(&context, &desc);
+    assert(second.references == 1 && second.releases == 2);
+    assert(!context.hudless.resource && !context.native_config.HUDLessColor.resource);
+}
+'''
+
+
+def compile_and_run(code, cxx=False):
     with tempfile.TemporaryDirectory(prefix="yaagl-fsr-lifecycle-") as directory:
-        source = pathlib.Path(directory) / "lifecycle.c"
+        source = pathlib.Path(directory) / ("lifecycle.cpp" if cxx else "lifecycle.c")
         binary = pathlib.Path(directory) / "lifecycle"
         source.write_text(code)
-        subprocess.run(("clang", "-std=c11", "-D_DARWIN_C_SOURCE", "-Wall", "-Wextra",
+        compiler = ("clang++", "-std=c++20", "-arch", "x86_64") if cxx else ("clang", "-std=c11")
+        subprocess.run((*compiler, "-D_DARWIN_C_SOURCE", "-Wall", "-Wextra",
                         "-Werror", "-pthread", "-I", str(ROOT / "include"),
+                        "-iquote", str(ROOT),
                         str(source), "-o", str(binary)), check=True, timeout=60)
         subprocess.run((str(binary),), check=True, timeout=30)
 
 
 class FsrLifecycleTest(unittest.TestCase):
+    def test_scoped_com_ownership(self):
+        for fg in (False, True):
+            with self.subTest(framegeneration=fg):
+                name = "fsr-framegeneration.mm" if fg else "fsr-translator.mm"
+                source = (ROOT / "d3dmetal-sidecar" / name).read_text()
+                if fg:
+                    body = section(source, "struct Guid {", "struct Command {")
+                    aliases = '''
+using TestGuid = Guid;
+using TestLuid = Luid;
+#define testOwner owner
+#define testLuid getLuid
+#define testMatches matches
+'''
+                else:
+                    body = section(source, "struct ComGuid {", "struct State {")
+                    aliases = '''
+using TestGuid = ComGuid;
+using TestLuid = AdapterLuid;
+#define testOwner deviceOwner
+#define testLuid adapterLuid
+static bool testMatches(void* object, bool child, const TestLuid& expected)
+{
+    auto device = deviceOwner(object, child);
+    TestLuid value{};
+    return device && adapterLuid(device.get(), value) && sameAdapter(value, expected);
+}
+'''
+                compile_and_run(COM + body + aliases + COM_MAIN, cxx=True)
+
+    def test_hud_configuration_retention(self):
+        source = (ROOT / "dlls/amd_fidelityfx_framegeneration_dx12/main.c").read_text()
+        resources = section(source, "static void release_resource(", "static void release_frame_config(")
+        store = section(source, "static void store_native_config(", "static struct fg_context *acquire_context(")
+        compile_and_run(HUD + resources + store + HUD_MAIN)
+
     def test_loader_publication(self):
         for fg in (False, True):
             with self.subTest(framegeneration=fg):

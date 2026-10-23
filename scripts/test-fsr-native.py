@@ -343,6 +343,90 @@ static void motionRegression(id<MTLDevice> device, id<MTL4Compiler> compiler,
     [motion release]; [depth release]; [color release];
 }
 
+static void tableOwnershipRegression(id<MTLDevice> device, id<MTL4Compiler> compiler) {
+    auto feature=makeFeature(device,compiler,true);
+    auto color=sharedTexture(device,MTLPixelFormatRGBA8Unorm,64,64);
+    auto depth=sharedTexture(device,MTLPixelFormatR32Float,64,64);
+    auto motion=sharedTexture(device,MTLPixelFormatRG16Float,64,64);
+    auto exposure=sharedTexture(device,MTLPixelFormatR32Float,1,1);
+    auto nextExposure=sharedTexture(device,MTLPixelFormatR32Float,1,1);
+    auto output=texture(device,MTLPixelFormatRGBA8Unorm,128,128,
+        MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite);
+    std::vector<unsigned char> colors(64*64*4,64);
+    std::vector<float> depths(64*64,.5f);
+    std::vector<_Float16> motions(64*64*2,0);
+    float firstValue=1, nextValue=.5f;
+    [color replaceRegion:MTLRegionMake2D(0,0,64,64) mipmapLevel:0 withBytes:colors.data() bytesPerRow:64*4];
+    [depth replaceRegion:MTLRegionMake2D(0,0,64,64) mipmapLevel:0 withBytes:depths.data() bytesPerRow:64*4];
+    [motion replaceRegion:MTLRegionMake2D(0,0,64,64) mipmapLevel:0 withBytes:motions.data() bytesPerRow:64*4];
+    [exposure replaceRegion:MTLRegionMake2D(0,0,1,1) mipmapLevel:0 withBytes:&firstValue bytesPerRow:4];
+    [nextExposure replaceRegion:MTLRegionMake2D(0,0,1,1) mipmapLevel:0 withBytes:&nextValue bytesPerRow:4];
+    FrameInfo frame{};
+    frame.color=color; frame.depth=depth; frame.motionVectors=motion; frame.output=output;
+    frame.exposureMode=ExposureMode::Texture; frame.exposureTexture=exposure;
+    frame.inputContent={64,64}; frame.colorRect={0,0,64,64};
+    frame.depthRect=frame.motionRect=frame.colorRect; frame.outputRect={0,0,128,128};
+    frame.resetHistory=true;
+    FrameOperations operations{};
+    operations.colorTransfer=ColorTransfer::SRGB;
+    const auto prepareFrame = [&](const std::shared_ptr<Feature>& owner) {
+        Error error;
+        auto prepared=owner->prepare(frame,
+            {color,depth,motion,output,frame.exposureTexture,nullptr,nullptr},&error,operations);
+        if (!prepared) std::fprintf(stderr,"table prepare: %s\n",error.message.c_str());
+        assert(prepared);
+        return prepared;
+    };
+    auto prepared=prepareFrame(feature);
+    auto a=execute(device,prepared);
+    id firstFsr=[a->impl_->fsrArgumentTable retain];
+    id firstExposure=[a->impl_->argumentTable retain];
+    assert(firstFsr && firstExposure);
+    // GPU completion does not retire a lease retained by its caller.
+    auto b=execute(device,prepared);
+    assert(b->impl_->fsrArgumentTable != firstFsr);
+    assert(b->impl_->argumentTable != firstExposure);
+    auto initial=pixels<unsigned char>(device,output,4);
+    assert(std::abs(int(initial[(64*128+64)*4])-64)<=1);
+    a.reset();
+    auto c=execute(device,prepared);
+    assert(c->impl_->fsrArgumentTable == firstFsr);
+    assert(c->impl_->argumentTable == firstExposure);
+    b.reset(); c.reset(); prepared.reset();
+
+    const auto idleFsr=feature->impl_->idleFsrArgumentTables;
+    const auto idleExposure=feature->impl_->idleArgumentTables;
+    frame.exposureTexture=nextExposure;
+    prepared=prepareFrame(feature);
+    auto next=execute(device,prepared);
+    assert(std::find(idleFsr.begin(),idleFsr.end(),next->impl_->fsrArgumentTable)!=idleFsr.end());
+    assert(std::find(idleExposure.begin(),idleExposure.end(),next->impl_->argumentTable)!=idleExposure.end());
+    auto converted=pixels<_Float16>(device,next->impl_->convertedExposure,1);
+    assert(float(converted[0])==nextValue);
+    auto reusedOutput=pixels<unsigned char>(device,output,4);
+    auto reference=makeFeature(device,compiler,true);
+    auto referenceFrame=prepareFrame(reference);
+    auto referenceLease=execute(device,referenceFrame);
+    auto freshOutput=pixels<unsigned char>(device,output,4);
+    for (std::size_t i=0;i<freshOutput.size();++i)
+        assert(std::abs(int(freshOutput[i])-int(reusedOutput[i]))<=1);
+
+    feature->markDormant();
+    auto afterDormant=execute(device,prepared);
+    assert(afterDormant->impl_->fsrArgumentTable != next->impl_->fsrArgumentTable);
+    assert(afterDormant->impl_->argumentTable != next->impl_->argumentTable);
+    next.reset(); afterDormant.reset(); prepared.reset();
+    for (id table : feature->impl_->idleFsrArgumentTables) assert(!table);
+    for (id table : feature->impl_->idleArgumentTables) assert(!table);
+    for (const auto& bundle : feature->impl_->idleBundles)
+        assert(!bundle.resources.fsrArgumentTable && !bundle.resources.argumentTable);
+    [firstFsr release]; [firstExposure release];
+    referenceLease.reset(); referenceFrame.reset(); reference.reset(); feature.reset();
+    [output release]; [nextExposure release]; [exposure release];
+    [motion release]; [depth release]; [color release];
+    puts("SR_TABLE_OWNERSHIP_PASS: retained leases isolated; retired tables reused; exposure rebound; dormant pools empty");
+}
+
 int main() {
     @autoreleasepool {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -359,6 +443,7 @@ int main() {
         motionRegression(device,compiler,false,true,true,true);
         motionRegression(device,compiler,true,true,true,false);
         motionRegression(device,compiler,false,false,true,false);
+        tableOwnershipRegression(device,compiler);
 
         CreateContext context{device, compiler, CommandMode::Metal4};
         CreateInfo creation{};

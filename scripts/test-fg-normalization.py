@@ -1040,7 +1040,7 @@ extern "C" void objc_destroyWeak(id*);
 using namespace yaagl::pso::fsr::framegeneration;
 
 int main() {
-    std::array<id, 3> weak{}; // Unused factory, recorded factory, retired history.
+    std::array<id, 4> weak{}; // Unused factory, recorded factory, retired history, shared pipeline.
     std::shared_ptr<const PreparedFrame> recorded;
     bool uncounted = false;
     releaseHudRow(uncounted);
@@ -1096,6 +1096,7 @@ int main() {
             FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, true);
         assert(distortionConfiguration);
         objc_initWeak(&weak[1], distortionConfiguration->factory.get());
+        objc_initWeak(&weak[3], distortionConfiguration->decodePipeline.get());
         snapshot->configuration = distortionConfiguration;
         state->historyConfiguration = state->configurations.front();
         state->history = privateTexture(device, MTLPixelFormatRGBA16Float, 128, 128, MTLTextureUsageShaderRead);
@@ -1142,6 +1143,8 @@ int main() {
     @autoreleasepool {
         id required = objc_loadWeakRetained(&weak[1]);
         assert(required && "recorded snapshot lost its required configuration");
+        id requiredPipeline = objc_loadWeakRetained(&weak[3]);
+        assert(requiredPipeline && "recorded snapshot lost its shared pipeline");
         auto queue = [device newMTL4CommandQueue];
         auto allocator = [device newCommandAllocator];
         auto buffer = [device newCommandBuffer];
@@ -1162,7 +1165,8 @@ int main() {
         assert(dispatch_semaphore_wait(completed, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
         [options release]; dispatch_release(completed);
         lease.reset(); recorded.reset();
-        [buffer release]; [fence release]; [allocator release]; [queue release]; [required release];
+        [buffer release]; [fence release]; [allocator release]; [queue release];
+        [required release]; [requiredPipeline release];
         [device release];
     }
     for (auto& reference : weak) {
@@ -1366,10 +1370,12 @@ struct JitterRunner {
             if ([object.get() conformsToProtocol:@protocol(MTLBuffer)]) {
                 auto candidate = (id<MTLBuffer>)object.get();
                 if (candidate.storageMode != MTLStorageModeShared ||
-                    candidate.length != sizeof(FgParams)) continue;
+                    candidate.length % sizeof(FgParams)) continue;
                 auto values = static_cast<const FgParams*>(candidate.contents);
-                if (values->motionScale[0] != 0 && values->motionScale[1] != 0) {
-                    parameters = values; ++parameterCount;
+                for (NSUInteger i = 0; i < candidate.length / sizeof(FgParams); ++i) {
+                    if (values[i].motionScale[0] != 0 && values[i].motionScale[1] != 0) {
+                        parameters = &values[i]; ++parameterCount;
+                    }
                 }
             }
             if ([object.get() conformsToProtocol:@protocol(MTLTexture)]) {
@@ -1669,6 +1675,49 @@ struct JitterRunner {
                     assert(impl.snapshot->configuration);
                 }
                 encode(prepared, test, frame >= 3 ? &expected : nullptr);
+            }
+            releaseHudRow(state->hudCounted);
+        }
+    }
+
+    void srgbView() {
+        @autoreleasepool {
+            auto state = std::make_shared<State>();
+            state->creation.display_width = state->creation.display_height = 128;
+            const std::array<std::uint8_t, 4> color{64, 128, 192, 255};
+            for (std::uint64_t frame = 1; frame <= 3; ++frame) {
+                JitterFrame test{
+                    .name = "same sRGB scene/present view", .frame = frame,
+                    .renderWidth = 128, .renderHeight = 128,
+                    .jitterX = 0, .jitterY = 0,
+                    .cancellationX = 0, .cancellationY = 0, .pixelsX = 0, .pixelsY = 0,
+                    .previousValid = frame != 1
+                };
+                auto prepared = prepare(state, test);
+                auto& impl = *prepared->impl_;
+                impl.first = uniformTexture(device, MTLPixelFormatRGBA8Unorm_sRGB,
+                    128, 128, color, MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView);
+                impl.second = uniformTexture(device, MTLPixelFormatRGBA8Unorm_sRGB,
+                    128, 128, std::array<std::uint8_t, 4>{0, 0, 0, 0},
+                    MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView);
+                impl.snapshot->motion = uniformTexture(device, MTLPixelFormatRG16Float,
+                    128, 128, std::array<__fp16, 2>{0, 0});
+                Command command;
+                command.value.kind = transport::CommandListKind::mpl;
+                command.value.device = device; command.value.compiler = compiler;
+                impl.snapshot->configuration = configure(*state, command,
+                    impl.snapshot->parameters, (id<MTLTexture>)impl.snapshot->depth.get(),
+                    MTLPixelFormatRGBA8Unorm_sRGB, MTLPixelFormatInvalid,
+                    128, 128, FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
+                assert(impl.snapshot->configuration);
+                encode(prepared, test);
+                std::vector<std::array<std::uint8_t, 4>> pixels(128 * 128);
+                [(id<MTLTexture>)impl.second.get() getBytes:pixels.data()
+                    bytesPerRow:128 * sizeof(color) fromRegion:MTLRegionMake2D(0, 0, 128, 128)
+                    mipmapLevel:0];
+                for (const auto& pixel : pixels)
+                    for (unsigned channel = 0; channel < color.size(); ++channel)
+                        assert(std::abs(int(pixel[channel]) - int(color[channel])) <= 1);
             }
             releaseHudRow(state->hudCounted);
         }
@@ -2042,6 +2091,7 @@ int main() {
         runner.uiComposition(false);
         runner.uiComposition(true);
         runner.uiComposition(false, true);
+        runner.srgbView();
         runner.alphaMask();
         runner.outputOrigin();
         runner.cacheHistory();

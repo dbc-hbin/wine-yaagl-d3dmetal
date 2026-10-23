@@ -100,7 +100,11 @@ python3 scripts/stage-runtime.py --verify-runtime build/staged/wine --current-so
 
 변경한 native transport, 패처, 준비 도구, staging, 런처의 관련 테스트를 실행합니다. 빌드나 CPU fixture 통과는 게임 화질이나 FSR 프레임 생성 동작의 증명이 아닙니다. 실제 런타임 시나리오 결과는 정적 검사·단위 테스트와 구분해 기록합니다.
 
-FSR 1차 오버헤드 최적화는 셰이더 소스, GPU 패스, 리소스 바인딩, fence와 history/reset 결정을 보존합니다. SR은 feature 안에서 내장 셰이더 library를 공유하고, FG는 configuration의 기존 pipeline 묶음마다 library를 한 번 생성합니다. Unix API 주소는 성공한 경우 acquire/release 방식으로 게시하여 이후 호출의 로더 mutex를 생략하며, 조회 실패는 다시 시도할 수 있습니다. FG는 closing context의 마지막 참조가 반환될 때만 파괴 대기자를 깨우고, 실제 실행 리소스·패스 수로 객체 보관 공간을 GPU 인코딩 전에 예약합니다. `python3 scripts/test-fsr-lifecycle.py`는 동시 초기화, 실패 후 재시도, 초기화 완료 후 빠른 경로와 파괴 대기자 알림을 검사합니다. 이 변경만으로 게임 성능 향상이 실측됐다는 뜻은 아닙니다.
+FSR 오버헤드 최적화는 셰이더 소스, GPU 패스, 입력 리소스, fence와 history/reset 결정을 보존합니다. SR은 feature 안에서 내장 셰이더 library를 공유하고, FG는 같은 context·device의 configuration 사이에서 library와 불변 compute pipeline을 공유하되 interpolator와 history identity는 분리합니다. Unix API 주소는 성공한 경우 acquire/release 방식으로 게시하여 이후 호출의 로더 mutex를 생략하며, 조회 실패는 다시 시도할 수 있습니다. FG는 closing context의 마지막 참조가 반환될 때만 파괴 대기자를 깨우고, 실제 실행 리소스·패스 수로 객체 보관 공간을 GPU 인코딩 전에 예약합니다.
+
+임시 COM 장치 참조는 shared control block 없이 scoped 소유권으로 관리하며 장기 보관 참조는 유지합니다. SR은 검증한 출력 layout을 재사용합니다. FG는 configure 잠금 안에서 mode 조회를 재사용하되 native 선택 뒤에 갱신하고, 동일 HUD-less 참조는 유지하면서 metadata를 갱신합니다. 같은 scene/present texture는 한 실행 안에서 raw view를 공유합니다. FG 상수는 실행별 불변 buffer 하나로 묶으며 GPU가 쓰는 disable hint의 복사 offset도 함께 반영합니다. SR argument table은 execution lease와 함께 보관하고 lease 반환 뒤에만 재사용합니다. 크기가 제한된 idle pool로 다른 프레임에서도 재사용하되 선택적 binding을 지우고 dormant feature에는 반환하지 않습니다. 사용 중인 lease끼리는 가변 table이나 상수 저장 공간을 공유하지 않습니다.
+
+`python3 scripts/test-fsr-lifecycle.py`는 동시 초기화, 실패 후 재시도, 초기화 완료 후 빠른 경로, 파괴 대기자 알림, 임시·장기 COM 소유권과 HUD-less 교체·비활성화를 검사합니다. Native SR 회귀 검사는 유지 중인 lease의 격리, 반환된 table의 재사용, 노출 texture 재바인딩과 dormant 정리를 확인합니다. FG 회귀 검사는 동일 texture의 sRGB 출력과 context 파괴 이후 공유 pipeline의 수명을 확인합니다. 이 검사만으로 게임 성능 향상이나 게임 전체 화면의 동일성이 입증되는 것은 아닙니다.
 
 FG는 Prepare/Dispatch 호출마다 configuration 조회·생성 전에 Metal4 지원 여부를 한 번 검사하고, configuration은 같은 검증된 command를 사용하여 중복 조회를 생략합니다. 이 검사는 configuration 캐시 밖에 있어 캐시 적중 시에도 유지됩니다. Producer→native 회귀 검사는 캐시 생성 전후에 compiler가 없으면 대기 프레임을 소비하거나 history를 바꾸지 않고 거부하는지, 이후 정상 재시도가 성공하는지 확인합니다.
 

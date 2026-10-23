@@ -393,10 +393,14 @@ struct ExecutionResources {
     id<MTLBuffer> finishParams = nil;
     id<MTLBuffer> debugParams = nil;
     id<MTLBuffer> motionResampleParams = nil;
+    id argumentTable = nil;
+    id fsrArgumentTable = nil;
     id residency = nil;
 
     void release() noexcept {
         releaseObject(residency);
+        releaseObject(fsrArgumentTable);
+        releaseObject(argumentTable);
         releaseObject(debugParams);
         releaseObject(motionResampleParams);
         releaseObject(finishParams);
@@ -426,6 +430,8 @@ struct ExecutionResources {
         std::swap(finishParams, other.finishParams);
         std::swap(debugParams, other.debugParams);
         std::swap(motionResampleParams, other.motionResampleParams);
+        std::swap(argumentTable, other.argumentTable);
+        std::swap(fsrArgumentTable, other.fsrArgumentTable);
         std::swap(residency, other.residency);
     }
 };
@@ -471,7 +477,31 @@ struct Feature::Impl {
     std::mutex bundleMutex;
     std::array<CachedBundle, 2> idleBundles{};
     std::array<id, 2> idleResidencies{};
+    decltype(idleResidencies) idleArgumentTables{};
+    decltype(idleResidencies) idleFsrArgumentTables{};
     std::size_t nextBundleSlot = 0;
+
+    id takeArgumentTable(bool fsr) noexcept {
+        std::lock_guard<std::mutex> lock(bundleMutex);
+        for (auto& slot : fsr ? idleFsrArgumentTables : idleArgumentTables)
+            if (slot) return std::exchange(slot, nil);
+        return nil;
+    }
+
+    void putArgumentTable(id& table, bool fsr) noexcept {
+        if (!table) return;
+        {
+            std::lock_guard<std::mutex> lock(bundleMutex);
+            if (!dormant.load(std::memory_order_relaxed)) {
+                for (auto& slot : fsr ? idleFsrArgumentTables : idleArgumentTables) {
+                    if (slot) continue;
+                    slot = std::exchange(table, nil);
+                    return;
+                }
+            }
+        }
+        releaseObject(table);
+    }
 
     id<MTLTexture> takeTexture(MTLPixelFormat format, NSUInteger width, NSUInteger height,
                                MTLTextureUsage usage) noexcept {
@@ -554,6 +584,8 @@ struct Feature::Impl {
             }
         }
         releaseObject(resources.residency);
+        putArgumentTable(resources.argumentTable, false);
+        putArgumentTable(resources.fsrArgumentTable, true);
         putBuffer(resources.finishParams);
         putBuffer(resources.debugParams);
         putBuffer(resources.motionResampleParams);
@@ -652,6 +684,7 @@ struct Feature::Impl {
         dormant.store(true);
         std::array<ExecutionResources, 2> bundles;
         std::array<id, 2> residencies{};
+        decltype(idleArgumentTables) argumentTables{}, fsrArgumentTables{};
         {
             std::lock_guard<std::mutex> lock(bundleMutex);
             for (std::size_t i = 0; i != idleBundles.size(); ++i) {
@@ -659,9 +692,13 @@ struct Feature::Impl {
                 idleBundles[i].owner = nullptr;
             }
             residencies.swap(idleResidencies);
+            argumentTables.swap(idleArgumentTables);
+            fsrArgumentTables.swap(idleFsrArgumentTables);
         }
         for (auto& resources : bundles) resources.release();
         for (auto& set : residencies) releaseObject(set);
+        for (auto& table : argumentTables) releaseObject(table);
+        for (auto& table : fsrArgumentTables) releaseObject(table);
         std::lock_guard<std::mutex> lock(scratchMutex);
         for (auto& texture : idleTextures) releaseObject(texture);
         for (auto& buffer : idleBuffers) releaseObject(buffer);
@@ -672,6 +709,8 @@ struct Feature::Impl {
     ~Impl() {
         for (auto& entry : idleBundles) returnResources(entry.resources);
         for (auto& set : idleResidencies) releaseObject(set);
+        for (auto& table : idleArgumentTables) releaseObject(table);
+        for (auto& table : idleFsrArgumentTables) releaseObject(table);
         for (auto& texture : idleTextures) releaseObject(texture);
         for (auto& buffer : idleBuffers) releaseObject(buffer);
         for (auto& generation : generations) generation.reset();
@@ -693,14 +732,10 @@ struct ExecutionLease::Impl : ExecutionResources {
     std::weak_ptr<Feature::Impl> feature;
     std::weak_ptr<PreparedFrame::Impl> prepared;
     std::shared_ptr<ScalerGeneration> generation;
-    id argumentTable = nil;
-    id fsrArgumentTable = nil;
     id<MTLFence> fence = nil;
     bool replayEligible = false;
     ~Impl() {
         releaseObject(fence);
-        releaseObject(fsrArgumentTable);
-        releaseObject(argumentTable);
         // The transport retains this lease through GPU completion. Only a live
         // frame may reuse its committed set and owned scratch allocations.
         if (auto owner = feature.lock()) {
@@ -872,7 +907,7 @@ TemporalOutputLayout temporalOutputLayout(const Feature::Impl& feature,
 
 bool validateFrameTextures(const Feature::Impl& feature, const FrameInfo& frame,
                            const TextureSet& set, const FrameOperations& operations,
-                           Error* error) noexcept {
+                           TemporalOutputLayout& temporal, Error* error) noexcept {
     id<MTLTexture> color = asTexture(set.color);
     id<MTLTexture> depth = asTexture(set.depth);
     id<MTLTexture> motion = asTexture(set.motion);
@@ -963,7 +998,7 @@ bool validateFrameTextures(const Feature::Impl& feature, const FrameInfo& frame,
                  "MetalFX output subrect offset requires create-time output-subrect opt-in");
         return false;
     }
-    const TemporalOutputLayout temporal = temporalOutputLayout(feature, frame, operations);
+    temporal = temporalOutputLayout(feature, frame, operations);
     const float scaleX = static_cast<float>(temporal.width) /
                           static_cast<float>(frame.inputContent.width);
     const float scaleY = static_cast<float>(temporal.height) /
@@ -1042,8 +1077,7 @@ bool validateFrameTextures(const Feature::Impl& feature, const FrameInfo& frame,
                  "FSR transfer conversion requires shader-readable color and shader-writable output");
         return false;
     }
-    const TemporalOutputLayout outputLayout = temporalOutputLayout(feature, frame, operations);
-    if (outputLayout.capped && !feature.create.lowResolutionMotionVectors() &&
+    if (temporal.capped && !feature.create.lowResolutionMotionVectors() &&
         !hasUsage(motion, MTLTextureUsageShaderRead)) {
         setError(error, ErrorCode::IncompatibleTexture,
                  "capped display motion resampling requires shader-readable motion");
@@ -1057,7 +1091,7 @@ bool validateFrameTextures(const Feature::Impl& feature, const FrameInfo& frame,
                  "FSR debug visualization inputs must be shader-readable");
         return false;
     }
-    if ((operations.sharpening || outputLayout.capped || operations.drawDebugView) &&
+    if ((operations.sharpening || temporal.capped || operations.drawDebugView) &&
         !hasUsage(output, MTLTextureUsageShaderWrite)) {
         setError(error, ErrorCode::IncompatibleTexture,
                  "FSR output finishing requires a shader-writable output texture");
@@ -1161,14 +1195,13 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
                                                const FrameInfo& frame,
                                                const TextureSet& set,
                                                const FrameOperations& operations,
+                                               const TemporalOutputLayout& temporal,
                                                Error* error) noexcept {
     id<MTLTexture> color = asTexture(set.color);
     id<MTLTexture> depth = asTexture(set.depth);
     id<MTLTexture> motion = asTexture(set.motion);
     id<MTLTexture> output = asTexture(set.output);
     id<MTLTexture> reactive = asTexture(set.reactive);
-    const TemporalOutputLayout temporal = temporalOutputLayout(feature, frame, operations);
-
     if (feature.currentGeneration &&
         generationMatches(*feature.currentGeneration, frame, color, depth, motion, output, reactive,
                           operations, temporal))
@@ -1530,14 +1563,18 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
             if (@available(macOS 26.0, *)) {
                 MTL4ArgumentTableDescriptor* descriptor = nil;
                 @try {
-                    descriptor = [MTL4ArgumentTableDescriptor new];
-                    descriptor.maxBufferBindCount = 1;
-                    descriptor.maxTextureBindCount = 4;
-                    descriptor.initializeBindings = YES;
-                    descriptor.label = @"YAAGL FSR translation";
-                    NSError* tableError = nil;
-                    lease->fsrArgumentTable =
-                        [feature.device newArgumentTableWithDescriptor:descriptor error:&tableError];
+                    if (!lease->fsrArgumentTable)
+                        lease->fsrArgumentTable = feature.takeArgumentTable(true);
+                    if (!lease->fsrArgumentTable) {
+                        descriptor = [MTL4ArgumentTableDescriptor new];
+                        descriptor.maxBufferBindCount = 1;
+                        descriptor.maxTextureBindCount = 4;
+                        descriptor.initializeBindings = YES;
+                        descriptor.label = @"YAAGL FSR translation";
+                        NSError* tableError = nil;
+                        lease->fsrArgumentTable =
+                            [feature.device newArgumentTableWithDescriptor:descriptor error:&tableError];
+                    }
                     if (!lease->fsrArgumentTable) {
                         setError(error, ErrorCode::ResourceCreationFailed,
                                  "failed to create Metal4 FSR argument table");
@@ -1557,13 +1594,17 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
             if (@available(macOS 26.0, *)) {
                 MTL4ArgumentTableDescriptor* descriptor = nil;
                 @try {
-                    descriptor = [MTL4ArgumentTableDescriptor new];
-                    descriptor.maxTextureBindCount = 2;
-                    descriptor.initializeBindings = YES;
-                    descriptor.label = @"YAAGL MetalFX exposure conversion";
-                    NSError* tableError = nil;
-                    lease->argumentTable =
-                        [feature.device newArgumentTableWithDescriptor:descriptor error:&tableError];
+                    if (!lease->argumentTable)
+                        lease->argumentTable = feature.takeArgumentTable(false);
+                    if (!lease->argumentTable) {
+                        descriptor = [MTL4ArgumentTableDescriptor new];
+                        descriptor.maxTextureBindCount = 2;
+                        descriptor.initializeBindings = YES;
+                        descriptor.label = @"YAAGL MetalFX exposure conversion";
+                        NSError* tableError = nil;
+                        lease->argumentTable =
+                            [feature.device newArgumentTableWithDescriptor:descriptor error:&tableError];
+                    }
                     if (!lease->argumentTable) {
                         setError(error, ErrorCode::ResourceCreationFailed,
                                  "failed to create Metal4 exposure argument table");
@@ -1647,8 +1688,8 @@ bool encodeFsrPassMetal4(ExecutionLease::Impl& lease,
         [table setAddress:params.gpuAddress atIndex:0];
         [table setTexture:first.gpuResourceID atIndex:0];
         [table setTexture:second.gpuResourceID atIndex:1];
-        if (third) [table setTexture:third.gpuResourceID atIndex:2];
-        if (fourth) [table setTexture:fourth.gpuResourceID atIndex:3];
+        [table setTexture:(third ? third.gpuResourceID : MTLResourceID{}) atIndex:2];
+        [table setTexture:(fourth ? fourth.gpuResourceID : MTLResourceID{}) atIndex:3];
         [encoder waitForFence:fence beforeEncoderStages:MTLStageDispatch];
         [encoder setComputePipelineState:pipeline];
         [encoder setArgumentTable:table];
@@ -2134,14 +2175,14 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(
     const FrameInfo& info, const TextureSet& textures, Error* error,
     const FrameOperations& operations) noexcept {
     clearError(error);
+    TemporalOutputLayout temporal{};
     if (!impl_ || !validateFrameScalars(info, error) ||
-        !validateFrameTextures(*impl_, info, textures, operations, error)) {
+        !validateFrameTextures(*impl_, info, textures, operations, temporal, error)) {
         return {};
     }
 
     try {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        const TemporalOutputLayout temporal = temporalOutputLayout(*impl_, info, operations);
         const bool resampleDisplayMotion = temporal.capped &&
                                             !impl_->create.lowResolutionMotionVectors();
         const bool needsFsrPipelines = operations.colorTransfer != ColorTransfer::Linear ||
@@ -2151,7 +2192,7 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(
             !ensureFsrPipelines(*impl_, error, operations.drawDebugView,
                                 resampleDisplayMotion)) return {};
         std::shared_ptr<ScalerGeneration> generation =
-            ensureScaler(*impl_, info, textures, operations, error);
+            ensureScaler(*impl_, info, textures, operations, temporal, error);
         if (!generation) return {};
 
         id<MTLTexture> color = asTexture(textures.color);
