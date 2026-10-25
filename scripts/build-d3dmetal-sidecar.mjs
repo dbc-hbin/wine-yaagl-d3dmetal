@@ -15,6 +15,8 @@ if (!output || process.argv.length !== 3 || output === "--test-controls") {
 const outputDirectory = resolve(output);
 const sourceDirectory = resolve(root, "d3dmetal-sidecar");
 const sourcePaths = [
+  "d3dmetal-sidecar/async-pipeline.hpp", "d3dmetal-sidecar/async-pipeline-state.hpp",
+  "d3dmetal-sidecar/async-pipeline.mm",
   "d3dmetal-sidecar/metalfx-contract.hpp",
   "d3dmetal-sidecar/metalfx-backend.hpp", "d3dmetal-sidecar/metalfx-backend.mm",
   "d3dmetal-sidecar/d3dmetal-transport.hpp", "d3dmetal-sidecar/d3dmetal-transport.mm",
@@ -41,7 +43,7 @@ const sources = sourcePaths.map((path) => ({
 }));
 const layout = JSON.parse(readFileSync(resolve(sourceDirectory, "layout.json"), "utf8"));
 const hookNames = layout.hooks.map(hook => hook.id);
-if (layout.formatVersion !== 27 || new Set(hookNames).size !== hookNames.length ||
+if (layout.formatVersion !== 31 || new Set(hookNames).size !== hookNames.length ||
     layout.hooks.some((hook, index) => !/^[A-Za-z][A-Za-z0-9]*$/.test(hook.id) ||
         hook.dispatchFieldOffset !== index * layout.dispatch.pointerSize)) {
   throw new Error("unsupported beta3 sidecar dispatch layout");

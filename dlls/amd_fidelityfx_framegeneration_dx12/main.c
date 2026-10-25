@@ -113,12 +113,14 @@ struct native_api
     ffxReturnCode_t (*configure)(ffxContext *, const ffxConfigureDescHeader *);
     ffxReturnCode_t (*query)(ffxContext *, ffxQueryDescHeader *);
     ffxReturnCode_t (*dispatch)(ffxContext *, const ffxDispatchDescHeader *);
+    FfxApiPresentCallbackFunc default_present;
 };
 
 static HINSTANCE builtin_instance;
 static INIT_ONCE native_once = INIT_ONCE_STATIC_INIT;
 static struct native_api native;
 static DWORD callback_tls = TLS_OUT_OF_INDEXES;
+static LONG64 next_present_source;
 
 enum context_mode
 {
@@ -138,6 +140,7 @@ struct callback_binding
     void *present_user;
     FfxApiFrameGenerationDispatchFunc generate;
     void *generate_user;
+    BOOL only_generated;
 };
 
 struct callback_scope
@@ -153,7 +156,8 @@ static BOOL binding_matches(
     return binding && binding->present == desc->presentCallback &&
         binding->present_user == desc->presentCallbackUserContext &&
         binding->generate == desc->frameGenerationCallback &&
-        binding->generate_user == desc->frameGenerationCallbackUserContext;
+        binding->generate_user == desc->frameGenerationCallbackUserContext &&
+        binding->only_generated == desc->onlyPresentGenerated;
 }
 
 struct frame_config_snapshot
@@ -178,6 +182,7 @@ struct fg_context
 
     ffxContext original;
     uint64_t translated;
+    uint64_t present_source;
     IUnknown *device;
 
     SRWLOCK configure_lock;
@@ -222,6 +227,53 @@ static SRWLOCK debug_lock = SRWLOCK_INIT;
 static ffxApiMessage global_message;
 static uint32_t global_debug_level;
 
+static FfxApiPresentCallbackFunc native_default_present(HMODULE module)
+{
+    /* Native FG binary 3f5e674a59b40075...:
+     * stable set_config substitutes RVA 0xf5600 and NULL user context.
+     * Its presenter runs the callback, then Present, on the same thread.
+     * Pin that private contract to the image's RSDS identity and entry bytes;
+     * other native builds retain their original callback configuration.
+     */
+    static const GUID pdb = {0xf977ea5e, 0xeaed, 0x467f,
+        {0x80, 0x0d, 0xe4, 0x37, 0xac, 0x3b, 0x9e, 0x74}};
+    static const BYTE entry[] = {
+        0x40, 0x55, 0x53, 0x56, 0x41, 0x56, 0x41, 0x57,
+        0x48, 0x8d, 0xac, 0x24, 0xd0, 0xfe, 0xff, 0xff,
+        0x48, 0x81, 0xec, 0x30, 0x02, 0x00, 0x00
+    };
+    const BYTE *base = (const BYTE *)module;
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
+    const IMAGE_NT_HEADERS64 *nt = (const IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
+    const IMAGE_DATA_DIRECTORY *directory;
+    const IMAGE_DEBUG_DIRECTORY *debug;
+    DWORD size, i;
+    WCHAR option[2];
+
+    if (GetEnvironmentVariableW(L"YAAGL_D3DMETAL_ASYNC", option, ARRAYSIZE(option)) != 1 ||
+        option[0] != '1' || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return NULL;
+    size = nt->OptionalHeader.SizeOfImage;
+    if (size != 0x247a000 || memcmp(base + 0xf5600, entry, sizeof(entry))) return NULL;
+    directory = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+    if (directory->VirtualAddress > size || directory->Size > size - directory->VirtualAddress)
+        return NULL;
+    debug = (const IMAGE_DEBUG_DIRECTORY *)(base + directory->VirtualAddress);
+    for (i = 0; i < directory->Size / sizeof(*debug); ++i)
+    {
+        const BYTE *cv;
+        DWORD age;
+        if (debug[i].Type != IMAGE_DEBUG_TYPE_CODEVIEW || debug[i].SizeOfData < 24 ||
+            debug[i].AddressOfRawData > size ||
+            debug[i].SizeOfData > size - debug[i].AddressOfRawData) continue;
+        cv = base + debug[i].AddressOfRawData;
+        memcpy(&age, cv + 20, sizeof(age));
+        if (!memcmp(cv, "RSDS", 4) && !memcmp(cv + 4, &pdb, sizeof(pdb)) && age == 1)
+            return (FfxApiPresentCallbackFunc)(base + 0xf5600);
+    }
+    return NULL;
+}
+
 static BOOL CALLBACK initialize_native(INIT_ONCE *once, void *parameter, void **result)
 {
     WCHAR *path;
@@ -264,6 +316,7 @@ static BOOL CALLBACK initialize_native(INIT_ONCE *once, void *parameter, void **
         FreeLibrary(module);
         return FALSE;
     }
+    api.default_present = native_default_present(module);
 
     /*
      * Keep the module loaded for process lifetime.  Native swapchain objects,
@@ -633,6 +686,36 @@ static void reclaim_native_bindings(struct fg_context *context)
     }
 }
 
+static ffxReturnCode_t compose_present(struct callback_binding *binding,
+                                      ffxCallbackDescFrameGenerationPresent *desc)
+{
+    const uint64_t frame_id = desc->frameID;
+    const BOOL generated = desc->isGeneratedFrame;
+    struct stable_swapchain *swapchain = binding->context->swapchain;
+    IDXGISwapChain4 *real = native.default_present && swapchain
+        ? swapchain->lpVtbl->real(swapchain) : NULL;
+    FfxApiPresentCallbackFunc callback = binding->present
+        ? binding->present : native.default_present;
+    ffxReturnCode_t result = callback(desc, binding->present ? binding->present_user : NULL);
+
+    if (real)
+    {
+        struct yaagl_fsr_fg_present_packet packet;
+        memset(&packet, 0, sizeof(packet));
+        initialize_packet(&packet.header, sizeof(packet), YAAGL_FSR_FG_PRESENT, 0);
+        packet.swapchain = (uintptr_t)real;
+        packet.source = binding->context->present_source;
+        packet.frame_id = frame_id;
+        packet.generated = generated;
+        packet.only_generated = binding->only_generated;
+        /* Arm after the application callback, which may itself present.
+         * The native presenter still calls Present when composition fails.
+         */
+        bridge_call(&packet);
+    }
+    return result;
+}
+
 static ffxReturnCode_t native_present_callback(ffxCallbackDescFrameGenerationPresent *desc, void *user)
 {
     struct callback_binding *binding = user;
@@ -640,7 +723,7 @@ static ffxReturnCode_t native_present_callback(ffxCallbackDescFrameGenerationPre
     ffxReturnCode_t result;
 
     enter_callback(&scope, binding->context);
-    result = binding->present(desc, binding->present_user);
+    result = compose_present(binding, desc);
     leave_callback(&scope);
     return result;
 }
@@ -666,7 +749,14 @@ static ffxReturnCode_t configure_native_callbacks(
     struct callback_binding *previous = context->active_native_binding;
     ffxReturnCode_t result;
 
-    if (desc->presentCallback || desc->frameGenerationCallback)
+    /* This updates only the effect context. Its currently installed swapchain
+     * binding remains live; draining is not equivalent to replacing it.
+     */
+    if (desc->flags & FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY)
+        return native.configure(&context->original, &desc->header);
+
+    if (desc->presentCallback || desc->frameGenerationCallback ||
+        (native.default_present && context->swapchain))
     {
         binding = previous;
         if (!binding_matches(binding, desc))
@@ -682,10 +772,11 @@ static ffxReturnCode_t configure_native_callbacks(
             binding->present_user = desc->presentCallbackUserContext;
             binding->generate = desc->frameGenerationCallback;
             binding->generate_user = desc->frameGenerationCallbackUserContext;
+            binding->only_generated = desc->onlyPresentGenerated;
             binding->next = context->native_bindings;
             context->native_bindings = binding;
         }
-        if (binding->present)
+        if (binding->present || (native.default_present && context->swapchain))
         {
             config.presentCallback = native_present_callback;
             config.presentCallbackUserContext = binding;
@@ -1198,11 +1289,11 @@ static ffxReturnCode_t present_callback(ffxCallbackDescFrameGenerationPresent *d
     struct callback_scope scope;
     ffxReturnCode_t result;
 
-    if (!binding || !desc || !binding->present)
+    if (!binding || !desc || (!binding->present && !native.default_present))
         return FFX_API_RETURN_ERROR_PARAMETER;
 
     enter_callback(&scope, binding->context);
-    result = binding->present(desc, binding->present_user);
+    result = compose_present(binding, desc);
     if (TRACE_ON(yaagl_fsr_fg) && desc->isGeneratedFrame &&
         InterlockedIncrement(&trace_count) <= 120)
         TRACE("MetalFX generated present frame=%llu result=%u\n",
@@ -1280,11 +1371,12 @@ static void build_swapchain_config(FfxFrameGenerationConfig *output,
     if (binding)
     {
         /*
-         * NULL preserves the native swapchain's official default UI
-         * composition function, including its premultiplied-alpha extension.
+         * On the pinned native build, the wrapper calls the same default UI
+         * composition function with NULL context and the original pNext chain.
+         * Other builds keep native NULL substitution.
          */
-        output->presentCallback = binding->present ? present_callback : NULL;
-        output->presentCallbackContext = binding->present ? binding : NULL;
+        output->presentCallback = binding->present || native.default_present ? present_callback : NULL;
+        output->presentCallbackContext = output->presentCallback ? binding : NULL;
         output->frameGenerationCallback = generation_callback;
         output->frameGenerationCallbackContext = binding;
     }
@@ -1484,6 +1576,7 @@ static ffxReturnCode_t configure_frame_generation(
             binding->present_user = desc->presentCallbackUserContext;
             binding->generate = desc->frameGenerationCallback;
             binding->generate_user = desc->frameGenerationCallbackUserContext;
+            binding->only_generated = desc->onlyPresentGenerated;
         }
         else
         {
@@ -1765,6 +1858,7 @@ ffxReturnCode_t ffxCreateContext(ffxContext *output,
     InitializeSRWLock(&context->configure_lock);
     InitializeCriticalSection(&context->dispatch_lock);
     context->references = 1;
+    context->present_source = InterlockedIncrement64(&next_present_source);
 
     if (is_swapchain)
     {

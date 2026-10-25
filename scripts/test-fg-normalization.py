@@ -1198,6 +1198,8 @@ NATIVE_JITTER = r'''
 #include <array>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <objc/runtime.h>
 #include <cmath>
 #include <cstdio>
@@ -1505,6 +1507,12 @@ struct JitterRunner {
                          test.cancellationX);
         good &= near(test.name, "cancellation.y", parameters->jitterCancellation[1],
                      test.cancellationY);
+        // The GPU inputs below are on the stabilized color grid. MetalFX's
+        // sampling offset must describe that grid, not the original render grid.
+        auto effect = (id<MTLFXFrameInterpolatorBase>)
+            prepared->impl_->configuration->factory.get();
+        good &= near(test.name, "stabilized input jitter.x", effect.jitterOffsetX, 0);
+        good &= near(test.name, "stabilized input jitter.y", effect.jitterOffsetY, 0);
         // Read actual GPU-normalized vectors, not an interpolated-color MAE.
         // All pixels must match, including edges; stop diagnostics at the first mismatch.
         bool pixelsGood = true;
@@ -1977,6 +1985,23 @@ struct JitterRunner {
         contexts.emplace(99, state);
         yaagl_fsr_fg_configure_packet config{};
         config.header = {sizeof(config), YAAGL_FSR_FG_BRIDGE_VERSION, YAAGL_FSR_FG_CONFIGURE, 0, 99};
+        {
+            std::lock_guard executionLock(state->executionMutex);
+            const auto epoch = state->generationEpoch;
+            const auto scratch = state->scratch->idle.get();
+            config.enabled = 1;
+            auto repeated = std::async(std::launch::async, [config]() mutable {
+                @autoreleasepool {
+                    return api(YAAGL_FSR_FG_CONFIGURE, &config);
+                }
+            });
+            assert(repeated.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+            assert(repeated.get() == Ok);
+            assert(state->generationEpoch == epoch && state->scratch->idle.get() == scratch);
+            config.enabled = 2;
+            assert(api(YAAGL_FSR_FG_CONFIGURE, &config) == Parameter);
+        }
+        config.enabled = 0;
         assert(api(YAAGL_FSR_FG_CONFIGURE, &config) == Ok);
         assert(!state->scratch->idle && !state->history);
         outstanding.reset();

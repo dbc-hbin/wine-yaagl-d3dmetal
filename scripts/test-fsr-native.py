@@ -153,6 +153,58 @@ static std::shared_ptr<Feature> makeFeature(id<MTLDevice> device, id<MTL4Compile
     return feature;
 }
 
+static void cachedExtentRegression(id<MTLDevice> device, id<MTL4Compiler> compiler) {
+    auto feature=makeFeature(device,compiler,true);
+    auto color=sharedTexture(device,MTLPixelFormatRGBA16Float,88,72);
+    auto depth=sharedTexture(device,MTLPixelFormatR32Float,88,72);
+    auto motion=sharedTexture(device,MTLPixelFormatRG16Float,88,72);
+    auto output=sharedTexture(device,MTLPixelFormatRGBA16Float,192,160);
+    auto referenceOutput=sharedTexture(device,MTLPixelFormatRGBA16Float,192,160);
+    std::vector<_Float16> colors(88*72*4), vectors(88*72*2,0);
+    std::vector<float> depths(88*72,.5f);
+    for(unsigned y=0;y<72;++y) for(unsigned x=0;x<88;++x) {
+        for(unsigned c=0;c<3;++c) colors[(y*88+x)*4+c]=float((x+y)%16)/16;
+        colors[(y*88+x)*4+3]=1;
+    }
+    [color replaceRegion:MTLRegionMake2D(0,0,88,72) mipmapLevel:0
+        withBytes:colors.data() bytesPerRow:88*4*sizeof(_Float16)];
+    [depth replaceRegion:MTLRegionMake2D(0,0,88,72) mipmapLevel:0
+        withBytes:depths.data() bytesPerRow:88*sizeof(float)];
+    [motion replaceRegion:MTLRegionMake2D(0,0,88,72) mipmapLevel:0
+        withBytes:vectors.data() bytesPerRow:88*2*sizeof(_Float16)];
+    auto small=frameInfo(color,depth,motion,output,64,48,160,128,true);
+    small.resetHistory=false;
+    auto first=prepare(feature,small,{});
+    auto firstLease=execute(device,first);
+    auto large=frameInfo(color,depth,motion,output,80,64,160,128,true);
+    auto expanded=prepare(feature,large,{});
+    auto expandedLease=execute(device,expanded);
+    auto resumed=prepare(feature,small,{});
+    assert(resumed->impl_->generation==first->impl_->generation);
+    assert(resumed->impl_->activation!=first->impl_->activation);
+    auto consecutive=prepare(feature,small,{});
+    assert(consecutive->impl_->activation==resumed->impl_->activation);
+    // An older retained frame must not consume the reactivation reset.
+    auto olderLease=execute(device,first);
+    assert(first->impl_->generation->encodedActivation!=resumed->impl_->activation);
+    auto resumedLease=execute(device,resumed);
+    assert(resumedLease->impl_->stagedDepth.width==small.inputContent.width);
+    assert(resumedLease->impl_->stagedDepth.height==small.inputContent.height);
+    auto reference=makeFeature(device,compiler,true);
+    small.output=referenceOutput;
+    auto referenceLease=execute(device,prepare(reference,small,{}));
+    auto actual=pixels<_Float16>(device,output,4);
+    auto expected=pixels<_Float16>(device,referenceOutput,4);
+    for(unsigned y=13;y<13+128;++y) for(unsigned x=11;x<11+160;++x)
+        for(unsigned c=0;c<4;++c) {
+            auto index=(y*192+x)*4+c;
+            assert(std::isfinite(float(actual[index])));
+            assert(std::fabs(float(actual[index])-float(expected[index]))<.003f);
+        }
+    [referenceOutput release]; [output release]; [motion release];
+    [depth release]; [color release];
+}
+
 static float inverseSrgb(float value) {
     return value <= .04045f ? value/12.92f : std::pow((value+.055f)/1.055f,2.4f);
 }
@@ -779,6 +831,7 @@ int main() {
         [compilerDescriptor release];
         assert(compiler);
         colorRegression(device,compiler);
+        cachedExtentRegression(device,compiler);
         generatedPaddingRegression(device,compiler);
         motionRegression(device,compiler,false,true,false,false);
         motionRegression(device,compiler,false,true,true,false);

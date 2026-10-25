@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Exercise Game Mode child routing through real Wine CreateProcess calls.
+"""Exercise exact-game host routing through real Wine CreateProcess calls.
 
-The runtime must contain the game host and patched ntdll. Uses a temporary
-prefix; no installed game or system Game Mode policy is changed.
+Uses a temporary runtime/prefix and a native image-path probe, not a production
+host report. Does not invoke the policy supervisor or Apple policy tool.
 """
 import argparse
-import json
 import os
 from pathlib import Path
 import shutil
@@ -41,6 +40,23 @@ int wmain(int argc, wchar_t **argv)
 }
 '''
 
+PROBE = r'''
+#include <limits.h>
+#include <mach-o/dyld.h>
+#include <stdio.h>
+#include <unistd.h>
+__attribute__((constructor)) static void record_image(void)
+{
+    char path[PATH_MAX], record[PATH_MAX + 32];
+    uint32_t capacity = sizeof(path);
+    if (_NSGetExecutablePath(path, &capacity)) _exit(90);
+    int length = snprintf(record, sizeof(record), "NATIVE_IMAGE:%s\n", path);
+    /* One atomic record: concurrent Wine services cannot interleave paths. */
+    if (length < 0 || length > PIPE_BUF || (size_t)length >= sizeof(record)) _exit(91);
+    if (write(STDOUT_FILENO, record, length) != length) _exit(92);
+}
+'''
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -48,12 +64,19 @@ def main():
     parser.add_argument('--compiler', default='x86_64-w64-mingw32-clang')
     args = parser.parse_args()
     runtime = args.runtime.resolve()
-    wine, server = runtime / 'bin/wine.real', runtime / 'bin/wineserver'
     compiler = shutil.which(args.compiler)
     if not compiler:
         parser.error('supply --compiler with the installed LLVM MinGW compiler')
-    with tempfile.TemporaryDirectory(prefix='yaagl-game-mode-routing-') as temporary:
-        root = Path(temporary)
+    with tempfile.TemporaryDirectory(prefix='yaagl-game-mode-routing-', dir='/tmp') as temporary:
+        root = Path(temporary).resolve()
+        test_runtime = root / 'runtime with spaces'
+        shutil.copytree(runtime, test_runtime, symlinks=True)
+        runtime = test_runtime
+        for path in runtime.rglob('*'):
+            if path.is_symlink():
+                path.resolve(strict=True).relative_to(runtime.resolve())
+        host = runtime / 'libexec/yaagl-game-mode/ZZZ.app/Contents/MacOS/wine'
+        wine, server = runtime / 'bin/wine.real', runtime / 'bin/wineserver'
         source = root / 'spawn.c'
         source.write_text(GUEST)
         parent, target, helper = (root / name for name in ('launcher.exe', 'ZenlessZoneZero.exe', 'helper.exe'))
@@ -62,7 +85,10 @@ def main():
         shutil.copy2(parent, helper)
         alias = root / 'target-alias.exe'
         alias.symlink_to(target.name)
-        report = root / 'launch.json'
+        probe_source, probe = root / 'probe.c', root / 'probe.dylib'
+        probe_source.write_text(PROBE)
+        subprocess.run(['xcrun', 'clang', '-arch', 'arm64', '-arch', 'x86_64', '-dynamiclib',
+                        '-Wall', '-Wextra', '-Werror', str(probe_source), '-o', str(probe)], check=True)
         env = {key: value for key, value in os.environ.items()
                if not key.startswith(('WINE', 'YAAGL_GAME_MODE', 'DYLD_'))}
         env.update(WINEPREFIX=str(root / 'prefix'), WINEDEBUG='-all',
@@ -79,23 +105,28 @@ def main():
                 ('different-command-line', target, helper, '-', True, True),
                 ('file-alias', alias, alias, '-', True, True),
                 ('non-target-descendant', target, target, windows(helper), True, True),
+                ('missing-host', target, target, '-', True, False),
             )
             for name, image, token, descendant, enabled, expected in cases:
-                report.unlink(missing_ok=True)
-                launch_env = dict(env)
+                if name == 'missing-host':
+                    host.rename(host.with_name('wine.disabled'))
+                launch_env = dict(env, DYLD_INSERT_LIBRARIES=str(probe))
                 if enabled:
-                    launch_env.update(YAAGL_GAME_MODE_TARGET=str(target), YAAGL_GAME_MODE_REPORT=str(report))
+                    launch_env['YAAGL_GAME_MODE_TARGET'] = str(target)
                 result = subprocess.run([str(wine), str(parent), windows(image), windows(token), descendant],
                                         env=launch_env, text=True, capture_output=True, timeout=60)
-                assert result.returncode == 0, (name, result.stdout, result.stderr)
-                assert 'leaf completed' in result.stdout, (name, result.stdout, result.stderr)
-                assert report.exists() == expected, (name, result.stderr)
-                events = result.stderr.count('game mode host host-started')
-                assert events == int(expected), (name, result.stderr)
-                if expected:
-                    record = json.loads(report.read_text())
-                    assert record['state'] == 'host-started' and record['pid'] > 0, (name, record)
-                print(f'PASS {name}: host starts={events}')
+                if name == 'missing-host':
+                    assert result.returncode != 0, (name, result.stdout, result.stderr)
+                    assert 'leaf completed' not in result.stdout, (name, result.stdout)
+                else:
+                    assert result.returncode == 0, (name, result.stdout, result.stderr)
+                    assert 'leaf completed' in result.stdout, (name, result.stdout, result.stderr)
+                paths = [Path(line.removeprefix('NATIVE_IMAGE:')).resolve()
+                         for line in result.stdout.splitlines() if line.startswith('NATIVE_IMAGE:')]
+                # Require the probe to have run even in the negative-routing cases.
+                assert wine.resolve() in paths, (name, paths, result.stderr)
+                assert paths.count(host) == int(expected), (name, paths, result.stderr)
+                print(f'PASS {name}: native game hosts={paths.count(host)}')
                 subprocess.run([str(server), '-w'], env=env, check=True, timeout=60)
         finally:
             subprocess.run([str(server), '-k'], env=env, capture_output=True, timeout=30)

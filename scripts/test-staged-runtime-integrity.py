@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import plistlib
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -119,6 +120,50 @@ class StagedRuntimeIntegrityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.check()
 
+    def test_public_fsr_matches_both_guest_architectures_and_build_bytes(self):
+        paths = [f'lib/wine/{arch}-windows/amd_fidelityfx_{module}_dx12.dll'
+                 for arch in ('x86_64', 'i386') for module in ('upscaler', 'framegeneration')]
+        build = {'hostArtifacts': {}}
+        for relative in paths:
+            path = self.tree / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(relative.encode())
+            build['hostArtifacts'][relative] = stage.digest(path)
+        exports = ''.join(f'Ordinal: {ordinal}\nName: {name}\n'
+                          for ordinal, name in stage.ORIGINAL_FG_EXPORTS)
+
+        def readobj(command, **kwargs):
+            architecture = 'i386' if '/i386-windows/' in str(command[-1]) else 'x86-64'
+            return f'Format: COFF-{architecture}\n' + exports
+
+        with patch.dict(stage.os.environ, {'WINE_LLVM_READOBJ': '/fixture/llvm-readobj'}), \
+                patch.object(stage.subprocess, 'check_output', side_effect=readobj) as inspect:
+            stage.check_public_fsr(self.tree, build)
+            self.assertEqual({str(call.args[0][-1]) for call in inspect.call_args_list},
+                             {str(self.tree / relative) for relative in paths})
+            for relative in paths:
+                path = self.tree / relative
+                original = path.read_bytes()
+                with self.subTest(path=relative):
+                    path.write_bytes(b'stale producer')
+                    # Reinventorying a stage cannot change the selected host's identity.
+                    self.record['signed_artifacts'], self.record['symlinks'] = stage.inventory(self.tree)
+                    with self.assertRaisesRegex(ValueError, 'differs from source build'):
+                        stage.check_public_fsr(self.tree, build)
+                    path.unlink()
+                    with self.assertRaisesRegex(ValueError, 'differs from source build'):
+                        stage.check_public_fsr(self.tree, build)
+                    path.write_bytes(original)
+                    expected = build['hostArtifacts'].pop(relative)
+                    with self.assertRaisesRegex(ValueError, 'differs from source build'):
+                        stage.check_public_fsr(self.tree, build)
+                    build['hostArtifacts'][relative] = expected
+            stage.check_public_fsr(self.tree, build)
+            inspect.side_effect = None
+            inspect.return_value = 'Format: COFF-x86-64\n' + exports
+            with self.assertRaisesRegex(ValueError, 'architecture/exports mismatch'):
+                stage.check_public_fsr(self.tree, build)
+
     def test_beta2_schema_and_version_rejected(self):
         self.record['stage_schema'] = 6
         with self.assertRaises(ValueError):
@@ -209,6 +254,234 @@ class StagedRuntimeIntegrityTests(unittest.TestCase):
             package.validate_helper_sources(helper, staged)
 
 
+class GamePolicyPackagingTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='game-policy-packaging-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.build = self.root / 'build'
+        (self.build / 'game-mode').mkdir(parents=True)
+        self.tree = self.root / 'runtime with spaces'
+        self.tree.mkdir()
+        for name, data in (('game-policy-supervisor', b'\xca\xfe\xba\xbe'),
+                           ('gamepolicyctl', b'original Apple signature fixture')):
+            path = self.build / 'game-mode' / name
+            path.write_bytes(data)
+            path.chmod(0o755)
+        self.metadata = plistlib.loads((stage.ROOT / 'scripts/yaagl-game-mode.plist').read_bytes())
+        (self.build / 'game-mode/Info.plist').write_bytes(plistlib.dumps(self.metadata))
+        host = self.build / 'game-mode/wine'
+        host.write_bytes(self.host_image(self.metadata))
+        host.chmod(0o755)
+        ntdll = self.tree / 'lib/wine/x86_64-unix/ntdll.so'
+        ntdll.parent.mkdir(parents=True)
+        ntdll.write_bytes(b'normal runtime ntdll')
+
+    def host_image(self, metadata):
+        payload = plistlib.dumps(metadata)
+        header = struct.pack('<8I', 0xfeedfacf, 0x1000007, 3, 2, 1, 152, 0, 0)
+        segment = struct.pack('<II16sQQQQIIII', 0x19, 152, b'__TEXT',
+                              0, 184 + len(payload), 0, 184 + len(payload), 5, 5, 1, 0)
+        section = struct.pack('<16s16sQQ8I', b'__info_plist', b'__TEXT',
+                              184, len(payload), 184, 0, 0, 0, 0, 0, 0, 0)
+        return header + segment + section + payload
+
+    def validate(self):
+        with patch.object(stage.game_mode.subprocess, 'check_output', return_value=plistlib.dumps(
+                    {'com.apple.gamepolicyd.tool.privileged.xpc': True})), \
+                patch.object(stage.game_mode.subprocess, 'run'):
+            stage.game_mode.validate(self.tree)
+
+    def install(self, signing=None):
+        with patch.object(stage.game_mode.subprocess, 'check_output', return_value=plistlib.dumps(
+                    {'com.apple.gamepolicyd.tool.privileged.xpc': True})), \
+                patch.object(stage.game_mode.subprocess, 'run', side_effect=signing) as run:
+            stage.game_mode.install(self.build, self.tree)
+        return run.call_args_list
+
+    def test_original_helper_survives_supervisor_signing(self):
+        calls = self.install()
+        source = self.build / 'game-mode/gamepolicyctl'
+        destination = self.tree / stage.game_mode.POLICY_TOOL
+        self.assertEqual(destination.read_bytes(), source.read_bytes())
+        signing = [call.args[0] for call in calls if '--sign' in call.args[0]]
+        self.assertEqual([command[-1] for command in signing],
+                         [str(self.tree / stage.game_mode.SUPERVISOR),
+                          str(self.tree / stage.game_mode.BUNDLE)])
+        self.assertTrue(all('--deep' not in command for command in signing))
+        self.assertNotIn(self.tree / stage.game_mode.BUNDLE, destination.parents)
+
+    def test_missing_symlink_and_nonexecutable_host_rejected(self):
+        self.install()
+        host = self.tree / stage.game_mode.HOST
+        host.chmod(0o644)
+        with self.assertRaises(ValueError):
+            self.validate()
+        host.chmod(0o755)
+        saved = host.with_name('saved')
+        host.rename(saved)
+        with self.assertRaises(ValueError):
+            self.validate()
+        host.symlink_to(saved.name)
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_bad_host_architecture_and_metadata_rejected(self):
+        self.install()
+        host = self.tree / stage.game_mode.HOST
+        original = host.read_bytes()
+        arm64 = bytearray(original)
+        struct.pack_into('<I', arm64, 4, 0x100000c)
+        for payload in (b'', b'not Mach-O', original[:40], bytes(arm64),
+                        self.host_image({**self.metadata, 'LSSupportsGameMode': False})):
+            with self.subTest(payload=payload[:32]):
+                host.write_bytes(payload)
+                with self.assertRaises(ValueError):
+                    self.validate()
+        host.write_bytes(original)
+        info = self.tree / stage.game_mode.INFO_PLIST
+        info.write_bytes(plistlib.dumps({**self.metadata, 'CFBundleIdentifier': 'other'}))
+        with self.assertRaises(ValueError):
+            self.validate()
+        info.unlink()
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_adjacent_ntdll_override_rejected(self):
+        self.install()
+        override = (self.tree / stage.game_mode.HOST).with_name('ntdll.so')
+        override.write_bytes(b'override')
+        with self.assertRaises(ValueError):
+            self.validate()
+        override.unlink()
+        override.symlink_to('/missing/external/ntdll.so')
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_host_and_bundle_signatures_verified(self):
+        self.install()
+        for relative in (stage.game_mode.HOST, stage.game_mode.BUNDLE):
+            def reject(command, **kwargs):
+                if '--verify' in command and command[-1] == str(self.tree / relative):
+                    raise subprocess.CalledProcessError(1, command)
+            with self.subTest(relative=relative), \
+                    patch.object(stage.game_mode.subprocess, 'check_output', return_value=plistlib.dumps(
+                        {'com.apple.gamepolicyd.tool.privileged.xpc': True})), \
+                    patch.object(stage.game_mode.subprocess, 'run', side_effect=reject):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    stage.game_mode.validate(self.tree)
+
+    def test_missing_and_symlink_sources_rejected(self):
+        source = self.build / 'game-mode/gamepolicyctl'
+        saved = source.with_name('saved')
+        source.rename(saved)
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink):
+                if symlink:
+                    source.symlink_to(saved.name)
+                with self.assertRaises(ValueError), patch.object(stage.game_mode.subprocess, 'run') as run:
+                    stage.game_mode.copy_policy_tool(source, self.root / 'copy')
+                run.assert_not_called()
+                self.assertFalse((self.root / 'copy').exists())
+
+    def test_untrusted_source_rejected_before_copy(self):
+        with patch.object(stage.game_mode.subprocess, 'run',
+                          side_effect=subprocess.CalledProcessError(1, 'codesign')):
+            with self.assertRaises(subprocess.CalledProcessError):
+                stage.game_mode.copy_policy_tool(self.build / 'game-mode/gamepolicyctl', self.root / 'copy')
+        self.assertFalse((self.root / 'copy').exists())
+
+    def test_missing_or_disabled_privilege_rejected_before_copy(self):
+        for entitlement in ({}, {'com.apple.gamepolicyd.tool.privileged.xpc': False},
+                            {'com.apple.gamepolicyd.tool.privileged.xpc': 'true'}):
+            with self.subTest(entitlement=entitlement), \
+                    patch.object(stage.game_mode.subprocess, 'run'), \
+                    patch.object(stage.game_mode.subprocess, 'check_output',
+                                 return_value=plistlib.dumps(entitlement)):
+                with self.assertRaises(ValueError):
+                    stage.game_mode.copy_policy_tool(self.build / 'game-mode/gamepolicyctl', self.root / 'copy')
+                self.assertFalse((self.root / 'copy').exists())
+
+    def test_malformed_entitlements_rejected_before_copy(self):
+        with patch.object(stage.game_mode.subprocess, 'run'), \
+                patch.object(stage.game_mode.subprocess, 'check_output', return_value=b'not a plist'):
+            with self.assertRaises(plistlib.InvalidFileException):
+                stage.game_mode.copy_policy_tool(self.build / 'game-mode/gamepolicyctl', self.root / 'copy')
+        self.assertFalse((self.root / 'copy').exists())
+
+    def test_invalid_supervisor_rejected(self):
+        self.install()
+        supervisor = self.tree / stage.game_mode.SUPERVISOR
+        original = supervisor.read_bytes()
+        for payload in (b'', b'not a Mach-O', b'\xcf\xfa\xed\xfe'):
+            with self.subTest(payload=payload):
+                supervisor.write_bytes(payload)
+                with self.assertRaises(ValueError), patch.object(stage.game_mode.subprocess, 'run') as run:
+                    stage.game_mode.validate(self.tree)
+                run.assert_not_called()
+        supervisor.write_bytes(original)
+        supervisor.chmod(0o644)
+        with self.assertRaises(ValueError):
+            stage.game_mode.validate(self.tree)
+        supervisor.chmod(0o755)
+        saved = supervisor.with_name('saved-supervisor')
+        supervisor.rename(saved)
+        with self.assertRaises(ValueError):
+            stage.game_mode.validate(self.tree)
+        supervisor.symlink_to(saved.name)
+        with self.assertRaises(ValueError):
+            stage.game_mode.validate(self.tree)
+
+    def test_supervisor_signature_is_verified(self):
+        self.install()
+        with patch.object(stage.game_mode.subprocess, 'run',
+                          side_effect=subprocess.CalledProcessError(1, 'codesign')) as run:
+            with self.assertRaises(subprocess.CalledProcessError):
+                stage.game_mode.validate(self.tree)
+        self.assertEqual(run.call_args.args[0],
+                         ['/usr/bin/codesign', '--verify', '--strict',
+                          str(self.tree / stage.game_mode.SUPERVISOR)])
+
+    def test_signing_cannot_change_apple_helper(self):
+        def sign(command, **kwargs):
+            if '--sign' in command and command[-1] == str(self.tree / stage.game_mode.SUPERVISOR):
+                (self.tree / stage.game_mode.POLICY_TOOL).write_bytes(b'resigned')
+        with self.assertRaises(ValueError):
+            self.install(sign)
+
+    def test_bundle_signing_cannot_change_apple_helper(self):
+        def sign(command, **kwargs):
+            if '--sign' in command and command[-1] == str(self.tree / stage.game_mode.BUNDLE):
+                (self.tree / stage.game_mode.POLICY_TOOL).write_bytes(b'resigned')
+        with self.assertRaises(ValueError):
+            self.install(sign)
+
+    def test_installed_helper_trust_is_rechecked(self):
+        self.install()
+        tool = self.tree / stage.game_mode.POLICY_TOOL
+        def reject(command, **kwargs):
+            if command[-1] == str(tool):
+                raise subprocess.CalledProcessError(1, command)
+        with patch.object(stage.game_mode.subprocess, 'run', side_effect=reject), \
+                self.assertRaises(subprocess.CalledProcessError):
+            stage.game_mode.validate(self.tree)
+
+    def test_relocator_cannot_rewrite_apple_helper(self):
+        tool = self.tree / stage.game_mode.POLICY_TOOL
+        tool.parent.mkdir(parents=True)
+        tool.write_bytes(b'Apple helper')
+        dependency = self.tree / 'lib/nonportable.dylib'
+        dependency.write_bytes(b'dependency')
+        with patch.object(full, 'macho', side_effect=lambda path: path == tool), \
+                patch.object(full, 'load_commands', return_value=(
+                    ['/developer/nonportable.dylib'], [], None)), \
+                patch.object(full.subprocess, 'run') as run:
+            with self.assertRaises(ValueError):
+                full.relocate_runtime(self.tree)
+        run.assert_not_called()
+        self.assertEqual(tool.read_bytes(), b'Apple helper')
+
+
 class PackageVersionTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='beta3-package-version-')
@@ -221,6 +494,21 @@ class PackageVersionTests(unittest.TestCase):
         (self.tree / 'bin').mkdir(parents=True)
         for name in ('wine', 'wine.real', 'wineserver'):
             (self.tree / 'bin' / name).write_bytes(b'host fixture')
+        policy_tool = self.tree / stage.game_mode.POLICY_TOOL
+        policy_tool.parent.mkdir(parents=True)
+        policy_tool.write_bytes(b'original Apple policy helper fixture')
+        policy_tool.chmod(0o755)
+        supervisor = self.tree / stage.game_mode.SUPERVISOR
+        supervisor.write_bytes(b'signed universal supervisor fixture')
+        supervisor.chmod(0o755)
+        self.fsr_payload = {
+            f'lib/wine/{arch}-windows/amd_fidelityfx_{module}_dx12.dll':
+                f'{arch} {module} current producer'.encode()
+            for arch in ('x86_64', 'i386') for module in ('upscaler', 'framegeneration')}
+        for relative, payload in self.fsr_payload.items():
+            path = self.tree / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
         framework = self.tree / 'lib/external/D3DMetal.framework'
         framework.mkdir(parents=True)
         (framework / 'D3DMetal').write_bytes(b'framework fixture')
@@ -279,6 +567,11 @@ class PackageVersionTests(unittest.TestCase):
                 with tarfile.open(archive, 'r:xz') as stream:
                     manifest = json.load(stream.extractfile('wine/yaagl-d3dmetal-runtime.json'))
                     self.assertFalse(any('D3DMetal.framework' in name for name in stream.getnames()))
+                    for relative, payload in self.fsr_payload.items():
+                        self.assertEqual(stream.extractfile('wine/' + relative).read(), payload)
+                    for relative in (stage.game_mode.SUPERVISOR, stage.game_mode.POLICY_TOOL):
+                        self.assertEqual(stream.extractfile('wine/' + relative).read(),
+                                         (self.tree / relative).read_bytes())
                 self.assertEqual(manifest['runtimeId'], runtime_id)
                 self.assertEqual(manifest['wineVersion'], 'wine-' + version)
                 self.assertEqual(manifest['gameMode'], stage.game_mode.CAPABILITY)

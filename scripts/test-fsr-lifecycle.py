@@ -605,6 +605,207 @@ int main(void)
 '''
 
 
+PRESENT_CALLBACK = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#define __declspec(value)
+#include "d3dmetal-sidecar/third-party/fidelityfx/Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h"
+#include "yaagl_fsr_fg_bridge.h"
+typedef int BOOL;
+typedef struct { int unused; } IDXGISwapChain4;
+struct stable_swapchain;
+struct stable_swapchain_vtbl {
+    IDXGISwapChain4 *(*real)(struct stable_swapchain *);
+};
+struct stable_swapchain { const struct stable_swapchain_vtbl *lpVtbl; };
+struct fg_context { struct stable_swapchain *swapchain; uint64_t present_source; };
+struct callback_binding {
+    struct fg_context *context;
+    FfxApiPresentCallbackFunc present;
+    void *present_user;
+    BOOL only_generated;
+};
+static struct { FfxApiPresentCallbackFunc default_present; } native;
+static IDXGISwapChain4 real_swapchain;
+static IDXGISwapChain4 *get_real(struct stable_swapchain *swapchain)
+{
+    assert(swapchain);
+    return &real_swapchain;
+}
+static struct yaagl_fsr_fg_present_packet observed;
+static unsigned notifications;
+static ffxReturnCode_t bridge_call(void *packet)
+{
+    observed = *(struct yaagl_fsr_fg_present_packet *)packet;
+    ++notifications;
+    return FFX_API_RETURN_OK;
+}
+'''
+
+PRESENT_CALLBACK_MAIN = r'''
+static struct ffxCallbackDescFrameGenerationPresentPremulAlpha extension;
+static unsigned app_calls, default_calls;
+static ffxReturnCode_t default_present(ffxCallbackDescFrameGenerationPresent *desc, void *user)
+{
+    assert(!user && desc->header.pNext == &extension.header && extension.usePremulAlpha);
+    ++default_calls;
+    return FFX_API_RETURN_OK;
+}
+static ffxReturnCode_t app_present(ffxCallbackDescFrameGenerationPresent *desc, void *user)
+{
+    assert(user == &app_calls);
+    ++app_calls;
+    /* A nested presentation occurs before the outer callback returns.
+     * Descriptor edits must not change the outer native packet's identity.
+     */
+    struct yaagl_fsr_fg_present_packet nested = {0};
+    nested.frame_id = 99;
+    bridge_call(&nested);
+    desc->frameID = 99;
+    desc->isGeneratedFrame = false;
+    return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
+}
+int main(void)
+{
+    const struct stable_swapchain_vtbl vtbl = {get_real};
+    struct stable_swapchain swapchain = {&vtbl};
+    struct fg_context context = {&swapchain, 7};
+    struct callback_binding binding = {&context, app_present, &app_calls, 1};
+    ffxCallbackDescFrameGenerationPresent desc = {0};
+    native.default_present = default_present;
+    desc.frameID = 3;
+    desc.isGeneratedFrame = true;
+    assert(compose_present(&binding, &desc) == FFX_API_RETURN_ERROR_RUNTIME_ERROR);
+    assert(app_calls == 1 && notifications == 2);
+    assert(observed.frame_id == 3 && observed.generated && observed.source == 7 &&
+           observed.only_generated);
+    assert(observed.swapchain == (uintptr_t)&real_swapchain);
+    binding.present = NULL;
+    extension.usePremulAlpha = true;
+    desc.header.pNext = &extension.header;
+    assert(compose_present(&binding, &desc) == FFX_API_RETURN_OK);
+    assert(default_calls == 1 && notifications == 3 && !observed.generated);
+    native.default_present = NULL;
+    binding.present = app_present;
+    assert(compose_present(&binding, &desc) == FFX_API_RETURN_ERROR_RUNTIME_ERROR);
+    assert(app_calls == 2 && notifications == 4 && observed.frame_id == 99);
+}
+'''
+
+
+BINDINGS = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#define __declspec(value)
+#include "d3dmetal-sidecar/third-party/fidelityfx/Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h"
+typedef int BOOL;
+struct fg_context;
+'''
+
+BINDINGS_NATIVE = r'''
+struct stable_swapchain;
+struct stable_swapchain_vtbl {
+    bool (*wait_for_presents)(struct stable_swapchain *);
+};
+struct stable_swapchain { const struct stable_swapchain_vtbl *lpVtbl; };
+struct fg_context {
+    ffxContext original;
+    struct stable_swapchain *swapchain;
+    struct callback_binding *native_bindings, *active_native_binding;
+};
+static struct callback_binding *installed;
+static unsigned allocations, frees, waits;
+static bool drained = true;
+static bool wait_presenter(struct stable_swapchain *swapchain)
+{
+    assert(swapchain);
+    ++waits;
+    return drained;
+}
+static const ffxAllocationCallbacks *context_allocator(struct fg_context *context)
+{
+    (void)context;
+    return NULL;
+}
+static void *allocate_memory(const ffxAllocationCallbacks *callbacks, size_t size)
+{
+    (void)callbacks;
+    ++allocations;
+    return calloc(1, size);
+}
+static void free_memory(const ffxAllocationCallbacks *callbacks, void *memory)
+{
+    (void)callbacks;
+    assert(memory != installed); /* Draining does not uninstall a callback. */
+    ++frees;
+    free(memory);
+}
+static ffxReturnCode_t native_present_callback(ffxCallbackDescFrameGenerationPresent *desc, void *user)
+{
+    (void)desc; (void)user;
+    return FFX_API_RETURN_OK;
+}
+static ffxReturnCode_t native_generation_callback(ffxDispatchDescFrameGeneration *desc, void *user)
+{
+    (void)desc; (void)user;
+    return FFX_API_RETURN_OK;
+}
+static ffxReturnCode_t configure_native(ffxContext *context, const ffxConfigureDescHeader *header)
+{
+    const struct ffxConfigureDescFrameGeneration *desc = (const void *)header;
+    (void)context;
+    if (!(desc->flags & FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY))
+        installed = desc->presentCallbackUserContext;
+    return FFX_API_RETURN_OK;
+}
+static struct {
+    FfxApiPresentCallbackFunc default_present;
+    ffxReturnCode_t (*configure)(ffxContext *, const ffxConfigureDescHeader *);
+} native = {native_present_callback, configure_native};
+'''
+
+BINDINGS_MAIN = r'''
+int main(void)
+{
+    const struct stable_swapchain_vtbl vtbl = {wait_presenter};
+    struct stable_swapchain swapchain = {&vtbl};
+    struct fg_context context = {0};
+    struct ffxConfigureDescFrameGeneration desc = {0};
+    context.swapchain = &swapchain;
+    assert(configure_native_callbacks(&context, &desc) == FFX_API_RETURN_OK);
+    struct callback_binding *first = installed;
+    assert(first && context.active_native_binding == first && allocations == 1 && !frees);
+    unsigned previous_waits = waits;
+    desc.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+    desc.frameGenerationCallback = native_generation_callback;
+    desc.onlyPresentGenerated = true;
+    assert(configure_native_callbacks(&context, &desc) == FFX_API_RETURN_OK);
+    assert(installed == first && context.active_native_binding == first);
+    assert(allocations == 1 && !frees && waits == previous_waits && !first->only_generated);
+    desc.flags = 0;
+    drained = false;
+    assert(configure_native_callbacks(&context, &desc) == FFX_API_RETURN_OK);
+    assert(installed != first && installed->only_generated && allocations == 2 && !frees);
+    drained = true;
+    desc.frameGenerationCallback = NULL;
+    assert(configure_native_callbacks(&context, &desc) == FFX_API_RETURN_OK);
+    assert(allocations == 3 && frees == 2 && installed->only_generated);
+    desc.onlyPresentGenerated = false;
+    assert(configure_native_callbacks(&context, &desc) == FFX_API_RETURN_OK);
+    assert(allocations == 4 && frees == 3 && !installed->only_generated);
+    installed = context.active_native_binding = NULL;
+    reclaim_native_bindings(&context);
+    assert(!context.native_bindings && frees == allocations);
+}
+'''
+
+
 def compile_and_run(code, cxx=False):
     with tempfile.TemporaryDirectory(prefix="yaagl-fsr-lifecycle-") as directory:
         source = pathlib.Path(directory) / ("lifecycle.cpp" if cxx else "lifecycle.c")
@@ -619,6 +820,20 @@ def compile_and_run(code, cxx=False):
 
 
 class FsrLifecycleTest(unittest.TestCase):
+    def test_native_binding_installation(self):
+        source = (ROOT / "dlls/amd_fidelityfx_framegeneration_dx12/main.c").read_text()
+        binding = section(source, "struct callback_binding\n", "struct callback_scope\n")
+        matches = section(source, "static BOOL binding_matches(", "struct frame_config_snapshot\n")
+        reclaim = section(source, "static void reclaim_native_bindings(", "static ffxReturnCode_t compose_present(")
+        configure = section(source, "static ffxReturnCode_t configure_native_callbacks(", "static void release_swapchain(")
+        compile_and_run(BINDINGS + binding + matches + BINDINGS_NATIVE + reclaim + configure + BINDINGS_MAIN)
+
+    def test_present_callback_identity(self):
+        source = (ROOT / "dlls/amd_fidelityfx_framegeneration_dx12/main.c").read_text()
+        initialize = section(source, "static void initialize_packet(", "static ffxReturnCode_t bridge_call(")
+        compose = section(source, "static ffxReturnCode_t compose_present(", "static ffxReturnCode_t native_present_callback(")
+        compile_and_run(PRESENT_CALLBACK + initialize + compose + PRESENT_CALLBACK_MAIN)
+
     def test_sr_dispatch_device_validation(self):
         source = (ROOT / "d3dmetal-sidecar/fsr-translator.mm").read_text()
         ownership = section(source, "struct ComGuid {", "struct State {")

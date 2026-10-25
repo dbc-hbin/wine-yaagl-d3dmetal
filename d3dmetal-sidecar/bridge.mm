@@ -1,3 +1,6 @@
+#import <objc/message.h>
+#import <objc/runtime.h>
+
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 
@@ -6,6 +9,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "async-pipeline.hpp"
+#include "d3dmetal-transport.hpp"
 #include "fsr-translator.hpp"
 #include "fsr-framegeneration.hpp"
 #include "display-routing.hpp"
@@ -19,6 +24,24 @@ namespace {
 constexpr std::size_t kHookCount = static_cast<std::size_t>(layout::Hook::Count);
 std::array<std::uintptr_t, kHookCount> originalFunctions{};
 std::array<std::uintptr_t, kHookCount> dispatchTable{};
+
+char presentResidencyKey;
+
+void addPresentResidency(id queue, SEL selector, id set) {
+    // Only DoPresent's layer-set registration reaches this hook. Its worker
+    // serializes Present on this queue, including the synchronous path.
+    id previous = objc_getAssociatedObject(queue, &presentResidencyKey);
+    if (previous == set) return;
+    using Message = void (*)(id, SEL, id);
+    if (previous != nil) {
+        reinterpret_cast<Message>(objc_msgSend)(
+            queue, @selector(removeResidencySet:), previous);
+    }
+    reinterpret_cast<Message>(objc_msgSend)(queue, selector, set);
+    // The queue owns this bookkeeping. Replacement releases the old set;
+    // queue destruction releases the final association without a global map.
+    objc_setAssociatedObject(queue, &presentResidencyKey, set, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
 
 std::int32_t __attribute__((ms_abi)) queryVideoMemoryInfo(
     void* adapter, std::uint32_t node, std::uint32_t group,
@@ -101,11 +124,31 @@ __attribute__((constructor)) void initialize() noexcept {
         }
         const display::Hooks displayHooks = display::initialize(reinterpret_cast<std::uintptr_t>(base),
             original(layout::Hook::GetContainingOutput), original(layout::Hook::SetFullscreenState));
+        const auto completionHook = d3dmetal::initializeCompletionHook(
+            original(layout::Hook::CompleteExecute));
+        if (!completionHook) return;
+        const auto asyncHooks = async_pipeline::initialize(base, {
+            original(layout::Hook::GraphicsCtor), original(layout::Hook::GetRenderPipelineState),
+            original(layout::Hook::GraphicsDestroy), original(layout::Hook::MPLDraw),
+            original(layout::Hook::MPLDrawIndexed), original(layout::Hook::RootCtor),
+            original(layout::Hook::RootDestroy), original(layout::Hook::MPLReset),
+            original(layout::Hook::MPLBeginQuery), original(layout::Hook::MPLEndQuery),
+            original(layout::Hook::MPLDestroy), original(layout::Hook::Present1),
+            original(layout::Hook::DX11Draw), original(layout::Hook::DX11DrawIndexed),
+            original(layout::Hook::DX11Begin), original(layout::Hook::DX11End),
+            original(layout::Hook::DX11Destroy),
+        });
         dispatchTable = {
             displayHooks.getContainingOutput,
             displayHooks.setFullscreenState,
             reinterpret_cast<std::uintptr_t>(&queryVideoMemoryInfo),
             replayHooks[0],
+            asyncHooks[0], asyncHooks[1], asyncHooks[2], asyncHooks[3],
+            asyncHooks[4], asyncHooks[5], asyncHooks[6], asyncHooks[7],
+            asyncHooks[8], asyncHooks[9], asyncHooks[10], asyncHooks[11],
+            asyncHooks[12], asyncHooks[13], asyncHooks[14], asyncHooks[15], asyncHooks[16],
+            completionHook,
+            reinterpret_cast<std::uintptr_t>(&addPresentResidency),
         };
         auto& slot = *reinterpret_cast<std::uintptr_t*>(const_cast<std::uint8_t*>(base) + layout::kDataSlot);
         std::atomic_ref<std::uintptr_t>(slot).store(

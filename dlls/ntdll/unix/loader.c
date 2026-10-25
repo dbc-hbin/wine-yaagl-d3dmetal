@@ -472,56 +472,26 @@ static void preloader_exec( char **argv, WORD machine )
         execv( argv[1], argv + 1 );
 }
 
-static void report_game_mode( const char *state, const char *reason )
-{
-    const char *path = getenv( "YAAGL_GAME_MODE_REPORT" );
-    struct stat st;
-    char record[256];
-    int fd, length;
-
-    fprintf( stderr, "wine: game mode host %s%s%s (pid %ld)\n",
-             state, reason ? ": " : "", reason ? reason : "", (long)getpid() );
-    if (!path || path[0] != '/') return;
-    fd = open( path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600 );
-    if (fd == -1) return;
-    if (!fstat( fd, &st ) && S_ISREG( st.st_mode ) && st.st_uid == geteuid() && st.st_nlink == 1 &&
-        !ftruncate( fd, 0 ))
-    {
-        /* State and reason are fixed internal tokens, never user text. */
-        length = snprintf( record, sizeof(record), "{\"state\":\"%s\",\"pid\":%ld,\"reason\":\"%s\"}\n",
-                           state, (long)getpid(), reason ? reason : "" );
-        if (write( fd, record, length ) != length)
-            fprintf( stderr, "wine: could not write game mode launch result\n" );
-    }
-    close( fd );
-}
-
 /* exec the appropriate wine loader for the specified machine */
 static NTSTATUS loader_exec( char **argv, WORD machine, BOOL game_mode )
 {
     static char noexec[] = "WINELOADERNOEXEC=1";
 
     putenv( noexec );
-    unsetenv( "YAAGL_GAME_MODE_ACTIVE" );
 
     if (game_mode)
     {
-        if (machine != IMAGE_FILE_MACHINE_AMD64 || build_dir)
-        {
-            report_game_mode( "failed", "unsupported-runtime" );
-            return STATUS_NOT_SUPPORTED;
-        }
-        argv[1] = build_path( bin_dir, "../libexec/yaagl-game-mode/ZZZ.app/Contents/MacOS/wine" );
-        if (!argv[1] || setenv( "YAAGL_GAME_MODE_ACTIVE", "1", 1 ))
-        {
-            free( argv[1] );
-            report_game_mode( "failed", "out-of-memory" );
+        char *host;
+
+        if (machine != IMAGE_FILE_MACHINE_AMD64 || build_dir) return STATUS_NOT_SUPPORTED;
+        if (!(host = build_path( bin_dir, "../libexec/yaagl-game-mode/ZZZ.app/Contents/MacOS/wine" )))
             return STATUS_NO_MEMORY;
-        }
-        preloader_exec( argv, machine );
-        report_game_mode( "failed", "host-exec-failed" );
-        free( argv[1] );
-        unsetenv( "YAAGL_GAME_MODE_ACTIVE" );
+        /* The unmodified loader uses argv[0] to find ntdll outside the app.
+         * exec still gives this process the host's native application identity. */
+        argv[1] = (char *)wineloader;
+        execv( host, argv + 1 );
+        fprintf( stderr, "wine: could not execute Game Mode host: %s\n", strerror(errno) );
+        free( host );
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
@@ -539,12 +509,24 @@ static NTSTATUS loader_exec( char **argv, WORD machine, BOOL game_mode )
  *
  * argv[0] and argv[1] must be reserved for the preloader and loader respectively.
  */
-NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info, BOOL game_mode )
+NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info,
+                         const char *unix_name )
 {
     WORD machine = pe_info->machine;
     ULONGLONG res_start = pe_info->base;
     ULONGLONG res_end = pe_info->base + pe_info->map_size;
     char preloader_reserve[64], socket_env[64];
+    BOOL game_mode = FALSE;
+#ifdef __APPLE__
+    const char *target = getenv( "YAAGL_GAME_MODE_TARGET" );
+    struct stat target_stat, image_stat;
+
+    /* Match Wine's resolved image, not a launcher-supplied command line.
+     * File identity also handles drive aliases and case-insensitive paths. */
+    if (target && target[0] == '/' && unix_name &&
+        !stat( target, &target_stat ) && !stat( unix_name, &image_stat ))
+        game_mode = target_stat.st_dev == image_stat.st_dev && target_stat.st_ino == image_stat.st_ino;
+#endif
 
     if (pe_info->wine_fakedll) res_start = res_end = 0;
     if (pe_info->image_flags & IMAGE_FLAGS_ComPlusNativeReady)
@@ -2306,9 +2288,6 @@ DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
 
     virtual_init();
     init_environment();
-
-    if (getenv( "YAAGL_GAME_MODE_ACTIVE" ) && !strcmp( getenv( "YAAGL_GAME_MODE_ACTIVE" ), "1" ))
-        report_game_mode( "host-started", NULL );
 
 #ifdef __APPLE__
     apple_main_thread();

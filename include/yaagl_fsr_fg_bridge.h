@@ -6,7 +6,7 @@
 
 #include <stdint.h>
 
-#define YAAGL_FSR_FG_BRIDGE_VERSION 5u
+#define YAAGL_FSR_FG_BRIDGE_VERSION 6u
 
 enum yaagl_fsr_fg_create_flags
 {
@@ -24,7 +24,8 @@ enum yaagl_fsr_fg_operation
     YAAGL_FSR_FG_DISPATCH = 3,
     YAAGL_FSR_FG_DESTROY = 4,
     YAAGL_FSR_FG_CONFIGURE = 5,
-    YAAGL_FSR_FG_RETIRE_FRAME = 6
+    YAAGL_FSR_FG_RETIRE_FRAME = 6,
+    YAAGL_FSR_FG_PRESENT = 7
 };
 
 struct yaagl_fsr_fg_packet_header
@@ -167,4 +168,18 @@ struct yaagl_fsr_fg_retire_frame_packet
 struct yaagl_fsr_fg_destroy_packet
 {
     struct yaagl_fsr_fg_packet_header header;
+};
+
+/* One-shot notification from the native presenter's composition callback.
+ * source identifies the PE context lifetime, not a translation context.
+ * swapchain is the underlying public IDXGISwapChain4 interface.
+ */
+struct yaagl_fsr_fg_present_packet
+{
+    struct yaagl_fsr_fg_packet_header header;
+    uint64_t swapchain;
+    uint64_t source;
+    uint64_t frame_id;
+    uint32_t generated;
+    uint32_t only_generated;
 };

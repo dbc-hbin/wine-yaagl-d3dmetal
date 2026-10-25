@@ -15,6 +15,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace yaagl::pso::d3dmetal {
@@ -346,15 +347,116 @@ using ExecutionLeaseFor = std::conditional_t<
     std::shared_ptr<const metalfx::ExecutionLease>,
     std::shared_ptr<const fsr::framegeneration::ExecutionLease>>;
 
-struct OwnerState {
-    PreparedWork prepared;
+struct ExecutionSlot;
+
+struct ExecutionLeaseStore {
+    std::mutex mutex;
+    std::vector<std::shared_ptr<ExecutionSlot>> slots;
+
+    void retain(const std::shared_ptr<ExecutionSlot>& slot) {
+        std::lock_guard lock(mutex);
+        slots.push_back(slot);
+    }
+    void retire(const ExecutionSlot* slot) noexcept {
+        std::lock_guard lock(mutex);
+        std::erase_if(slots, [slot](const auto& value) { return value.get() == slot; });
+    }
+};
+
+struct ExecutionSlot {
     using Lease = std::variant<std::shared_ptr<const metalfx::ExecutionLease>,
                                std::shared_ptr<const fsr::framegeneration::ExecutionLease>>;
-    // Each replay owns distinct GPU resources until the native allocator resets.
-    // ExtendResourceLifetime transfers the recorded owner's +1; Reset releases
-    // it only when the application's command-allocator lifetime permits reuse.
-    std::optional<Lease> firstLease;
-    std::vector<Lease> leases;
+    Lease lease;
+    std::mutex mutex;
+    std::weak_ptr<ExecutionLeaseStore> owner;
+    void* commandBuffer;
+
+    ExecutionSlot(Lease initial, const std::shared_ptr<ExecutionLeaseStore>& store,
+                  void* buffer) noexcept
+        : lease(std::move(initial)), owner(store), commandBuffer(buffer) {}
+
+    void retire() noexcept {
+        {
+            std::lock_guard lock(mutex);
+            std::visit([](auto& value) { value.reset(); }, lease);
+        }
+        if (auto store = owner.lock()) store->retire(this);
+    }
+};
+
+std::mutex gPendingLock;
+std::unordered_map<void*, std::vector<std::weak_ptr<ExecutionSlot>>> gPending;
+std::atomic<bool> gPendingNonempty{false};
+
+void unregisterSlot(const ExecutionSlot* slot) noexcept {
+    std::lock_guard lock(gPendingLock);
+    const auto found = gPending.find(slot->commandBuffer);
+    if (found == gPending.end()) return;
+    std::erase_if(found->second, [slot](const auto& weak) {
+        const auto value = weak.lock();
+        return !value || value.get() == slot;
+    });
+    if (found->second.empty()) gPending.erase(found);
+    gPendingNonempty.store(!gPending.empty(), std::memory_order_release);
+}
+
+std::shared_ptr<ExecutionSlot> reserveExecutionSlot(
+    const std::shared_ptr<ExecutionLeaseStore>& owner, void* buffer, ExecutionSlot::Lease initial) {
+    auto slot = std::make_shared<ExecutionSlot>(std::move(initial), owner, buffer);
+    owner->retain(slot);
+    try {
+        std::lock_guard lock(gPendingLock);
+        gPending[buffer].emplace_back(slot);
+        gPendingNonempty.store(true, std::memory_order_release);
+    } catch (...) {
+        unregisterSlot(slot.get());
+        owner->retire(slot.get());
+        throw;
+    }
+    return slot;
+}
+
+void retireCompletedBuffer(void* buffer) noexcept {
+    std::vector<std::weak_ptr<ExecutionSlot>> completed;
+    {
+        std::lock_guard lock(gPendingLock);
+        const auto found = gPending.find(buffer);
+        if (found == gPending.end()) return;
+        completed = std::move(found->second);
+        gPending.erase(found);
+        gPendingNonempty.store(!gPending.empty(), std::memory_order_release);
+    }
+    // Destructors return Metal resources to their pools. Never run them while
+    // holding the registry lock, or retain a raw recorded-owner pointer.
+    for (const auto& weak : completed)
+        if (auto slot = weak.lock()) slot->retire();
+}
+
+using CompleteExecute = void (*)(void*);
+std::atomic<CompleteExecute> gCompleteExecute;
+
+void completeExecute(void* completion) {
+    if (gPendingNonempty.load(std::memory_order_acquire)) {
+        // beta3 DoExecute::$_2::operator() at 0x16f0d0 is invoked by GPU
+        // feedback. Its capture contains worker +0 and ExecuteCommand +0x10.
+        // EncodeExecute begins/re-encodes each submission's buffer; the
+        // original completion returns it to the pool only after this hook.
+        const auto worker = loadAt<void*>(completion);
+        if (loadAt<std::uint8_t>(worker, 0x1a) == 1) {
+            const auto command = loadAt<void*>(completion, 0x10);
+            @autoreleasepool {
+                retireCompletedBuffer(loadAt<void*>(command, 0xa8));
+            }
+        }
+    }
+    gCompleteExecute.load(std::memory_order_acquire)(completion);
+}
+
+struct OwnerState {
+    PreparedWork prepared;
+    // Recorded inputs remain allocator-owned. Completed executions retire
+    // independently; unsubmitted or partially encoded work keeps this fallback.
+    std::shared_ptr<ExecutionLeaseStore> leases = std::make_shared<ExecutionLeaseStore>();
     std::mutex leaseLock;
     std::array<id, kMaxResources> textures{};
     std::array<id, kMaxResources> buffers{};
@@ -381,6 +483,10 @@ struct OwnerState {
     }
 
     ~OwnerState() {
+        {
+            std::lock_guard lock(leases->mutex);
+            for (const auto& slot : leases->slots) unregisterSlot(slot.get());
+        }
         for (std::size_t i = 0; i < textureCount; ++i)
             (textures[i] ? [textures[i] release] : [buffers[i] release]);
     }
@@ -391,7 +497,7 @@ struct OwnerState {
         bool encoded = false;
         try {
             std::lock_guard<std::mutex> lock(leaseLock);
-            // Reserve the lease entry before the backend can append GPU work.
+            // Reserve and register the slot before the backend can append GPU work.
             // PreparedFrame publishes its ExecutionLease before any command;
             // keeping it through a false return preserves partially encoded
             // resource ownership as well.
@@ -401,14 +507,10 @@ struct OwnerState {
                 if constexpr (std::is_same_v<T, std::monostate>) return false;
                 else {
                     using FrameLease = ExecutionLeaseFor<T>;
-                    Lease* slot;
-                    if (!firstLease)
-                        slot = &firstLease.emplace(FrameLease{});
-                    else {
-                        leases.emplace_back(FrameLease{});
-                        slot = &leases.back();
-                    }
-                    FrameLease& lease = std::get<FrameLease>(*slot);
+                    auto slot = reserveExecutionSlot(
+                        leases, commandBuffer, ExecutionSlot::Lease{FrameLease{}});
+                    std::lock_guard slotLock(slot->mutex);
+                    FrameLease& lease = std::get<FrameLease>(slot->lease);
                     bool result;
                     if constexpr (std::is_same_v<T, std::shared_ptr<const metalfx::PreparedFrame>>)
                         result = frame && frame->encode(commandBuffer, fence, lease, &error);
@@ -437,6 +539,12 @@ struct OwnerState {
 @end
 
 namespace yaagl::pso::d3dmetal {
+
+std::uintptr_t initializeCompletionHook(std::uintptr_t original) noexcept {
+    if (!original) return 0;
+    gCompleteExecute.store(reinterpret_cast<CompleteExecute>(original), std::memory_order_release);
+    return reinterpret_cast<std::uintptr_t>(&completeExecute);
+}
 
 bool initialize(const void* d3dmetalImageBase) noexcept {
     std::lock_guard<std::mutex> lock(gRuntimeLock);

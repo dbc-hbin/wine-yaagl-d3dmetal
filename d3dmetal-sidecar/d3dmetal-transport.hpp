@@ -121,6 +121,10 @@ struct RecordRequest {
 // locates D3DMetal from MPLCreateContext in the current process.
 bool initialize(const void* d3dmetalImageBase = nullptr) noexcept;
 
+// Wrap the pinned beta3 GPU-completion handler before it signals fences or
+// returns the submitted Metal4 command buffer to the native pool.
+std::uintptr_t initializeCompletionHook(std::uintptr_t original) noexcept;
+
 // Public DX12 wrapper -> the current beta3 MPL list and allocator via native
 // private-interface RTTI and MDE getters. Non-MPL command lists are rejected.
 bool unwrapCommandList(void* d3d12CommandList, NativeCommandList& out) noexcept;

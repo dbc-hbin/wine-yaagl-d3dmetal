@@ -20,19 +20,43 @@ const layout = JSON.parse(await readFile(new URL("../d3dmetal-sidecar/layout.jso
 const sites = D3DMETAL_SIDECAR_PATCH_SITES;
 
 // Independent acceptance inventory: deriving this from layout.hooks would let
-// deleting a retained hook or reintroducing a cache hook change the test oracle.
+// deleting a retained hook or replacing a native compiler change the test oracle.
 const retained = [
   ["GetContainingOutput", 0x129760, "415741565657"],
   ["SetFullscreenState", 0x128fe4, "4156565755534881ec30010000"],
   ["QueryVideoMemoryInfo", 0x1678ae, "415741564154"],
   ["ReplayTemporalScale", 0x417e0, "554889e5415741564154"],
 ];
+const asynchronous = [
+  ["GraphicsCtor", 0x123ee8, "5541574156"],
+  ["GetRenderPipelineState", 0x126576, "5541574156"],
+  ["GraphicsDestroy", 0x121502, "415741564154"],
+  ["MPLDraw", 0xea208, "4157415656"],
+  ["MPLDrawIndexed", 0xea0a8, "4157415656"],
+  ["RootCtor", 0x879f6, "5541574156"],
+  ["RootDestroy", 0x85486, "415741564154"],
+  ["MPLReset", 0xeb8bc, "415741564155"],
+  ["MPLBeginQuery", 0xe856a, "415741564155"],
+  ["MPLEndQuery", 0xea3f4, "415741564155"],
+  ["MPLDestroy", 0xf2d6e, "415741564154"],
+  ["Present1", 0x129a78, "415741564155"],
+  ["DX11Draw", 0xe3788, "4157415656"],
+  ["DX11DrawIndexed", 0xe38b4, "4157415656"],
+  ["DX11Begin", 0xe34fa, "4157415656"],
+  ["DX11End", 0xe338a, "4157415656"],
+  ["DX11Destroy", 0xcd716, "4157415653"],
+];
+const completion = [
+  ["CompleteExecute", 0x16f0d0, "5541574156"],
+];
+const presentation = [
+  ["PresentResidencyAdd", 0x16d242, "ff15e0403700"],
+];
 const removed = [
   ["Metal4Render", 0x1842b9, "5541574156"],
   ["Render", 0x184353, "5541574156"],
   ["Mesh", 0x1843fc, "5541574156"],
   ["Compute", 0x1844a5, "5541574156"],
-  ["GetRender", 0x126576, "5541574156"],
   ["CompileCompute", 0x96758, "5541574156"],
   ["DestroyDevice", 0x60f54, "5541574156"],
   ["CreateRTFunction", 0x138d28, "5541574156"],
@@ -60,13 +84,21 @@ function assertNativeEntries(bytes) {
 
 function assertRetainedRoutes(patched) {
   for (const [index, hook] of layout.hooks.entries()) {
-    assert.equal(patched[hook.entryOffset], 0xe9);
+    assert.equal(patched[hook.entryOffset], hook.callSite ? 0xe8 : 0xe9);
     assert.equal(hook.entryOffset + 5 + patched.readInt32LE(hook.entryOffset + 1), hook.gateOffset);
     assert.equal(hook.gateOffset + 8 + patched.readInt32LE(hook.gateOffset + 3), layout.dispatch.dataSlotVMAddr);
     assert.equal(hook.gateOffset + 17 + patched.readInt32LE(hook.gateOffset + 13), layout.dispatch.dataSlotVMAddr);
     assert.equal(patched.readInt32LE(hook.gateOffset + 20), index * 8);
     assert.equal(hook.gateOffset + 10 + patched.readInt8(hook.gateOffset + 9), hook.trampolineOffset);
     const prologue = Buffer.from(hook.originalHex, "hex");
+    if (hook.callSite) {
+      assert.equal(hook.id, "PresentResidencyAdd");
+      assert.equal(patched[hook.entryOffset + 5], 0x90);
+      assert.equal(patched.readUInt16LE(hook.trampolineOffset), 0x25ff);
+      assert.equal(hook.trampolineOffset + 6 + patched.readInt32LE(hook.trampolineOffset + 2),
+        hook.entryOffset + 6 + pristine.readInt32LE(hook.entryOffset + 2));
+      continue;
+    }
     assert.deepEqual(patched.subarray(hook.trampolineOffset, hook.trampolineOffset + prologue.length), prologue);
     const jump = hook.trampolineOffset + prologue.length;
     assert.equal(patched[jump], 0xe9);
@@ -74,18 +106,20 @@ function assertRetainedRoutes(patched) {
   }
 }
 
-await test("format 27 has exactly four compact non-cache dispatch slots", () => {
-  assert.equal(layout.formatVersion, 27);
+await test("format 31 retains feature, async and completion gates with scoped Present residency", () => {
+  assert.equal(layout.formatVersion, 31);
   assert.equal(layout.source.sha256, "a64950e8324cec32c9a442daa1fafd03823bd199fdd84fee5c73679b5fe86660");
   assert.equal(layout.source.machUuid, "4418ec47c3f03285a05615d87d785ffe");
   assert.equal(layout.constructorVerification.markerHex,
-    Buffer.from("YAAGLB3SIDEcar\x1b", "ascii").toString("hex"));
+    Buffer.from("YAAGLB3SIDEcar\x1f", "ascii").toString("hex"));
   assert.equal(layout.dispatch.pointerSize, 8);
-  assert.deepEqual(layout.hooks.map(hook => [hook.id, hook.entryOffset, hook.originalHex]), retained);
-  assert.deepEqual(layout.hooks.map(hook => hook.dispatchFieldOffset), [0, 8, 16, 24]);
-  assert.deepEqual(layout.hooks.map(hook => hook.gateOffset), [0x4e0040, 0x4e0080, 0x4e00c0, 0x4e0100]);
+  const expected = [...retained, ...asynchronous, ...completion, ...presentation];
+  assert.deepEqual(layout.hooks.map(hook => [hook.id, hook.entryOffset, hook.originalHex]), expected);
+  assert.deepEqual(layout.hooks.map(hook => hook.dispatchFieldOffset), expected.map((_, index) => index * 8));
+  assert.deepEqual(layout.hooks.map(hook => hook.gateOffset), expected.map((_, index) => 0x4e0040 + index * 0x40));
+  assert.deepEqual(layout.hooks.filter(hook => hook.callSite).map(hook => hook.id), ["PresentResidencyAdd"]);
   assert.deepEqual(layout.binaryPatches, []);
-  assert.equal(sites.length, 5 + 4 * 3);
+  assert.equal(sites.length, 5 + expected.length * 3);
 });
 
 await test("beta3 canonical gates preserve the input and every unpatched byte", () => {
@@ -175,7 +209,9 @@ await test("the complete former seventeen-hook payload is rejected rather than m
   legacyDependency.write("@loader_path/Resources/libYaaglNativePsoCache.dylib", 24, "utf8");
   legacyDependency.copy(legacy, layout.dependency.commandOffset);
   legacy.fill(0, 0x4e0040, 0x4e1000);
-  for (const [index, [, entry, originalHex]] of [...removed, ...retained].entries()) {
+  const legacyHooks = [...removed.slice(0, 4), ["GetRender", 0x126576, "5541574156"],
+    ...removed.slice(4), ...retained];
+  for (const [index, [, entry, originalHex]] of legacyHooks.entries()) {
     const original = Buffer.from(originalHex, "hex");
     const gateOffset = 0x4e0040 + index * 0x40;
     const trampoline = gateOffset + 0x18;

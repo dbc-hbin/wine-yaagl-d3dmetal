@@ -14,9 +14,9 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-host_loader = importlib.util.spec_from_file_location('game_mode_host', ROOT / 'scripts/game-mode-host.py')
-game_mode = importlib.util.module_from_spec(host_loader)
-host_loader.loader.exec_module(game_mode)
+game_mode_loader = importlib.util.spec_from_file_location('game_mode', ROOT / 'scripts/game-mode.py')
+game_mode = importlib.util.module_from_spec(game_mode_loader)
+game_mode_loader.loader.exec_module(game_mode)
 REL = Path('lib/external/D3DMetal.framework/Versions/A')
 IMAGE = str(REL / 'D3DMetal')
 CONVERTER = str(REL / 'Resources/libmetalirconverter.dylib')
@@ -38,7 +38,7 @@ ORIGINAL_FG_EXPORTS = ((1, 'ffxConfigure'), (2, 'ffxCreateContext'), (3, 'ffxDes
                        (4, 'ffxDispatch'), (5, 'ffxQuery'))
 FSR_ARTIFACT_PATHS = tuple(f'lib/wine/{arch}/amd_fidelityfx_{module}_dx12.{suffix}'
     for module in ('upscaler', 'framegeneration')
-    for arch, suffix in (('x86_64-windows', 'dll'), ('x86_64-unix', 'so')))
+    for arch, suffix in (('x86_64-windows', 'dll'), ('i386-windows', 'dll'), ('x86_64-unix', 'so')))
 FSR_POLICY = {'implementation': 'builtin-fsr-api-to-metalfx-with-metalfx-frame-interpolation',
               'dll_override': 'amd_fidelityfx_upscaler_dx12,amd_fidelityfx_framegeneration_dx12=b',
               'native_fg_fallback': PRIVATE_FG_PATH, 'default_upscaler': 'metalfx',
@@ -46,8 +46,8 @@ FSR_POLICY = {'implementation': 'builtin-fsr-api-to-metalfx-with-metalfx-frame-i
 NGX_POLICY = {'implementation': 'stock-gptk-ngx-to-metalfx', 'aliases': NGX_ALIASES}
 REQUIRED_HOST = ('bin/wine', 'bin/wineserver', 'lib/wine/x86_64-unix/ntdll.so',
                  'lib/wine/x86_64-unix/win32u.so', 'lib/wine/x86_64-unix/winemac.so',
-                 'lib/wine/x86_64-unix/winegstreamer.so', game_mode.HOST,
-                 game_mode.BUNDLE + '/Contents/Info.plist') + FSR_ARTIFACT_PATHS
+                 'lib/wine/x86_64-unix/winegstreamer.so', game_mode.SUPERVISOR,
+                 game_mode.POLICY_TOOL, game_mode.HOST, game_mode.INFO_PLIST) + FSR_ARTIFACT_PATHS
 
 
 def digest(path: Path) -> str:
@@ -179,7 +179,7 @@ def check_sources(manifest: dict) -> None:
             raise ValueError(f'build source changed: {entry["path"]}')
 
 
-def check_fsr_pe(path: Path) -> None:
+def check_fsr_pe(path: Path, architecture='x86-64') -> None:
     tool = os.environ.get('WINE_LLVM_READOBJ') or shutil.which('llvm-readobj')
     if not tool and os.environ.get('WINE_MINGW_ROOT'):
         tool = str(Path(os.environ['WINE_MINGW_ROOT']) / 'bin/llvm-readobj')
@@ -187,8 +187,19 @@ def check_fsr_pe(path: Path) -> None:
         raise ValueError('set WINE_LLVM_READOBJ or WINE_MINGW_ROOT for FSR PE validation')
     output = subprocess.check_output([tool, '--coff-exports', str(path)], text=True)
     exports = tuple((int(n), name) for n, name in re.findall(r'Ordinal: (\d+)\s+Name: (\w+)', output))
-    if 'Format: COFF-x86-64' not in output or exports != ORIGINAL_FG_EXPORTS:
+    if f'Format: COFF-{architecture}\n' not in output or exports != ORIGINAL_FG_EXPORTS:
         raise ValueError(f'FSR PE architecture/exports mismatch: {path}')
+
+
+def check_public_fsr(runtime: Path, build: dict) -> None:
+    for relative in FSR_ARTIFACT_PATHS:
+        if not relative.endswith('.dll'):
+            continue
+        path = runtime / relative
+        expected = build['hostArtifacts'].get(relative)
+        if not expected or not path.is_file() or not under(path, runtime) or digest(path) != expected:
+            raise ValueError(f'public FSR DLL differs from source build: {relative}')
+        check_fsr_pe(path, 'i386' if '/i386-windows/' in relative else 'x86-64')
 
 
 def original_fg_provenance(path: Path) -> dict:
@@ -233,6 +244,7 @@ def validate_stage(runtime: Path, current_sources=False) -> dict:
                     ('steam64.exe', 'steam32.exe', 'lsteamclient64.dll', 'lsteamclient32.dll'))
     if not required <= stage['signed_artifacts'].keys():
         raise ValueError('full source runtime artifact inventory is incomplete')
+    check_public_fsr(runtime, build)
     check_stock(runtime, load_spec())
     fallback = runtime / PRIVATE_FG_PATH
     if digest(fallback) != ORIGINAL_FG_SHA256 or fallback.stat().st_mode & 0o222:
@@ -249,7 +261,7 @@ def validate_stage(runtime: Path, current_sources=False) -> dict:
     if stage.get('display_bridge') != display_bridge_provenance(runtime):
         raise ValueError('Wine display bridge identity mismatch')
     inspect_image(runtime)
-    for path in (runtime / SIDECAR, runtime / 'lib/external/D3DMetal.framework', runtime / game_mode.BUNDLE):
+    for path in (runtime / SIDECAR, runtime / 'lib/external/D3DMetal.framework'):
         subprocess.run(['codesign', '--verify', '--strict', str(path)], check=True)
     if current_sources:
         check_sources(stage['native_build_manifest'])

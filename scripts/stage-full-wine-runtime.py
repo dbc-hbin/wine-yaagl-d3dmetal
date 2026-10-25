@@ -68,7 +68,8 @@ def relocate_runtime(runtime: Path) -> list[dict]:
             continue
         dependencies, rpaths, identity = load_commands(path)
         edits = []
-        preserve = path.relative_to(runtime).as_posix() in (stage.IMAGE, stage.CONVERTER, stage.SHARED_DYLIB_PATH)
+        preserve = path.relative_to(runtime).as_posix() in (
+            stage.IMAGE, stage.CONVERTER, stage.SHARED_DYLIB_PATH, stage.game_mode.POLICY_TOOL)
         def expand(value):
             return Path(value.replace('@loader_path', str(path.parent)).replace('@executable_path', str(runtime / 'bin')))
         for dep in dependencies:
@@ -203,15 +204,15 @@ def main() -> int:
     if files != build['hostArtifacts'] or links != build['hostSymlinks']:
         raise ValueError('installed host differs from the build provenance')
     stage.game_mode.validate(host)
+    stage.check_public_fsr(host, build)
     for relative in stage.REQUIRED_HOST:
         if relative not in files:
             raise ValueError(f'full source host is missing: {relative}')
         path = host / relative
-        if relative in stage.FSR_ARTIFACT_PATHS and relative.endswith('.dll'):
-            stage.check_fsr_pe(path)
-        elif macho(path):
+        if macho(path):
             architectures = subprocess.check_output(['lipo', '-archs', str(path)], text=True).split()
-            expected = build['wineserverArchitecture'] if relative == 'bin/wineserver' else 'x86_64'
+            expected = (build['wineserverArchitecture'] if relative == 'bin/wineserver' else
+                        'arm64' if relative == stage.game_mode.POLICY_TOOL else 'x86_64')
             if expected not in architectures:
                 raise ValueError(f'host architecture mismatch: {relative}: expected {expected}')
     if source_tree := build.get('sourceTreeSha256'):
@@ -258,10 +259,11 @@ def main() -> int:
         # The Apple bridge/converter must not be rewritten; their load paths are already portable.
         relocations = relocate_runtime(temporary)
         for path in (temporary / stage.SIDECAR, temporary / framework_relative,
-                     temporary / stage.game_mode.BUNDLE):
+                     temporary / stage.game_mode.SUPERVISOR, temporary / stage.game_mode.BUNDLE):
             subprocess.run(['codesign', '--force', '--sign', '-', str(path)], check=True)
             subprocess.run(['codesign', '--verify', '--strict', str(path)], check=True)
         stage.check_stock(temporary, spec)
+        stage.game_mode.validate(temporary)
         inspection = stage.inspect_image(temporary)
         files, links = stage.inventory(temporary)
         manifest = {'stage_schema': stage.STAGE_SCHEMA, 'gptk_version': '4.0b3',

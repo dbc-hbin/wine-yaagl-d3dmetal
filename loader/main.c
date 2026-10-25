@@ -151,9 +151,7 @@ static void *try_dlopen( const char *argv0 )
     if (!argv0) return NULL;
     if (!(dir = realpath_dirname( argv0 ))) return NULL;
 
-    if ((p = remove_tail( dir, "/libexec/yaagl-game-mode/ZZZ.app/Contents/MacOS" )))
-        path = build_path( p, "lib/wine/x86_64-unix/ntdll.so" );
-    else if ((p = remove_tail( dir, "/loader" )))
+    if ((p = remove_tail( dir, "/loader" )))
         path = build_path( p, "dlls/ntdll/ntdll.so" );
     else
         path = build_path( dir, "ntdll.so" );

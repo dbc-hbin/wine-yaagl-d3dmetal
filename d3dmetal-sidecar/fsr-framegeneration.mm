@@ -1,5 +1,6 @@
 #include "fsr-framegeneration.hpp"
 #include "d3dmetal-transport.hpp"
+#include "async-pipeline-state.hpp"
 #include "../include/yaagl_fsr_fg_bridge.h"
 #include "third-party/fidelityfx/Kits/FidelityFX/api/include/ffx_api_types.h"
 #include "fsr-kernels.inc"
@@ -1616,8 +1617,10 @@ bool PreparedFrame::encode(
                     (state.creation.flags & YAAGL_FSR_FG_DEPTH_INVERTED) != 0;
                 effect.motionVectorScaleX = 1.0f;
                 effect.motionVectorScaleY = 1.0f;
-                effect.jitterOffsetX = p.jitter_x;
-                effect.jitterOffsetY = p.jitter_y;
+                // Color is already stabilized, and the prepass aligns depth
+                // and motion to it. Native sampling must not reapply render jitter.
+                effect.jitterOffsetX = 0.0f;
+                effect.jitterOffsetY = 0.0f;
                 effect.deltaTime = p.frame_time_delta_ms * 0.001f;
                 effect.aspectRatio = p.camera_aspect_ratio > 0
                     ? p.camera_aspect_ratio
@@ -1811,6 +1814,17 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
         return finish(Parameter);
     try {
         @try {
+            if (operation == YAAGL_FSR_FG_PRESENT) {
+                if (header.size != sizeof(yaagl_fsr_fg_present_packet))
+                    return finish(Parameter);
+                const auto& p = *static_cast<const yaagl_fsr_fg_present_packet*>(arguments);
+                if (!p.swapchain || !p.source || p.generated > 1 || p.only_generated > 1)
+                    return finish(Parameter);
+                async_pipeline::presentationHistory().mark(
+                    {reinterpret_cast<void*>(p.swapchain), p.source, p.frame_id,
+                     p.generated != 0, p.only_generated != 0});
+                return finish(Ok);
+            }
             if (operation == YAAGL_FSR_FG_DESTROY) {
                 if (header.size != sizeof(yaagl_fsr_fg_destroy_packet))
                     return finish(Parameter);
@@ -1864,6 +1878,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                 if (state->retired) return finish(Parameter);
                 auto& config = *static_cast<yaagl_fsr_fg_configure_packet*>(arguments);
                 if (config.enabled > 1) return finish(Parameter);
+                if (config.enabled && state->generationEnabled) return finish(Ok);
                 std::lock_guard executionLock(state->executionMutex);
                 state->generationEnabled = config.enabled != 0;
                 if (!state->generationEnabled) {

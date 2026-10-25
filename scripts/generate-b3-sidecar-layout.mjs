@@ -42,8 +42,27 @@ const hooks = [
   ["SetFullscreenState", 0x128fe4, "4156565755534881ec30010000"],
   ["QueryVideoMemoryInfo", 0x1678ae, "415741564154"],
   ["ReplayTemporalScale", 0x417e0, "554889e5415741564154"],
+  ["GraphicsCtor", 0x123ee8, "5541574156"],
+  ["GetRenderPipelineState", 0x126576, "5541574156"],
+  ["GraphicsDestroy", 0x121502, "415741564154"],
+  ["MPLDraw", 0xea208, "4157415656"],
+  ["MPLDrawIndexed", 0xea0a8, "4157415656"],
+  ["RootCtor", 0x879f6, "5541574156"],
+  ["RootDestroy", 0x85486, "415741564154"],
+  ["MPLReset", 0xeb8bc, "415741564155"],
+  ["MPLBeginQuery", 0xe856a, "415741564155"],
+  ["MPLEndQuery", 0xea3f4, "415741564155"],
+  ["MPLDestroy", 0xf2d6e, "415741564154"],
+  ["Present1", 0x129a78, "415741564155"],
+  ["DX11Draw", 0xe3788, "4157415656"],
+  ["DX11DrawIndexed", 0xe38b4, "4157415656"],
+  ["DX11Begin", 0xe34fa, "4157415656"],
+  ["DX11End", 0xe338a, "4157415656"],
+  ["DX11Destroy", 0xcd716, "4157415653"],
+  ["CompleteExecute", 0x16f0d0, "5541574156"],
+  ["PresentResidencyAdd", 0x16d242, "ff15e0403700", true],
 ];
-const formatVersion = 27;
+const formatVersion = 31;
 const gateStart = 0x4e0040;
 const slot = 0x563f18;
 const markerOffset = gateStart + 0x780;
@@ -74,7 +93,7 @@ const gateHex = (gate, dispatchOffset) => {
     Buffer.from("41ffa3", "hex"), jump,
   ]).toString("hex");
 };
-const hooksOut = hooks.map(([id, entryOffset, originalHex], index) => {
+const hooksOut = hooks.map(([id, entryOffset, originalHex, callSite = false], index) => {
   const original = Buffer.from(originalHex, "hex");
   const observed = bytes.subarray(entryOffset, entryOffset + original.length).toString("hex");
   if (observed !== originalHex) throw new Error(`${id} prologue mismatch at 0x${entryOffset.toString(16)}: ${observed}`);
@@ -82,14 +101,28 @@ const hooksOut = hooks.map(([id, entryOffset, originalHex], index) => {
   const trampolineOffset = gateOffset + 0x18;
   const dispatchFieldOffset = index * 8;
   const entryPatch = Buffer.concat([
-    Buffer.from("e9", "hex"), Buffer.from(rel32(entryOffset, gateOffset), "hex"),
-    Buffer.alloc(original.length - 5),
+    Buffer.from(callSite ? "e8" : "e9", "hex"), Buffer.from(rel32(entryOffset, gateOffset), "hex"),
+    Buffer.alloc(original.length - 5, callSite ? 0x90 : 0),
   ]).toString("hex");
-  const trampoline = Buffer.concat([
-    original, Buffer.from("e9", "hex"), Buffer.from(rel32(trampolineOffset + original.length, entryOffset + original.length), "hex"),
-  ]).toString("hex");
+  let trampoline;
+  if (callSite) {
+    if (original.length !== 6 || original.readUInt16LE() !== 0x15ff) {
+      throw new Error(`${id}: expected a RIP-relative indirect call`);
+    }
+    const targetSlot = entryOffset + original.length + original.readInt32LE(2);
+    const displacement = Buffer.alloc(4);
+    displacement.writeInt32LE(targetSlot - (trampolineOffset + 6));
+    // The call site supplies the return address. Tail-call the original
+    // imported function without adding a frame or changing stack alignment.
+    trampoline = Buffer.concat([Buffer.from("ff25", "hex"), displacement]).toString("hex");
+  } else {
+    trampoline = Buffer.concat([
+      original, Buffer.from("e9", "hex"), Buffer.from(rel32(trampolineOffset + original.length, entryOffset + original.length), "hex"),
+    ]).toString("hex");
+  }
   return {
     id,
+    ...(callSite ? { callSite: true } : {}),
     entryOffset,
     gateOffset,
     trampolineOffset,
@@ -124,7 +157,7 @@ const layout = {
   constructorVerification: {
     markerOffset,
     markerHex,
-    description: "GPTK4b3 feature-only dispatch; native PSO, function, RT, and library caching remains unmodified.",
+    description: "GPTK4b3 feature and opt-in async graphics dispatch; workers use the original native pipeline and shader caches.",
   },
   textCave: {
     offset: gateStart,

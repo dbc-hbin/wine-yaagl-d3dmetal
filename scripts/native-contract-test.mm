@@ -9,6 +9,7 @@
 #include <iterator>
 #include <string>
 #include <typeinfo>
+#include "native-test-layout.hpp"
 
 namespace {
 template<class T> void put(std::vector<std::uint8_t>& bytes, std::size_t at, const T& value) {
@@ -378,8 +379,7 @@ void testLoadedImage(const char* path, const char* pristinePath) {
     yaagl::native::D3DMetalApi api;
     assert(api.load(image));
     const auto* base = reinterpret_cast<const std::uint8_t*>(image);
-    constexpr char marker[] = "YAAGLB3SIDEcar\x1b";
-    assert(std::memcmp(base + 0x4e07c0, marker, sizeof(marker) - 1) == 0);
+    assert(std::memcmp(base + kSidecarMarkerOffset, kSidecarMarker, sizeof(kSidecarMarker)) == 0);
     std::ifstream stream(pristinePath, std::ios::binary);
     assert(stream);
     const std::vector<std::uint8_t> pristine{std::istreambuf_iterator<char>(stream), {}};
@@ -388,11 +388,14 @@ void testLoadedImage(const char* path, const char* pristinePath) {
         0x138d28, 0x139418, 0x13c544, 0x92d6a, 0x1863fe, 0x12507c,
     };
     for (const auto offset : nativeEntries) {
+        bool hooked = false;
+        for (const auto entry : kSidecarHookEntries) hooked |= entry == offset;
+        if (hooked) continue;
         assert(offset + 64 <= pristine.size());
         assert(std::memcmp(base + offset, pristine.data() + offset, 64) == 0);
     }
-    std::puts("all thirteen loaded native cache entries match pristine bytes: PASS");
-    const auto* dispatch = yaagl::native::readObject<const std::uintptr_t*>(base + 0x563f18);
+    std::puts("unhooked native cache entries match pristine bytes: PASS");
+    const auto* dispatch = yaagl::native::readObject<const std::uintptr_t*>(base + kSidecarDispatchSlot);
     assert(dispatch);
     void* fsr = dlsym(handle, "yaagl_fsr_api");
     void* fg = dlsym(handle, "yaagl_fsr_fg_api");
@@ -412,6 +415,11 @@ void testLoadedImage(const char* path, const char* pristinePath) {
     for (std::size_t index = 0; index < 4; ++index) {
         assert(dispatch[index] == reinterpret_cast<std::uintptr_t>(
             findImplementation(sidecar, implementations[index])));
+    }
+    for (std::size_t index = 0; index < std::size(kSidecarHookEntries); ++index) {
+        Dl_info hookInfo{};
+        assert(dispatch[index] && dladdr(reinterpret_cast<void*>(dispatch[index]), &hookInfo));
+        assert(hookInfo.dli_fbase == sidecarInfo.dli_fbase);
     }
     // Exercise the real entry -> gate -> compact slot -> production hook with
     // its supported null-output contract; no fabricated DXGI object is used.

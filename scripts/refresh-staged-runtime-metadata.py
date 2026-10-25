@@ -44,7 +44,7 @@ def derived_metadata(tree: Path, record: dict) -> tuple[dict, dict, str]:
             f"Runtime ID: {provenance['runtimeId']}\n"
             f"Source commit: {provenance['sourceCommit']}\n"
             f"Source tree SHA-256: {provenance['sourceTreeSha256']}\n"
-            'Graphics: GPTK 4.0b3; native GPTK caches; four-hook sidecar; stock NGX-to-MetalFX; pristine converter\n'
+            f"Graphics: GPTK 4.0b3; native GPTK caches; {record['native_build_manifest']['d3dmetal']['hookCount']}-hook sidecar; stock NGX-to-MetalFX; pristine converter\n"
             f"D3DMetal signed artifact SHA-256: {graphics['artifacts']['framework']['sha256']}\n"
             f"Native sidecar signed artifact SHA-256: {graphics['artifacts']['module']['sha256']}\n")
     return graphics, provenance, text

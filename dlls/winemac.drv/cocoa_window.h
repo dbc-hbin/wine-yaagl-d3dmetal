@@ -67,13 +67,6 @@
     BOOL exitingFullScreen;
     NSRect nonFullscreenFrame;
     NSTimeInterval enteredFullScreenTime;
-    BOOL gameModeHost;
-    BOOL gameModeFullscreenRequested;
-    BOOL gameModeFullscreenSuppressed;
-    BOOL gameModeNativeFullscreen;
-    BOOL gameModeFullscreenPending;
-    BOOL gameModeFramePending;
-    BOOL gameModeFullscreenExitRequested;
 
     int draggingPhase;
     NSPoint dragStartPosition;

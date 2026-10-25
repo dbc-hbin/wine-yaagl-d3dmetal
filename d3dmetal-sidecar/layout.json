@@ -1,5 +1,5 @@
 {
-  "formatVersion": 27,
+  "formatVersion": 31,
   "source": {
     "sha256": "a64950e8324cec32c9a442daa1fafd03823bd199fdd84fee5c73679b5fe86660",
     "machUuid": "4418ec47c3f03285a05615d87d785ffe",
@@ -19,8 +19,8 @@
   },
   "constructorVerification": {
     "markerOffset": 5113792,
-    "markerHex": "594141474c4233534944456361721b",
-    "description": "GPTK4b3 feature-only dispatch; native PSO, function, RT, and library caching remains unmodified."
+    "markerHex": "594141474c4233534944456361721f",
+    "description": "GPTK4b3 feature and opt-in async graphics dispatch; workers use the original native pipeline and shader caches."
   },
   "textCave": {
     "offset": 5111872,
@@ -86,6 +86,235 @@
       "gateHex": "48833d103e080000740e4c8b1d073e080041ffa318000000",
       "trampolineHex": "554889e5415741564154e9c316b6ff",
       "dispatchFieldOffset": 24
+    },
+    {
+      "id": "GraphicsCtor",
+      "entryOffset": 1195752,
+      "gateOffset": 5112128,
+      "trampolineOffset": 5112152,
+      "continuationOffset": 1195757,
+      "originalHex": "5541574156",
+      "entryPatchHex": "e953c23b00",
+      "gateHex": "48833dd03d080000740e4c8b1dc73d080041ffa320000000",
+      "trampolineHex": "5541574156e98b3dc4ff",
+      "dispatchFieldOffset": 32
+    },
+    {
+      "id": "GetRenderPipelineState",
+      "entryOffset": 1205622,
+      "gateOffset": 5112192,
+      "trampolineOffset": 5112216,
+      "continuationOffset": 1205627,
+      "originalHex": "5541574156",
+      "entryPatchHex": "e9059c3b00",
+      "gateHex": "48833d903d080000740e4c8b1d873d080041ffa328000000",
+      "trampolineHex": "5541574156e9d963c4ff",
+      "dispatchFieldOffset": 40
+    },
+    {
+      "id": "GraphicsDestroy",
+      "entryOffset": 1185026,
+      "gateOffset": 5112256,
+      "trampolineOffset": 5112280,
+      "continuationOffset": 1185032,
+      "originalHex": "415741564154",
+      "entryPatchHex": "e9b9ec3b0000",
+      "gateHex": "48833d503d080000740e4c8b1d473d080041ffa330000000",
+      "trampolineHex": "415741564154e92513c4ff",
+      "dispatchFieldOffset": 48
+    },
+    {
+      "id": "MPLDraw",
+      "entryOffset": 958984,
+      "gateOffset": 5112320,
+      "trampolineOffset": 5112344,
+      "continuationOffset": 958989,
+      "originalHex": "4157415656",
+      "entryPatchHex": "e9f35f3f00",
+      "gateHex": "48833d103d080000740e4c8b1d073d080041ffa338000000",
+      "trampolineHex": "4157415656e9eb9fc0ff",
+      "dispatchFieldOffset": 56
+    },
+    {
+      "id": "MPLDrawIndexed",
+      "entryOffset": 958632,
+      "gateOffset": 5112384,
+      "trampolineOffset": 5112408,
+      "continuationOffset": 958637,
+      "originalHex": "4157415656",
+      "entryPatchHex": "e993613f00",
+      "gateHex": "48833dd03c080000740e4c8b1dc73c080041ffa340000000",
+      "trampolineHex": "4157415656e94b9ec0ff",
+      "dispatchFieldOffset": 64
+    },
+    {
+      "id": "RootCtor",
+      "entryOffset": 555510,
+      "gateOffset": 5112448,
+      "trampolineOffset": 5112472,
+      "continuationOffset": 555515,
+      "originalHex": "5541574156",
+      "entryPatchHex": "e985884500",
+      "gateHex": "48833d903c080000740e4c8b1d873c080041ffa348000000",
+      "trampolineHex": "5541574156e95977baff",
+      "dispatchFieldOffset": 72
+    },
+    {
+      "id": "RootDestroy",
+      "entryOffset": 545926,
+      "gateOffset": 5112512,
+      "trampolineOffset": 5112536,
+      "continuationOffset": 545932,
+      "originalHex": "415741564154",
+      "entryPatchHex": "e935ae450000",
+      "gateHex": "48833d503c080000740e4c8b1d473c080041ffa350000000",
+      "trampolineHex": "415741564154e9a951baff",
+      "dispatchFieldOffset": 80
+    },
+    {
+      "id": "MPLReset",
+      "entryOffset": 964796,
+      "gateOffset": 5112576,
+      "trampolineOffset": 5112600,
+      "continuationOffset": 964802,
+      "originalHex": "415741564155",
+      "entryPatchHex": "e93f4a3f0000",
+      "gateHex": "48833d103c080000740e4c8b1d073c080041ffa358000000",
+      "trampolineHex": "415741564155e99fb5c0ff",
+      "dispatchFieldOffset": 88
+    },
+    {
+      "id": "MPLBeginQuery",
+      "entryOffset": 951658,
+      "gateOffset": 5112640,
+      "trampolineOffset": 5112664,
+      "continuationOffset": 951664,
+      "originalHex": "415741564155",
+      "entryPatchHex": "e9d17d3f0000",
+      "gateHex": "48833dd03b080000740e4c8b1dc73b080041ffa360000000",
+      "trampolineHex": "415741564155e90d82c0ff",
+      "dispatchFieldOffset": 96
+    },
+    {
+      "id": "MPLEndQuery",
+      "entryOffset": 959476,
+      "gateOffset": 5112704,
+      "trampolineOffset": 5112728,
+      "continuationOffset": 959482,
+      "originalHex": "415741564155",
+      "entryPatchHex": "e9875f3f0000",
+      "gateHex": "48833d903b080000740e4c8b1d873b080041ffa368000000",
+      "trampolineHex": "415741564155e957a0c0ff",
+      "dispatchFieldOffset": 104
+    },
+    {
+      "id": "MPLDestroy",
+      "entryOffset": 994670,
+      "gateOffset": 5112768,
+      "trampolineOffset": 5112792,
+      "continuationOffset": 994676,
+      "originalHex": "415741564154",
+      "entryPatchHex": "e94dd63e0000",
+      "gateHex": "48833d503b080000740e4c8b1d473b080041ffa370000000",
+      "trampolineHex": "415741564154e99129c1ff",
+      "dispatchFieldOffset": 112
+    },
+    {
+      "id": "Present1",
+      "entryOffset": 1219192,
+      "gateOffset": 5112832,
+      "trampolineOffset": 5112856,
+      "continuationOffset": 1219198,
+      "originalHex": "415741564155",
+      "entryPatchHex": "e983693b0000",
+      "gateHex": "48833d103b080000740e4c8b1d073b080041ffa378000000",
+      "trampolineHex": "415741564155e95b96c4ff",
+      "dispatchFieldOffset": 120
+    },
+    {
+      "id": "DX11Draw",
+      "entryOffset": 931720,
+      "gateOffset": 5112896,
+      "trampolineOffset": 5112920,
+      "continuationOffset": 931725,
+      "originalHex": "4157415656",
+      "entryPatchHex": "e9b3cc3f00",
+      "gateHex": "48833dd03a080000740e4c8b1dc73a080041ffa380000000",
+      "trampolineHex": "4157415656e92b33c0ff",
+      "dispatchFieldOffset": 128
+    },
+    {
+      "id": "DX11DrawIndexed",
+      "entryOffset": 932020,
+      "gateOffset": 5112960,
+      "trampolineOffset": 5112984,
+      "continuationOffset": 932025,
+      "originalHex": "4157415656",
+      "entryPatchHex": "e9c7cb3f00",
+      "gateHex": "48833d903a080000740e4c8b1d873a080041ffa388000000",
+      "trampolineHex": "4157415656e91734c0ff",
+      "dispatchFieldOffset": 136
+    },
+    {
+      "id": "DX11Begin",
+      "entryOffset": 931066,
+      "gateOffset": 5113024,
+      "trampolineOffset": 5113048,
+      "continuationOffset": 931071,
+      "originalHex": "4157415656",
+      "entryPatchHex": "e9c1cf3f00",
+      "gateHex": "48833d503a080000740e4c8b1d473a080041ffa390000000",
+      "trampolineHex": "4157415656e91d30c0ff",
+      "dispatchFieldOffset": 144
+    },
+    {
+      "id": "DX11End",
+      "entryOffset": 930698,
+      "gateOffset": 5113088,
+      "trampolineOffset": 5113112,
+      "continuationOffset": 930703,
+      "originalHex": "4157415656",
+      "entryPatchHex": "e971d13f00",
+      "gateHex": "48833d103a080000740e4c8b1d073a080041ffa398000000",
+      "trampolineHex": "4157415656e96d2ec0ff",
+      "dispatchFieldOffset": 152
+    },
+    {
+      "id": "DX11Destroy",
+      "entryOffset": 841494,
+      "gateOffset": 5113152,
+      "trampolineOffset": 5113176,
+      "continuationOffset": 841499,
+      "originalHex": "4157415653",
+      "entryPatchHex": "e9252e4100",
+      "gateHex": "48833dd039080000740e4c8b1dc739080041ffa3a0000000",
+      "trampolineHex": "4157415653e9b9d1beff",
+      "dispatchFieldOffset": 160
+    },
+    {
+      "id": "CompleteExecute",
+      "entryOffset": 1503440,
+      "gateOffset": 5113216,
+      "trampolineOffset": 5113240,
+      "continuationOffset": 1503445,
+      "originalHex": "5541574156",
+      "entryPatchHex": "e9ab143700",
+      "gateHex": "48833d9039080000740e4c8b1d8739080041ffa3a8000000",
+      "trampolineHex": "5541574156e933ebc8ff",
+      "dispatchFieldOffset": 168
+    },
+    {
+      "id": "PresentResidencyAdd",
+      "callSite": true,
+      "entryOffset": 1495618,
+      "gateOffset": 5113280,
+      "trampolineOffset": 5113304,
+      "continuationOffset": 1495624,
+      "originalHex": "ff15e0403700",
+      "entryPatchHex": "e87933370090",
+      "gateHex": "48833d5039080000740e4c8b1d4739080041ffa3b0000000",
+      "trampolineHex": "ff254a0d0000",
+      "dispatchFieldOffset": 176
     }
   ],
   "binaryPatches": [],
@@ -93,8 +322,8 @@
     {
       "id": "B3TextMarker",
       "offset": 5113792,
-      "expectedHex": "594141474c4233534944456361721b"
+      "expectedHex": "594141474c4233534944456361721f"
     }
   ],
-  "patchedPayloadSha256": "a6261565f67b336b86d0a17812053b9afb5b749774bf50079ddfed066e6e74f1"
+  "patchedPayloadSha256": "3ef8ce976b3e7dac9466f28ab74eb5a35858f30d800de89309d2041405459149"
 }

@@ -26,19 +26,26 @@ Historical `patches/wine-p3/` and `patches/wine-tuned/` remain available in the 
 - Preserve shared-window-surface registration, dirty generation, clipping, lifetime and message handling together with the macdrv producer/consumer paths.
 - The external D3DMetal bridge retains its 192-byte function table and 120-byte window-data ABI. Native helpers and Windows x64 DXGI callbacks must keep their distinct calling conventions. Do not change external layout assertions to conceal a merge error.
 - Keep monitor/fullscreen routing, `macdrv_query_d3dmetal_display`, native cursor ownership, raw-input baseline and warp-consumption behavior while preserving 11.20 Objective-C types, IME interfaces and WineMetalSwapChain autorelease handling.
+- Do not restore Game Mode's automatic native-fullscreen selection or transitions. Keep explicit fullscreen geometry/cursor handling separate from Game Mode. The signed host's `game-policy-supervisor` directly executes its bundled Apple-signed `gamepolicyctl` for a global override, validates its ANSI-colored status, and restores the previous policy after the last monitored game exits. Preserve the tool's original bytes/signature and privileged entitlement checks; never relocate or re-sign it, or reintroduce runtime Xcode/xcrun discovery. Preserve process-exit registration before mutation, same-user coordination and external-policy/recovery handling together.
 
-### FSR and the four-hook sidecar
+### FSR and the native sidecar
 
 Carry both `dlls/amd_fidelityfx_*_dx12` modules, their exports and Unix bridges, the `include/yaagl_*` contracts, `d3dmetal-sidecar/` and its vendored FidelityFX headers as one source contract. Preserve current SR/FG jitter, motion, depth, camera, color, UI composition, barriers and resource-lifetime behavior. MetalFX frame history and interpolator reuse remain; they are not the removed GPTK caches.
 
-`d3dmetal-sidecar/layout.json` remains beta3-specific format 27 with marker `YAAGLB3SIDEcar\x1b`, no additional `binaryPatches`, and four dispatch slots in order:
+`d3dmetal-sidecar/layout.json` is beta3-specific format 31 with marker `YAAGLB3SIDEcar\x1f`, no additional `binaryPatches`, and 23 dispatch slots. The original four retain their order:
 
 1. `GetContainingOutput`
 2. `SetFullscreenState`
 3. `QueryVideoMemoryInfo`
 4. `ReplayTemporalScale`
 
-The module is `libD3DMetalSidecar.dylib`. Keep `--sidecar-module` / `--sidecar-manifest`, `nativeSidecarBuild` / `nativeSidecar`, `patches.nativeSidecar` and the preparation pipeline names consistent. The 13 custom cache/provenance/lifetime/singleflight hooks remain absent. Non-FSR replay uses Apple's original implementation. The converter and stock NGX/DLSS pair remain pristine; experimental DLSS/Streamline/nameplate work is excluded.
+`CompleteExecute` follows the async gates and is independent of the async option. It retires FSR execution leases at native Metal4 GPU completion, before the original completion routine notifies fences and returns the buffer to its pool. Preserve recorded input ownership and unsubmitted/partial-work fallback ownership. Do not regress to allocator-reset-only retirement: the beta3 migration removed the former completion integration, allowing completed replay resources to accumulate in long-lived allocators.
+
+`PresentResidencyAdd` follows `CompleteExecute` and patches only the indirect call at `0x16d242`, not a function prologue. Its fallback trampoline tail-jumps through the original imported `objc_msgSend` slot, preserving the call site's return address and stack alignment. The serialized native worker registers one current layer set per Metal4 queue and replaces it on a set change. Queue-associated state releases the final set on queue destruction; device/baseline registrations are not removed. The macOS 27 IOGPU implementation uses a retaining `NSCountedSet`, so duplicate adds increment a count and distinct stale layer sets consume the documented 32-set budget. This capacity/lifetime correction does not establish a whole-game memory improvement.
+
+The async suffix is `GraphicsCtor`, `GetRenderPipelineState`, `GraphicsDestroy`, `MPLDraw`, `MPLDrawIndexed`, `RootCtor`, `RootDestroy`, `MPLReset`, `MPLBeginQuery`, `MPLEndQuery`, `MPLDestroy`, `Present1`, `DX11Draw`, `DX11DrawIndexed`, `DX11Begin`, `DX11End`, `DX11Destroy`. It is disabled unless `YAAGL_D3DMETAL_ASYNC=1`. Preserve the mixed ABI, root-signature classification, query tracking, texture/subresource recurrence and destructor drain together; never change only the getter to return null while a draw continues. DX11 uses the native compiler's pending-byte and destructor-wait protocol, with the original context lock and binding/draw/resource-merge order. Its omission point also covers deferred replay and must not treat an unscheduled dynamic variant as perpetually pending.
+
+The module is `libD3DMetalSidecar.dylib`. Keep `--sidecar-module` / `--sidecar-manifest`, `nativeSidecarBuild` / `nativeSidecar`, `patches.nativeSidecar` and the preparation pipeline names consistent. The former custom caches remain absent; the graphics getter wrapper schedules Apple's original compilation and retains native result ownership. Non-FSR replay uses Apple's original implementation. The converter and stock NGX/DLSS pair remain pristine; experimental DLSS/Streamline/nameplate work is excluded.
 
 ### Media, audio, devices, networking and resources
 
@@ -73,6 +80,8 @@ These nine source-reference fixes are ancestors of Wine 11.20. Keep their upstre
 Use a fresh `WINE_P3_ROOT` with `WINE_NATIVE_SERVER=yes` and the explicit Xcode/LLVM MinGW/Bison/x86_64 dependency environment. The full builder includes both FSR modules and creates its own Wine tools and headers. `sourceTreeSha256` covers tracked and nonignored untracked source bytes; the upstream HEAD alone is not the identity of an uncommitted port. Do not edit manifests to relabel old binaries or hide source changes.
 
 Pristine GPTK 4.0b3, stock graphics/NGX modules, license resources, Steam helpers, TLS/font/media dependencies and the original game FG fallback remain separate inputs. Rebuild the native sidecar and validate its source manifest, then stage with `stage-full-wine-runtime.py`. The staged runtime must pass `stage-runtime.py --verify-runtime ... --current-sources` before packaging.
+
+Public FSR upscaler and framegeneration DLLs come from the full Wine host, not the native sidecar or graphics donor. Both `x86_64-windows` and `i386-windows` DLLs are required, checked for architecture and exports, and matched to the full build's `hostArtifacts` hashes at staging and verification. A sidecar-only rebuild does not update these DLLs. After producer changes, rebuild and install the full host with `build-wine-p3.sh` into a fresh build root, then restage and package; the x86_64-only `build-fsr-translator.sh` output is not a full-host packaging input. Do not refresh inventories around old DLLs to claim a current build.
 
 Run the existing MSync message, cursor, FSR contract/memory/resource/motion/GPU, native ABI/layout, preparation, launcher and staging checks against the final inputs. Supplement the focused MSync harness with real Wine wait/APC/child-process and shared-memory scenarios using the paired ARM64 server and Rosetta clients. Run the existing real-runtime memory-reset and XAudio callback regressions on both guest architectures. Finally exercise the new runtime in an isolated prefix and observe actual loaded modules and game rendering. No source-level check proves universal image correctness, game performance parity, physical-device coverage or absence of rare concurrency failures.
 

@@ -7,12 +7,12 @@ import { fileURLToPath } from "node:url";
 
 const layoutText = await readFile(new URL("../d3dmetal-sidecar/layout.json", import.meta.url), "utf8");
 const layoutSha256 = createHash("sha256").update(layoutText).digest("hex");
-const expectedLayoutSha256 = "b542c345cf436af67433116e793e94205fe03807050bb1ca5fad9a01a92dfa16";
+const expectedLayoutSha256 = "050a3e0f31e111d0fac7d2ef5b289794630823e1ded65733cd2c8aec57e40a74";
 if (layoutSha256 !== expectedLayoutSha256) {
   throw new Error(`layout corruption: expected SHA-256 ${expectedLayoutSha256}, got ${layoutSha256}`);
 }
 const layout = JSON.parse(layoutText);
-if (layout.formatVersion !== 27) throw new Error(`unsupported beta3 layout format ${layout.formatVersion}`);
+if (layout.formatVersion !== 31) throw new Error(`unsupported beta3 layout format ${layout.formatVersion}`);
 
 export const D3DMETAL_SIDECAR_PATCHED_PAYLOAD_SHA256 =
   layout.patchedPayloadSha256;
@@ -182,8 +182,16 @@ for (const hook of layout.hooks) {
   const entryPatch = Buffer.from(hook.entryPatchHex, "hex");
   const gate = Buffer.from(hook.gateHex, "hex");
   const trampoline = Buffer.from(hook.trampolineHex, "hex");
-  if (hook.continuationOffset !== hook.entryOffset + original.length || entryPatch.length !== original.length || !trampoline.subarray(0, original.length).equals(original) || hook.gateOffset + gate.length > layout.textCave.endOffset || hook.trampolineOffset + trampoline.length > layout.textCave.endOffset || gate[8] !== 0x74 || hook.gateOffset + 8 + gate.readInt32LE(3) !== layout.dispatch.dataSlotVMAddr || hook.gateOffset + 17 + gate.readInt32LE(13) !== layout.dispatch.dataSlotVMAddr || hook.gateOffset + 10 + gate.readInt8(9) !== hook.trampolineOffset) {
-    throw new Error(`layout corruption: invalid relocated prologue for ${hook.id}`);
+  const relocated = hook.callSite
+    ? original.length === 6 && original.readUInt16LE() === 0x15ff &&
+      entryPatch.length === 6 && entryPatch[0] === 0xe8 && entryPatch[5] === 0x90 &&
+      hook.entryOffset + 5 + entryPatch.readInt32LE(1) === hook.gateOffset &&
+      trampoline.length === 6 && trampoline.readUInt16LE() === 0x25ff &&
+      hook.trampolineOffset + 6 + trampoline.readInt32LE(2) ===
+        hook.entryOffset + 6 + original.readInt32LE(2)
+    : trampoline.subarray(0, original.length).equals(original);
+  if (hook.continuationOffset !== hook.entryOffset + original.length || entryPatch.length !== original.length || !relocated || hook.gateOffset + gate.length > layout.textCave.endOffset || hook.trampolineOffset + trampoline.length > layout.textCave.endOffset || gate[8] !== 0x74 || hook.gateOffset + 8 + gate.readInt32LE(3) !== layout.dispatch.dataSlotVMAddr || hook.gateOffset + 17 + gate.readInt32LE(13) !== layout.dispatch.dataSlotVMAddr || hook.gateOffset + 10 + gate.readInt8(9) !== hook.trampolineOffset) {
+    throw new Error(`layout corruption: invalid relocated hook for ${hook.id}`);
   }
 }
 

@@ -39,7 +39,6 @@
 # include <sys/times.h>
 #endif
 #include <sys/types.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #ifdef HAVE_SYS_SYSCTL_H
 # include <sys/sysctl.h>
@@ -408,17 +407,6 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     int stdin_fd = -1, stdout_fd = -1;
     pid_t pid;
     char **argv;
-    BOOL game_mode = FALSE;
-#ifdef __APPLE__
-    const char *target = getenv( "YAAGL_GAME_MODE_TARGET" );
-    struct stat target_stat, image_stat;
-
-    /* Match the resolved image, not the command line supplied by a launcher.
-     * File identity also handles drive aliases and case-insensitive paths. */
-    if (target && target[0] == '/' && unix_name &&
-        !stat( target, &target_stat ) && !stat( unix_name, &image_stat ))
-        game_mode = target_stat.st_dev == image_stat.st_dev && target_stat.st_ino == image_stat.st_ino;
-#endif
 
     if (wine_server_handle_to_fd( params->hStdInput, FILE_READ_DATA, &stdin_fd, NULL ) &&
         isatty(0) && is_unix_console_handle( params->hStdInput ))
@@ -454,7 +442,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
             }
             argv = build_argv( &params->CommandLine, 2 );
 
-            exec_wineloader( argv, socketfd, pe_info, game_mode );
+            exec_wineloader( argv, socketfd, pe_info, unix_name );
             _exit(1);
         }
 

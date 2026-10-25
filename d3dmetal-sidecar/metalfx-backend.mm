@@ -1200,19 +1200,32 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
     id<MTLTexture> motion = asTexture(set.motion);
     id<MTLTexture> output = asTexture(set.output);
     id<MTLTexture> reactive = asTexture(set.reactive);
+    std::shared_ptr<ScalerGeneration> selected;
     if (feature.currentGeneration &&
         generationMatches(*feature.currentGeneration, frame, color, depth, motion, output, reactive,
                           operations, temporal))
-        return feature.currentGeneration;
-    for (const auto& cached : feature.generations) {
-        if (cached && generationMatches(*cached, frame, color, depth, motion, output, reactive,
-                                         operations, temporal)) {
-            feature.currentGeneration = cached;
+        selected = feature.currentGeneration;
+    if (!selected || selected->inputCapacityWidth != frame.inputContent.width ||
+        selected->inputCapacityHeight != frame.inputContent.height) {
+        for (const auto& cached : feature.generations) {
+            const bool exact = cached && cached->inputCapacityWidth == frame.inputContent.width &&
+                               cached->inputCapacityHeight == frame.inputContent.height;
+            if (cached && (!selected || exact) &&
+                generationMatches(*cached, frame, color, depth, motion, output, reactive,
+                                  operations, temporal)) {
+                selected = cached;
+                if (exact) break;
+            }
+        }
+    }
+    if (selected) {
+        if (selected != feature.currentGeneration) {
+            feature.currentGeneration = selected;
             // Prepared frames retain their activation so an older encode cannot
             // consume the reset owed to this nonconsecutive sequence.
             ++feature.currentGeneration->activation;
-            return feature.currentGeneration;
         }
+        return selected;
     }
 
     NSUInteger inputCapacityWidth = frame.inputContent.width;
