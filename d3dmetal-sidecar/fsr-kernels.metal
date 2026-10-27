@@ -292,10 +292,13 @@ struct YaaglFgParams {
     float motionVectorsInvalidValue;
     uint motionVectorsInvalidValuePresent;
     float2 sourceJitterUv;
+    float2 sourceUvScale;
+    float2 sourceUvOffset;
 };
 
 static uint2 fg_source_position(uint2 tid, constant YaaglFgParams& params) {
-    float2 uv = (float2(tid) + 0.5f) / float2(params.extent) + params.sourceJitterUv;
+    float2 uv = (float2(tid) + 0.5f) / float2(params.extent) *
+                params.sourceUvScale + params.sourceUvOffset + params.sourceJitterUv;
     return uint2(clamp(floor(uv * float2(params.sourceExtent)),
                        float2(0.0f), float2(params.sourceExtent - 1u)));
 }
@@ -365,7 +368,7 @@ static float2 fg_motion(float2 value, float depth,
                     float2(params.outputExtent) / float2(params.motionTargetExtent);
     if (params.reconstructCameraMotion) {
         float2 uv = (float2(params.sourceOrigin) + float2(tid) + 0.5f) /
-                    float2(params.outputExtent);
+                    float2(params.outputExtent) + params.sourceUvOffset;
         float4 clip = float4(uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), depth, 1.0f);
         // NGX rows occupy Metal columns: this is the public row-vector transform.
         float4 previous = params.clipToPreviousClip * clip;

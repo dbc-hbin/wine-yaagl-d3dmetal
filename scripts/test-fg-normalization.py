@@ -4,7 +4,9 @@ Dispatch tests capture the bridge/native DLL boundaries; native tests use real
 Metal4/MetalFX objects and exact GPU completion callbacks without Wine or a game.
 The jitter fixture also submits partial prepasses after injected encoder exceptions.
 The camera fixture links both public camera packet producers to native encoding,
-checking emitted matrices and final pixels. FG_CAMERA_NATIVE_MASK=1 additionally
+checking matrices and final pixels against a separate same-depth native reference.
+Normal/reversed native-output differences are diagnostics, not translator failures.
+FG_CAMERA_NATIVE_MASK=1 additionally
 reads the mover mask only on the UUID-pinned, reviewed MetalFX implementation.
 The history fixture feeds public producer packets through the native registry
 and real Metal4 consumption, substituting COM/D3DMetal transport and context setup.
@@ -1346,6 +1348,7 @@ struct JitterRunner {
         // Exercise production history capture with raw public jitter and sizes.
         state->capturePreparedJitter(*snapshot, test.frame);
         assert(snapshot->hasPreviousJitter == test.previousValid);
+        state->commitPreparedJitter(*snapshot, test.frame);
         snapshot->produced = true;
         auto impl = std::make_shared<PreparedFrame::Impl>();
         impl->state = state; impl->snapshot = snapshot;
@@ -1424,7 +1427,8 @@ struct JitterRunner {
                     candidate.width == test.outputWidth && candidate.height == 128) {
                     motion = candidate; ++textureCount;
                 }
-                if (candidate.pixelFormat == MTLPixelFormatR32Float &&
+                if ((candidate.pixelFormat == MTLPixelFormatR32Float ||
+                     candidate.pixelFormat == MTLPixelFormatR16Float) &&
                     (candidate.usage & MTLTextureUsageShaderWrite) &&
                     candidate.width == test.outputWidth && candidate.height == 128)
                     depth = candidate;
@@ -1531,8 +1535,15 @@ struct JitterRunner {
                     expectedMotion ? float((*expectedMotion)[index][1]) : test.pixelsY);
                 if (expectedDepth) {
                     float actualDepth;
-                    std::memcpy(&actualDepth, static_cast<const char*>(readback.contents) +
-                        rowBytes * 128 + y * rowBytes + x * sizeof(float), sizeof(float));
+                    if (depth.pixelFormat == MTLPixelFormatR16Float) {
+                        __fp16 value;
+                        std::memcpy(&value, static_cast<const char*>(readback.contents) +
+                            rowBytes * 128 + y * rowBytes + x * sizeof(value), sizeof(value));
+                        actualDepth = float(value);
+                    } else {
+                        std::memcpy(&actualDepth, static_cast<const char*>(readback.contents) +
+                            rowBytes * 128 + y * rowBytes + x * sizeof(float), sizeof(float));
+                    }
                     pixelsGood &= near(test.name, "GPU depth", actualDepth,
                                        (*expectedDepth)[index]);
                 }
@@ -2418,6 +2429,100 @@ struct JitterRunner {
         }
     }
 
+    void publicRectangleAlignment() {
+        @autoreleasepool {
+            constexpr unsigned displayWidth = 128, displayHeight = 256;
+            constexpr unsigned renderWidth = 64, renderHeight = 128;
+            constexpr unsigned left = 32, top = 64, cropWidth = 64, cropHeight = 128;
+            for (bool half : {false, true}) {
+                for (bool inverted : {false, true}) {
+                    for (bool displayMotion : {false, true}) {
+                        auto state = std::make_shared<State>();
+                        state->creation.display_width = displayWidth;
+                        state->creation.display_height = displayHeight;
+                        state->creation.flags = YAAGL_FSR_FG_MOTION_VECTORS_JITTERED |
+                            (inverted ? YAAGL_FSR_FG_DEPTH_INVERTED : 0) |
+                            (displayMotion ? YAAGL_FSR_FG_DISPLAY_RESOLUTION_MOTION_VECTORS : 0);
+                        const unsigned motionWidth = displayMotion ? displayWidth : renderWidth;
+                        const unsigned motionHeight = displayMotion ? displayHeight : renderHeight;
+                        std::vector<float> depths(renderWidth * renderHeight);
+                        std::vector<std::uint16_t> halfDepths(renderWidth * renderHeight);
+                        std::vector<std::array<__fp16, 2>> motion(motionWidth * motionHeight);
+                        for (unsigned y = 0; y < renderHeight; ++y)
+                            for (unsigned x = 0; x < renderWidth; ++x) {
+                                const float value = x / 512.f + y / 1024.f;
+                                depths[y * renderWidth + x] = value;
+                                const __fp16 halfValue = __fp16(value);
+                                std::memcpy(&halfDepths[y * renderWidth + x],
+                                    &halfValue, sizeof(halfValue));
+                            }
+                        for (unsigned y = 0; y < motionHeight; ++y)
+                            for (unsigned x = 0; x < motionWidth; ++x)
+                                motion[y * motionWidth + x] = {__fp16(x / 8.f), __fp16(y / 8.f)};
+                        for (std::uint64_t frame = 1; frame <= 2; ++frame) {
+                            JitterFrame test{
+                                .name = displayMotion ? "public crop full-display motion" :
+                                                        "public crop render motion",
+                                .frame = frame, .renderWidth = renderWidth, .renderHeight = renderHeight,
+                                .jitterX = frame == 1 ? .75f : -.75f,
+                                .jitterY = frame == 1 ? -.75f : .75f,
+                                .cancellationX = frame == 1 ? 0.f : displayMotion ? 3.f : 1.5f,
+                                .cancellationY = frame == 1 ? 0.f : displayMotion ? -3.f : -1.5f,
+                                .pixelsX = 0, .pixelsY = 0, .scaleX = 1, .scaleY = 1,
+                                .previousValid = frame != 1, .outputWidth = cropWidth,
+                                .depthFormat = half ? MTLPixelFormatR16Float : MTLPixelFormatR32Float
+                            };
+                            auto prepared = prepare(state, test);
+                            auto& impl = *prepared->impl_;
+                            impl.snapshot->depth->texture = half
+                                ? pixelTexture(device, MTLPixelFormatR16Float,
+                                    renderWidth, renderHeight, halfDepths)
+                                : pixelTexture(device, MTLPixelFormatR32Float,
+                                    renderWidth, renderHeight, depths);
+                            impl.snapshot->motion->texture = pixelTexture(device, MTLPixelFormatRG16Float,
+                                motionWidth, motionHeight, motion);
+                            auto& d = impl.dispatch;
+                            d.generation_rect_left = left; d.generation_rect_top = top;
+                            d.generation_rect_width = cropWidth; d.generation_rect_height = cropHeight;
+                            d.present_x = d.hudless_x = d.output_x = left;
+                            d.present_y = d.hudless_y = d.output_y = top;
+                            std::vector<float> expectedDepth(cropWidth * cropHeight);
+                            std::vector<std::array<__fp16, 2>> expectedMotion(cropWidth * cropHeight);
+                            for (unsigned y = 0; y < cropHeight; ++y)
+                                for (unsigned x = 0; x < cropWidth; ++x) {
+                                    // The crop selects full-display pixel centers. Convert
+                                    // those centers to render pixels before adding jitter.
+                                    const unsigned sx = unsigned(std::clamp(
+                                        int(std::floor((x + left + .5f) * .5f + test.jitterX)),
+                                        0, int(renderWidth - 1)));
+                                    const unsigned sy = unsigned(std::clamp(
+                                        int(std::floor((y + top + .5f) * .5f + test.jitterY)),
+                                        0, int(renderHeight - 1)));
+                                    const auto index = y * cropWidth + x;
+                                    const float depthValue = depths[sy * renderWidth + sx];
+                                    expectedDepth[index] = half ? float(__fp16(depthValue)) : depthValue;
+                                    const auto value = displayMotion
+                                        ? motion[(y + top) * motionWidth + x + left]
+                                        : motion[sy * motionWidth + sx];
+                                    const float factor = displayMotion ? 1.f : 2.f;
+                                    expectedMotion[index] = {
+                                        __fp16((float(value[0]) - test.cancellationX) * factor),
+                                        __fp16((float(value[1]) - test.cancellationY) * factor)};
+                                }
+                            // At the first cropped pixel, frame 1 selects render (17,31).
+                            if (frame == 1)
+                                assert(expectedDepth[0] == 17.f / 512.f + 31.f / 1024.f);
+                            encode(prepared, test, nullptr, &expectedMotion, &expectedDepth);
+                            auto effect = (id<MTLFXFrameInterpolatorBase>)impl.configuration->factory.get();
+                            assert(bool(effect.depthReversed) == inverted);
+                        }
+                        releaseHudRow(state->hudCounted);
+                    }
+                }
+            }
+        }
+    }
+
     void outputOrigin() {
         @autoreleasepool {
             using Pixel = std::array<__fp16, 4>;
@@ -2665,7 +2770,7 @@ int main() {
         runner.scenario(jittered, {
             {.name = "output domain first", .frame = 1, .renderWidth = 64, .renderHeight = 32,
              .jitterX = .5f, .jitterY = -.25f,
-             .cancellationX = 0, .cancellationY = 0, .pixelsX = 4, .pixelsY = -8,
+             .cancellationX = 0, .cancellationY = 0, .pixelsX = 4.25f, .pixelsY = -8,
              .previousValid = false},
             {.name = "output domain reset", .frame = 2, .renderWidth = 64, .renderHeight = 32,
              .jitterX = -.5f, .jitterY = .25f,
@@ -2683,6 +2788,7 @@ int main() {
         runner.alphaMask();
         runner.outputOrigin();
         runner.displayMotionRectangle();
+        runner.publicRectangleAlignment();
         runner.cacheHistory();
         runner.spatialJitter(false);
         runner.spatialJitter(true);
@@ -2805,11 +2911,123 @@ static std::vector<float> nativeCameraMask(id effect, id<MTLDevice> device) {
     return result;
 }
 
+// A separate interpolator keeps its own history for each raw-depth convention.
+// Reuse the GPU inputs already checked against the fixture's depth/motion oracle,
+// but supply independently expected camera/reset values, not production bindings.
+struct CameraReference {
+    Object interpolator, previous;
+
+    std::vector<std::array<__fp16, 4>> encode(
+        JitterRunner& runner, const ExecutionLease& lease, bool reversed, bool reset,
+        bool infinite, const simd_float4x4& view, const simd_float4x4& projection) {
+        auto current = (id<MTLTexture>)lease.impl_->currentScene->texture.get();
+        const auto width = current.width, height = current.height;
+        if (!interpolator) {
+            auto descriptor = [MTLFXFrameInterpolatorDescriptor new];
+            descriptor.colorTextureFormat = descriptor.outputTextureFormat = MTLPixelFormatRGBA16Float;
+            descriptor.depthTextureFormat = MTLPixelFormatR32Float;
+            descriptor.motionTextureFormat = MTLPixelFormatRG16Float;
+            descriptor.inputWidth = descriptor.outputWidth = width;
+            descriptor.inputHeight = descriptor.outputHeight = height;
+            descriptor.requiresPrevColorTexture = NO;
+            id created = [descriptor newFrameInterpolatorWithDevice:runner.device compiler:runner.compiler];
+            assert(created);
+            interpolator = Object(created);
+            [created release]; [descriptor release];
+        }
+        auto effect = (id<MTL4FXFrameInterpolator>)interpolator.get();
+        if (reset) previous = Object(current);
+        assert(previous);
+        auto output = privateTexture(runner.device, MTLPixelFormatRGBA16Float, width, height,
+                                     effect.outputTextureUsage | MTLTextureUsageShaderRead);
+        effect.colorTexture = current;
+        effect.prevColorTexture = (id<MTLTexture>)previous.get();
+        effect.depthTexture = (id<MTLTexture>)lease.impl_->scratch->depth.get();
+        effect.motionTexture = (id<MTLTexture>)lease.impl_->scratch->motion.get();
+        effect.outputTexture = (id<MTLTexture>)output.get();
+        effect.shouldResetHistory = reset;
+        effect.depthReversed = reversed;
+        effect.motionVectorScaleX = effect.motionVectorScaleY = 1;
+        effect.jitterOffsetX = effect.jitterOffsetY = 0;
+        effect.deltaTime = .016f;
+        effect.aspectRatio = float(width) / height;
+        effect.nearPlane = .25f;
+        effect.farPlane = infinite ? INFINITY : 250.f;
+        effect.fieldOfView = 180.f / float(M_PI);
+        effect.worldToViewMatrix = view;
+        effect.viewToClipMatrix = projection;
+        effect.contentWidth = width; effect.contentHeight = height;
+
+        const NSUInteger alignment =
+            [runner.device minimumTextureBufferAlignmentForPixelFormat:MTLPixelFormatRGBA16Float];
+        const NSUInteger rowBytes =
+            (width * sizeof(std::array<__fp16, 4>) + alignment - 1) / alignment * alignment;
+        auto readback = [runner.device newBufferWithLength:rowBytes * height
+                                                 options:MTLResourceStorageModeShared];
+        auto descriptor = [MTLResidencySetDescriptor new];
+        NSError* error = nil;
+        auto residency = [runner.device newResidencySetWithDescriptor:descriptor error:&error];
+        [descriptor release];
+        assert(output && readback && residency && !error);
+        for (id allocation : {current, effect.prevColorTexture, effect.depthTexture,
+                              effect.motionTexture, effect.outputTexture})
+            [residency addAllocation:allocation];
+        [residency addAllocation:readback];
+        [residency commit];
+        auto allocator = [runner.device newCommandAllocator];
+        auto command = [runner.device newCommandBuffer];
+        auto fence = [runner.device newFence];
+        assert(allocator && command && fence);
+        [command beginCommandBufferWithAllocator:allocator];
+        [command useResidencySet:residency];
+        auto begin = [command computeCommandEncoder];
+        [begin updateFence:fence afterEncoderStages:MTLStageDispatch];
+        [begin endEncoding];
+        effect.fence = fence;
+        [effect encodeToCommandBuffer:command];
+        auto copy = [command computeCommandEncoder];
+        [copy waitForFence:fence beforeEncoderStages:MTLStageBlit];
+        [copy copyFromTexture:effect.outputTexture sourceSlice:0 sourceLevel:0
+            sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(width, height, 1)
+            toBuffer:readback destinationOffset:0 destinationBytesPerRow:rowBytes
+            destinationBytesPerImage:rowBytes * height];
+        [copy endEncoding];
+        [command endCommandBuffer];
+        auto done = dispatch_semaphore_create(0);
+        auto options = [MTL4CommitOptions new];
+        [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            assert(!feedback.error);
+            dispatch_semaphore_signal(done);
+        }];
+        [runner.queue commit:&command count:1 options:options];
+        assert(dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 30*NSEC_PER_SEC)) == 0);
+        std::vector<std::array<__fp16, 4>> result(width * height);
+        for (NSUInteger y = 0; y < height; ++y)
+            for (NSUInteger x = 0; x < width; ++x) {
+                auto& pixel = result[y * width + x];
+                std::memcpy(pixel.data(), static_cast<const char*>(readback.contents) +
+                    y * rowBytes + x * sizeof(pixel), sizeof(pixel));
+                // Independent CPU forward-sRGB reference, rounded to output format.
+                for (unsigned c = 0; c < 3; ++c) {
+                    const float value = std::max(float(pixel[c]), 0.f);
+                    pixel[c] = __fp16(value <= .0031308f ? value * 12.92f :
+                        1.055f * std::pow(value, 1.f / 2.4f) - .055f);
+                }
+            }
+        previous = Object(current);
+        [options release]; dispatch_release(done);
+        [fence release]; [command release]; [allocator release];
+        [residency release]; [readback release];
+        return result;
+    }
+};
+
 static void cameraSequence(JitterRunner& runner, unsigned producer,
                            bool infinite, unsigned control) {
     // control: moving camera, no camera, reset on third frame, private override.
     constexpr unsigned width = 192, height = 128;
     std::shared_ptr<State> states[2];
+    CameraReference references[2];
     for (unsigned reversed = 0; reversed != 2; ++reversed) {
         states[reversed] = std::make_shared<State>();
         states[reversed]->creation.display_width = width;
@@ -2899,8 +3117,9 @@ static void cameraSequence(JitterRunner& runner, unsigned producer,
             assert(impl.configuration);
             std::fprintf(stderr, "CAMERA producer=%u infinite=%u control=%u reversed=%u frame=%u\n",
                          producer, infinite, control, reversed, frame);
-            runner.encode(prepared, test, reversed ? &colors[0] : nullptr,
-                          &motion, &depth, &colors[reversed]);
+            std::shared_ptr<const ExecutionLease> execution;
+            runner.encode(prepared, test, nullptr, &motion, &depth,
+                          &colors[reversed], -1, &execution);
             auto effect = (id<MTLFXFrameInterpolatorBase>)impl.configuration->factory.get();
             assert(effect.depthReversed == bool(reversed));
             // MetalFX consumes and clears shouldResetHistory during encode.
@@ -2932,32 +3151,65 @@ static void cameraSequence(JitterRunner& runner, unsigned producer,
             // Reset/no-camera/first-frame masks are not promised to be written.
             if (control != 1 && frame > 1 && !test.dispatchReset)
                 masks[reversed] = nativeCameraMask(effect, runner.device);
+            const auto reference = references[reversed].encode(runner, *execution,
+                reversed, frame == 1 || test.dispatchReset, infinite, expectedView, expected);
+            bool matches = true;
+            float maxReferenceDelta = 0;
+            for (std::size_t i = 0; i < reference.size(); ++i)
+                for (unsigned c = 0; c < 4; ++c) {
+                    const float actual = colors[reversed][i][c], wanted = reference[i][c];
+                    const float difference = std::fabs(actual - wanted);
+                    maxReferenceDelta = std::max(maxReferenceDelta, difference);
+                    if (std::isfinite(actual) && std::isfinite(wanted) && difference <= .004f)
+                        continue;
+                    if (matches)
+                        std::fprintf(stderr,
+                            "camera native reference: pixel (%zu,%zu) channel %u expected %.6f, got %.6f\n",
+                            i % width, i / width, c, wanted, actual);
+                    matches = false;
+                }
+            runner.failures += !matches;
+            std::fprintf(stderr, "CAMERA_REFERENCE frame=%u reversed=%u maxDelta=%g\n",
+                         frame, reversed, maxReferenceDelta);
         }
         if (!masks[0].empty()) {
             assert(masks[0].size() == width * height && masks[1].size() == masks[0].size());
-            float staticMax = 0, moverMax = 0, domainDelta = 0;
+            float staticMax[2]{}, moverMax[2]{}, domainDelta = 0;
             for (unsigned y = 0; y < height; ++y)
                 for (unsigned x = 0; x < width; ++x) {
                     const auto i = y * width + x;
                     assert(std::isfinite(masks[0][i]) && std::isfinite(masks[1][i]));
                     domainDelta = std::max(domainDelta, std::fabs(masks[0][i] - masks[1][i]));
-                    if (y >= 50 && y < 78) moverMax = std::max(moverMax, masks[0][i]);
-                    else if (y < 46 || y >= 82) staticMax = std::max(staticMax, masks[0][i]);
+                    for (unsigned reversed = 0; reversed < 2; ++reversed) {
+                        if (y >= 50 && y < 78)
+                            moverMax[reversed] = std::max(moverMax[reversed], masks[reversed][i]);
+                        else if (y < 46 || y >= 82)
+                            staticMax[reversed] = std::max(staticMax[reversed], masks[reversed][i]);
+                    }
                 }
-            std::fprintf(stderr, "CAMERA_MASK frame=%u staticMax=%g moverMax=%g domainDelta=%g\n",
-                         frame, staticMax, moverMax, domainDelta);
-            assert(domainDelta < .002f && staticMax < .01f && moverMax > .1f);
+            for (unsigned reversed = 0; reversed < 2; ++reversed) {
+                std::fprintf(stderr, "CAMERA_MASK frame=%u reversed=%u staticMax=%g moverMax=%g\n",
+                             frame, reversed, staticMax[reversed], moverMax[reversed]);
+                assert(staticMax[reversed] < .01f && moverMax[reversed] > .1f);
+            }
+            std::fprintf(stderr, "CAMERA_MASK_DOMAIN_DIAGNOSTIC frame=%u maxDelta=%g\n",
+                         frame, domainDelta);
         }
         double delta = 0, checksum = 0;
+        float maximum = 0;
         for (std::size_t i = 0; i < colors[0].size(); ++i)
             for (unsigned c = 0; c < 4; ++c) {
                 assert(std::isfinite(float(colors[0][i][c])) &&
                        std::isfinite(float(colors[1][i][c])));
-                delta += std::fabs(float(colors[0][i][c]) - float(colors[1][i][c]));
+                const float difference = std::fabs(float(colors[0][i][c]) - float(colors[1][i][c]));
+                delta += difference;
+                maximum = std::max(maximum, difference);
                 checksum += float(colors[0][i][c]);
             }
-        std::fprintf(stderr, "CAMERA_PIXELS frame=%u meanDomainDelta=%g checksum=%g\n",
-                     frame, delta / (width * height * 4), checksum);
+        // Native depth conventions are not a per-pixel equivalence contract.
+        // Keep their observed difference separate from the same-domain reference.
+        std::fprintf(stderr, "CAMERA_DOMAIN_DIAGNOSTIC frame=%u maxDelta=%g meanDelta=%g checksum=%g\n",
+                     frame, maximum, delta / (width * height * 4), checksum);
     }
     for (auto& state : states) releaseHudRow(state->hudCounted);
 }
@@ -3477,6 +3729,67 @@ static void dynamicPrepareHistory(JitterRunner& runner) {
     assert(api(YAAGL_FSR_FG_DESTROY, &destroy) == Ok);
 }
 
+static void rejectedPrepareRetry(JitterRunner& runner, bool rejectedReset) {
+    fg_history_begin();
+    auto state = std::make_shared<State>();
+    state->creation.display_width = state->creation.display_height = 128;
+    state->creation.max_render_width = state->creation.max_render_height = 128;
+    state->creation.flags = YAAGL_FSR_FG_MOTION_VECTORS_JITTERED;
+    contexts.emplace(17, state);
+    auto depth = uniformTexture(runner.device, MTLPixelFormatR32Float, 64, 32, .5f);
+    auto motion = uniformTexture(runner.device, MTLPixelFormatRG16Float, 64, 32,
+        std::array<__fp16, 2>{0, 0});
+    auto color = uniformTexture(runner.device, MTLPixelFormatRGBA16Float, 128, 128,
+        std::array<__fp16, 4>{.25f, .5f, .75f, 1});
+    auto output = privateTexture(runner.device, MTLPixelFormatRGBA16Float, 128, 128,
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+    HistoryResource list{historyVtable.data()};
+    HistoryResource resources[] = {
+        {historyVtable.data(), depth.get()}, {historyVtable.data(), motion.get()},
+        {historyVtable.data(), color.get()}, {historyVtable.data(), output.get()}
+    };
+    assert(fg_history_prepare(11, 64, .25f, false,
+        &list, &resources[0], &resources[1]) == Ok);
+    completeHistoryPrepare(runner);
+    assert(fg_history_generate(11, 0, false, &list, &resources[2], &resources[3]) == Ok);
+    JitterFrame first{
+        .name = "accepted frame before rejected Prepare", .frame = 11,
+        .renderWidth = 64, .renderHeight = 32, .jitterX = .25f, .jitterY = -.25f,
+        .cancellationX = 0, .cancellationY = 0, .pixelsX = 0, .pixelsY = 0
+    };
+    runner.encode(std::const_pointer_cast<PreparedFrame>(recordedHistory), first);
+    assert(encodedCameraReset && state->historyFrame == 11);
+    recordedHistory.reset();
+    const auto history = state->history;
+
+    historyRecordAvailable = false;
+    assert(fg_history_prepare(12, 64, .5f, rejectedReset,
+        &list, &resources[0], &resources[1]) == Runtime);
+    historyRecordAvailable = true;
+    assert(!recordedHistory && !state->findFrame(12) && state->frameCount == 0);
+    assert(state->history.get() == history.get() && state->historyFrame == 11);
+
+    assert(fg_history_prepare(12, 64, -.5f, false,
+        &list, &resources[0], &resources[1]) == Ok);
+    const auto snapshot = recordedHistory->impl_->snapshot;
+    assert(snapshot->hasPreviousJitter && snapshot->previousJitterUvX == .25f / 64);
+    completeHistoryPrepare(runner);
+    assert(fg_history_generate(12, 0, false, &list, &resources[2], &resources[3]) == Ok);
+    JitterFrame retry{
+        .name = rejectedReset ? "retry after rejected reset" : "retry after rejected Prepare",
+        .frame = 12, .renderWidth = 64, .renderHeight = 32,
+        .jitterX = -.5f, .jitterY = -.25f,
+        .cancellationX = .75f, .cancellationY = 0, .pixelsX = -1.5f, .pixelsY = 0
+    };
+    runner.encode(std::const_pointer_cast<PreparedFrame>(recordedHistory), retry);
+    assert(!encodedCameraReset && encodedPreviousColor == history->texture.get());
+    assert(state->historyFrame == 12);
+    recordedHistory.reset();
+    yaagl_fsr_fg_destroy_packet destroy{};
+    destroy.header = {sizeof(destroy), YAAGL_FSR_FG_BRIDGE_VERSION, YAAGL_FSR_FG_DESTROY, 0, 17};
+    assert(api(YAAGL_FSR_FG_DESTROY, &destroy) == Ok);
+}
+
 int main() {
     @autoreleasepool {
         JitterRunner runner;
@@ -3490,6 +3803,8 @@ int main() {
         inputOwnership(runner);
         pendingFrameMetadata(runner);
         dynamicPrepareHistory(runner);
+        rejectedPrepareRetry(runner, false);
+        rejectedPrepareRetry(runner, true);
         for (unsigned route = 0; route != 3; ++route) {
             producerHistory(runner, route, false, 0);
             producerHistory(runner, route, true, 0);

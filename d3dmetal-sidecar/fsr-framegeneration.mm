@@ -471,12 +471,16 @@ struct State {
     float preparedJitterUvX = 0;
     float preparedJitterUvY = 0;
 
-    void capturePreparedJitter(Snapshot& snapshot, std::uint64_t frame) {
+    void capturePreparedJitter(Snapshot& snapshot, std::uint64_t frame) const {
         const auto& parameters = snapshot.parameters;
         snapshot.hasPreviousJitter = hasPreparedJitter &&
             preparedFrame + 1 == frame && !parameters.reset;
         snapshot.previousJitterUvX = preparedJitterUvX;
         snapshot.previousJitterUvY = preparedJitterUvY;
+    }
+
+    void commitPreparedJitter(const Snapshot& snapshot, std::uint64_t frame) {
+        const auto& parameters = snapshot.parameters;
         hasPreparedJitter = true;
         preparedFrame = frame;
         // Preserve each frame's render domain when output history survives a resize.
@@ -909,8 +913,10 @@ struct alignas(16) FgParams {
     float motionVectorsInvalidValue;
     std::uint32_t motionVectorsInvalidValuePresent;
     float sourceJitterUv[2];
+    float sourceUvScale[2] = {1.0f, 1.0f};
+    float sourceUvOffset[2];
 };
-static_assert(sizeof(FgParams) == 192);
+static_assert(sizeof(FgParams) == 208);
 
 struct PassTextures {
     id<MTLTexture> source = nil;
@@ -1317,14 +1323,24 @@ bool PreparedFrame::encode(
                 uiParams.sourceOrigin[1] = d.present_y;
 
                 FgParams depthParams{};
-                depthParams.sourceOrigin[0] = p.depth_subrect_x;
-                depthParams.sourceOrigin[1] = p.depth_subrect_y;
                 depthParams.extent[0] = configuration.width;
                 depthParams.extent[1] = configuration.height;
                 depthParams.sourceExtent[0] = impl_->snapshot->depthWidth;
                 depthParams.sourceExtent[1] = impl_->snapshot->depthHeight;
                 depthParams.sourceJitterUv[0] = p.jitter_x / float(p.render_width);
                 depthParams.sourceJitterUv[1] = p.jitter_y / float(p.render_height);
+                if (!d.independent_subrects) {
+                    // Public generation rectangles crop the full display, not
+                    // the render snapshot. Apply the crop before render jitter.
+                    depthParams.sourceUvScale[0] =
+                        float(configuration.width) / state.creation.display_width;
+                    depthParams.sourceUvScale[1] =
+                        float(configuration.height) / state.creation.display_height;
+                    depthParams.sourceUvOffset[0] =
+                        float(sceneParams.sourceOrigin[0]) / state.creation.display_width;
+                    depthParams.sourceUvOffset[1] =
+                        float(sceneParams.sourceOrigin[1]) / state.creation.display_height;
+                }
 
                 FgParams motionParams{};
                 motionParams.extent[0] = configuration.width;
@@ -1350,6 +1366,15 @@ bool PreparedFrame::encode(
                     : (p.motion_height ? p.motion_height : p.render_height);
                 motionParams.outputExtent[0] = configuration.outputWidth;
                 motionParams.outputExtent[1] = configuration.outputHeight;
+                if (!displayMotion && !d.independent_subrects) {
+                    for (unsigned axis = 0; axis < 2; ++axis) {
+                        motionParams.sourceUvScale[axis] = depthParams.sourceUvScale[axis];
+                        motionParams.sourceUvOffset[axis] = depthParams.sourceUvOffset[axis];
+                    }
+                    // Cropping does not shrink full-render pixel displacement.
+                    motionParams.outputExtent[0] = state.creation.display_width;
+                    motionParams.outputExtent[1] = state.creation.display_height;
+                }
                 if (displayMotion && !d.independent_subrects &&
                     impl_->snapshot->motionWidth == state.creation.display_width &&
                     impl_->snapshot->motionHeight == state.creation.display_height) {
@@ -2189,6 +2214,8 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                 if (!generate) state->eraseFrame(frame);
                 return finish(Runtime);
             }
+            if (!generate)
+                state->commitPreparedJitter(*implementation->snapshot, frame);
             if (generate) state->eraseFrame(frame);
             state->providerSelected = true;
             state->metalDevice = Object((id)command.value.device);
