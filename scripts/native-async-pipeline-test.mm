@@ -1,4 +1,19 @@
+#import <Foundation/Foundation.h>
+#import <objc/runtime.h>
+#include <future>
+#include <utility>
+
+static thread_local std::promise<void>* historyLookupSignal;
+static id observedAssociatedObject(id object, const void* key) {
+    id value = objc_getAssociatedObject(object, key);
+    if (auto* signal = std::exchange(historyLookupSignal, nullptr))
+        signal->set_value();
+    return value;
+}
+#define objc_getAssociatedObject observedAssociatedObject
 #include "../d3dmetal-sidecar/async-pipeline.mm"
+#undef objc_getAssociatedObject
+#include "../d3dmetal-sidecar/low-latency-state.hpp"
 
 #include <atomic>
 #include <barrier>
@@ -15,11 +30,44 @@ template<class T> void ready(std::future<T>& future) {
     assert(future.wait_for(5s) == std::future_status::ready);
 }
 
+template<class Draw>
+void registryProgressWhileHistoryBlocked(std::mutex& mutex, Draw draw) {
+    assert(runtime().managedPipelinePublished.load());
+    std::unique_lock historyLock(mutex);
+    std::promise<void> entered;
+    auto enteredSignal = entered.get_future();
+    auto drawing = std::async(std::launch::async, [&] {
+        @autoreleasepool {
+            historyLookupSignal = &entered;
+            return draw();
+        }
+    });
+    // The association lookup is inside the old global critical section.
+    // Holding the real history mutex prevents the draw from releasing it.
+    ready(enteredSignal);
+    enteredSignal.get();
+    auto unrelated = std::async(std::launch::async, [] { return stateFor(nullptr); });
+    ready(unrelated);
+    assert(!unrelated.get());
+    historyLock.unlock();
+    ready(drawing);
+    assert(drawing.get());
+}
+
 void __attribute__((ms_abi)) dx11QueryFixture(void*, void*) {}
 std::atomic<unsigned> dx12Emitted{0};
 std::vector<char> dx11Order;
 void __attribute__((ms_abi)) dx12DrawFixture(
     void*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) { ++dx12Emitted; }
+void __attribute__((ms_abi)) dx12DrawIndexedFixture(
+    void*, std::uint32_t, std::uint32_t, std::uint32_t, std::int32_t, std::uint32_t) {
+    ++dx12Emitted;
+}
+std::int32_t dx12ResetResult = 0;
+std::int32_t __attribute__((ms_abi)) dx12ResetFixture(void*, void*, void*) {
+    return dx12ResetResult;
+}
+void __attribute__((ms_abi)) dx12QueryFixture(void*, void*, std::uint32_t, std::uint32_t) {}
 
 struct PresentFixtureControl {
     std::int32_t result = 0;
@@ -48,12 +96,12 @@ std::int32_t __attribute__((ms_abi)) nativePresentFixture(
 void presentEpochFixture() {
     auto& rt = runtime();
     const auto savedFrame = rt.frame.load();
-    const auto savedOriginal = original[11];
+    const auto savedOriginal = original.present;
     const auto savedEnabled = enabled;
     std::array<std::uint8_t, 0x128> native{}, other{};
     void* external = native.data() + 0x10;
     void* otherExternal = other.data() + 0x10;
-    original[11] = reinterpret_cast<std::uintptr_t>(&nativePresentFixture);
+    original.present = reinterpret_cast<std::uintptr_t>(&nativePresentFixture);
     enabled = true;
     rt.frame = 100;
     const auto call = [&](void* object, PresentFrame marker, bool counts,
@@ -143,9 +191,190 @@ void presentEpochFixture() {
     realWorker.get();
     member(31, false, false); // Worker completion cannot clear this thread's pair.
 
-    original[11] = savedOriginal;
+    enabled = false;
+    for (bool generated : {false, true}) {
+        yaagl::latency::Limiter limiter(true);
+        int device;
+        presentationHistory().mark({external, 1, 32, generated});
+        auto old = limiter.begin(&device, native.data(),
+            !presentationHistory().hasFrameGeneration(external));
+        assert(!limiter.enabled(&device)); // Actual FG remains excluded.
+        call(native.data(), {}, false);
+        limiter.finish(old, true);
+        limiter.complete(native.data());
+        limiter.retire(native.data());
+        limiter.destroy(&device);
+
+        // Reuse both native addresses without FG on the same rendering thread.
+        auto reused = limiter.begin(&device, native.data(),
+            !presentationHistory().hasFrameGeneration(external));
+        assert(limiter.enabled(&device));
+        limiter.finish(reused, true);
+        limiter.complete(native.data());
+        limiter.retire(native.data());
+        limiter.destroy(&device);
+    }
+    call(native.data(), {external, 1, 33, true}, false, -1, false);
+    call(native.data(), {external, 1, 34, true}, false, 0, false, 1);
+    call(native.data(), {external, 1, 35, false}, false, 1, false);
+    call(native.data(), {otherExternal, 1, 36, true}, false);
+
+    original.present = savedOriginal;
     enabled = savedEnabled;
     rt.frame = savedFrame;
+}
+
+void dx12SafetyFixture() {
+    @autoreleasepool {
+        auto& rt = runtime();
+        std::array<std::uint8_t, 0xe50> list{};
+        std::array<std::uint8_t, 0x710> native{};
+        int root, device, otherDevice, heapA, heapB, pipeline;
+        auto texture = [[NSObject alloc] init];
+        auto fresh = [[NSObject alloc] init];
+        const auto put = []<class T>(auto& object, std::size_t offset, T value) {
+            std::memcpy(object.data() + offset, &value, sizeof(value));
+        };
+        put(list, 0x100, native.data());
+        put(list, 0x130, std::uint64_t{0x46});
+        put(list, 0x138, std::uint8_t{1});
+        put(list, 0x13c, std::uint32_t{1});
+        put(list, 0x1d0, texture);
+        put(list, 0x3f4, std::uint32_t{1});
+        put(list, 0xe48, &root);
+        std::vector<std::function<void()>> queued;
+        unsigned compiled = 0, rejected = 0;
+        auto owner = std::make_shared<State>(
+            [&](Key) -> void* { ++compiled; return &pipeline; },
+            [&](std::function<void()> job) { queued.push_back(std::move(job)); });
+        rt.pipelines.emplace(native.data(), Pipeline{owner, &device, 1});
+        rt.roots.emplace(&root, Root{true, &device, 1});
+        rt.lists.emplace(list.data(), List{true, {}});
+        original.draw = reinterpret_cast<std::uintptr_t>(&dx12DrawFixture);
+        original.drawIndexed = reinterpret_cast<std::uintptr_t>(&dx12DrawIndexedFixture);
+        original.reset = reinterpret_cast<std::uintptr_t>(&dx12ResetFixture);
+        original.beginQuery = original.endQuery = reinterpret_cast<std::uintptr_t>(&dx12QueryFixture);
+        original.listDestroy = reinterpret_cast<std::uintptr_t>(+[](void*) {});
+        enabled = true;
+        for (std::uint64_t frame = 1; frame <= 5; ++frame) {
+            rt.frame = frame;
+            targets(list.data(), true);
+        }
+        const auto reject = [&](const char* name) {
+            const auto before = dx12Emitted.load();
+            draw(list.data(), 3, 1, 0, 0);
+            drawIndexed(list.data(), 3, 1, 0, 0, 0);
+            if (dx12Emitted != before + 2 || !queued.empty())
+                std::fprintf(stderr, "DX12 unsafe omission: %s\n", name);
+            assert(dx12Emitted == before + 2 && queued.empty() && compiled == 0);
+            ++rejected;
+        };
+        rt.roots.erase(&root);
+        reject("missing root");
+        rt.roots.emplace(&root, Root{false, &device, 1});
+        reject("UAV-capable root");
+        rt.roots.at(&root).safe = true;
+        rt.roots.at(&root).device = &otherDevice;
+        reject("different root device");
+        rt.roots.at(&root).device = &device;
+        rt.roots.at(&root).id = 2;
+        reject("different root identity");
+        rt.roots.at(&root).id = 1;
+        rt.lists.erase(list.data());
+        reject("unregistered command list");
+        rt.lists.emplace(list.data(), List{false, {}});
+        reject("uninitialized command list");
+        dx12ResetResult = -1;
+        assert(reset(list.data(), nullptr, nullptr) == -1);
+        reject("failed initial reset");
+        dx12ResetResult = 0;
+        assert(reset(list.data(), nullptr, nullptr) == 0);
+        beginQuery(list.data(), &heapA, 0, 0);
+        beginQuery(list.data(), &heapA, 0, 1);
+        reject("active queries");
+        endQuery(list.data(), &heapA, 2, 0);
+        reject("end-only timestamp preserves active queries");
+        endQuery(list.data(), &heapA, 0, 0);
+        reject("different query index remains active");
+        endQuery(list.data(), &heapB, 0, 1);
+        reject("different query heap cannot end the remaining query");
+        dx12ResetResult = -1;
+        assert(reset(list.data(), nullptr, nullptr) == -1);
+        reject("failed reset preserves active query");
+        dx12ResetResult = 0;
+        assert(reset(list.data(), nullptr, nullptr) == 0);
+        assert(rt.lists.at(list.data()).queries.empty());
+        put(list, 0x70, std::uint32_t{1});
+        reject("bundle");
+        put(list, 0x70, std::uint32_t{0});
+        put(native, 0x44, std::uint32_t{1});
+        reject("native pipeline exclusion");
+        put(native, 0x44, std::uint32_t{0});
+        put(native, 0x32e, std::uint8_t{1});
+        reject("native stream-output exclusion");
+        put(native, 0x32e, std::uint8_t{0});
+        put(list, 0x428, std::uint8_t{1});
+        reject("native draw-state exclusion");
+        put(list, 0x428, std::uint8_t{0});
+        put(list, 0x3f4, std::uint32_t{9});
+        reject("unsupported attachment count");
+        put(list, 0x3f4, std::uint32_t{1});
+        put(list, 0x1d0, static_cast<id>(nil));
+        reject("no target");
+        put(list, 0x1d0, fresh);
+        reject("first-use target");
+        put(list, 0x1d0, texture);
+        listDestroy(list.data());
+        reject("retired command list");
+        assert(reset(list.data(), nullptr, nullptr) == 0);
+
+        // Empty direct/indexed draws must neither enqueue a cold variant nor
+        // keep previously recurrent attachments eligible in later epochs.
+        for (std::uint64_t frame = 6; frame <= 7; ++frame) {
+            rt.frame = frame;
+            for (const auto size : {std::pair{0u, 1u}, std::pair{3u, 0u}}) {
+                const auto before = dx12Emitted.load();
+                draw(list.data(), size.first, size.second, 0, 0);
+                drawIndexed(list.data(), size.first, size.second, 0, 0, 0);
+                assert(dx12Emitted == before + 2 && queued.empty() && compiled == 0);
+            }
+        }
+        assert(!targets(list.data(), false));
+        for (std::uint64_t frame = 10; frame <= 14; ++frame) {
+            rt.frame = frame;
+            targets(list.data(), true);
+        }
+
+        // The same cold key must be skippable with every guard restored. The
+        // scheduler retains the job, so compiler speed cannot mask a bad gate.
+        const auto before = dx12Emitted.load();
+        draw(list.data(), 3, 1, 0, 0);
+        drawIndexed(list.data(), 3, 1, 0, 0, 0);
+        assert(dx12Emitted == before && queued.size() == 1 && compiled == 0);
+        rt.frame = 15;
+        draw(list.data(), 3, 1, 0, 0);
+        drawIndexed(list.data(), 3, 1, 0, 0, 0);
+        assert(dx12Emitted == before && queued.size() == 1 && compiled == 0);
+        rt.frame = 16;
+        assert(!targets(list.data(), false)); // Omitted frames cannot renew history.
+        // Expiry makes this draw non-skippable. It must execute the queued
+        // compile itself rather than wait for our deliberately idle scheduler.
+        draw(list.data(), 3, 1, 0, 0);
+        assert(dx12Emitted == before + 1 && compiled == 1);
+        queued.front()(); // The late callback cannot compile a second time.
+        draw(list.data(), 3, 1, 0, 0);
+        drawIndexed(list.data(), 3, 1, 0, 0, 0);
+        assert(dx12Emitted == before + 3 && compiled == 1);
+        owner->stop();
+        owner->wait();
+        rt.pipelines.erase(native.data());
+        rt.roots.erase(&root);
+        rt.lists.erase(list.data());
+        enabled = false;
+        [fresh release]; [texture release];
+        std::printf("DX12 safety gates: %u rejected conditions, direct/indexed and pending/ready controls passed\n",
+                    rejected);
+    }
 }
 
 int main() {
@@ -267,12 +496,123 @@ int main() {
     ready(retireWorker);
     retireWorker.get();
 
+    // Synchronous consumers and retirement can take work from an idle queue.
+    // Retained callbacks must also be safe after both state and owner are gone.
+    std::vector<std::function<void()>> late;
+    unsigned stolenCompiles = 0;
+    bool stolenOwnerAlive = true;
+    {
+        State stolen([&](Key candidate) -> void* {
+            assert(stolenOwnerAlive);
+            ++stolenCompiles;
+            return candidate.flags == 3 ? nullptr : &nativePipeline;
+        }, [&](std::function<void()> job) { late.push_back(std::move(job)); });
+        stolen.request({1, 1}, true);
+        assert(stolen.request({1, 1}, false).pipeline == &nativePipeline);
+        stolen.request({2, 2}, true);
+        stolen.request({3, 3}, true);
+        stolen.wait();
+        assert(stolenCompiles == 3);
+        assert(stolen.request({3, 3}, false).status == Status::Failed);
+        stolen.request({4, 4}, true);
+        stolen.stop();
+        stolen.wait();
+        assert(stolenCompiles == 4);
+        assert(stolen.request({5, 5}, true).status == Status::Failed);
+        stolenOwnerAlive = false;
+    }
+    for (auto& callback : late) callback();
+    assert(stolenCompiles == 4);
+
+    // Admission precedes enqueue. Retirement can finish the admitted job even
+    // while the submitter is suspended in its scheduler callback.
+    std::function<void()> delayed;
+    std::promise<void> enqueueEntered, enqueueRelease;
+    auto enqueueEnteredSignal = enqueueEntered.get_future();
+    auto enqueueReleaseSignal = enqueueRelease.get_future();
+    unsigned delayedCompiles = 0;
+    {
+        State submitting([&](Key) -> void* { ++delayedCompiles; return &nativePipeline; },
+            [&](std::function<void()> job) {
+                enqueueEntered.set_value();
+                enqueueReleaseSignal.wait();
+                delayed = std::move(job);
+            });
+        auto submitter = std::async(std::launch::async, [&] { submitting.request(key, true); });
+        ready(enqueueEnteredSignal);
+        submitting.stop();
+        submitting.wait();
+        assert(delayedCompiles == 1);
+        enqueueRelease.set_value();
+        ready(submitter);
+        submitter.get();
+    }
+    delayed();
+    assert(delayedCompiles == 1);
+
+    // Owner-wide draining assists an unstarted variant while another variant
+    // is already compiling, then joins that running job before retirement.
+    std::vector<std::function<void()>> mixedJobs;
+    std::promise<void> runningEntered, runningRelease, queuedCompleted;
+    auto runningEnteredSignal = runningEntered.get_future();
+    auto runningReleaseSignal = runningRelease.get_future();
+    auto queuedCompletedSignal = queuedCompleted.get_future();
+    std::atomic<bool> drained{false};
+    std::atomic<unsigned> mixedCompiles{0};
+    State mixed([&](Key candidate) -> void* {
+        ++mixedCompiles;
+        if (candidate.flags == 1) {
+            runningEntered.set_value();
+            runningReleaseSignal.wait();
+        } else {
+            queuedCompleted.set_value();
+        }
+        return &nativePipeline;
+    }, [&](std::function<void()> job) { mixedJobs.push_back(std::move(job)); });
+    mixed.request({1, 1}, true);
+    mixed.request({2, 2}, true);
+    auto runningJob = std::async(std::launch::async, mixedJobs.front());
+    ready(runningEnteredSignal);
+    mixed.stop();
+    auto draining = std::async(std::launch::async, [&] { mixed.wait(); drained = true; });
+    ready(queuedCompletedSignal);
+    assert(!drained && mixedCompiles == 2);
+    runningRelease.set_value();
+    ready(runningJob); runningJob.get();
+    ready(draining); draining.get();
+    mixedJobs.back()();
+    assert(drained && mixedCompiles == 2);
+
+    // The callback and two synchronous consumers race for one claim.
+    std::function<void()> racingCallback;
+    std::atomic<unsigned> racingCompiles{0};
+    State racing([&](Key) -> void* { ++racingCompiles; return &nativePipeline; },
+        [&](std::function<void()> job) { racingCallback = std::move(job); });
+    racing.request(key, true);
+    std::barrier claimStart(4);
+    auto queuedCaller = std::async(std::launch::async, [&] {
+        claimStart.arrive_and_wait();
+        racingCallback();
+    });
+    const auto synchronousClaim = [&] {
+        claimStart.arrive_and_wait();
+        return racing.request(key, false);
+    };
+    auto firstClaim = std::async(std::launch::async, synchronousClaim);
+    auto secondClaim = std::async(std::launch::async, synchronousClaim);
+    claimStart.arrive_and_wait();
+    ready(queuedCaller); queuedCaller.get();
+    ready(firstClaim); ready(secondClaim);
+    assert(firstClaim.get().pipeline == &nativePipeline);
+    assert(secondClaim.get().pipeline == &nativePipeline && racingCompiles == 1);
+    racing.stop(); racing.wait();
+
     {
         auto& rt = runtime();
         std::array<std::uint8_t, 0x710> native{};
         std::array<std::uint8_t, 0x60> device{};
         std::array<std::uint8_t, 0x10> description{};
-        original[1] = reinterpret_cast<std::uintptr_t>(+[](void*, std::uint32_t, std::uint64_t) -> void* {
+        original.getRenderPipelineState = reinterpret_cast<std::uintptr_t>(+[](void*, std::uint32_t, std::uint64_t) -> void* {
             static int result;
             return &result;
         });
@@ -289,10 +629,10 @@ int main() {
         }
         const std::uint32_t mpl = 2;
         std::memcpy(device.data() + 0x58, &mpl, sizeof(mpl));
-        original[0] = reinterpret_cast<std::uintptr_t>(+[](void* owner, void*, const void*) {
+        original.graphicsCtor = reinterpret_cast<std::uintptr_t>(+[](void* owner, void*, const void*) {
             getRenderPipeline(owner, 2, 0x46);
         });
-        original[2] = reinterpret_cast<std::uintptr_t>(+[](void*) {});
+        original.graphicsDestroy = reinterpret_cast<std::uintptr_t>(+[](void*) {});
         rt.queue = dispatch_queue_create("yaagl.async-publication-test", DISPATCH_QUEUE_SERIAL);
         graphicsCtor(native.data(), device.data(), description.data());
         auto published = stateFor(native.data());
@@ -308,6 +648,7 @@ int main() {
         enabled = false;
     }
 
+    dx12SafetyFixture();
     Recurrence history;
     for (unsigned i = 0; i != 100; ++i) history.observe(1);
     assert(!history.eligible(1));
@@ -344,7 +685,7 @@ int main() {
         rt.pipelines.emplace(coldPSO.data(), Pipeline{cold, &device, 1});
         rt.roots.emplace(&root, Root{true, &device, 1});
         rt.lists.emplace(list.data(), List{true, {}});
-        original[3] = reinterpret_cast<std::uintptr_t>(&dx12DrawFixture);
+        original.draw = reinterpret_cast<std::uintptr_t>(&dx12DrawFixture);
         enabled = true;
         for (std::uint64_t frame = 1; frame <= 5; ++frame) {
             rt.frame = frame;
@@ -383,6 +724,10 @@ int main() {
         graphicsDestroy(warmPSO.data());
         put(0x100, coldPSO.data());
         // Ready draws must still establish history for a later cold owner.
+        auto* target = static_cast<YAAGLAsyncTargetHistory*>(
+            objc_getAssociatedObject(texture, &historyKey));
+        assert(target);
+        registryProgressWhileHistoryBlocked(target->mutex, [&] { return skipDraw(list.data()); });
         assert(skipDraw(list.data()));
         compileCold();
         assert(!skipDraw(list.data()));
@@ -615,8 +960,8 @@ int main() {
         dx11Lock = [](void*, std::uint32_t) { dx11Order.push_back('L'); };
         dx11Unlock = [](void*) { dx11Order.push_back('U'); };
         dx11MergeResources = [](void*) { dx11Order.push_back('M'); };
-        original[14] = original[15] = reinterpret_cast<std::uintptr_t>(&dx11QueryFixture);
-        original[16] = reinterpret_cast<std::uintptr_t>(+[](void*, void*) {});
+        original.dx11Begin = original.dx11End = reinterpret_cast<std::uintptr_t>(&dx11QueryFixture);
+        original.dx11Destroy = reinterpret_cast<std::uintptr_t>(+[](void*, void*) {});
         enabled = true;
         unsigned emitted = 0;
         const auto draw = [&] {
@@ -642,9 +987,21 @@ int main() {
             assert(warmDraw.get());
         }
         std::atomic_ref<std::uint8_t>(pipeline[0x38]).store(1);
+        auto* target = static_cast<YAAGLDX11TargetHistory*>(
+            objc_getAssociatedObject(texture, &dx11HistoryKey));
+        assert(target);
+        registryProgressWhileHistoryBlocked(target->mutex, [&] { return !draw(); });
         for (unsigned repeat = 0; repeat < 20; ++repeat) assert(!draw());
+        rt.frame = 6;
+        assert(!draw()); // The last emitted draw was in epoch 5.
+        rt.frame = 7;
+        assert(draw()); // A skipped epoch does not renew eligibility.
         std::atomic_ref<std::uint8_t>(pipeline[0x38]).store(0);
         assert(draw()); // Completion, or an unscheduled variant, must make progress.
+        for (std::uint64_t frame = 8; frame <= 12; ++frame) {
+            rt.frame = frame;
+            assert(draw());
+        }
         std::atomic_ref<std::uint8_t>(pipeline[0x38]).store(1);
         for (const auto offset : {0x1c10, 0x1c18, 0x1c20, 0x9d30}) {
             put(offset, pipeline.data());
@@ -683,9 +1040,9 @@ int main() {
         assert(draw()); // Repeats in one epoch cannot promote the fresh target.
         put(0x95e0, &view);
         assert(!draw());
-        rt.frame = 7;
+        rt.frame = 14;
         assert(draw()); // A missing presentation epoch expires recurrence.
-        for (std::uint64_t frame = 8; frame <= 11; ++frame) {
+        for (std::uint64_t frame = 15; frame <= 18; ++frame) {
             rt.frame = frame;
             assert(draw());
         }
@@ -695,9 +1052,15 @@ int main() {
         dx11Destroy(context.data(), nullptr);
         assert(!draw()); // A retired context cannot leave a stale active query.
         put(0x95e0, &freshView);
+        put(0x95d0, &freshView);
         for (std::uint64_t frame = 20; frame <= 24; ++frame) {
             rt.frame = frame;
-            dx11Draw(context.data(), 0, 1, [](void*) {});
+            for (const auto size : {std::pair{0u, 1u}, std::pair{3u, 0u}}) {
+                dx11Order.clear();
+                dx11Draw(context.data(), size.first, size.second,
+                         [](void*) { dx11Order.push_back('E'); });
+                assert((dx11Order == std::vector<char>{'L', 'P', 'E', 'M', 'U'}));
+            }
         }
         assert(draw()); // Zero-count draws cannot establish target recurrence.
         enabled = false;

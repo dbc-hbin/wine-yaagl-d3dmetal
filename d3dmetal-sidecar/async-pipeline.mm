@@ -3,7 +3,9 @@
 #include <objc/runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,7 +54,7 @@ using Present = std::int32_t (__attribute__((ms_abi)) *)(void*, std::uint32_t, s
 using ParseRoot = RootDescription* (*)(const void*, std::uint32_t, void*);
 using ReleaseRoot = void (*)(RootDescription*);
 
-std::array<std::uintptr_t, kHookCount> original{};
+Hooks original{};
 ParseRoot parseRoot = nullptr;
 ReleaseRoot releaseRoot = nullptr;
 const std::uint64_t* dxgiInfo = nullptr;
@@ -163,25 +165,25 @@ void* getRenderPipeline(void* native, std::uint32_t flags, std::uint64_t formats
             return state->request({flags, formats}, false).pipeline;
         }
     }
-    return reinterpret_cast<Getter>(original[1])(native, flags, formats);
+    return reinterpret_cast<Getter>(original.getRenderPipelineState)(native, flags, formats);
 }
 
 void graphicsCtor(void* native, void* device, const void* description) {
     if (!enabled || field<std::uint32_t>(device, 0x58) != 2) {
-        reinterpret_cast<GraphicsCtor>(original[0])(native, device, description);
+        reinterpret_cast<GraphicsCtor>(original.graphicsCtor)(native, device, description);
         return;
     }
     std::vector<Key> keys;
     {
         Construction context(native);
-        reinterpret_cast<GraphicsCtor>(original[0])(native, device, description);
+        reinterpret_cast<GraphicsCtor>(original.graphicsCtor)(native, device, description);
         keys = std::move(context.keys);
     }
     if (keys.empty() || field<std::uint8_t>(native, 0x28)) return;
     auto state = std::make_shared<State>(
         [native](Key key) -> void* {
             @autoreleasepool {
-                void* result = reinterpret_cast<Getter>(original[1])(native, key.flags, key.formats);
+                void* result = reinterpret_cast<Getter>(original.getRenderPipelineState)(native, key.flags, key.formats);
                 auto& rt = runtime();
                 if (result) ++rt.ready; else ++rt.failed;
                 if (logging) std::fprintf(stderr,
@@ -221,11 +223,11 @@ void graphicsDestroy(void* native) {
             rt.pipelines.erase(native);
         }
     }
-    reinterpret_cast<Destroy>(original[2])(native);
+    reinterpret_cast<Destroy>(original.graphicsDestroy)(native);
 }
 
 void rootCtor(void* root, void* device, const void* bytes, std::uint32_t length) {
-    reinterpret_cast<RootCtor>(original[5])(root, device, bytes, length);
+    reinterpret_cast<RootCtor>(original.rootCtor)(root, device, bytes, length);
     if (!enabled) return;
     bool safe = false;
     if (field<std::int32_t>(root, 0x638) == 0) {
@@ -245,11 +247,11 @@ void rootDestroy(void* root) {
         std::lock_guard lock(rt.mutex);
         rt.roots.erase(root);
     }
-    reinterpret_cast<Destroy>(original[6])(root);
+    reinterpret_cast<Destroy>(original.rootDestroy)(root);
 }
 
 std::int32_t __attribute__((ms_abi)) reset(void* list, void* allocator, void* initialPipeline) {
-    const auto result = reinterpret_cast<Reset>(original[7])(list, allocator, initialPipeline);
+    const auto result = reinterpret_cast<Reset>(original.reset)(list, allocator, initialPipeline);
     if (enabled && result >= 0) {
         auto& rt = runtime();
         std::lock_guard lock(rt.mutex);
@@ -264,11 +266,11 @@ void __attribute__((ms_abi)) beginQuery(void* list, void* heap, std::uint32_t ty
         std::lock_guard lock(rt.mutex);
         rt.lists[list].queries.emplace(reinterpret_cast<std::uintptr_t>(heap), type, index);
     }
-    reinterpret_cast<Query>(original[8])(list, heap, type, index);
+    reinterpret_cast<Query>(original.beginQuery)(list, heap, type, index);
 }
 
 void __attribute__((ms_abi)) endQuery(void* list, void* heap, std::uint32_t type, std::uint32_t index) {
-    reinterpret_cast<Query>(original[9])(list, heap, type, index);
+    reinterpret_cast<Query>(original.endQuery)(list, heap, type, index);
     if (enabled) {
         auto& rt = runtime();
         std::lock_guard lock(rt.mutex);
@@ -285,18 +287,18 @@ void listDestroy(void* list) {
         std::lock_guard lock(rt.mutex);
         rt.lists.erase(list);
     }
-    reinterpret_cast<Destroy>(original[10])(list);
+    reinterpret_cast<Destroy>(original.listDestroy)(list);
 }
 
 std::int32_t __attribute__((ms_abi)) present(void* swapchain, std::uint32_t interval,
                                             std::uint32_t flags, const void* parameters) {
-    if (!enabled)
-        return reinterpret_cast<Present>(original[11])(swapchain, interval, flags, parameters);
     // The pinned IDXGISwapChain4 Present thunk subtracts 0x10 from the public
     // interface before entering this native object (also used by the unpack bridge).
     const auto frame = presentationHistory().take(static_cast<std::uint8_t*>(swapchain) + 0x10);
+    if (!enabled)
+        return reinterpret_cast<Present>(original.present)(swapchain, interval, flags, parameters);
     const auto before = field<std::uint64_t>(swapchain, 0x120);
-    const auto result = reinterpret_cast<Present>(original[11])(swapchain, interval, flags, parameters);
+    const auto result = reinterpret_cast<Present>(original.present)(swapchain, interval, flags, parameters);
     const bool advanced = result >= 0 && !(flags & 1) &&
         field<std::uint64_t>(swapchain, 0x120) != before;
     if (presentationHistory().complete(frame, advanced)) ++runtime().frame;
@@ -320,7 +322,7 @@ id targetHistory(id texture, const void* key, bool observe, Create create) {
 
 template<class History, class Key, std::size_t N>
 bool useTargets(const std::array<std::pair<History*, Key>, N>& targets, std::size_t count,
-                bool observe, bool requireEligible = false) {
+                bool observe) {
     if (!count) return false;
     struct Observation {
         std::uint64_t identity = 0;
@@ -334,8 +336,7 @@ bool useTargets(const std::array<std::pair<History*, Key>, N>& targets, std::siz
     };
     static thread_local Observed observed;
     auto frame = runtime().frame.load();
-    const bool remember = observe && !requireEligible;
-    if (remember && observed.count == count && observed.frame == frame) {
+    if (observe && observed.count == count && observed.frame == frame) {
         bool unchanged = true;
         for (std::size_t i = 0; i < count; ++i) {
             const auto* owner = targets[i].first;
@@ -363,42 +364,43 @@ bool useTargets(const std::array<std::pair<History*, Key>, N>& targets, std::siz
     for (auto owner = owners.begin(); owner != end; ++owner)
         locks[owner - owners.begin()] = std::unique_lock((*owner)->mutex);
 
-    // Preserve a single multi-attachment decision, including DX11's conditional
-    // observation, without serializing unrelated textures. Never acquire the
-    // runtime/creation mutex while holding these ordered history locks.
+    // Preserve a single multi-attachment decision without serializing unrelated
+    // textures. Never acquire the runtime/creation mutex while holding these
+    // ordered history locks.
     frame = runtime().frame.load();
     bool recurrent = true;
-    if (!observe || requireEligible) {
+    if (!observe) {
         for (std::size_t i = 0; i < count; ++i)
             if (!targets[i].first->history.use(targets[i].second, frame, false)) recurrent = false;
     }
-    if (observe && (!requireEligible || recurrent)) {
-        if (remember) observed.count = 0;
+    if (observe) {
+        observed.count = 0;
         for (std::size_t i = 0; i < count; ++i) {
             auto& history = targets[i].first->history;
             history.use(targets[i].second, frame, true);
-            if (remember)
-                observed.entries[i] = {history.identity(), targets[i].second,
-                                       history.observationRevision()};
+            observed.entries[i] = {history.identity(), targets[i].second,
+                                   history.observationRevision()};
         }
         // A later subresource observation can reset an earlier entry of the
         // same history. Its earlier ticket must then miss, not inherit the
         // final revision of that reset history.
-        if (remember) {
-            observed.frame = frame;
-            observed.count = count;
-        }
+        observed.frame = frame;
+        observed.count = count;
     }
     return recurrent;
 }
 
 // Associations remain the lifetime boundary; no texture address/history pair
 // survives a draw. Each texture retains the same bounded subresource history.
-bool targets(void* list, bool observe) {
-    const auto count = field<std::uint32_t>(list, 0x3f4);
-    if (count > 8) return false;
+struct DX12Attachments {
     std::array<std::pair<YAAGLAsyncTargetHistory*, std::uint64_t>, 8 + 2> entries{};
-    std::size_t used = 0;
+    std::size_t count = 0;
+};
+
+DX12Attachments collectTargets(void* list, bool observe) {
+    DX12Attachments result;
+    const auto count = field<std::uint32_t>(list, 0x3f4);
+    if (count > 8) return result;
     const auto visit = [&](std::size_t offset) {
         id texture = field<id>(list, offset);
         if (!texture) return;
@@ -408,12 +410,17 @@ bool targets(void* list, bool observe) {
         auto* history = static_cast<YAAGLAsyncTargetHistory*>(
             targetHistory(texture, &historyKey, observe,
                           [] { return [[YAAGLAsyncTargetHistory alloc] init]; }));
-        entries[used++] = {history, key};
+        result.entries[result.count++] = {history, key};
     };
     for (std::uint32_t i = 0; i < count; ++i) visit(0x1d0 + i * 0x38);
     visit(0x390);
     visit(0x3b0);
-    return useTargets(entries, used, observe);
+    return result;
+}
+
+bool targets(void* list, bool observe) {
+    const auto attachments = collectTargets(list, observe);
+    return useTargets(attachments.entries, attachments.count, observe);
 }
 
 Key dynamicKey(void* list, void* native) {
@@ -477,15 +484,12 @@ bool skipDraw(void* list) {
             commands != rt.lists.end() && commands->second.initialized && commands->second.queries.empty() &&
             field<std::uint32_t>(list, 0x70) == 0 && // Direct lists, not bundles.
             field<std::uint32_t>(native, 0x44) == 0 &&
-            !field<std::uint8_t>(native, 0x32e) && !field<std::uint8_t>(list, 0x428) &&
-            targets(list, false);
+            !field<std::uint8_t>(native, 0x32e) && !field<std::uint8_t>(list, 0x428);
     }
+    if (eligible) eligible = targets(list, false);
     if (eligible && state->request(key, true).status == Status::Pending) {
         auto& rt = runtime();
         const auto skipped = ++rt.skipped;
-        // Keep an already established recurring target alive across pending
-        // frames, without promoting any previously ineligible target.
-        targets(list, true);
         if (logging && (skipped == 1 || (skipped & (skipped - 1)) == 0))
             std::fprintf(stderr, "[D3DMetal async] skipped=%llu pso=%p\n",
                          static_cast<unsigned long long>(skipped), native);
@@ -507,16 +511,16 @@ void recordDraw(void* list, std::uint32_t count, std::uint32_t instances) {
 
 void __attribute__((ms_abi)) draw(void* list, std::uint32_t count, std::uint32_t instances,
                                 std::uint32_t start, std::uint32_t baseInstance) {
-    if (skipDraw(list)) return;
-    reinterpret_cast<Draw>(original[3])(list, count, instances, start, baseInstance);
+    if (count && instances && skipDraw(list)) return;
+    reinterpret_cast<Draw>(original.draw)(list, count, instances, start, baseInstance);
     recordDraw(list, count, instances);
 }
 
 void __attribute__((ms_abi)) drawIndexed(void* list, std::uint32_t count, std::uint32_t instances,
                                        std::uint32_t start, std::int32_t baseVertex,
                                        std::uint32_t baseInstance) {
-    if (skipDraw(list)) return;
-    reinterpret_cast<DrawIndexed>(original[4])(list, count, instances, start, baseVertex, baseInstance);
+    if (count && instances && skipDraw(list)) return;
+    reinterpret_cast<DrawIndexed>(original.drawIndexed)(list, count, instances, start, baseVertex, baseInstance);
     recordDraw(list, count, instances);
 }
 
@@ -544,18 +548,18 @@ DX11Attachments dx11Attachments(void* context) {
 
 // Native descriptor resolution happens under the context lock, before taking
 // the runtime mutex. Histories are attached to the returned Metal texture views.
-bool dx11Targets(const DX11Attachments& attachments, bool observe, bool requireEligible = false) {
+bool dx11Targets(const DX11Attachments& attachments, bool observe) {
     std::array<std::pair<YAAGLDX11TargetHistory*, decltype(DX11Attachment::subresource)>,
                std::tuple_size_v<DX11Attachments>> entries{};
     std::size_t used = 0;
     for (const auto& attachment : attachments) {
         if (!attachment.texture) continue;
         auto* history = static_cast<YAAGLDX11TargetHistory*>(
-            targetHistory(attachment.texture, &dx11HistoryKey, observe && !requireEligible,
+            targetHistory(attachment.texture, &dx11HistoryKey, observe,
                           [] { return [[YAAGLDX11TargetHistory alloc] init]; }));
         entries[used++] = {history, attachment.subresource};
     }
-    return useTargets(entries, used, observe, requireEligible);
+    return useTargets(entries, used, observe);
 }
 
 bool dx11SkipDraw(void* context, const DX11Attachments& attachments) {
@@ -574,14 +578,13 @@ bool dx11SkipDraw(void* context, const DX11Attachments& attachments) {
     for (std::size_t stage = 0; stage < 5; ++stage)
         if (field<std::uint64_t>(context, 0x94f8 + stage * 8)) return false;
     auto& rt = runtime();
-    std::uint64_t skipped;
     {
         std::lock_guard lock(rt.mutex);
         const auto queries = rt.dx11Queries.find(context);
-        if ((queries != rt.dx11Queries.end() && !queries->second.empty()) ||
-            !dx11Targets(attachments, true, true)) return false;
-        skipped = ++rt.skipped;
+        if (queries != rt.dx11Queries.end() && !queries->second.empty()) return false;
     }
+    if (!dx11Targets(attachments, false)) return false;
+    const auto skipped = ++rt.skipped;
     if (logging && (skipped == 1 || (skipped & (skipped - 1)) == 0))
         std::fprintf(stderr, "[D3DMetal async] dx11-skipped=%llu pso=%p\n",
                      static_cast<unsigned long long>(skipped), native);
@@ -595,7 +598,7 @@ void dx11Draw(void* context, std::uint32_t count, std::uint32_t instances, Emit 
     // merge resource usage. SetGraphicsPipelineState replay only marks state
     // dirty; compilation is awaited by the later draw, not by that binding.
     dx11PushState(context);
-    const auto attachments = dx11Attachments(context);
+    const auto attachments = count && instances ? dx11Attachments(context) : DX11Attachments{};
     if (!count || !instances || !dx11SkipDraw(context, attachments)) {
         emit(static_cast<std::uint8_t*>(field<void*>(context, 0x1a90)) + 0x58);
         if (count && instances && field<void*>(context, 0x1be8))
@@ -607,7 +610,7 @@ void dx11Draw(void* context, std::uint32_t count, std::uint32_t instances, Emit 
 void __attribute__((ms_abi)) dx11DrawInstanced(void* context, std::uint32_t count,
     std::uint32_t instances, std::uint32_t start, std::uint32_t baseInstance) {
     if (!enabled) {
-        reinterpret_cast<Draw>(original[12])(context, count, instances, start, baseInstance);
+        reinterpret_cast<Draw>(original.dx11Draw)(context, count, instances, start, baseInstance);
         return;
     }
     dx11Draw(context, count, instances, [&](void* list) {
@@ -618,7 +621,7 @@ void __attribute__((ms_abi)) dx11DrawInstanced(void* context, std::uint32_t coun
 void __attribute__((ms_abi)) dx11DrawIndexedInstanced(void* context, std::uint32_t count,
     std::uint32_t instances, std::uint32_t start, std::int32_t baseVertex, std::uint32_t baseInstance) {
     if (!enabled) {
-        reinterpret_cast<DrawIndexed>(original[13])(context, count, instances, start, baseVertex, baseInstance);
+        reinterpret_cast<DrawIndexed>(original.dx11DrawIndexed)(context, count, instances, start, baseVertex, baseInstance);
         return;
     }
     dx11Draw(context, count, instances, [&](void* list) {
@@ -627,20 +630,20 @@ void __attribute__((ms_abi)) dx11DrawIndexedInstanced(void* context, std::uint32
 }
 
 void __attribute__((ms_abi)) dx11Begin(void* context, void* query) {
-    if (!enabled) { reinterpret_cast<DX11Query>(original[14])(context, query); return; }
+    if (!enabled) { reinterpret_cast<DX11Query>(original.dx11Begin)(context, query); return; }
     DX11ContextLock lock(context);
     {
         auto& rt = runtime();
         std::lock_guard historyLock(rt.mutex);
         rt.dx11Queries[context].insert(query);
     }
-    reinterpret_cast<DX11Query>(original[14])(context, query);
+    reinterpret_cast<DX11Query>(original.dx11Begin)(context, query);
 }
 
 void __attribute__((ms_abi)) dx11End(void* context, void* query) {
-    if (!enabled) { reinterpret_cast<DX11Query>(original[15])(context, query); return; }
+    if (!enabled) { reinterpret_cast<DX11Query>(original.dx11End)(context, query); return; }
     DX11ContextLock lock(context);
-    reinterpret_cast<DX11Query>(original[15])(context, query);
+    reinterpret_cast<DX11Query>(original.dx11End)(context, query);
     auto& rt = runtime();
     std::lock_guard historyLock(rt.mutex);
     const auto found = rt.dx11Queries.find(context);
@@ -656,25 +659,31 @@ void dx11Destroy(void* context, void* vtt) {
         std::lock_guard lock(rt.mutex);
         rt.dx11Queries.erase(context);
     }
-    reinterpret_cast<DX11Destroy>(original[16])(context, vtt);
+    reinterpret_cast<DX11Destroy>(original.dx11Destroy)(context, vtt);
 }
 
 } // namespace
 
-std::array<std::uintptr_t, kHookCount> initialize(
-    const std::uint8_t* image, const std::array<std::uintptr_t, kHookCount>& originals) {
+Hooks initialize(const std::uint8_t* image, const Hooks& originals) {
     original = originals;
-    const std::array<std::uintptr_t, kHookCount> hooks = {
-        reinterpret_cast<std::uintptr_t>(&graphicsCtor), reinterpret_cast<std::uintptr_t>(&getRenderPipeline),
-        reinterpret_cast<std::uintptr_t>(&graphicsDestroy), reinterpret_cast<std::uintptr_t>(&draw),
-        reinterpret_cast<std::uintptr_t>(&drawIndexed), reinterpret_cast<std::uintptr_t>(&rootCtor),
-        reinterpret_cast<std::uintptr_t>(&rootDestroy), reinterpret_cast<std::uintptr_t>(&reset),
-        reinterpret_cast<std::uintptr_t>(&beginQuery), reinterpret_cast<std::uintptr_t>(&endQuery),
-        reinterpret_cast<std::uintptr_t>(&listDestroy), reinterpret_cast<std::uintptr_t>(&present),
-        reinterpret_cast<std::uintptr_t>(&dx11DrawInstanced),
-        reinterpret_cast<std::uintptr_t>(&dx11DrawIndexedInstanced),
-        reinterpret_cast<std::uintptr_t>(&dx11Begin), reinterpret_cast<std::uintptr_t>(&dx11End),
-        reinterpret_cast<std::uintptr_t>(&dx11Destroy),
+    const Hooks hooks = {
+        .graphicsCtor = reinterpret_cast<std::uintptr_t>(&graphicsCtor),
+        .getRenderPipelineState = reinterpret_cast<std::uintptr_t>(&getRenderPipeline),
+        .graphicsDestroy = reinterpret_cast<std::uintptr_t>(&graphicsDestroy),
+        .draw = reinterpret_cast<std::uintptr_t>(&draw),
+        .drawIndexed = reinterpret_cast<std::uintptr_t>(&drawIndexed),
+        .rootCtor = reinterpret_cast<std::uintptr_t>(&rootCtor),
+        .rootDestroy = reinterpret_cast<std::uintptr_t>(&rootDestroy),
+        .reset = reinterpret_cast<std::uintptr_t>(&reset),
+        .beginQuery = reinterpret_cast<std::uintptr_t>(&beginQuery),
+        .endQuery = reinterpret_cast<std::uintptr_t>(&endQuery),
+        .listDestroy = reinterpret_cast<std::uintptr_t>(&listDestroy),
+        .present = reinterpret_cast<std::uintptr_t>(&present),
+        .dx11Draw = reinterpret_cast<std::uintptr_t>(&dx11DrawInstanced),
+        .dx11DrawIndexed = reinterpret_cast<std::uintptr_t>(&dx11DrawIndexedInstanced),
+        .dx11Begin = reinterpret_cast<std::uintptr_t>(&dx11Begin),
+        .dx11End = reinterpret_cast<std::uintptr_t>(&dx11End),
+        .dx11Destroy = reinterpret_cast<std::uintptr_t>(&dx11Destroy),
     };
     const char* option = std::getenv("YAAGL_D3DMETAL_ASYNC");
     if (!option || std::strcmp(option, "1") != 0) return hooks;

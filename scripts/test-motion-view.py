@@ -117,11 +117,8 @@ def main():
         source = directory / "motion-view.mm"
         binary = directory / "motion-view"
         source.write_text(SOURCE)
-        kernels = (NATIVE / "fsr-kernels.metal").read_text()
-        (directory / "fsr-kernels.inc").write_text(
-            'static const char kFsrKernelsSource[] = R"YAAGL_METAL('
-            + kernels + ')YAAGL_METAL";\n'
-        )
+        subprocess.run(("node", str(NATIVE.parent / "scripts/build-fsr-kernels.mjs"),
+                        str(directory)), check=True)
         subprocess.run((
             "xcrun", "clang++", "-arch", "x86_64", "-std=c++20", "-fno-objc-arc",
             "-I", str(NATIVE), "-I", str(directory), str(source),

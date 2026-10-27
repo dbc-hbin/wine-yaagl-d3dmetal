@@ -126,25 +126,16 @@ constexpr std::uint32_t kKnownFlags = FeatureFlagIsHDR | FeatureFlagMVLowRes |
                                       FeatureFlagMVJittered | FeatureFlagDepthInverted |
                                       FeatureFlagAutoExposure;
 
-const char* kExposureKernel = R"METAL(
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void yaagl_metalfx_exposure_r_to_r16(
-    texture2d<float, access::read> source [[texture(0)]],
-    texture2d<half, access::write> destination [[texture(1)]]) {
-    const float exposure = source.read(uint2(0, 0)).r;
-    destination.write(half4(half(exposure), half(0.0), half(0.0), half(1.0)), uint2(0, 0));
-}
-)METAL";
-
 id<MTLComputePipelineState> makePipeline(id<MTLDevice> device, id<MTLLibrary> library,
-                                                 NSString* functionName) noexcept {
+                                         NSString* functionName,
+                                         MTLFunctionConstantValues* constants = nil) noexcept {
     id<MTLFunction> function = nil;
     @try {
         NSError* error = nil;
         if (!library) return nil;
-        function = [library newFunctionWithName:functionName];
+        function = constants
+            ? [library newFunctionWithName:functionName constantValues:constants error:&error]
+            : [library newFunctionWithName:functionName];
         if (!function) return nil;
         return [device newComputePipelineStateWithFunction:function error:&error];
     } @catch (id) {
@@ -156,15 +147,17 @@ id<MTLComputePipelineState> makePipeline(id<MTLDevice> device, id<MTLLibrary> li
 
 id<MTLComputePipelineState> makeExposurePipeline(id<MTLDevice> device) noexcept {
     id<MTLLibrary> library = nil;
+    dispatch_data_t data = dispatch_data_create(kFsrKernelsMetallib, sizeof(kFsrKernelsMetallib),
+                                                nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
     @try {
         NSError* error = nil;
-        library = [device newLibraryWithSource:[NSString stringWithUTF8String:kExposureKernel]
-                                      options:nil error:&error];
+        library = [device newLibraryWithData:data error:&error];
         return makePipeline(device, library, @"yaagl_metalfx_exposure_r_to_r16");
     } @catch (id) {
         return nil;
     } @finally {
         [library release];
+        dispatch_release(data);
     }
 }
 
@@ -221,7 +214,8 @@ MTLPixelFormat workingOutputFormat(MTLPixelFormat format,
 id<MTLTexture> makeScratchTexture(id<MTLDevice> device, id<MTLTexture> source,
                                    MTLPixelFormat format, MTLTextureUsage usage,
                                    NSString* suffix, NSUInteger width = 0,
-                                   NSUInteger height = 0) noexcept {
+                                   NSUInteger height = 0,
+                                   bool allowGPUOptimizedContents = true) noexcept {
     id<MTLTexture> texture = nil;
     @try {
         MTLTextureDescriptor* descriptor =
@@ -232,6 +226,7 @@ id<MTLTexture> makeScratchTexture(id<MTLDevice> device, id<MTLTexture> source,
         descriptor.storageMode = MTLStorageModePrivate;
         descriptor.hazardTrackingMode = MTLHazardTrackingModeTracked;
         descriptor.usage = usage;
+        descriptor.allowGPUOptimizedContents = allowGPUOptimizedContents;
         texture = [device newTextureWithDescriptor:descriptor];
         if (texture && source.label) texture.label = [source.label stringByAppendingString:suffix];
         return texture;
@@ -363,10 +358,12 @@ struct ScalerGeneration {
 };
 
 bool scratchMatches(id<MTLTexture> texture, MTLPixelFormat format,
-                    NSUInteger width, NSUInteger height, MTLTextureUsage usage) noexcept {
+                    NSUInteger width, NSUInteger height, MTLTextureUsage usage,
+                    bool allowGPUOptimizedContents) noexcept {
     @try {
         return texture && texture.pixelFormat == format && texture.width == width &&
-               texture.height == height && texture.usage == usage;
+               texture.height == height && texture.usage == usage &&
+               texture.allowGPUOptimizedContents == allowGPUOptimizedContents;
     } @catch (id) {
         return false;
     }
@@ -438,7 +435,6 @@ struct ExecutionResources {
 
 struct Feature::Impl {
     CreateInfo create{};
-    CommandMode commandMode = CommandMode::Metal4;
     id<MTLDevice> device = nil;
     id compiler = nil;
     id<MTLLibrary> fsrLibrary = nil;
@@ -446,7 +442,7 @@ struct Feature::Impl {
     id<MTLComputePipelineState> linearizePipeline = nil;
     id<MTLComputePipelineState> combineMaskPipeline = nil;
     id<MTLComputePipelineState> paddingPipeline = nil;
-    id<MTLComputePipelineState> finishPipeline = nil;
+    std::array<id<MTLComputePipelineState>, 2> finishPipelines{};
     id<MTLComputePipelineState> debugPipeline = nil;
     id<MTLComputePipelineState> debugDepthPipeline = nil;
     id<MTLComputePipelineState> motionResamplePipeline = nil;
@@ -505,10 +501,10 @@ struct Feature::Impl {
     }
 
     id<MTLTexture> takeTexture(MTLPixelFormat format, NSUInteger width, NSUInteger height,
-                               MTLTextureUsage usage) noexcept {
+                               MTLTextureUsage usage, bool allowGPUOptimizedContents = true) noexcept {
         std::lock_guard<std::mutex> lock(scratchMutex);
         for (auto& texture : idleTextures) {
-            if (scratchMatches(texture, format, width, height, usage)) {
+            if (scratchMatches(texture, format, width, height, usage, allowGPUOptimizedContents)) {
                 idleTextureBytes -= scratchBytes(texture);
                 return std::exchange(texture, nil);
             }
@@ -524,7 +520,7 @@ struct Feature::Impl {
     void returnResources(ExecutionResources& resources) noexcept {
         // The lease is retained until GPU completion. Commit the empty set
         // before allowing any scratch allocation it named into the general pool.
-        if (resources.residency && commandMode == CommandMode::Metal4 &&
+        if (resources.residency &&
             !dormant.load(std::memory_order_relaxed) &&
             emptyResidencySet(resources.residency)) {
             std::lock_guard<std::mutex> lock(bundleMutex);
@@ -706,7 +702,7 @@ struct Feature::Impl {
         releaseObject(debugDepthPipeline);
         releaseObject(motionResamplePipeline);
         releaseObject(debugPipeline);
-        releaseObject(finishPipeline);
+        for (auto& pipeline : finishPipelines) releaseObject(pipeline);
         releaseObject(combineMaskPipeline);
         releaseObject(paddingPipeline);
         releaseObject(linearizePipeline);
@@ -728,8 +724,7 @@ struct ExecutionLease::Impl : ExecutionResources {
         // The transport retains this lease through GPU completion. Only a live
         // frame may reuse its committed set and owned scratch allocations.
         if (auto owner = feature.lock()) {
-            if (auto frame = prepared.lock(); replayEligible && frame &&
-                owner->commandMode == CommandMode::Metal4)
+            if (auto frame = prepared.lock(); replayEligible && frame)
                 owner->putBundle(*this, frame.get());
             owner->returnResources(*this);
         } else {
@@ -764,6 +759,7 @@ struct PreparedFrame::Impl {
     bool needsMotionStaging = false;
     bool resampleDisplayMotion = false;
     bool needsReactiveStaging = false;
+    bool directComposition = false;
     Rect scalerMotionRect{};
     bool needsExposureConversion = false;
     mutable std::mutex firstLeaseMutex;
@@ -786,15 +782,17 @@ namespace {
 id<MTLTexture> acquireScratch(Feature::Impl& feature, id<MTLTexture> source,
                               MTLPixelFormat format, MTLTextureUsage usage,
                               NSString* suffix, NSUInteger width = 0,
-                              NSUInteger height = 0) noexcept {
+                              NSUInteger height = 0,
+                              bool allowGPUOptimizedContents = true) noexcept {
     const NSUInteger actualWidth = width ? width : source.width;
     const NSUInteger actualHeight = height ? height : source.height;
     // A pooled texture keeps the label from its creation. Relabeling every
     // acquisition would build a new string per scratch texture per frame.
-    if (id<MTLTexture> texture = feature.takeTexture(format, actualWidth, actualHeight, usage))
+    if (id<MTLTexture> texture = feature.takeTexture(
+            format, actualWidth, actualHeight, usage, allowGPUOptimizedContents))
         return texture;
     return makeScratchTexture(feature.device, source, format, usage, suffix,
-                              actualWidth, actualHeight);
+                              actualWidth, actualHeight, allowGPUOptimizedContents);
 }
 
 id<MTLTexture> acquireExposure(Feature::Impl& feature) noexcept {
@@ -817,22 +815,17 @@ bool validateCreate(const CreateContext& context, const CreateInfo& create,
         return false;
     }
     @try {
-        if (context.mode == CommandMode::Metal4) {
-            if (@available(macOS 26.0, *)) {
-                id<MTL4Compiler> compiler =
-                    reinterpret_cast<id<MTL4Compiler>>(asCompiler(context.compiler));
-                if (!compiler || compiler.device != device ||
-                    ![MTLFXTemporalScalerDescriptor supportsMetal4FX:device]) {
-                    setError(error, ErrorCode::InvalidContext,
-                             "Metal4 compiler/device does not support Metal4FX temporal scaling");
-                    return false;
-                }
-            } else {
-                setError(error, ErrorCode::UnsupportedFeature, "Metal4 MetalFX translation requires macOS 26 or newer");
+        if (@available(macOS 26.0, *)) {
+            id<MTL4Compiler> compiler =
+                reinterpret_cast<id<MTL4Compiler>>(asCompiler(context.compiler));
+            if (!compiler || compiler.device != device ||
+                ![MTLFXTemporalScalerDescriptor supportsMetal4FX:device]) {
+                setError(error, ErrorCode::InvalidContext,
+                         "Metal4 compiler/device does not support Metal4FX temporal scaling");
                 return false;
             }
-        } else if (![MTLFXTemporalScalerDescriptor supportsDevice:device]) {
-            setError(error, ErrorCode::UnsupportedFeature, "Metal device does not support MetalFX temporal scaling");
+        } else {
+            setError(error, ErrorCode::UnsupportedFeature, "Metal4 MetalFX translation requires macOS 26 or newer");
             return false;
         }
 
@@ -1117,13 +1110,15 @@ bool ensureFsrPipelines(Feature::Impl& feature, const FrameOperations& operation
     const bool finish = !debug && (linearize || operations.sharpening || temporal.capped);
     const bool resampleMotion = temporal.capped && !feature.create.lowResolutionMotionVectors();
     if (!feature.fsrLibrary) {
+        dispatch_data_t data = dispatch_data_create(kFsrKernelsMetallib, sizeof(kFsrKernelsMetallib),
+                                                    nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         @try {
             NSError* libraryError = nil;
-            feature.fsrLibrary = [feature.device
-                newLibraryWithSource:[NSString stringWithUTF8String:kFsrKernelsSource]
-                             options:nil error:&libraryError];
+            feature.fsrLibrary = [feature.device newLibraryWithData:data error:&libraryError];
         } @catch (id) {
             feature.fsrLibrary = nil;
+        } @finally {
+            dispatch_release(data);
         }
     }
     if (linearize && !feature.linearizePipeline)
@@ -1132,9 +1127,13 @@ bool ensureFsrPipelines(Feature::Impl& feature, const FrameOperations& operation
     if (combineMasks && !feature.combineMaskPipeline)
         feature.combineMaskPipeline = makePipeline(feature.device, feature.fsrLibrary,
                                                    @"yaagl_fsr_combine_masks");
-    if (finish && !feature.finishPipeline)
-        feature.finishPipeline = makePipeline(feature.device, feature.fsrLibrary,
-                                              @"yaagl_fsr_finish");
+    if (finish && !feature.finishPipelines[operations.sharpening]) {
+        auto constants = [MTLFunctionConstantValues new];
+        [constants setConstantValue:&operations.sharpening type:MTLDataTypeBool atIndex:0];
+        feature.finishPipelines[operations.sharpening] =
+            makePipeline(feature.device, feature.fsrLibrary, @"yaagl_fsr_finish", constants);
+        [constants release];
+    }
     if (debug && !debugDepth && !feature.debugPipeline)
         feature.debugPipeline = makePipeline(feature.device, feature.fsrLibrary,
                                              @"yaagl_sr_debug_view");
@@ -1146,7 +1145,7 @@ bool ensureFsrPipelines(Feature::Impl& feature, const FrameOperations& operation
                                                       @"yaagl_sr_resample_motion");
     if ((linearize && !feature.linearizePipeline) ||
         (combineMasks && !feature.combineMaskPipeline) ||
-        (finish && !feature.finishPipeline) ||
+        (finish && !feature.finishPipelines[operations.sharpening]) ||
         (resampleMotion && !feature.motionResamplePipeline) ||
         (debugDepth && !feature.debugDepthPipeline) ||
         (debug && !debugDepth && !feature.debugPipeline)) {
@@ -1293,13 +1292,9 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
         }
 
         id scaler = nil;
-        if (feature.commandMode == CommandMode::Metal4) {
-            if (@available(macOS 26.0, *)) {
-                id<MTL4Compiler> compiler = reinterpret_cast<id<MTL4Compiler>>(feature.compiler);
-                scaler = [descriptor newTemporalScalerWithDevice:feature.device compiler:compiler];
-            }
-        } else {
-            scaler = [descriptor newTemporalScalerWithDevice:feature.device];
+        if (@available(macOS 26.0, *)) {
+            id<MTL4Compiler> compiler = reinterpret_cast<id<MTL4Compiler>>(feature.compiler);
+            scaler = [descriptor newTemporalScalerWithDevice:feature.device compiler:compiler];
         }
         if (!scaler) {
             setError(error, ErrorCode::ScalerCreationFailed,
@@ -1342,6 +1337,19 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
     }
 }
 
+struct alignas(8) FsrParams {
+    std::uint32_t sourceOrigin[2];
+    std::uint32_t compositionOrigin[2];
+    std::uint32_t destinationOrigin[2];
+    std::uint32_t extent[2];
+    std::uint32_t dispatchOrigin[2];
+    std::uint32_t dispatchExtent[2];
+    std::uint32_t transfer;
+    std::uint32_t flags;
+    float sharpness;
+    float exposure;
+};
+
 std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame,
                                                 Error* error) noexcept {
     try {
@@ -1351,9 +1359,14 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
         Feature::Impl& feature = *frame.feature;
         ScalerGeneration& generation = *frame.generation;
 
-        if (feature.commandMode != CommandMode::Metal4 || !feature.takeBundle(*lease, &frame)) {
-            if (feature.commandMode == CommandMode::Metal4)
-                lease->residency = feature.takeResidency();
+        if (!feature.takeBundle(*lease, &frame)) {
+            lease->residency = feature.takeResidency();
+            // In-place padding blits can corrupt GPU-optimized scratch on extent
+            // changes despite blit barriers. Keep this opt-out local to copied,
+            // padded inputs; generated textures and full-capacity copies retain it.
+            const bool fullInputCapacity =
+                frame.frame.inputContent.width == generation.inputCapacityWidth &&
+                frame.frame.inputContent.height == generation.inputCapacityHeight;
             const bool transfer = frame.operations.colorTransfer != ColorTransfer::Linear;
             const bool finish = !frame.operations.drawDebugView &&
                 (transfer || frame.operations.sharpening || frame.cappedOutput);
@@ -1389,13 +1402,13 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                 lease->stagedColor = acquireScratch(
                     feature, frame.color, frame.color.pixelFormat, generation.colorUsage,
                     @".YAAGL.MetalFX.ActiveColor", generation.inputCapacityWidth,
-                    generation.inputCapacityHeight);
+                    generation.inputCapacityHeight, fullInputCapacity);
             }
             if (frame.needsDepthStaging)
                 lease->stagedDepth = acquireScratch(
                     feature, frame.depth, frame.depth.pixelFormat, generation.depthUsage,
                     @".YAAGL.MetalFX.ActiveDepth", generation.inputCapacityWidth,
-                    generation.inputCapacityHeight);
+                    generation.inputCapacityHeight, fullInputCapacity);
             if (frame.needsMotionStaging)
                 lease->stagedMotion = acquireScratch(
                     feature, frame.motion, frame.motion.pixelFormat,
@@ -1406,8 +1419,9 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                     feature.create.lowResolutionMotionVectors() ? generation.inputCapacityWidth
                                                                 : frame.scalerMotionRect.width,
                     feature.create.lowResolutionMotionVectors() ? generation.inputCapacityHeight
-                                                                : frame.scalerMotionRect.height);
-            if (frame.operations.combineCompositionMask) {
+                                                                : frame.scalerMotionRect.height,
+                    !feature.create.lowResolutionMotionVectors() || fullInputCapacity);
+            if (frame.operations.combineCompositionMask && !frame.directComposition) {
                 lease->combinedMask = acquireScratch(
                     feature, frame.reactive ? frame.reactive : frame.composition,
                     MTLPixelFormatR8Unorm,
@@ -1424,7 +1438,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                 lease->stagedReactive = acquireScratch(
                     feature, frame.reactive, frame.reactive.pixelFormat,
                     generation.reactiveUsage, @".YAAGL.MetalFX.ActiveReactive",
-                    generation.inputCapacityWidth, generation.inputCapacityHeight);
+                    generation.inputCapacityWidth, generation.inputCapacityHeight, fullInputCapacity);
             }
             if ((!transfer && frame.needsColorStaging && !lease->stagedColor) ||
                 (frame.needsDepthStaging && !lease->stagedDepth) ||
@@ -1444,44 +1458,39 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                 }
             }
 
-            struct alignas(8) Params {
-                std::uint32_t sourceOrigin[2];
-                std::uint32_t compositionOrigin[2];
-                std::uint32_t destinationOrigin[2];
-                std::uint32_t extent[2];
-                std::uint32_t dispatchOrigin[2];
-                std::uint32_t dispatchExtent[2];
-                std::uint32_t transfer;
-                std::uint32_t flags;
-                float sharpness;
-                float exposure;
-            };
             const std::uint32_t flags = (frame.reactive ? 1u : 0u) |
                                         (frame.composition ? 2u : 0u) |
-                                        (frame.operations.sharpening ? 4u : 0u) |
                                         (frame.frame.exposureMode == ExposureMode::Texture ? 8u : 0u) |
                                         (frame.cappedOutput ? 16u : 0u);
             const auto makeParams = [&](const Rect& source, const Rect& destination,
-                                        const Rect& dispatch, ColorTransfer transfer) {
-                Params params{{source.x, source.y},
+                                        const Rect& dispatch, ColorTransfer transfer,
+                                        bool padding = false) {
+                FsrParams params{{source.x, source.y},
                               {frame.frame.compositionRect.x, frame.frame.compositionRect.y},
                               {destination.x, destination.y},
                               {source.width, source.height}, {dispatch.x, dispatch.y},
                               {dispatch.width, dispatch.height}, static_cast<std::uint32_t>(transfer),
                               flags, frame.operations.sharpness, frame.frame.preExposure};
-                id<MTLBuffer> buffer = feature.takeBuffer(sizeof(params));
+                std::array<FsrParams, 3> records{params, params, params};
+                if (padding) {
+                    records[1].dispatchOrigin[0] = source.width;
+                    records[1].dispatchExtent[0] = dispatch.width - source.width;
+                    records[1].dispatchExtent[1] = source.height;
+                    records[2].dispatchOrigin[1] = source.height;
+                    records[2].dispatchExtent[1] = dispatch.height - source.height;
+                }
+                const auto length = padding ? sizeof(records) : sizeof(params);
+                id<MTLBuffer> buffer = feature.takeBuffer(length);
                 if (buffer) {
-                    std::memcpy(buffer.contents, &params, sizeof(params));
+                    std::memcpy(buffer.contents, records.data(), length);
                     return buffer;
                 }
-                return [feature.device newBufferWithBytes:&params length:sizeof(params)
+                return [feature.device newBufferWithBytes:records.data() length:length
                                                    options:MTLResourceStorageModeShared];
             };
             const Rect generatedDispatch{0, 0,
-                static_cast<std::uint32_t>(feature.commandMode == CommandMode::Metal4
-                    ? generation.inputCapacityWidth : frame.frame.inputContent.width),
-                static_cast<std::uint32_t>(feature.commandMode == CommandMode::Metal4
-                    ? generation.inputCapacityHeight : frame.frame.inputContent.height)};
+                static_cast<std::uint32_t>(generation.inputCapacityWidth),
+                static_cast<std::uint32_t>(generation.inputCapacityHeight)};
             if (transfer) {
                 const ColorTransfer inputTransfer =
                     frame.operations.colorTransfer == ColorTransfer::SRGB &&
@@ -1490,7 +1499,8 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                 const Rect destination{0, 0, frame.frame.inputContent.width,
                                        frame.frame.inputContent.height};
                 lease->linearizeParams = makeParams(frame.frame.colorRect, destination,
-                                                    generatedDispatch, inputTransfer);
+                                                    generatedDispatch, inputTransfer,
+                                                    !fullInputCapacity);
             }
             if (frame.resampleDisplayMotion) {
                 const Rect destination{0, 0, frame.scalerMotionRect.width,
@@ -1498,7 +1508,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                 lease->motionResampleParams = makeParams(frame.frame.motionRect, destination,
                                                          destination, ColorTransfer::Linear);
             }
-            if (frame.operations.combineCompositionMask)
+            if (frame.operations.combineCompositionMask && !frame.directComposition)
                 lease->maskParams = makeParams(
                     frame.frame.reactiveRect,
                     Rect{0, 0, frame.frame.inputContent.width, frame.frame.inputContent.height},
@@ -1552,7 +1562,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
             }
             if ((transfer && !lease->linearizeParams) ||
                 (frame.resampleDisplayMotion && !lease->motionResampleParams) ||
-                (frame.operations.combineCompositionMask && !lease->maskParams) ||
+                (frame.operations.combineCompositionMask && !frame.directComposition && !lease->maskParams) ||
                 (frame.operations.drawDebugView && !lease->debugParams) ||
                 (finish && !lease->finishParams)) {
                 setError(error, ErrorCode::ResourceCreationFailed,
@@ -1567,16 +1577,15 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                     lease->stagedDepth, lease->stagedMotion, lease->stagedReactive,
                     lease->linearizeParams, lease->maskParams, lease->finishParams,
                     lease->debugParams, lease->motionResampleParams), reusable);
-            if (feature.commandMode == CommandMode::Metal4 && !lease->residency) {
+            if (!lease->residency) {
                 setError(error, ErrorCode::ResourceCreationFailed,
                          "failed to create Metal4 residency set for MetalFX execution");
                 return {};
             }
         }
 
-        if ((lease->linearizeParams || lease->maskParams || lease->finishParams ||
-             lease->motionResampleParams || lease->debugParams) &&
-            feature.commandMode == CommandMode::Metal4) {
+        if (lease->linearizeParams || lease->maskParams || lease->finishParams ||
+            lease->motionResampleParams || lease->debugParams) {
             if (@available(macOS 26.0, *)) {
                 MTL4ArgumentTableDescriptor* descriptor = nil;
                 @try {
@@ -1607,7 +1616,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
             }
         }
 
-        if (frame.needsExposureConversion && feature.commandMode == CommandMode::Metal4) {
+        if (frame.needsExposureConversion) {
             if (@available(macOS 26.0, *)) {
                 MTL4ArgumentTableDescriptor* descriptor = nil;
                 @try {
@@ -1648,37 +1657,16 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
     }
 }
 
-bool encodeExposureLegacy(const PreparedFrame::Impl& frame,
-                          ExecutionLease::Impl& lease,
-                          id<MTLCommandBuffer> command,
-                          id<MTLFence> fence) {
-    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-    if (!encoder) return false;
-    @try {
-        [encoder waitForFence:fence];
-        [encoder setComputePipelineState:frame.feature->exposurePipeline];
-        [encoder setTexture:frame.exposure atIndex:0];
-        [encoder setTexture:lease.convertedExposure atIndex:1];
-        [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-        [encoder updateFence:fence];
-        [encoder endEncoding];
-        return true;
-    } @catch (id) {
-        @try { [encoder endEncoding]; } @catch (id) {}
-        return false;
-    }
-}
-
 void dispatchFsrPassMetal4(ExecutionLease::Impl& lease,
                           id<MTL4ComputeCommandEncoder> encoder,
                           id<MTLComputePipelineState> pipeline, id<MTLBuffer> params,
                           id<MTLTexture> first, id<MTLTexture> second,
                           id<MTLTexture> third, const Rect& rect,
-                          id<MTLTexture> fourth = nil) API_AVAILABLE(macos(26.0)) {
+                          id<MTLTexture> fourth = nil,
+                          NSUInteger parameterOffset = 0) API_AVAILABLE(macos(26.0)) {
     id<MTL4ArgumentTable> table =
         reinterpret_cast<id<MTL4ArgumentTable>>(lease.fsrArgumentTable);
-    [table setAddress:params.gpuAddress atIndex:0];
+    [table setAddress:params.gpuAddress + parameterOffset atIndex:0];
     [table setTexture:first.gpuResourceID atIndex:0];
     [table setTexture:second.gpuResourceID atIndex:1];
     [table setTexture:(third ? third.gpuResourceID : MTLResourceID{}) atIndex:2];
@@ -1701,33 +1689,6 @@ bool encodeFsrPassMetal4(ExecutionLease::Impl& lease,
         [encoder waitForFence:fence beforeEncoderStages:MTLStageDispatch];
         dispatchFsrPassMetal4(lease, encoder, pipeline, params, first, second, third, rect, fourth);
         [encoder updateFence:fence afterEncoderStages:MTLStageDispatch];
-        [encoder endEncoding];
-        return true;
-    } @catch (id) {
-        @try { [encoder endEncoding]; } @catch (id) {}
-        return false;
-    }
-}
-
-bool encodeFsrPassLegacy(
-                         id<MTLCommandBuffer> command, id<MTLFence> fence,
-                         id<MTLComputePipelineState> pipeline, id<MTLBuffer> params,
-                         id<MTLTexture> first, id<MTLTexture> second,
-                         id<MTLTexture> third, const Rect& rect,
-                         id<MTLTexture> fourth = nil) {
-    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-    if (!encoder) return false;
-    @try {
-        [encoder waitForFence:fence];
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:params offset:0 atIndex:0];
-        [encoder setTexture:first atIndex:0];
-        [encoder setTexture:second atIndex:1];
-        if (third) [encoder setTexture:third atIndex:2];
-        if (fourth) [encoder setTexture:fourth atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(rect.width, rect.height, 1)
-             threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-        [encoder updateFence:fence];
         [encoder endEncoding];
         return true;
     } @catch (id) {
@@ -1822,40 +1783,6 @@ bool encodeInputCopiesMetal4(const PreparedFrame::Impl& frame, ExecutionLease::I
     }
 }
 
-bool encodeInputCopiesLegacy(const PreparedFrame::Impl& frame, ExecutionLease::Impl& lease,
-                             id<MTLCommandBuffer> command, id<MTLFence> fence) {
-    if (!lease.stagedColor && !lease.stagedDepth &&
-        (!lease.stagedMotion || frame.resampleDisplayMotion) &&
-        !lease.stagedReactive)
-        return true;
-    id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
-    if (!encoder) return false;
-    @try {
-        [encoder waitForFence:fence];
-        const auto copy = [&](id<MTLTexture> source, id<MTLTexture> destination,
-                              const Rect& rect) {
-            if (!destination) return;
-            [encoder copyFromTexture:source sourceSlice:0 sourceLevel:0
-                        sourceOrigin:MTLOriginMake(rect.x, rect.y, 0)
-                          sourceSize:MTLSizeMake(rect.width, rect.height, 1)
-                           toTexture:destination destinationSlice:0 destinationLevel:0
-                   destinationOrigin:MTLOriginMake(0, 0, 0)];
-            extendTextureEdges(encoder, destination, rect.width, rect.height, [] {});
-        };
-        copy(frame.color, lease.stagedColor, frame.frame.colorRect);
-        copy(frame.depth, lease.stagedDepth, frame.frame.depthRect);
-        if (!frame.resampleDisplayMotion)
-            copy(frame.motion, lease.stagedMotion, frame.scalerMotionRect);
-        copy(frame.reactive, lease.stagedReactive, frame.frame.reactiveRect);
-        [encoder updateFence:fence];
-        [encoder endEncoding];
-        return true;
-    } @catch (id) {
-        @try { [encoder endEncoding]; } @catch (id) {}
-        return false;
-    }
-}
-
 bool encodeFsrPreMetal4(const PreparedFrame::Impl& frame, ExecutionLease::Impl& lease,
                         id<MTL4CommandBuffer> command, id<MTLFence> fence)
                         API_AVAILABLE(macos(26.0)) {
@@ -1892,71 +1819,23 @@ bool encodeFsrPreMetal4(const PreparedFrame::Impl& frame, ExecutionLease::Impl& 
                      static_cast<std::uint32_t>(lease.combinedMask.height)});
         }
         // Extend already-converted active edges without repeating transfer math.
-        const auto& generation = *frame.generation;
-        if (lease.linearColor &&
-            (generation.inputCapacityWidth != frame.frame.inputContent.width ||
-             generation.inputCapacityHeight != frame.frame.inputContent.height)) {
+        if (lease.linearColor && lease.linearizeParams.length > sizeof(FsrParams)) {
             [encoder barrierAfterEncoderStages:MTLStageDispatch
                            beforeEncoderStages:MTLStageDispatch
                              visibilityOptions:MTL4VisibilityOptionDevice];
-            const Rect capacity{0, 0,
-                static_cast<std::uint32_t>(generation.inputCapacityWidth),
-                static_cast<std::uint32_t>(generation.inputCapacityHeight)};
-            dispatchFsrPassMetal4(lease, encoder, frame.feature->paddingPipeline,
-                lease.linearizeParams, lease.linearColor, lease.linearColor, nil, capacity);
+            const auto* records = static_cast<const FsrParams*>(lease.linearizeParams.contents);
+            for (std::size_t index = 1; index < lease.linearizeParams.length / sizeof(FsrParams);
+                 ++index) {
+                const auto& params = records[index];
+                const Rect strip{params.dispatchOrigin[0], params.dispatchOrigin[1],
+                                 params.dispatchExtent[0], params.dispatchExtent[1]};
+                if (!strip.width || !strip.height) continue;
+                dispatchFsrPassMetal4(lease, encoder, frame.feature->paddingPipeline,
+                    lease.linearizeParams, lease.linearColor, lease.linearColor, nil, strip,
+                    nil, index * sizeof(FsrParams));
+            }
         }
         [encoder updateFence:fence afterEncoderStages:MTLStageDispatch];
-        [encoder endEncoding];
-        return true;
-    } @catch (id) {
-        @try { [encoder endEncoding]; } @catch (id) {}
-        return false;
-    }
-}
-
-bool encodeFsrPreLegacy(const PreparedFrame::Impl& frame, ExecutionLease::Impl& lease,
-                        id<MTLCommandBuffer> command, id<MTLFence> fence) {
-    if (frame.resampleDisplayMotion && !encodeFsrPassLegacy(
-            command, fence, frame.feature->motionResamplePipeline,
-            lease.motionResampleParams, frame.motion, lease.stagedMotion, nil,
-            frame.scalerMotionRect))
-        return false;
-    if (lease.linearColor && !encodeFsrPassLegacy(
-             command, fence, frame.feature->linearizePipeline,
-            lease.linearizeParams, frame.color, lease.linearColor, nil, frame.frame.colorRect))
-        return false;
-    if (lease.combinedMask) {
-        id<MTLTexture> fallback = frame.reactive ? frame.reactive : frame.composition;
-        if (!encodeFsrPassLegacy( command, fence,
-                                frame.feature->combineMaskPipeline, lease.maskParams,
-                                frame.reactive ? frame.reactive : fallback,
-                                frame.composition ? frame.composition : fallback,
-                                lease.combinedMask, frame.frame.reactiveRect))
-            return false;
-    }
-    return true;
-}
-
-bool encodeFsrInputPaddingLegacy(const PreparedFrame::Impl& frame,
-                                ExecutionLease::Impl& lease,
-                                id<MTLCommandBuffer> command,
-                                id<MTLFence> fence) {
-    const NSUInteger width = frame.frame.inputContent.width;
-    const NSUInteger height = frame.frame.inputContent.height;
-    const bool padLinearColor = lease.linearColor &&
-        (lease.linearColor.width != width || lease.linearColor.height != height);
-    const bool padCombinedMask = lease.combinedMask &&
-        (lease.combinedMask.width != width || lease.combinedMask.height != height);
-    if (!padLinearColor && !padCombinedMask) return true;
-    id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
-    if (!encoder) return false;
-    @try {
-        [encoder waitForFence:fence];
-        if (padLinearColor)
-            extendTextureEdges(encoder, lease.linearColor, width, height, [] {});
-        if (padCombinedMask)
-            extendTextureEdges(encoder, lease.combinedMask, width, height, [] {});
-        [encoder updateFence:fence];
         [encoder endEncoding];
         return true;
     } @catch (id) {
@@ -1977,25 +1856,8 @@ bool encodeFsrFinishMetal4(const PreparedFrame::Impl& frame, ExecutionLease::Imp
             lease.debugParams, lease.privateOutput, frame.depth, frame.motion,
             frame.frame.outputRect, frame.output);
     }
-    return encodeFsrPassMetal4(lease, command, fence, frame.feature->finishPipeline,
-                               lease.finishParams, lease.privateOutput, frame.output,
-                               lease.convertedExposure ? lease.convertedExposure :
-                                   (frame.exposure ? frame.exposure : lease.privateOutput),
-                               frame.frame.outputRect);
-}
-
-bool encodeFsrFinishLegacy(const PreparedFrame::Impl& frame, ExecutionLease::Impl& lease,
-                           id<MTLCommandBuffer> command, id<MTLFence> fence) {
-    if (!lease.finishParams && !lease.debugParams) return true;
-    if (frame.operations.drawDebugView) {
-        const bool depthFormat = isDepthFormat(frame.depth.pixelFormat);
-        return encodeFsrPassLegacy(
-            command, fence,
-            depthFormat ? frame.feature->debugDepthPipeline : frame.feature->debugPipeline,
-            lease.debugParams, lease.privateOutput, frame.depth, frame.motion,
-            frame.frame.outputRect, frame.output);
-    }
-    return encodeFsrPassLegacy( command, fence, frame.feature->finishPipeline,
+    return encodeFsrPassMetal4(lease, command, fence,
+                               frame.feature->finishPipelines[frame.operations.sharpening],
                                lease.finishParams, lease.privateOutput, frame.output,
                                lease.convertedExposure ? lease.convertedExposure :
                                    (frame.exposure ? frame.exposure : lease.privateOutput),
@@ -2024,36 +1886,6 @@ bool copyOutputMetal4(const PreparedFrame::Impl& frame,
                destinationOrigin:MTLOriginMake(rect.x + frame.placementX,
                                                 rect.y + frame.placementY, 0)];
         [encoder updateFence:fence afterEncoderStages:MTLStageBlit];
-        [encoder endEncoding];
-        return true;
-    } @catch (id) {
-        @try { [encoder endEncoding]; } @catch (id) {}
-        return false;
-    }
-}
-
-bool copyOutputLegacy(const PreparedFrame::Impl& frame,
-                      ExecutionLease::Impl& lease,
-                      id<MTLCommandBuffer> command,
-                      id<MTLFence> fence) {
-    if (!lease.privateOutput || lease.finishParams || lease.debugParams) return true;
-    id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
-    if (!encoder) return false;
-    const Rect& rect = frame.frame.outputRect;
-    @try {
-        [encoder waitForFence:fence];
-        [encoder copyFromTexture:lease.privateOutput
-                     sourceSlice:0
-                     sourceLevel:0
-                    sourceOrigin:MTLOriginMake(0, 0, 0)
-                      sourceSize:MTLSizeMake(frame.temporalOutputWidth,
-                                             frame.temporalOutputHeight, 1)
-                       toTexture:frame.output
-                destinationSlice:0
-                destinationLevel:0
-               destinationOrigin:MTLOriginMake(rect.x + frame.placementX,
-                                                rect.y + frame.placementY, 0)];
-        [encoder updateFence:fence];
         [encoder endEncoding];
         return true;
     } @catch (id) {
@@ -2101,7 +1933,8 @@ void configureScalerForFrame(Feature::Impl& feature, ScalerGeneration& generatio
                                    : nil];
     if (@available(macOS 27.0, *))
         [scaler setReactiveMaskTexture:lease.combinedMask ? lease.combinedMask :
-                                        (lease.stagedReactive ? lease.stagedReactive : frame.reactive)];
+                                        (lease.stagedReactive ? lease.stagedReactive :
+                                         (frame.directComposition ? frame.composition : frame.reactive))];
     [scaler setInputContentWidth:frame.frame.inputContent.width];
     [scaler setInputContentHeight:frame.frame.inputContent.height];
     if (@available(macOS 27.0, *)) {
@@ -2114,9 +1947,11 @@ void configureScalerForFrame(Feature::Impl& feature, ScalerGeneration& generatio
         [scaler setMotionContentOffsetX:lease.stagedMotion ? 0 : frame.scalerMotionRect.x];
         [scaler setMotionContentOffsetY:lease.stagedMotion ? 0 : frame.scalerMotionRect.y];
         [scaler setReactiveMaskContentOffsetX:lease.combinedMask || lease.stagedReactive
-                                             ? 0 : frame.frame.reactiveRect.x];
+                                             ? 0 : frame.directComposition
+                                                 ? frame.frame.compositionRect.x : frame.frame.reactiveRect.x];
         [scaler setReactiveMaskContentOffsetY:lease.combinedMask || lease.stagedReactive
-                                             ? 0 : frame.frame.reactiveRect.y];
+                                             ? 0 : frame.directComposition
+                                                 ? frame.frame.compositionRect.y : frame.frame.reactiveRect.y];
         [scaler setOutputOffsetX:0];
         [scaler setOutputOffsetY:0];
     }
@@ -2151,7 +1986,6 @@ std::shared_ptr<Feature> Feature::create(const CreateContext& context,
     try {
         auto impl = std::make_shared<Impl>();
         impl->create = info;
-        impl->commandMode = context.mode;
         impl->device = retainObject(asDevice(context.device));
         impl->compiler = retainObject(asCompiler(context.compiler));
         @try {
@@ -2171,10 +2005,6 @@ std::shared_ptr<Feature> Feature::create(const CreateContext& context,
         setError(error, ErrorCode::ResourceCreationFailed, "failed to allocate MetalFX feature state");
         return {};
     }
-}
-
-CommandMode Feature::mode() const noexcept {
-    return impl_ ? impl_->commandMode : CommandMode::Legacy;
 }
 
 void Feature::markDormant() noexcept {
@@ -2204,8 +2034,7 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(
         std::shared_ptr<ScalerGeneration> generation =
             ensureScaler(*impl_, info, textures, operations, temporal, error);
         if (!generation) return {};
-        if (impl_->commandMode == CommandMode::Metal4 &&
-            operations.colorTransfer != ColorTransfer::Linear &&
+        if (operations.colorTransfer != ColorTransfer::Linear &&
             (generation->inputCapacityWidth != info.inputContent.width ||
              generation->inputCapacityHeight != info.inputContent.height) &&
             !impl_->paddingPipeline) {
@@ -2270,6 +2099,12 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(
         const bool smallerThanInputCapacity =
             activeInput.width != generation->inputCapacityWidth ||
             activeInput.height != generation->inputCapacityHeight;
+        frame->directComposition = operations.combineCompositionMask && !reactive &&
+            composition.pixelFormat == MTLPixelFormatR8Unorm && !smallerThanInputCapacity &&
+            exactDescriptorInput(composition, info.compositionRect,
+                                 activeInput.width, activeInput.height,
+                                 generation->inputCapacityWidth, generation->inputCapacityHeight,
+                                 generation->reactiveUsage);
         frame->needsColorStaging = operations.colorTransfer == ColorTransfer::Linear &&
             (smallerThanInputCapacity ||
              !exactDescriptorInput(color, info.colorRect, activeInput.width, activeInput.height,
@@ -2320,10 +2155,6 @@ PreparedFrame::PreparedFrame(std::shared_ptr<Impl> impl) noexcept : impl_(std::m
 
 PreparedFrame::~PreparedFrame() = default;
 
-CommandMode PreparedFrame::mode() const noexcept {
-    return impl_ && impl_->feature ? impl_->feature->commandMode : CommandMode::Legacy;
-}
-
 bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
                            std::shared_ptr<const ExecutionLease>& leaseResult,
                            Error* error) const noexcept {
@@ -2356,99 +2187,55 @@ bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
         ScalerGeneration& generation = *impl_->generation;
         std::lock_guard<std::mutex> lock(generation.encodeMutex);
         const ScalerBindings bindings(generation.scaler);
-        const bool inputExtentChanged = generation.hasLastInputContent &&
-            (generation.lastInputContentWidth != impl_->frame.inputContent.width ||
-             generation.lastInputContentHeight != impl_->frame.inputContent.height);
+        // MetalFX preserves history across dynamic-resolution changes. Its
+        // input-content contract assumes a stable aspect ratio.
+        const bool inputAspectChanged = generation.hasLastInputContent &&
+            static_cast<std::uint64_t>(generation.lastInputContentWidth) *
+                    impl_->frame.inputContent.height !=
+                static_cast<std::uint64_t>(impl_->frame.inputContent.width) *
+                    generation.lastInputContentHeight;
         const bool effectiveReset = impl_->frame.resetHistory ||
                                     generation.encodedActivation != impl_->activation ||
-                                    inputExtentChanged;
+                                    inputAspectChanged;
         @try {
-            if (feature.commandMode == CommandMode::Metal4) {
-                if (@available(macOS 26.0, *)) {
-                    id<MTL4CommandBuffer> command =
-                        reinterpret_cast<id<MTL4CommandBuffer>>(commandBuffer);
-                    id<MTLResidencySet> residency =
-                        reinterpret_cast<id<MTLResidencySet>>(lease->residency);
-                    if (command.device != feature.device) {
-                        setError(error, ErrorCode::InvalidContext,
-                                 "Metal4 command buffer belongs to a different device");
-                        return false;
-                    }
-                    if (residency) [command useResidencySet:residency];
-                    if (!encodeInputCopiesMetal4(*impl_, *lease, command, lease->fence)) {
-                        setError(error, ErrorCode::EncodeFailed,
-                                 "failed to encode MetalFX active-input copies on Metal4");
-                        return false;
-                    }
-                    if (!encodeFsrPreMetal4(*impl_, *lease, command, lease->fence)) {
-                        setError(error, ErrorCode::EncodeFailed,
-                                 "failed to encode FSR preprocessing on Metal4");
-                        return false;
-                    }
-                    configureScalerForFrame(feature, generation, *impl_, *lease, lease->fence,
-                                            effectiveReset);
-                    [generation.scaler encodeToCommandBuffer:command];
-                    if (!encodeFsrFinishMetal4(*impl_, *lease, command, lease->fence)) {
-                        setError(error, ErrorCode::EncodeFailed,
-                                 "failed to encode FSR transfer/RCAS output on Metal4");
-                        return false;
-                    }
-                    if (!copyOutputMetal4(*impl_, *lease, command, lease->fence)) {
-                        setError(error, ErrorCode::EncodeFailed,
-                                 "failed to encode required MetalFX output subrect copy on Metal4");
-                        return false;
-                    }
-                } else {
-                    setError(error, ErrorCode::UnsupportedFeature,
-                             "Metal4 MetalFX encode is unavailable on this OS");
-                    return false;
-                }
-            } else {
-                id<MTLCommandBuffer> command = reinterpret_cast<id<MTLCommandBuffer>>(commandBuffer);
+            if (@available(macOS 26.0, *)) {
+                id<MTL4CommandBuffer> command =
+                    reinterpret_cast<id<MTL4CommandBuffer>>(commandBuffer);
+                id<MTLResidencySet> residency =
+                    reinterpret_cast<id<MTLResidencySet>>(lease->residency);
                 if (command.device != feature.device) {
                     setError(error, ErrorCode::InvalidContext,
-                             "legacy command buffer belongs to a different device");
+                             "Metal4 command buffer belongs to a different device");
                     return false;
                 }
-                if (@available(macOS 15.0, *)) {
-                    id<MTLResidencySet> residency =
-                        reinterpret_cast<id<MTLResidencySet>>(lease->residency);
-                    if (residency) [command useResidencySet:residency];
-                }
-                if (impl_->needsExposureConversion &&
-                    !encodeExposureLegacy(*impl_, *lease, command, lease->fence)) {
+                if (residency) [command useResidencySet:residency];
+                if (!encodeInputCopiesMetal4(*impl_, *lease, command, lease->fence)) {
                     setError(error, ErrorCode::EncodeFailed,
-                             "failed to encode numerical exposure conversion on legacy Metal");
+                             "failed to encode MetalFX active-input copies on Metal4");
                     return false;
                 }
-                if (!encodeInputCopiesLegacy(*impl_, *lease, command, lease->fence)) {
+                if (!encodeFsrPreMetal4(*impl_, *lease, command, lease->fence)) {
                     setError(error, ErrorCode::EncodeFailed,
-                             "failed to encode MetalFX active-input copies on legacy Metal");
-                    return false;
-                }
-                if (!encodeFsrPreLegacy(*impl_, *lease, command, lease->fence)) {
-                    setError(error, ErrorCode::EncodeFailed,
-                             "failed to encode FSR preprocessing on legacy Metal");
-                    return false;
-                }
-                if (!encodeFsrInputPaddingLegacy(*impl_, *lease, command, lease->fence)) {
-                    setError(error, ErrorCode::EncodeFailed,
-                             "failed to extend processed MetalFX input padding on legacy Metal");
+                             "failed to encode FSR preprocessing on Metal4");
                     return false;
                 }
                 configureScalerForFrame(feature, generation, *impl_, *lease, lease->fence,
                                         effectiveReset);
                 [generation.scaler encodeToCommandBuffer:command];
-                if (!encodeFsrFinishLegacy(*impl_, *lease, command, lease->fence)) {
+                if (!encodeFsrFinishMetal4(*impl_, *lease, command, lease->fence)) {
                     setError(error, ErrorCode::EncodeFailed,
-                             "failed to encode FSR transfer/RCAS output on legacy Metal");
+                             "failed to encode FSR transfer/RCAS output on Metal4");
                     return false;
                 }
-                if (!copyOutputLegacy(*impl_, *lease, command, lease->fence)) {
+                if (!copyOutputMetal4(*impl_, *lease, command, lease->fence)) {
                     setError(error, ErrorCode::EncodeFailed,
-                             "failed to encode required MetalFX output subrect copy on legacy Metal");
+                             "failed to encode required MetalFX output subrect copy on Metal4");
                     return false;
                 }
+            } else {
+                setError(error, ErrorCode::UnsupportedFeature,
+                         "Metal4 MetalFX encode is unavailable on this OS");
+                return false;
             }
         } @catch (id) {
             setError(error, ErrorCode::EncodeFailed,

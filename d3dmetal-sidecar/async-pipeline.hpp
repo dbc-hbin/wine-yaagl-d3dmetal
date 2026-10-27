@@ -1,15 +1,30 @@
 #pragma once
 
-#include <array>
-#include <cstddef>
 #include <cstdint>
 
 namespace yaagl::pso::async_pipeline {
-constexpr std::size_t kHookCount = 17;
 // Order matches the async suffix of layout.json's dispatch table.
-std::array<std::uintptr_t, kHookCount> initialize(
-    const std::uint8_t* image,
-    const std::array<std::uintptr_t, kHookCount>& originals);
+struct Hooks {
+    std::uintptr_t graphicsCtor;
+    std::uintptr_t getRenderPipelineState;
+    std::uintptr_t graphicsDestroy;
+    std::uintptr_t draw;
+    std::uintptr_t drawIndexed;
+    std::uintptr_t rootCtor;
+    std::uintptr_t rootDestroy;
+    std::uintptr_t reset;
+    std::uintptr_t beginQuery;
+    std::uintptr_t endQuery;
+    std::uintptr_t listDestroy;
+    std::uintptr_t present;
+    std::uintptr_t dx11Draw;
+    std::uintptr_t dx11DrawIndexed;
+    std::uintptr_t dx11Begin;
+    std::uintptr_t dx11End;
+    std::uintptr_t dx11Destroy;
+};
+
+Hooks initialize(const std::uint8_t* image, const Hooks& originals);
 
 struct Statistics {
     std::uint32_t version;

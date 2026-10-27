@@ -52,13 +52,18 @@ const completion = [
 const presentation = [
   ["PresentResidencyAdd", 0x16d242, "ff15e0403700"],
 ];
+const latency = [
+  ["NvapiQueryInterface", 0x17d757, "415741564155"],
+  ["CompletePresent", 0x12b610, "53488b5f20"],
+  ["LatencySwapchainDestroy", 0x12ac64, "5541574156"],
+  ["LatencyDeviceDestroy", 0x60f54, "5541574156"],
+];
 const removed = [
   ["Metal4Render", 0x1842b9, "5541574156"],
   ["Render", 0x184353, "5541574156"],
   ["Mesh", 0x1843fc, "5541574156"],
   ["Compute", 0x1844a5, "5541574156"],
   ["CompileCompute", 0x96758, "5541574156"],
-  ["DestroyDevice", 0x60f54, "5541574156"],
   ["CreateRTFunction", 0x138d28, "5541574156"],
   ["CreateRTCombined", 0x139418, "5541574156"],
   ["CreateRTIntersection", 0x13c544, "4156534883ec28"],
@@ -106,14 +111,14 @@ function assertRetainedRoutes(patched) {
   }
 }
 
-await test("format 31 retains feature, async and completion gates with scoped Present residency", () => {
-  assert.equal(layout.formatVersion, 31);
+await test("format 32 retains existing gates and adds native latency lifecycle gates", () => {
+  assert.equal(layout.formatVersion, 32);
   assert.equal(layout.source.sha256, "a64950e8324cec32c9a442daa1fafd03823bd199fdd84fee5c73679b5fe86660");
   assert.equal(layout.source.machUuid, "4418ec47c3f03285a05615d87d785ffe");
   assert.equal(layout.constructorVerification.markerHex,
-    Buffer.from("YAAGLB3SIDEcar\x1f", "ascii").toString("hex"));
+    Buffer.from("YAAGLB3SIDEcar\x20", "ascii").toString("hex"));
   assert.equal(layout.dispatch.pointerSize, 8);
-  const expected = [...retained, ...asynchronous, ...completion, ...presentation];
+  const expected = [...retained, ...asynchronous, ...completion, ...presentation, ...latency];
   assert.deepEqual(layout.hooks.map(hook => [hook.id, hook.entryOffset, hook.originalHex]), expected);
   assert.deepEqual(layout.hooks.map(hook => hook.dispatchFieldOffset), expected.map((_, index) => index * 8));
   assert.deepEqual(layout.hooks.map(hook => hook.gateOffset), expected.map((_, index) => 0x4e0040 + index * 0x40));

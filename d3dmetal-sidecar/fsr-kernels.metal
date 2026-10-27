@@ -6,6 +6,13 @@
 #include <metal_stdlib>
 using namespace metal;
 
+kernel void yaagl_metalfx_exposure_r_to_r16(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<half, access::write> destination [[texture(1)]]) {
+    const float exposure = source.read(uint2(0, 0)).r;
+    destination.write(half4(half(exposure), half(0.0), half(0.0), half(1.0)), uint2(0, 0));
+}
+
 struct YaaglFsrParams {
     uint2 sourceOrigin;
     uint2 compositionOrigin;
@@ -22,7 +29,6 @@ struct YaaglFsrParams {
 enum : uint {
     YaaglFsrHasReactive = 1u << 0,
     YaaglFsrHasComposition = 1u << 1,
-    YaaglFsrSharpen = 1u << 2,
     YaaglFsrHasExposure = 1u << 3,
     YaaglFsrCenteredOutput = 1u << 4,
 };
@@ -105,9 +111,10 @@ kernel void yaagl_fsr_extend_edges(
     texture2d<float, access::write> destination [[texture(1)]],
     constant YaaglFsrParams& params [[buffer(0)]],
     uint2 tid [[thread_position_in_grid]]) {
-    if (any(tid >= params.dispatchExtent) || all(tid < params.extent)) return;
+    if (any(tid >= params.dispatchExtent)) return;
+    uint2 position = params.dispatchOrigin + tid;
     // Source and destination alias, but active source pixels are never written.
-    destination.write(source.read(min(tid, params.extent - 1u)), tid);
+    destination.write(source.read(min(position, params.extent - 1u)), position);
 }
 
 kernel void yaagl_sr_resample_motion(
@@ -165,6 +172,8 @@ static float3 rcas(texture2d<float, access::read> source, uint2 position,
     return (lobe * (b + d + h + f) + e) * reciprocal / exposure;
 }
 
+constant bool yaagl_fsr_sharpen_enabled [[function_constant(0)]];
+
 kernel void yaagl_fsr_finish(
     texture2d<float, access::read> source [[texture(0)]],
     texture2d<float, access::write> destination [[texture(1)]],
@@ -184,7 +193,7 @@ kernel void yaagl_fsr_finish(
     float exposure = params.exposure;
     if (params.flags & YaaglFsrHasExposure)
         exposure = max(exposureTexture.read(uint2(0)).r, 1.0e-7f);
-    if (params.flags & YaaglFsrSharpen)
+    if (yaagl_fsr_sharpen_enabled)
         color.rgb = rcas(source, sourcePosition, params.sourceOrigin,
                          params.sourceOrigin + params.extent, params.sharpness, exposure, color.rgb);
     color.rgb = forward_transfer(color.rgb, params.transfer);
@@ -355,7 +364,8 @@ static float2 fg_motion(float2 value, float depth,
     float2 pixels = (value * params.motionScale - params.jitterCancellation) *
                     float2(params.outputExtent) / float2(params.motionTargetExtent);
     if (params.reconstructCameraMotion) {
-        float2 uv = (float2(tid) + 0.5f) / float2(params.extent);
+        float2 uv = (float2(params.sourceOrigin) + float2(tid) + 0.5f) /
+                    float2(params.outputExtent);
         float4 clip = float4(uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), depth, 1.0f);
         // NGX rows occupy Metal columns: this is the public row-vector transform.
         float4 previous = params.clipToPreviousClip * clip;
@@ -372,7 +382,7 @@ kernel void yaagl_fg_normalize_motion(
     constant YaaglFgParams& params [[buffer(0)]],
     uint2 tid [[thread_position_in_grid]]) {
     if (any(tid >= params.extent)) return;
-    float2 value = source.read(fg_source_position(tid, params)).xy;
+    float2 value = source.read(uint2(params.sourceOrigin) + fg_source_position(tid, params)).xy;
     float2 pixels = fg_motion(value, params.reconstructCameraMotion ? depth.read(tid).r : 0.0f,
                              params, tid);
     destination.write(float4(pixels, 0.0f, 0.0f), tid);
@@ -390,7 +400,7 @@ kernel void yaagl_fg_normalize_depth_motion_r32(
     if (any(tid >= params[0].extent)) return;
     float4 storedDepth = depth.read(fg_source_position(tid, params[0]));
     normalizedDepth.write(storedDepth, tid);
-    float2 value = motion.read(fg_source_position(tid, params[1])).xy;
+    float2 value = motion.read(uint2(params[1].sourceOrigin) + fg_source_position(tid, params[1])).xy;
     float2 pixels = fg_motion(value, storedDepth.r, params[1], tid);
     normalizedMotion.write(float4(pixels, 0.0f, 0.0f), tid);
 }

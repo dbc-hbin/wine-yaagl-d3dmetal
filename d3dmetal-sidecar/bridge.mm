@@ -15,6 +15,7 @@
 #include "fsr-framegeneration.hpp"
 #include "display-routing.hpp"
 #include "layout.hpp"
+#include "low-latency.hpp"
 #include "ngx-hooks.hpp"
 #include "video-memory.hpp"
 
@@ -128,27 +129,45 @@ __attribute__((constructor)) void initialize() noexcept {
             original(layout::Hook::CompleteExecute));
         if (!completionHook) return;
         const auto asyncHooks = async_pipeline::initialize(base, {
-            original(layout::Hook::GraphicsCtor), original(layout::Hook::GetRenderPipelineState),
-            original(layout::Hook::GraphicsDestroy), original(layout::Hook::MPLDraw),
-            original(layout::Hook::MPLDrawIndexed), original(layout::Hook::RootCtor),
-            original(layout::Hook::RootDestroy), original(layout::Hook::MPLReset),
-            original(layout::Hook::MPLBeginQuery), original(layout::Hook::MPLEndQuery),
-            original(layout::Hook::MPLDestroy), original(layout::Hook::Present1),
-            original(layout::Hook::DX11Draw), original(layout::Hook::DX11DrawIndexed),
-            original(layout::Hook::DX11Begin), original(layout::Hook::DX11End),
-            original(layout::Hook::DX11Destroy),
+            .graphicsCtor = original(layout::Hook::GraphicsCtor),
+            .getRenderPipelineState = original(layout::Hook::GetRenderPipelineState),
+            .graphicsDestroy = original(layout::Hook::GraphicsDestroy),
+            .draw = original(layout::Hook::MPLDraw),
+            .drawIndexed = original(layout::Hook::MPLDrawIndexed),
+            .rootCtor = original(layout::Hook::RootCtor),
+            .rootDestroy = original(layout::Hook::RootDestroy),
+            .reset = original(layout::Hook::MPLReset),
+            .beginQuery = original(layout::Hook::MPLBeginQuery),
+            .endQuery = original(layout::Hook::MPLEndQuery),
+            .listDestroy = original(layout::Hook::MPLDestroy),
+            .present = original(layout::Hook::Present1),
+            .dx11Draw = original(layout::Hook::DX11Draw),
+            .dx11DrawIndexed = original(layout::Hook::DX11DrawIndexed),
+            .dx11Begin = original(layout::Hook::DX11Begin),
+            .dx11End = original(layout::Hook::DX11End),
+            .dx11Destroy = original(layout::Hook::DX11Destroy),
+        });
+        const auto latencyHooks = latency::initialize(base, {
+            .present = asyncHooks.present,
+            .queryInterface = original(layout::Hook::NvapiQueryInterface),
+            .completePresent = original(layout::Hook::CompletePresent),
+            .destroySwapchain = original(layout::Hook::LatencySwapchainDestroy),
+            .destroyDevice = original(layout::Hook::LatencyDeviceDestroy),
         });
         dispatchTable = {
             displayHooks.getContainingOutput,
             displayHooks.setFullscreenState,
             reinterpret_cast<std::uintptr_t>(&queryVideoMemoryInfo),
             replayHooks[0],
-            asyncHooks[0], asyncHooks[1], asyncHooks[2], asyncHooks[3],
-            asyncHooks[4], asyncHooks[5], asyncHooks[6], asyncHooks[7],
-            asyncHooks[8], asyncHooks[9], asyncHooks[10], asyncHooks[11],
-            asyncHooks[12], asyncHooks[13], asyncHooks[14], asyncHooks[15], asyncHooks[16],
+            asyncHooks.graphicsCtor, asyncHooks.getRenderPipelineState, asyncHooks.graphicsDestroy,
+            asyncHooks.draw, asyncHooks.drawIndexed, asyncHooks.rootCtor, asyncHooks.rootDestroy,
+            asyncHooks.reset, asyncHooks.beginQuery, asyncHooks.endQuery, asyncHooks.listDestroy,
+            latencyHooks.present, asyncHooks.dx11Draw, asyncHooks.dx11DrawIndexed,
+            asyncHooks.dx11Begin, asyncHooks.dx11End, asyncHooks.dx11Destroy,
             completionHook,
             reinterpret_cast<std::uintptr_t>(&addPresentResidency),
+            latencyHooks.queryInterface, latencyHooks.completePresent,
+            latencyHooks.destroySwapchain, latencyHooks.destroyDevice,
         };
         auto& slot = *reinterpret_cast<std::uintptr_t*>(const_cast<std::uint8_t*>(base) + layout::kDataSlot);
         std::atomic_ref<std::uintptr_t>(slot).store(

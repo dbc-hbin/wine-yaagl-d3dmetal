@@ -1,5 +1,5 @@
 {
-  "formatVersion": 31,
+  "formatVersion": 32,
   "source": {
     "sha256": "a64950e8324cec32c9a442daa1fafd03823bd199fdd84fee5c73679b5fe86660",
     "machUuid": "4418ec47c3f03285a05615d87d785ffe",
@@ -19,7 +19,7 @@
   },
   "constructorVerification": {
     "markerOffset": 5113792,
-    "markerHex": "594141474c4233534944456361721f",
+    "markerHex": "594141474c42335349444563617220",
     "description": "GPTK4b3 feature and opt-in async graphics dispatch; workers use the original native pipeline and shader caches."
   },
   "textCave": {
@@ -315,6 +315,54 @@
       "gateHex": "48833d5039080000740e4c8b1d4739080041ffa3b0000000",
       "trampolineHex": "ff254a0d0000",
       "dispatchFieldOffset": 176
+    },
+    {
+      "id": "NvapiQueryInterface",
+      "entryOffset": 1562455,
+      "gateOffset": 5113344,
+      "trampolineOffset": 5113368,
+      "continuationOffset": 1562461,
+      "originalHex": "415741564155",
+      "entryPatchHex": "e9a42e360000",
+      "gateHex": "48833d1039080000740e4c8b1d0739080041ffa3b8000000",
+      "trampolineHex": "415741564155e93ad1c9ff",
+      "dispatchFieldOffset": 184
+    },
+    {
+      "id": "CompletePresent",
+      "entryOffset": 1226256,
+      "gateOffset": 5113408,
+      "trampolineOffset": 5113432,
+      "continuationOffset": 1226261,
+      "originalHex": "53488b5f20",
+      "entryPatchHex": "e92b503b00",
+      "gateHex": "48833dd038080000740e4c8b1dc738080041ffa3c0000000",
+      "trampolineHex": "53488b5f20e9b3afc4ff",
+      "dispatchFieldOffset": 192
+    },
+    {
+      "id": "LatencySwapchainDestroy",
+      "entryOffset": 1223780,
+      "gateOffset": 5113472,
+      "trampolineOffset": 5113496,
+      "continuationOffset": 1223785,
+      "originalHex": "5541574156",
+      "entryPatchHex": "e9175a3b00",
+      "gateHex": "48833d9038080000740e4c8b1d8738080041ffa3c8000000",
+      "trampolineHex": "5541574156e9c7a5c4ff",
+      "dispatchFieldOffset": 200
+    },
+    {
+      "id": "LatencyDeviceDestroy",
+      "entryOffset": 397140,
+      "gateOffset": 5113536,
+      "trampolineOffset": 5113560,
+      "continuationOffset": 397145,
+      "originalHex": "5541574156",
+      "entryPatchHex": "e967f74700",
+      "gateHex": "48833d5038080000740e4c8b1d4738080041ffa3d0000000",
+      "trampolineHex": "5541574156e97708b8ff",
+      "dispatchFieldOffset": 208
     }
   ],
   "binaryPatches": [],
@@ -322,8 +370,8 @@
     {
       "id": "B3TextMarker",
       "offset": 5113792,
-      "expectedHex": "594141474c4233534944456361721f"
+      "expectedHex": "594141474c42335349444563617220"
     }
   ],
-  "patchedPayloadSha256": "3ef8ce976b3e7dac9466f28ab74eb5a35858f30d800de89309d2041405459149"
+  "patchedPayloadSha256": "2ddc60c3319d0dadbf187c2651cd067da2e00a7d75c826fd64ef2a31cf9fcaf4"
 }

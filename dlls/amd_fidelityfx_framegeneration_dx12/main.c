@@ -1512,7 +1512,7 @@ static ffxReturnCode_t configure_frame_generation(
             if (result == FFX_API_RETURN_OK) store_native_config(context, desc);
             return result;
         }
-        if (desc->frameGenerationEnabled)
+        if (desc->frameGenerationEnabled && !context->enabled)
         {
             result = configure_translation(context->translated, TRUE);
             if (result != FFX_API_RETURN_OK) return result;
@@ -1520,7 +1520,7 @@ static ffxReturnCode_t configure_frame_generation(
         result = snapshot_frame_config(context, desc);
         if (result != FFX_API_RETURN_OK)
         {
-            if (desc->frameGenerationEnabled)
+            if (desc->frameGenerationEnabled && !context->enabled)
                 configure_translation(context->translated, context->enabled);
             return result;
         }
@@ -1612,7 +1612,7 @@ static ffxReturnCode_t configure_frame_generation(
         return result;
     }
 
-    if (desc->frameGenerationEnabled)
+    if (desc->frameGenerationEnabled && !context->enabled)
     {
         result = configure_translation(context->translated, TRUE);
         if (result != FFX_API_RETURN_OK)
@@ -1631,7 +1631,7 @@ static ffxReturnCode_t configure_frame_generation(
     result = snapshot_frame_config(context, desc);
     if (result != FFX_API_RETURN_OK)
     {
-        if (desc->frameGenerationEnabled)
+        if (desc->frameGenerationEnabled && !context->enabled)
             configure_translation(context->translated, context->enabled);
         if (binding_changed)
             free_memory(context_allocator(context), binding);

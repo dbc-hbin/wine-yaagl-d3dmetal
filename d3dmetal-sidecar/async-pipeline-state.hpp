@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <utility>
 
@@ -46,7 +47,7 @@ public:
         // the existing unsafe-draw drain while any owner job is outstanding.
         if (stopped_ || active_.load(std::memory_order_relaxed)) return 0;
         const auto entry = results_.find(key);
-        return entry != results_.end() && entry->second.status == Status::Ready
+        return entry != results_.end() && entry->second.result.status == Status::Ready
             ? revision_.load(std::memory_order_relaxed) : 0;
     }
 
@@ -55,39 +56,38 @@ public:
     }
 
     Result request(Key key, bool asynchronous) {
-        {
-            std::unique_lock lock(mutex_);
-            if (stopped_) return {Status::Failed, nullptr};
-            auto [entry, inserted] = results_.try_emplace(key);
-            if (!inserted) {
-                if (!asynchronous) {
-                    completed_.wait(lock, [&] { return entry->second.status != Status::Pending; });
-                }
-                return entry->second;
-            }
+        std::unique_lock lock(mutex_);
+        if (stopped_) return {Status::Failed, nullptr};
+        auto [entry, inserted] = results_.try_emplace(key);
+        if (inserted) {
             // Invalidate cached readiness before any new owner work can run,
             // including a variant that can publish owner-wide native failure.
             revision_.fetch_add(1, std::memory_order_release);
             active_.fetch_add(1, std::memory_order_relaxed);
+            completed_.notify_all();
         }
-        const auto work = [this, key] {
-            void* pipeline = compile_(key);
-            {
-                std::lock_guard lock(mutex_);
-                results_.at(key) = {pipeline ? Status::Ready : Status::Failed, pipeline};
-                active_.fetch_sub(1, std::memory_order_relaxed);
-                completed_.notify_all();
-            }
-        };
+        if (entry->second.result.status != Status::Pending) return entry->second.result;
         if (asynchronous) {
-            enqueue_(work);
+            if (!inserted) return entry->second.result;
+            auto claimed = entry->second.claimed;
+            lock.unlock();
+            enqueue_([this, key, claimed] {
+                // A synchronous consumer may have completed this job and freed
+                // the owner before GCD delivers us. Only the independent token
+                // may be touched until this callback wins the claim.
+                if (!claimed->exchange(true, std::memory_order_relaxed)) complete(key);
+            });
             // A very fast compiler may already have completed. The next draw
             // observes it; this draw is allowed to be skipped without waiting.
             return {Status::Pending, nullptr};
         }
-        work();
-        std::lock_guard lock(mutex_);
-        return results_.at(key);
+        if (!entry->second.claimed->exchange(true, std::memory_order_relaxed)) {
+            lock.unlock();
+            complete(key);
+            lock.lock();
+        }
+        completed_.wait(lock, [&] { return entry->second.result.status != Status::Pending; });
+        return entry->second.result;
     }
 
     void stop() {
@@ -98,15 +98,44 @@ public:
 
     void wait() {
         std::unique_lock lock(mutex_);
-        completed_.wait(lock, [this] { return active_.load(std::memory_order_relaxed) == 0; });
+        while (active_.load(std::memory_order_relaxed)) {
+            auto pending = results_.begin();
+            for (; pending != results_.end(); ++pending) {
+                if (pending->second.result.status == Status::Pending &&
+                    !pending->second.claimed->exchange(true, std::memory_order_relaxed)) break;
+            }
+            if (pending == results_.end()) {
+                completed_.wait(lock);
+                continue;
+            }
+            // Drain every owner variant, but claim only the one being executed.
+            // Workers remain free to compile the other queued variants.
+            const Key key = pending->first;
+            lock.unlock();
+            complete(key);
+            lock.lock();
+        }
     }
 
 private:
+    void complete(Key key) {
+        void* pipeline = compile_(key);
+        std::lock_guard lock(mutex_);
+        results_.at(key).result = {pipeline ? Status::Ready : Status::Failed, pipeline};
+        active_.fetch_sub(1, std::memory_order_relaxed);
+        completed_.notify_all();
+        // No owner access after releasing this lock: a drain may free it.
+    }
+
+    struct Entry {
+        Result result;
+        std::shared_ptr<std::atomic<bool>> claimed = std::make_shared<std::atomic<bool>>(false);
+    };
     Compile compile_;
     Enqueue enqueue_;
     std::mutex mutex_;
     std::condition_variable completed_;
-    std::map<Key, Result> results_;
+    std::map<Key, Entry> results_;
     std::atomic<std::size_t> active_{0};
     std::atomic<std::uint64_t> revision_{1};
     bool stopped_ = false;
@@ -126,6 +155,10 @@ struct PresentFrame {
 class PresentationHistory final {
 public:
     void mark(PresentFrame frame) noexcept { pending_ = frame; }
+
+    bool hasFrameGeneration(void* swapchain) const noexcept {
+        return pending_.swapchain == swapchain && pending_.source != 0;
+    }
 
     PresentFrame take(void* swapchain) noexcept {
         const auto frame = std::exchange(pending_, {});

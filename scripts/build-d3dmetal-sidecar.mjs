@@ -6,6 +6,7 @@ import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { D3DMETAL_SIDECAR_PATCHED_PAYLOAD_SHA256 } from "./d3dmetal-sidecar-patch.mjs";
+import { buildFsrKernels } from "./build-fsr-kernels.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = process.argv[2];
@@ -17,6 +18,8 @@ const sourceDirectory = resolve(root, "d3dmetal-sidecar");
 const sourcePaths = [
   "d3dmetal-sidecar/async-pipeline.hpp", "d3dmetal-sidecar/async-pipeline-state.hpp",
   "d3dmetal-sidecar/async-pipeline.mm",
+  "d3dmetal-sidecar/low-latency.hpp", "d3dmetal-sidecar/low-latency-state.hpp",
+  "d3dmetal-sidecar/low-latency.mm", "include/yaagl_nvapi_low_latency.hpp",
   "d3dmetal-sidecar/metalfx-contract.hpp",
   "d3dmetal-sidecar/metalfx-backend.hpp", "d3dmetal-sidecar/metalfx-backend.mm",
   "d3dmetal-sidecar/d3dmetal-transport.hpp", "d3dmetal-sidecar/d3dmetal-transport.mm",
@@ -37,13 +40,14 @@ const sourcePaths = [
   "d3dmetal-sidecar/bridge.mm", "d3dmetal-sidecar/layout.json",
   "scripts/build-d3dmetal-sidecar.mjs", "scripts/d3dmetal-sidecar-patch.mjs",
   "scripts/generate-b3-sidecar-layout.mjs",
+  "scripts/build-fsr-kernels.mjs",
 ];
 const sources = sourcePaths.map((path) => ({
   path, sha256: createHash("sha256").update(readFileSync(resolve(root, path))).digest("hex"),
 }));
 const layout = JSON.parse(readFileSync(resolve(sourceDirectory, "layout.json"), "utf8"));
 const hookNames = layout.hooks.map(hook => hook.id);
-if (layout.formatVersion !== 31 || new Set(hookNames).size !== hookNames.length ||
+if (layout.formatVersion !== 32 || new Set(hookNames).size !== hookNames.length ||
     layout.hooks.some((hook, index) => !/^[A-Za-z][A-Za-z0-9]*$/.test(hook.id) ||
         hook.dispatchFieldOffset !== index * layout.dispatch.pointerSize)) {
   throw new Error("unsupported beta3 sidecar dispatch layout");
@@ -87,12 +91,7 @@ const header = [
 ].join("\n");
 mkdirSync(outputDirectory, { recursive: true });
 writeFileSync(resolve(outputDirectory, "layout.hpp"), header);
-const fsrKernelSource = readFileSync(resolve(sourceDirectory, "fsr-kernels.metal"), "utf8");
-if (fsrKernelSource.includes(")YAAGL_METAL\"")) {
-  throw new Error("FSR Metal source collides with its generated raw-string delimiter");
-}
-writeFileSync(resolve(outputDirectory, "fsr-kernels.inc"),
-  `static const char kFsrKernelsSource[] = R"YAAGL_METAL(${fsrKernelSource})YAAGL_METAL";\n`);
+const metalLibrary = buildFsrKernels(outputDirectory);
 const compilerLookup = spawnSync("xcrun", ["--find", "clang++"], { encoding: "utf8" });
 if (compilerLookup.status !== 0) throw new Error(compilerLookup.stderr || "clang++ unavailable");
 const compiler = compilerLookup.stdout.trim();
@@ -159,6 +158,7 @@ const manifest = {
   sources,
   compiler: { path: compiler, version: compilerVersion.stdout.trim(), sdkPath },
   compileArgs,
+  metalLibrary,
   module: {
     file: "libD3DMetalSidecar.dylib",
     sha256: createHash("sha256").update(readFileSync(modulePath)).digest("hex"),

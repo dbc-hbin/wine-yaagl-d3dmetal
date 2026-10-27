@@ -180,15 +180,11 @@ std::uint32_t dispatch(yaagl_fsr_dispatch_packet& packet) {
     }
     void* const validatedCommandDevice = commandDevice.get();
     if (!state->executionDevice) state->executionDevice = std::move(commandDevice);
-    const auto mode = metalfx::CommandMode::Metal4;
     const bool newGeneration = !state->backend ||
                                state->generationDevice != command.native.device ||
                                state->generationCompiler != command.native.compiler;
-    if (state->backend && state->backend->mode() != mode) {
-        return kParameter;
-    }
     if (newGeneration) {
-        metalfx::CreateContext context{command.native.device, command.native.compiler, mode};
+        metalfx::CreateContext context{command.native.device, command.native.compiler};
         metalfx::Error backendError;
         std::shared_ptr<metalfx::Feature> backend =
             metalfx::Feature::create(context, state->create.backend, &backendError);

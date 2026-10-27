@@ -1236,6 +1236,7 @@ struct JitterFrame {
     bool prepareReset = false, dispatchReset = false;
     bool previousValid = true;
     unsigned outputWidth = 128;
+    MTLPixelFormat depthFormat = MTLPixelFormatR32Float;
 };
 
 template<class Pixel>
@@ -1295,7 +1296,7 @@ struct JitterRunner {
 
     std::shared_ptr<PreparedFrame> prepare(const std::shared_ptr<State>& state,
                                           const JitterFrame& test,
-                                          bool configurePrepare = false) {
+                                          bool cachePressure = false) {
         auto snapshot = std::make_shared<Snapshot>();
         auto& p = snapshot->parameters;
         p.render_width = test.renderWidth; p.render_height = test.renderHeight;
@@ -1317,8 +1318,11 @@ struct JitterRunner {
             displayMotion ? state->creation.display_height : test.renderHeight;
         snapshot->depth = std::make_shared<TextureOwner>();
         snapshot->motion = std::make_shared<TextureOwner>();
-        snapshot->depth->texture = uniformTexture(device, MTLPixelFormatR32Float,
-            snapshot->depthWidth, snapshot->depthHeight, 0.5f);
+        snapshot->depth->texture = test.depthFormat == MTLPixelFormatR16Float
+            ? uniformTexture(device, test.depthFormat,
+                snapshot->depthWidth, snapshot->depthHeight, std::uint16_t(0x3800))
+            : uniformTexture(device, test.depthFormat,
+                snapshot->depthWidth, snapshot->depthHeight, 0.5f);
         // Binary16 (+0.25, -0.5): exact, uniform object motion, no camera term.
         snapshot->motion->texture = uniformTexture(device, MTLPixelFormatRG16Float,
             snapshot->motionWidth, snapshot->motionHeight,
@@ -1326,9 +1330,8 @@ struct JitterRunner {
         Command command;
         command.value.kind = transport::CommandListKind::mpl;
         command.value.device = device; command.value.compiler = compiler;
-        if (configurePrepare) {
-            // Real Prepare inserts a render-sized configuration before Dispatch
-            // selects the output-sized one. Both share the FIFO cache.
+        if (cachePressure) {
+            // Force configuration eviction independently of Prepare's input reuse.
             auto renderConfiguration = configure(*state, command, p,
                 (id<MTLTexture>)snapshot->depth->texture.get(), MTLPixelFormatRGBA16Float,
                 MTLPixelFormatInvalid, p.render_width, p.render_height,
@@ -1610,8 +1613,10 @@ struct JitterRunner {
         auto depth32 = uniformTexture(device, MTLPixelFormatR32Float, 64, 64, .5f);
         auto depth16 = uniformTexture(device, MTLPixelFormatR16Float, 64, 64, std::uint16_t(0x3800));
         NSError* error = nil;
-        auto library = [device newLibraryWithSource:[NSString stringWithUTF8String:kFsrKernelsSource]
-                                           options:nil error:&error];
+        dispatch_data_t data = dispatch_data_create(kFsrKernelsMetallib, sizeof(kFsrKernelsMetallib),
+                                                    nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        auto library = [device newLibraryWithData:data error:&error];
+        dispatch_release(data);
         assert(library && !error);
         const SEL selector = @selector(newFunctionWithName:);
         const Method method = class_getInstanceMethod(object_getClass(library), selector);
@@ -1821,8 +1826,10 @@ struct JitterRunner {
 
     void profileThreadgroups() {
         NSError* error = nil;
-        auto library = [device newLibraryWithSource:[NSString stringWithUTF8String:kFsrKernelsSource]
-                                          options:nil error:&error];
+        dispatch_data_t data = dispatch_data_create(kFsrKernelsMetallib, sizeof(kFsrKernelsMetallib),
+                                                    nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        auto library = [device newLibraryWithData:data error:&error];
+        dispatch_release(data);
         assert(library && !error);
         auto pipeline = makePipeline(device, library, @"yaagl_fg_decode_crop");
         assert(pipeline);
@@ -1834,15 +1841,11 @@ struct JitterRunner {
         for (const auto& profile : profiles) {
             auto configuration = std::make_shared<Configuration>();
             configuration->device = Object(device);
-            configuration->mode = Mode::Metal4;
             configuration->outputWidth = profile[2];
             configuration->outputHeight = profile[3];
             yaagl_fsr_fg_prepare_packet parameters{};
             parameters.render_width = profile[0]; parameters.render_height = profile[1];
             assert(configuration->threadgroupWidth(parameters) == profile[4]);
-            configuration->mode = Mode::Legacy;
-            assert(configuration->threadgroupWidth(parameters) == 8);
-            configuration->mode = Mode::Metal4;
             // Include an odd-sized pass under the same profile: dispatch shape
             // is configuration-wide, not selected from each pass's extent.
             for (bool fullExtent : {true, false}) {
@@ -1879,12 +1882,12 @@ struct JitterRunner {
                 execution->prepared = std::make_shared<PreparedFrame::Impl>();
                 execution->prepared->configuration = configuration;
                 execution->objects = {source, baseline, selected, Object(constants)};
-                assert(execution->makeResident(buffer, Mode::Metal4));
+                assert(execution->makeResident(buffer));
                 auto initial = [buffer computeCommandEncoder];
                 [initial updateFence:fence afterEncoderStages:MTLStageDispatch];
                 [initial endEncoding];
                 for (unsigned variant = 0; variant != 2; ++variant) {
-                    assert(computePass(buffer, fence, Mode::Metal4, table,
+                    assert(computePass(buffer, fence, table,
                         variant ? configuration->threadgroupWidth(parameters) : 8,
                         (id<MTLComputePipelineState>)pipeline.get(),
                         {.source = (id<MTLTexture>)source.get(),
@@ -2321,6 +2324,100 @@ struct JitterRunner {
         }
     }
 
+    void displayMotionRectangle() {
+        @autoreleasepool {
+            constexpr unsigned width = 128, height = 256, activeWidth = 64;
+            constexpr unsigned left = 32, top = 64;
+            enum class Domain { FullDisplay, Independent, Packed };
+            const struct {
+                const char* name;
+                Domain domain;
+                MTLPixelFormat depth;
+                bool reconstructCamera;
+            } cases[] = {
+                {"public display-motion crop", Domain::FullDisplay, MTLPixelFormatR32Float, false},
+                {"independent display-motion domain", Domain::Independent, MTLPixelFormatR32Float, false},
+                {"packed motion domain", Domain::Packed, MTLPixelFormatR32Float, false},
+                {"cropped R32 camera motion", Domain::FullDisplay, MTLPixelFormatR32Float, true},
+                {"cropped R16 motion", Domain::FullDisplay, MTLPixelFormatR16Float, false},
+                {"cropped R16 camera motion", Domain::FullDisplay, MTLPixelFormatR16Float, true},
+            };
+            for (const auto& scenario : cases) {
+                const bool crop = scenario.domain == Domain::FullDisplay;
+                auto state = std::make_shared<State>();
+                state->creation.display_width = width;
+                state->creation.display_height = height;
+                state->creation.flags = YAAGL_FSR_FG_DISPLAY_RESOLUTION_MOTION_VECTORS |
+                    YAAGL_FSR_FG_MOTION_VECTORS_JITTERED;
+                const unsigned sourceWidth = scenario.domain == Domain::Packed ? width / 2 : width;
+                const unsigned sourceHeight = scenario.domain == Domain::Packed ? height / 2 : height;
+                std::vector<std::array<__fp16, 2>> motion(sourceWidth * sourceHeight);
+                for (unsigned y = 0; y < sourceHeight; ++y)
+                    for (unsigned x = 0; x < sourceWidth; ++x)
+                        motion[y * sourceWidth + x] = {__fp16(x / 8.f), __fp16(y / 8.f)};
+                for (std::uint64_t frame = 1; frame <= 2; ++frame) {
+                    JitterFrame test{
+                        .name = scenario.name,
+                        .frame = frame, .renderWidth = activeWidth, .renderHeight = 128,
+                        .jitterX = frame == 1 ? .5f : -.5f,
+                        .jitterY = frame == 1 ? -.5f : .5f,
+                        .cancellationX = frame == 1 ? 0.f : 2.f,
+                        .cancellationY = frame == 1 ? 0.f : -2.f,
+                        .pixelsX = 0, .pixelsY = 0,
+                        .motionWidth = crop ? 0 : sourceWidth,
+                        .motionHeight = crop ? 0 : sourceHeight,
+                        .scaleX = 1, .scaleY = 1,
+                        .previousValid = frame != 1, .outputWidth = activeWidth,
+                        .depthFormat = scenario.depth
+                    };
+                    auto prepared = prepare(state, test);
+                    auto& impl = *prepared->impl_;
+                    impl.snapshot->motion->texture = pixelTexture(device,
+                        MTLPixelFormatRG16Float, sourceWidth, sourceHeight, motion);
+                    // Snapshot copies already consumed these source-resource offsets.
+                    impl.snapshot->parameters.motion_subrect_x = 7;
+                    impl.snapshot->parameters.motion_subrect_y = 11;
+                    if (scenario.reconstructCamera) {
+                        auto& p = impl.snapshot->parameters;
+                        p.reconstruct_camera_motion = 1;
+                        p.clip_to_previous_clip[0] = p.clip_to_previous_clip[5] = 2;
+                        p.clip_to_previous_clip[8] = .5f;
+                        p.clip_to_previous_clip[9] = -.5f;
+                        p.clip_to_previous_clip[10] = p.clip_to_previous_clip[15] = 1;
+                    }
+                    auto& d = impl.dispatch;
+                    d.generation_rect_left = left; d.generation_rect_top = top;
+                    d.generation_rect_width = activeWidth; d.generation_rect_height = 128;
+                    d.present_x = d.hudless_x = d.output_x = left;
+                    d.present_y = d.hudless_y = d.output_y = top;
+                    d.independent_subrects = scenario.domain == Domain::Independent;
+                    std::vector<std::array<__fp16, 2>> expected(activeWidth * 128);
+                    for (unsigned y = 0; y < 128; ++y)
+                        for (unsigned x = 0; x < activeWidth; ++x) {
+                            const unsigned sx = crop ? x + left :
+                                unsigned((x + .5f) * sourceWidth / activeWidth);
+                            const unsigned sy = crop ? y + top :
+                                unsigned((y + .5f) * sourceHeight / 128);
+                            const auto value = motion[sy * sourceWidth + sx];
+                            float mx = (float(value[0]) - test.cancellationX) *
+                                (crop ? width : activeWidth) / width;
+                            float my = (float(value[1]) - test.cancellationY) *
+                                (crop ? height : 128) / height;
+                            if (scenario.reconstructCamera) {
+                                // Scale about the full-display center, plus the
+                                // +/- depth/2 clip-space shift at raw depth 0.5.
+                                mx += x + left + .5f - width / 2.f + width / 8.f;
+                                my += y + top + .5f - height / 2.f + height / 8.f;
+                            }
+                            expected[y * activeWidth + x] = {__fp16(mx), __fp16(my)};
+                        }
+                    encode(prepared, test, nullptr, &expected);
+                }
+                releaseHudRow(state->hudCounted);
+            }
+        }
+    }
+
     void outputOrigin() {
         @autoreleasepool {
             using Pixel = std::array<__fp16, 4>;
@@ -2585,6 +2682,7 @@ int main() {
         runner.srgbView();
         runner.alphaMask();
         runner.outputOrigin();
+        runner.displayMotionRectangle();
         runner.cacheHistory();
         runner.spatialJitter(false);
         runner.spatialJitter(true);
@@ -2866,6 +2964,20 @@ static void cameraSequence(JitterRunner& runner, unsigned producer,
 
 int main() {
     @autoreleasepool {
+        yaagl_fsr_fg_prepare_packet camera{};
+        camera.camera_near = .1f;
+        for (float unusedFar : {NAN, -INFINITY, 0.f, -1.f}) {
+            camera.camera_far = unusedFar;
+            CameraPlanes planes{};
+            assert(normalizeCameraPlanes(camera, YAAGL_FSR_FG_DEPTH_INFINITE, planes));
+            assert(planes.nearPlane == .1f && planes.farPlane == INFINITY);
+            assert(!normalizeCameraPlanes(camera, 0, planes));
+        }
+        for (float invalidNear : {NAN, INFINITY, 0.f, -1.f}) {
+            camera.camera_near = invalidNear;
+            CameraPlanes planes{};
+            assert(!normalizeCameraPlanes(camera, YAAGL_FSR_FG_DEPTH_INFINITE, planes));
+        }
         JitterRunner runner;
         for (unsigned producer = 0; producer != 2; ++producer)
             for (unsigned infinite = 0; infinite != 2; ++infinite)
@@ -3305,8 +3417,7 @@ static void pendingFrameMetadata(JitterRunner& runner) {
     completeHistoryPrepare(runner);
     assert(offSnapshot->produced);
     for (unsigned i = 0; i != 65; ++i) {
-        assert(prepare(1000 + i) == Ok && !state->frameCount);
-        recordedHistory.reset();
+        assert(prepare(1000 + i) == Ok && !state->frameCount && !recordedHistory);
     }
     config.enabled = 1;
     assert(api(YAAGL_FSR_FG_CONFIGURE, &config) == Ok);
@@ -3322,6 +3433,50 @@ static void pendingFrameMetadata(JitterRunner& runner) {
         destroyedSnapshot->parameters.frame_id == UINT64_MAX);
 }
 
+static void dynamicPrepareHistory(JitterRunner& runner) {
+    fg_history_begin();
+    auto state = std::make_shared<State>();
+    state->creation.display_width = state->creation.display_height = 128;
+    state->creation.max_render_width = state->creation.max_render_height = 128;
+    contexts.emplace(17, state);
+    auto depth = uniformTexture(runner.device, MTLPixelFormatR32Float, 128, 32, .5f);
+    auto depth16 = uniformTexture(runner.device, MTLPixelFormatR16Float, 128, 32,
+        std::uint16_t(0x3800));
+    auto motion = uniformTexture(runner.device, MTLPixelFormatRG16Float, 128, 32,
+        std::array<std::uint16_t, 2>{0, 0});
+    auto color = uniformTexture(runner.device, MTLPixelFormatRGBA16Float, 128, 128,
+        std::array<__fp16, 4>{.25f, .5f, .75f, 1});
+    auto output = privateTexture(runner.device, MTLPixelFormatRGBA16Float, 128, 128,
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+    HistoryResource list{historyVtable.data()};
+    HistoryResource resources[] = {
+        {historyVtable.data(), depth.get()}, {historyVtable.data(), motion.get()},
+        {historyVtable.data(), color.get()}, {historyVtable.data(), output.get()}
+    };
+    for (std::uint64_t frame = 1; frame <= 14; ++frame) {
+        const unsigned width = 64 + unsigned((frame - 1) % 9);
+        if (frame == 13) resources[0].texture = depth16.get();
+        assert(fg_history_prepare(frame, width, 0, false,
+            &list, &resources[0], &resources[1]) == Ok);
+        assert(((id<MTLTexture>)recordedHistory->impl_->snapshot->depth->texture.get()).pixelFormat ==
+            (frame < 13 ? MTLPixelFormatR32Float : MTLPixelFormatR16Float));
+        completeHistoryPrepare(runner);
+        assert(fg_history_generate(frame, 0, false, &list, &resources[2], &resources[3]) == Ok);
+        JitterFrame test{
+            .name = "dynamic Prepare preserves generation history", .frame = frame,
+            .renderWidth = width, .renderHeight = 32, .jitterX = 0, .jitterY = 0,
+            .cancellationX = 0, .cancellationY = 0, .pixelsX = 0, .pixelsY = 0,
+            .previousValid = frame != 1
+        };
+        runner.encode(std::const_pointer_cast<PreparedFrame>(recordedHistory), test);
+        assert(encodedCameraReset == (frame == 1 || frame == 13));
+        recordedHistory.reset();
+    }
+    yaagl_fsr_fg_destroy_packet destroy{};
+    destroy.header = {sizeof(destroy), YAAGL_FSR_FG_BRIDGE_VERSION, YAAGL_FSR_FG_DESTROY, 0, 17};
+    assert(api(YAAGL_FSR_FG_DESTROY, &destroy) == Ok);
+}
+
 int main() {
     @autoreleasepool {
         JitterRunner runner;
@@ -3334,6 +3489,7 @@ int main() {
         historyVtable[26] = reinterpret_cast<void*>(&historyBarrier);
         inputOwnership(runner);
         pendingFrameMetadata(runner);
+        dynamicPrepareHistory(runner);
         for (unsigned route = 0; route != 3; ++route) {
             producerHistory(runner, route, false, 0);
             producerHistory(runner, route, true, 0);
@@ -3349,14 +3505,17 @@ int main() {
 
 
 NATIVE_FUSION = r'''
-static void complete(id<MTLCommandBuffer> buffer) {
+static void complete(id<MTL4CommandQueue> queue, id<MTL4CommandBuffer> buffer) {
+    [buffer endCommandBuffer];
     auto done = dispatch_semaphore_create(0);
-    [buffer addCompletedHandler:^(id<MTLCommandBuffer> result) {
-        assert(result.status == MTLCommandBufferStatusCompleted && !result.error);
+    auto options = [MTL4CommitOptions new];
+    [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+        assert(!feedback.error);
         dispatch_semaphore_signal(done);
     }];
-    [buffer commit];
+    [queue commit:&buffer count:1 options:options];
     assert(dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
+    [options release];
     dispatch_release(done);
 }
 template<class Pixel>
@@ -3371,10 +3530,13 @@ static void equalPixels(Object a, Object b) {
 }
 int main() {
     @autoreleasepool {
-        auto device = MTLCreateSystemDefaultDevice(); auto queue = [device newCommandQueue];
+        auto device = MTLCreateSystemDefaultDevice(); auto queue = [device newMTL4CommandQueue];
+        assert(device && queue);
         NSError* error = nil;
-        auto library = [device newLibraryWithSource:[NSString stringWithUTF8String:kFsrKernelsSource]
-                                          options:nil error:&error];
+        dispatch_data_t data = dispatch_data_create(kFsrKernelsMetallib, sizeof(kFsrKernelsMetallib),
+                                                    nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        auto library = [device newLibraryWithData:data error:&error];
+        dispatch_release(data);
         assert(library && !error);
         auto depthPipeline = makePipeline(device, library, @"yaagl_fg_resample_depth");
         auto motionPipeline = makePipeline(device, library, @"yaagl_fg_normalize_motion");
@@ -3437,31 +3599,51 @@ int main() {
                     }
                     auto constants = [device newBufferWithBytes:parameters length:sizeof(parameters)
                                                         options:MTLResourceStorageModeShared];
-                    auto buffer = [queue commandBuffer]; auto fence = [device newFence];
-                    auto initial = [buffer computeCommandEncoder]; [initial updateFence:fence]; [initial endEncoding];
-                    std::vector<Object> retained;
-                    assert(computePass(buffer, fence, Mode::Legacy, nil, 8,
+                    auto allocator = [device newCommandAllocator];
+                    auto buffer = [device newCommandBuffer]; auto fence = [device newFence];
+                    auto descriptor = [MTL4ArgumentTableDescriptor new];
+                    descriptor.maxBufferBindCount = 1; descriptor.maxTextureBindCount = 7;
+                    descriptor.initializeBindings = YES;
+                    auto table = [device newArgumentTableWithDescriptor:descriptor error:&error];
+                    [descriptor release];
+                    assert(constants && allocator && buffer && fence && table && !error);
+                    [buffer beginCommandBufferWithAllocator:allocator];
+                    auto execution = std::make_shared<ExecutionLease::Impl>();
+                    execution->prepared = std::make_shared<PreparedFrame::Impl>();
+                    execution->prepared->configuration = std::make_shared<Configuration>();
+                    execution->prepared->configuration->device = Object(device);
+                    execution->objects = {sourceDepth, sourceMotion, splitDepth, splitMotion,
+                        fusedDepth, fusedMotion, Object(constants), Object(table)};
+                    assert(execution->makeResident(buffer));
+                    auto initial = [buffer computeCommandEncoder];
+                    [initial updateFence:fence afterEncoderStages:MTLStageDispatch];
+                    [initial endEncoding];
+                    auto& retained = execution->objects;
+                    assert(computePass(buffer, fence, table, 8,
                         (id<MTLComputePipelineState>)depthPipeline.get(),
                         {.source = (id<MTLTexture>)sourceDepth.get(),
                          .destination = (id<MTLTexture>)splitDepth.get()},
                         constants, 0, depth, retained));
-                    assert(computePass(buffer, fence, Mode::Legacy, nil, 8,
+                    assert(computePass(buffer, fence, table, 8,
                         (id<MTLComputePipelineState>)motionPipeline.get(),
                         {.source = (id<MTLTexture>)sourceMotion.get(),
                          .destination = (id<MTLTexture>)splitMotion.get(),
                          .auxiliary0 = (id<MTLTexture>)splitDepth.get()},
                         constants, sizeof(FgParams), motion, retained));
-                    assert(computePass(buffer, fence, Mode::Legacy, nil, 8,
+                    assert(computePass(buffer, fence, table, 8,
                         (id<MTLComputePipelineState>)fusedPipeline.get(),
                         {.source = (id<MTLTexture>)sourceMotion.get(),
                          .destination = (id<MTLTexture>)fusedMotion.get(),
                          .auxiliary0 = (id<MTLTexture>)sourceDepth.get(),
                          .auxiliary1 = (id<MTLTexture>)fusedDepth.get()},
                         constants, 0, depth, retained));
-                    complete(buffer);
+                    complete(queue, buffer);
                     equalPixels<std::uint32_t>(splitDepth, fusedDepth);
                     equalPixels<std::array<std::uint16_t, 2>>(splitMotion, fusedMotion);
-                    ++cases; [constants release]; [fence release];
+                    ++cases;
+                    execution.reset();
+                    [constants release]; [table release]; [fence release];
+                    [buffer release]; [allocator release];
                 }
         std::vector<std::array<__fp16, 4>> colors(23 * 17);
         for (unsigned i = 0; i < colors.size(); ++i)
@@ -3487,30 +3669,50 @@ int main() {
             parameters[1].sourceOrigin[0] = 5; parameters[1].sourceOrigin[1] = 3;
             auto constants = [device newBufferWithBytes:parameters length:sizeof(parameters)
                                                 options:MTLResourceStorageModeShared];
-            auto buffer = [queue commandBuffer]; auto fence = [device newFence];
-            auto initial = [buffer computeCommandEncoder]; [initial updateFence:fence]; [initial endEncoding];
-            std::vector<Object> retained;
-            assert(computePass(buffer, fence, Mode::Legacy, nil, 8,
+            auto allocator = [device newCommandAllocator];
+            auto buffer = [device newCommandBuffer]; auto fence = [device newFence];
+            auto descriptor = [MTL4ArgumentTableDescriptor new];
+            descriptor.maxBufferBindCount = 1; descriptor.maxTextureBindCount = 7;
+            descriptor.initializeBindings = YES;
+            auto table = [device newArgumentTableWithDescriptor:descriptor error:&error];
+            [descriptor release];
+            assert(constants && allocator && buffer && fence && table && !error);
+            [buffer beginCommandBufferWithAllocator:allocator];
+            auto execution = std::make_shared<ExecutionLease::Impl>();
+            execution->prepared = std::make_shared<PreparedFrame::Impl>();
+            execution->prepared->configuration = std::make_shared<Configuration>();
+            execution->prepared->configuration->device = Object(device);
+            execution->objects = {sourceScene, sourceUi, splitScene, splitUi,
+                fusedScene, fusedUi, Object(constants), Object(table)};
+            assert(execution->makeResident(buffer));
+            auto initial = [buffer computeCommandEncoder];
+            [initial updateFence:fence afterEncoderStages:MTLStageDispatch];
+            [initial endEncoding];
+            auto& retained = execution->objects;
+            assert(computePass(buffer, fence, table, 8,
                 (id<MTLComputePipelineState>)decodePipeline.get(),
                 {.source = (id<MTLTexture>)sourceScene.get(),
                  .destination = (id<MTLTexture>)splitScene.get()},
                 constants, 0, parameters[0], retained));
-            assert(computePass(buffer, fence, Mode::Legacy, nil, 8,
+            assert(computePass(buffer, fence, table, 8,
                 (id<MTLComputePipelineState>)decodePipeline.get(),
                 {.source = (id<MTLTexture>)sourceUi.get(),
                  .destination = (id<MTLTexture>)splitUi.get()},
                 constants, sizeof(FgParams), parameters[1], retained));
-            assert(computePass(buffer, fence, Mode::Legacy, nil, 8,
+            assert(computePass(buffer, fence, table, 8,
                 (id<MTLComputePipelineState>)decodePair.get(),
                 {.source = (id<MTLTexture>)sourceScene.get(),
                  .destination = (id<MTLTexture>)fusedScene.get(),
                  .auxiliary0 = (id<MTLTexture>)sourceUi.get(),
                  .auxiliary1 = (id<MTLTexture>)fusedUi.get()},
                 constants, 0, parameters[0], retained));
-            complete(buffer);
+            complete(queue, buffer);
             equalPixels<std::array<std::uint16_t, 4>>(splitScene, fusedScene);
             equalPixels<std::array<std::uint16_t, 4>>(splitUi, fusedUi);
-            ++cases; [constants release]; [fence release];
+            ++cases;
+            execution.reset();
+            [constants release]; [table release]; [fence release];
+            [buffer release]; [allocator release];
         }
         std::printf("FG fused preprocessing: %u cases, all pixels bitwise equal\n", cases);
         [library release]; [queue release]; [device release];
@@ -3522,25 +3724,23 @@ int main() {
 class FrameGenerationNormalizationTest(unittest.TestCase):
     def test_native_fused_preprocessing(self):
         native = ROOT / "d3dmetal-sidecar"
-        kernels = (native / "fsr-kernels.metal").read_text()
         with tempfile.TemporaryDirectory(prefix="yaagl-fg-fusion-") as directory:
             directory = pathlib.Path(directory)
             source = directory / "fg-fusion.mm"
             binary = directory / "fg-fusion"
             source.write_text(NATIVE_JITTER.split("\nstruct JitterRunner {", 1)[0] + NATIVE_FUSION)
-            (directory / "fsr-kernels.inc").write_text(
-                'static const char kFsrKernelsSource[] = R"YAAGL_METAL(' + kernels + ')YAAGL_METAL";\n')
+            subprocess.run(("node", str(ROOT / "scripts/build-fsr-kernels.mjs"),
+                            str(directory)), check=True)
             subprocess.run(("xcrun", "clang++", "-arch", "x86_64", "-O2", "-std=c++20", "-fno-objc-arc",
                             "-I", str(native), "-I", str(directory), str(source),
                             *(str(native / file) for file in ("metalfx-backend.mm",
                               "d3dmetal-transport.mm")),
                             "-framework", "Foundation", "-framework", "Metal",
-                            "-framework", "MetalFX", "-o", str(binary)), check=True)
+                            "-framework", "MetalFX", "-Wl,-adhoc_codesign", "-o", str(binary)), check=True)
             subprocess.run((str(binary),), check=True)
 
     def test_producer_native_history(self):
         native = ROOT / "d3dmetal-sidecar"
-        kernels = (native / "fsr-kernels.metal").read_text()
         with tempfile.TemporaryDirectory(prefix="yaagl-fg-history-") as directory:
             directory = pathlib.Path(directory)
             producer = directory / "fg-producer.c"
@@ -3549,8 +3749,8 @@ class FrameGenerationNormalizationTest(unittest.TestCase):
             binary = directory / "fg-history"
             producer.write_text(dispatch_source())
             source.write_text(NATIVE_HISTORY)
-            (directory / "fsr-kernels.inc").write_text(
-                'static const char kFsrKernelsSource[] = R"YAAGL_METAL(' + kernels + ')YAAGL_METAL";\n')
+            subprocess.run(("node", str(ROOT / "scripts/build-fsr-kernels.mjs"),
+                            str(directory)), check=True)
             subprocess.run(("xcrun", "clang", "-arch", "x86_64", "-std=c11",
                             "-Wno-deprecated-declarations", "-Wall", "-Wextra", "-Werror",
                             "-DFG_HISTORY_FIXTURE=1", "-Dmain=fg_dispatch_main",
@@ -3562,12 +3762,11 @@ class FrameGenerationNormalizationTest(unittest.TestCase):
                             *(str(native / file) for file in ("metalfx-backend.mm",
                               "d3dmetal-transport.mm")),
                             "-framework", "Foundation", "-framework", "Metal",
-                            "-framework", "MetalFX", "-o", str(binary)), check=True)
+                            "-framework", "MetalFX", "-Wl,-adhoc_codesign", "-o", str(binary)), check=True)
             subprocess.run((str(binary),), check=True)
 
     def test_native_camera_depth_domain(self):
         native = ROOT / "d3dmetal-sidecar"
-        kernels = (native / "fsr-kernels.metal").read_text()
         with tempfile.TemporaryDirectory(prefix="yaagl-fg-camera-") as directory:
             directory = pathlib.Path(directory)
             producer = directory / "fg-producer.c"
@@ -3576,8 +3775,8 @@ class FrameGenerationNormalizationTest(unittest.TestCase):
             binary = directory / "fg-camera"
             producer.write_text(dispatch_source())
             source.write_text("#define FG_CAMERA_FIXTURE 1\n" + NATIVE_CAMERA)
-            (directory / "fsr-kernels.inc").write_text(
-                'static const char kFsrKernelsSource[] = R"YAAGL_METAL(' + kernels + ')YAAGL_METAL";\n')
+            subprocess.run(("node", str(ROOT / "scripts/build-fsr-kernels.mjs"),
+                            str(directory)), check=True)
             subprocess.run(("xcrun", "clang", "-arch", "x86_64", "-std=c11",
                             "-Wno-deprecated-declarations", "-Wall", "-Wextra", "-Werror",
                             "-Dmain=fg_dispatch_main",
@@ -3589,12 +3788,11 @@ class FrameGenerationNormalizationTest(unittest.TestCase):
                             *(str(native / file) for file in ("metalfx-backend.mm",
                               "d3dmetal-transport.mm")),
                             "-framework", "Foundation", "-framework", "Metal",
-                            "-framework", "MetalFX", "-o", str(binary)), check=True)
+                            "-framework", "MetalFX", "-Wl,-adhoc_codesign", "-o", str(binary)), check=True)
             subprocess.run((str(binary),), check=True)
 
     def test_native_barrier_failure_path(self):
         native = ROOT / "d3dmetal-sidecar"
-        kernels = (native / "fsr-kernels.metal").read_text()
         with tempfile.TemporaryDirectory(prefix="yaagl-fg-barriers-") as directory:
             directory = pathlib.Path(directory)
             producer = directory / "fg-producer.c"
@@ -3603,8 +3801,8 @@ class FrameGenerationNormalizationTest(unittest.TestCase):
             binary = directory / "fg-barriers"
             producer.write_text(dispatch_source())
             source.write_text(d3d12_states() + "\n" + NATIVE_BARRIERS)
-            (directory / "fsr-kernels.inc").write_text(
-                'static const char kFsrKernelsSource[] = R"YAAGL_METAL(' + kernels + ')YAAGL_METAL";\n')
+            subprocess.run(("node", str(ROOT / "scripts/build-fsr-kernels.mjs"),
+                            str(directory)), check=True)
             # Match the existing C fixture's compiler gate, including its
             # established exception for intentionally tested SDK Prepare V1.
             subprocess.run(("xcrun", "clang", "-arch", "x86_64", "-std=c11",
@@ -3617,45 +3815,41 @@ class FrameGenerationNormalizationTest(unittest.TestCase):
                             *(str(native / file) for file in ("metalfx-backend.mm",
                               "d3dmetal-transport.mm")),
                             "-framework", "Foundation", "-framework", "Metal",
-                            "-framework", "MetalFX", "-o", str(binary)), check=True)
+                            "-framework", "MetalFX", "-Wl,-adhoc_codesign", "-o", str(binary)), check=True)
             subprocess.run((str(binary),), check=True)
 
     def test_native_jitter_history(self):
         native = ROOT / "d3dmetal-sidecar"
-        kernels = (native / "fsr-kernels.metal").read_text()
-        self.assertNotIn(')YAAGL_METAL"', kernels)
         with tempfile.TemporaryDirectory(prefix="yaagl-fg-jitter-") as directory:
             directory = pathlib.Path(directory)
             source = directory / "fg-jitter.mm"
             binary = directory / "fg-jitter"
             source.write_text(NATIVE_JITTER)
-            (directory / "fsr-kernels.inc").write_text(
-                'static const char kFsrKernelsSource[] = R"YAAGL_METAL(' + kernels + ')YAAGL_METAL";\n')
+            subprocess.run(("node", str(ROOT / "scripts/build-fsr-kernels.mjs"),
+                            str(directory)), check=True)
             subprocess.run(("xcrun", "clang++", "-arch", "x86_64", "-std=c++20", "-fno-objc-arc",
                             "-I", str(native), "-I", str(directory), str(source),
                             *(str(native / file) for file in ("metalfx-backend.mm",
                               "d3dmetal-transport.mm")),
                             "-framework", "Foundation", "-framework", "Metal",
-                            "-framework", "MetalFX", "-o", str(binary)), check=True)
+                            "-framework", "MetalFX", "-Wl,-adhoc_codesign", "-o", str(binary)), check=True)
             subprocess.run((str(binary),), check=True)
 
     def test_native_destroy_ownership(self):
         native = ROOT / "d3dmetal-sidecar"
-        kernels = (native / "fsr-kernels.metal").read_text()
-        self.assertNotIn(')YAAGL_METAL"', kernels)
         with tempfile.TemporaryDirectory(prefix="yaagl-fg-destroy-") as directory:
             directory = pathlib.Path(directory)
             source = directory / "fg-destroy.mm"
             binary = directory / "fg-destroy"
             source.write_text(NATIVE_DESTROY)
-            (directory / "fsr-kernels.inc").write_text(
-                'static const char kFsrKernelsSource[] = R"YAAGL_METAL(' + kernels + ')YAAGL_METAL";\n')
+            subprocess.run(("node", str(ROOT / "scripts/build-fsr-kernels.mjs"),
+                            str(directory)), check=True)
             subprocess.run(("xcrun", "clang++", "-arch", "x86_64", "-std=c++20", "-fno-objc-arc",
                             "-I", str(native), "-I", str(directory), str(source),
                             *(str(native / file) for file in ("metalfx-backend.mm",
                               "d3dmetal-transport.mm")),
                             "-framework", "Foundation", "-framework", "Metal",
-                            "-framework", "MetalFX", "-o", str(binary)), check=True)
+                            "-framework", "MetalFX", "-Wl,-adhoc_codesign", "-o", str(binary)), check=True)
             subprocess.run((str(binary),), check=True)
 
     def test_production_dispatch(self):

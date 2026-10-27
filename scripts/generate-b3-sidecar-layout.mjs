@@ -61,8 +61,12 @@ const hooks = [
   ["DX11Destroy", 0xcd716, "4157415653"],
   ["CompleteExecute", 0x16f0d0, "5541574156"],
   ["PresentResidencyAdd", 0x16d242, "ff15e0403700", true],
+  ["NvapiQueryInterface", 0x17d757, "415741564155"],
+  ["CompletePresent", 0x12b610, "53488b5f20"],
+  ["LatencySwapchainDestroy", 0x12ac64, "5541574156"],
+  ["LatencyDeviceDestroy", 0x60f54, "5541574156"],
 ];
-const formatVersion = 31;
+const formatVersion = 32;
 const gateStart = 0x4e0040;
 const slot = 0x563f18;
 const markerOffset = gateStart + 0x780;

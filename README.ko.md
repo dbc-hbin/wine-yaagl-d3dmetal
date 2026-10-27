@@ -10,13 +10,13 @@ DLSS는 Apple 원본 `nvngx-on-metalfx.dll`과 Unix 모듈을 사용합니다. �
 
 공식 `wine-11.20` 태그를 기반으로 검증된 소스 `1846c16674b`의 런타임 변경을 이식한 트리입니다. 빌드 입력은 `dlls/`, `server/`, `include/`의 Wine 소스입니다. 유지한 계약과 업스트림 중복 처리 기준은 [이식 기록](documentation/WINE-REBASE.md)에 정리합니다. 과거 P3/tuned 패치 묶음은 원본 커밋에 참고 자료로 보존하며, 이 트리에 다시 적용하거나 복사하지 않습니다.
 
-beta3 훅 계약은 `d3dmetal-sidecar/layout.json`에 정의되어 있습니다. format 31, marker `YAAGLB3SIDEcar\x1f`, dispatch 슬롯 23개이며 추가 `binaryPatches`는 없습니다. 처음 네 훅은 `GetContainingOutput`, `SetFullscreenState`, `QueryVideoMemoryInfo`, `ReplayTemporalScale`로 유지합니다. Async 훅 12개는 graphics PSO 생성·조회·해제, MPL 일반·indexed draw, root signature 수명, command list reset·query·수명과 Present를 담당합니다. DX11 훅 5개는 일반·indexed draw, query Begin·End와 context 해제를 담당합니다. `CompleteExecute`는 완료된 FSR 실행의 리소스를 회수하고, 그 뒤에 `PresentResidencyAdd` 호출 지점 훅이 옵니다. `ngx-hooks.mm`은 기록된 FSR 명령을 처리하고, 나머지는 Apple 원본 replay로 전달합니다. FSR SR/FG는 Metal4/MPL transport를 사용합니다.
+beta3 훅 계약은 `d3dmetal-sidecar/layout.json`에 정의되어 있습니다. format 32, marker `YAAGLB3SIDEcar\x20`, dispatch 슬롯 27개이며 추가 `binaryPatches`는 없습니다. 처음 네 훅은 `GetContainingOutput`, `SetFullscreenState`, `QueryVideoMemoryInfo`, `ReplayTemporalScale`로 유지합니다. Async 훅 12개는 graphics PSO 생성·조회·해제, MPL 일반·indexed draw, root signature 수명, command list reset·query·수명과 Present를 담당합니다. DX11 훅 5개는 일반·indexed draw, query Begin·End와 context 해제를 담당합니다. `CompleteExecute`는 완료된 FSR 실행의 리소스를 회수하고, 그 뒤에 `PresentResidencyAdd` 호출 지점 훅이 옵니다. 이어지는 저지연 훅 4개는 native NVAPI 조회, Present 완료, swapchain 해제와 device 해제를 담당합니다. `ngx-hooks.mm`은 기록된 FSR 명령을 처리하고, 나머지는 Apple 원본 replay로 전달합니다. FSR SR/FG는 Metal4/MPL transport를 사용합니다.
 
 `PresentResidencyAdd`는 `DoPresent`의 layer set 등록 호출 `0x16d242`만 교체합니다. 조사한 macOS 27 IOGPU 구현은 등록을 `NSCountedSet`으로 강하게 보유하고 고유 set 32개 제한을 검사합니다. 큐마다 현재 layer set을 한 번만 등록하며, 다른 set으로 바뀌면 이전 등록을 먼저 제거하고 새 set을 추가합니다. 큐의 다른 등록은 유지합니다. 이 호출은 native worker가 직렬화하며, 큐에 연결된 상태는 교체 또는 큐 파괴까지 layer set을 최대 하나만 보유합니다. layer 교체에 따른 등록 누적을 수정한 것이며 실제 게임의 메모리 급증 해결을 입증한 것은 아닙니다. `node --test scripts/test-present-residency.mjs`는 실제 생성된 x86 호출·gate·trampoline과 production 훅을 Foundation의 실제 counting·소유권 동작으로 128회 layer 교체에 걸쳐 검사하며, D3DMetal을 로드하거나 GPU 작업을 실행하지 않습니다.
 
 현재 Wine FSR 진입점과 native 회귀 검사의 호출처는 Metal4를 선택하며, 저장소 안에서 backend의 Legacy command mode를 선택하는 호출처는 없습니다. SR C++ 인터페이스는 여전히 일반 `MTLCommandBuffer`를 사용하는 Legacy를 받으며 sidecar가 C++ factory/encode 심볼도 export하므로, 저장소 조사만으로 외부 호출자가 없다고 확정할 수는 없습니다. Legacy는 명시적인 인터페이스 전환 전까지 유지합니다. AMD native provider로의 원본 전달과는 별개이며, `YAAGL_FSR_UPSCALER=native`나 FG native fallback은 MetalFX Legacy를 선택하지 않습니다.
 
-과거의 커스텀 PSO/function 캐시, RT 출처 정보 추적, 캐시 문맥 훅과 라이브러리 singleflight는 제거한 상태를 유지합니다. `GetRenderPipelineState`에는 비동기 작업 예약 wrapper를 추가했지만, Metal PSO의 실제 컴파일과 소유권은 Apple 원본 getter와 캐시가 담당합니다. 나머지 과거 캐시 진입점은 원본을 유지하며, GPTK 자체 셰이더/stage·디스크 캐시, 라이브러리 게시·재사용, owner별 graphics/compute PSO와 RT 함수 재사용도 유지합니다.
+과거의 커스텀 PSO/function 캐시, RT 출처 정보 추적, 캐시 문맥 훅과 라이브러리 singleflight는 제거한 상태를 유지합니다. `GetRenderPipelineState`에는 비동기 작업 예약 wrapper를 추가했지만, Metal PSO의 실제 컴파일과 소유권은 Apple 원본 getter와 캐시가 담당합니다. 과거 device destructor 지점은 저지연 상태를 정리한 뒤 원본 destructor를 호출하는 용도로만 사용합니다. 나머지 과거 캐시 진입점은 원본을 유지하며, GPTK 자체 셰이더/stage·디스크 캐시, 라이브러리 게시·재사용, owner별 graphics/compute PSO와 RT 함수 재사용도 유지합니다.
 
 DXGI 비디오 메모리 조회, 출력 모니터 조회, 전체 화면 진입점과 출력 열거는 원본 메서드를 호출할 때도 Windows x64 호출 규약을 사용합니다. 네이티브 내부 헬퍼는 호스트 ABI를 유지합니다. 이 규약이 섞이면 렌더링 전 Unity 기동 단계에서 크래시가 발생합니다.
 
@@ -37,6 +37,10 @@ converter는 원본을 유지합니다. 준비 도구는 `native-sidecar-patch`,
 
 ## 선택적 비동기 graphics pipeline
 
+실제로 발행한 비어 있지 않은 draw만 attachment 반복 사용 이력을 갱신합니다. DX11·DX12에서 생략한 draw는 5개 epoch 이력을 연장하지 않습니다. 실제 draw가 target 이력을 갱신하지 않으면 적격성이 만료되고 다음 draw는 네이티브 동기 경로로 처리합니다. 정점·인덱스 수 또는 instance 수가 0인 DX12 draw는 작업 요청과 target 사용 기록 없이 async 판정을 건너뜁니다.
+
+DX12 동기 요청과 owner 전체 대기는 아직 시작하지 않은 작업을 직접 가져와 호출 스레드에서 컴파일하므로 GCD 실행 차례를 기다리지 않습니다. 이미 실행 중인 작업에는 합류하며, 네이티브 해제 전 owner의 모든 variant가 완료돼야 한다는 조건은 유지합니다. 큐 callback은 state·네이티브 PSO에 접근하기 전에 독립적으로 보유한 claim 토큰을 확인합니다. 따라서 동기 처리와 owner 해제가 끝난 뒤 callback이 도착해도 중복 컴파일이나 해제된 owner 접근이 발생하지 않습니다. Worker 병렬도와 QoS는 기존 GCD 정책을 유지합니다. Ready 확인값의 캐시 확대는 다중 PSO miss 측정에서 느려져 채택하지 않았습니다.
+
 고정된 native FFX presenter에서는 PE 합성 callback의 context 수명 식별자, frame ID와 생성·실제 프레임 구분을 같은 스레드의 다음 일치하는 실제 swapchain Present로 전달합니다. 생성 프레임 제출이 성공한 뒤 같은 프레임의 실제 출력이 이어져도 공통 epoch는 한 번만 증가합니다. 생성 프레임만 또는 실제 프레임만 출력할 때도 진행하며, 실패·TEST·native counter가 변하지 않은 호출은 세지 않습니다. 생성 전용 설정은 불변 binding에 보존하고 뒤따를 실제 프레임을 기다리는 쌍을 남기지 않습니다. No-notify 설정은 swapchain에 여전히 설치된 binding을 유지합니다. DLL의 RSDS 빌드 식별자와 기본 합성 함수의 진입 바이트로 분석한 callback 순서의 적용 대상을 제한합니다. 앱 callback과 원본 native 기본 UI 합성은 descriptor, premultiplied-alpha 확장과 user context 의미를 유지합니다. 알 수 없는 native 빌드는 기존 동작을 유지합니다. 5개 연속 epoch 조건과 만료 규칙은 바꾸지 않으며, 서로 독립적인 실제 swapchain Present는 기존 공통 시계를 계속 사용합니다.
 
 런타임 실행 환경에 `YAAGL_D3DMETAL_ASYNC=1`을 설정하면 DX12 graphics PSO 백그라운드 컴파일과 DX11의 네이티브 컴파일 대기 중 draw 생략을 활성화합니다. 기본값은 비활성입니다. `YAAGL_D3DMETAL_ASYNC_LOG=1`은 `dx11-skipped` 등을 기록합니다. 네이티브 읽기 전용 `yaagl_d3dmetal_async_stats` export의 구조는 `d3dmetal-sidecar/async-pipeline.hpp`에 있습니다. queued·ready·failed·synchronous는 sidecar가 관리하는 DX12 요청을, skipped는 두 API의 생략을 셉니다. 드라이버 cache miss나 프레임 시간 개선을 뜻하지 않습니다.
@@ -54,6 +58,22 @@ DX12의 UAV 판정은 원본 converter의 root-signature 파서를 재사용합�
 `node --test scripts/test-async-pipeline.mjs`는 동일 key 작업 중복 방지, 완료·실패·해제와 eligibility를 결정적으로 검사하며, 실제 texture-history 구현의 만료, mip·slice 분리, 객체 수명과 용량 경계도 검사합니다. `scripts/d3dmetal-async-smoke.cpp`는 별도 staged runtime에서 실제 D3D12·GPU readback으로 draw 재개, query·UAV 동기 처리, indirect root 상태 초기화와 PSO 해제를 검사합니다. 빌드 명령은 영문 README의 같은 절에 있으며, 격리한 prefix에서 async를 끈 경우와 켠 경우를 실행합니다. 첫 draw 이전에 컴파일이 끝난 경우도 정상으로 취급하고, pending 동작은 sleep이나 컴파일 속도에 의존하지 않는 네이티브 테스트로 검사합니다.
 
 `scripts/d3dmetal-dx11-async-smoke.cpp`는 실제 DX11 GPU readback, multithread 보호를 켠 context 잠금, 네 가지 direct draw 형태, query·UAV 동기 처리, 첫 사용 target과 리소스 수명·상태 복원을 포함한 deferred 재생을 검사합니다. 빌드 명령은 영문 README의 같은 절에 있으며 async OFF/ON으로 실행합니다. 네이티브 테스트는 pending 플래그를 명시적으로 유지해 컴파일 속도에 의존하지 않고 생략·완료·예약되지 않은 variant의 진행과 안전 조건을 검사합니다.
+
+## 선택적 2프레임 저지연 모드
+
+`YAAGL_D3DMETAL_LOW_LATENCY=1`을 설정하고 게임의 Reflex 저지연 옵션을 켭니다. 기본값은 비활성이며 async 컴파일 옵션과 독립적입니다. 원본 NVAPI·Unix bridge를 거쳐, 게임이 입력을 받기 전에 호출하는 `NvAPI_D3D_Sleep`에서 대기합니다. 이 호출이 없는 게임에 입력 훅을 강제로 추가하지 않습니다.
+
+Reflex 호출 없이 적용하려면 `YAAGL_D3DMETAL_LOW_LATENCY=force`를 설정합니다. 실제로 진행한 Present가 반환되기 전에 미완료 Present가 2개 미만이 될 때까지 기다려 다음 프레임의 공간을 확보합니다. 이때 native Present의 잠금은 이미 해제된 상태입니다. TEST, 비진행 호출과 `DXGI_PRESENT_DO_NOT_WAIT`에는 추가 대기를 넣지 않으며 DXGI waitable object 설정과 swapchain 생성 플래그는 유지합니다.
+
+강제 모드에서도 게임이 저지연을 요청하고 실제 Sleep을 호출하면 입력 전 경로로 전환합니다. 설정만 켜고 호출하지 않는 경우에는 전환하지 않습니다. Sleep 호출이 중단되거나 게임에서 Reflex를 끄면 Present 대기로 돌아가며, 두 경로에서 동시에 기다리지 않습니다. 따라서 게임의 Reflex OFF만으로 명시적으로 선택한 강제 모드가 꺼지지는 않습니다. 전체 기능을 끄려면 환경변수를 해제합니다. 강제 모드는 임의 게임의 입력 위치를 알 수 없으며 별도 시뮬레이션 스레드가 앞서가는 것까지 막지는 못합니다.
+
+협력 경로에서는 CPU가 예약한 프레임과 native Present 완료를 기다리는 프레임을 합쳐 최대 2개만 허용합니다. Sleep에서 먼저 예약하므로 렌더 스레드가 늦어져도 CPU가 계속 앞서가지 않습니다. Native Present 완료가 여유 공간을 반환하며 TEST·비진행 Present는 소비하지 않습니다. 협력 경로의 Present에는 추가 대기를 넣지 않습니다.
+
+TEST 뒤 실제 Present가 이어지면 예약을 유지합니다. TEST만 수행한 입력 반복이나 CPU 예약이 여러 개여서 TEST의 소속을 판별할 수 없는 경우에는, 발생하지 않을 GPU 완료를 기다리는 대신 대기를 비활성화합니다.
+
+두 모드 모두 활성 swapchain이 여러 개면 대기를 중단하며, 알려진 FFX 생성 프레임·Reflex out-of-band marker·겹치는 Present는 대기를 비활성화합니다. 협력 전용 모드는 동기화 이후 예약 없이 들어온 Present도 비활성화 조건입니다. 강제 모드보다 이 안전 조건이 우선합니다. 대기 경로 전환, 제외 판정과 native 객체 정리는 해당 대기자를 깨웁니다. Boost 요청은 힌트로 받지만 Apple GPU 클럭을 바꾸지 않습니다. NVAPI 최소 프레임 간격이 0이 아닌 요청은 `NVAPI_NOT_SUPPORTED`를 반환합니다. 고정 깊이 제한이며 FPS 제한기는 아닙니다. Sleep status는 실제 적격성과 관측한 대기 시간을 보고하며, `GetLatency`는 원본 구현으로 유지하므로 새로운 입력-화면 지연 측정값이 아닙니다.
+
+`node --test scripts/test-low-latency.mjs`는 이벤트 기반 동기화로 2개 제한, 지연 제출, 반환 전 완료 callback, rollback, 강제·Reflex 전환, 비차단 Present, 취소, 해제와 device 분리를 검사합니다. Native ABI·수명 근거와 측정 범위는 [저지연 조사 및 구현 기록](documentation/LOW-LATENCY-DESIGN.md)에 정리합니다.
 
 ## Wine과 sidecar 빌드
 

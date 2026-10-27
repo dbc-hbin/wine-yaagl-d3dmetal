@@ -27,7 +27,6 @@ namespace yaagl::pso::fsr::framegeneration {
 namespace {
 
 namespace transport = d3dmetal;
-using Mode = metalfx::CommandMode;
 
 constexpr std::uint32_t Ok = 0;
 constexpr std::uint32_t Runtime = 3;
@@ -290,7 +289,6 @@ struct Kernels {
 };
 
 struct Configuration {
-    Mode mode = Mode::Legacy;
     Object device;
     Object compiler;
     Object descriptor;
@@ -315,18 +313,15 @@ struct Configuration {
 
     NSUInteger threadgroupWidth(const yaagl_fsr_fg_prepare_packet& parameters) const {
         // Only this complete render/output profile has measured Metal4 evidence.
-        return mode == Mode::Metal4 &&
-            parameters.render_width == 1920 && parameters.render_height == 1080 &&
+        return parameters.render_width == 1920 && parameters.render_height == 1080 &&
             outputWidth == 2560 && outputHeight == 1440 ? 16 : 8;
     }
 
     Object makeInterpolator() const {
         if (@available(macOS 26.0, *)) {
             auto d = (MTLFXFrameInterpolatorDescriptor*)descriptor.get();
-            id instance = mode == Mode::Metal4
-                ? (id)[d newFrameInterpolatorWithDevice:(id<MTLDevice>)device.get()
-                                               compiler:(id<MTL4Compiler>)compiler.get()]
-                : (id)[d newFrameInterpolatorWithDevice:(id<MTLDevice>)device.get()];
+            id instance = [d newFrameInterpolatorWithDevice:(id<MTLDevice>)device.get()
+                                                  compiler:(id<MTL4Compiler>)compiler.get()];
             Object result(instance);
             [instance release];
             return result;
@@ -432,8 +427,8 @@ struct State {
     std::uint64_t generationEpoch = 0;
     // Protected by executionMutex; set while this context holds a HudRow count.
     bool hudCounted = false;
-    bool hasMode = false;
-    Mode mode = Mode::Legacy;
+    // Set only after the first eligible Prepare has selected the MetalFX provider.
+    bool providerSelected = false;
     Object metalDevice;
     // Dense pending metadata only; recorded commands retain their own snapshots.
     // Full IDs avoid modulo collisions, and swap removal never moves a Snapshot.
@@ -498,11 +493,10 @@ std::shared_ptr<State> lookup(std::uint64_t context) {
     return found == contexts.end() ? nullptr : found->second;
 }
 
-bool supported(id<MTLDevice> device, Mode mode, void* compiler) {
+bool supported(id<MTLDevice> device, void* compiler) {
     if (@available(macOS 26.0, *)) {
-        return device && (mode == Mode::Metal4
-            ? compiler && [MTLFXFrameInterpolatorDescriptor supportsMetal4FX:device]
-            : [MTLFXFrameInterpolatorDescriptor supportsDevice:device]);
+        return device && compiler &&
+            [MTLFXFrameInterpolatorDescriptor supportsMetal4FX:device];
     }
     return false;
 }
@@ -514,7 +508,6 @@ std::shared_ptr<Configuration> configure(
     NSUInteger outputWidth, NSUInteger outputHeight, std::uint32_t transfer,
     bool distortionEnabled) {
     if (@available(macOS 26.0, *)) {
-        const Mode mode = Mode::Metal4;
         auto device = (id<MTLDevice>)command.value.device;
         // api() already validated Metal4 support for this same retained command.
         const MTLPixelFormat color = MTLPixelFormatRGBA16Float;
@@ -525,7 +518,7 @@ std::shared_ptr<Configuration> configure(
         const bool cameraPresent = packet.camera_info_present != 0;
         // MetalFX consumes color, depth, and motion in one origin-zero active domain.
         for (const auto& cached : state.configurations) {
-            if (cached->device.get() == device && cached->mode == mode &&
+            if (cached->device.get() == device &&
                 cached->color == color && cached->ui == ui &&
                 cached->sourceColor == sourceColor && cached->sourceUi == sourceUi &&
                 cached->transfer == transfer && cached->cameraPresent == cameraPresent &&
@@ -537,7 +530,6 @@ std::shared_ptr<Configuration> configure(
         }
 
         auto result = std::make_shared<Configuration>();
-        result->mode = mode;
         result->device = Object(device);
         result->compiler = Object((id)command.value.compiler);
         result->color = color;
@@ -583,9 +575,10 @@ std::shared_ptr<Configuration> configure(
             kernels = {};
         if (!kernels.library) {
             NSError* libraryError = nil;
-            id<MTLLibrary> library = [device
-                newLibraryWithSource:[NSString stringWithUTF8String:kFsrKernelsSource]
-                             options:nil error:&libraryError];
+            dispatch_data_t data = dispatch_data_create(kFsrKernelsMetallib, sizeof(kFsrKernelsMetallib),
+                                                        nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+            id<MTLLibrary> library = [device newLibraryWithData:data error:&libraryError];
+            dispatch_release(data);
             kernels.library = Object(library);
             [library release];
             if (!kernels.library) return {};
@@ -734,12 +727,12 @@ struct CameraPlanes {
 bool normalizeCameraPlanes(const yaagl_fsr_fg_prepare_packet& p,
                            std::uint32_t createFlags, CameraPlanes& planes) noexcept {
     if (!std::isfinite(p.camera_near) || p.camera_near <= 0) return false;
-    if (std::isnan(p.camera_far) ||
-        (std::isinf(p.camera_far) && p.camera_far < 0)) return false;
     if (createFlags & YAAGL_FSR_FG_DEPTH_INFINITE) {
         planes = {p.camera_near, INFINITY};
         return true;
     }
+    if (std::isnan(p.camera_far) ||
+        (std::isinf(p.camera_far) && p.camera_far < 0)) return false;
     if (std::isinf(p.camera_far)) {
         planes = {p.camera_near, INFINITY};
         return true;
@@ -862,49 +855,35 @@ struct API_AVAILABLE(macos(26.0)) Prepass {
     }
 };
 
-bool copyTextures(id buffer, id fence, Mode mode, const Copy* copies,
-                  std::size_t count, std::vector<Object>& retained, id sharedEncoder = nil) {
+API_AVAILABLE(macos(26.0))
+bool copyTextures(id<MTL4CommandBuffer> buffer, id<MTLFence> fence, const Copy* copies,
+                  std::size_t count, std::vector<Object>& retained,
+                  id<MTL4ComputeCommandEncoder> sharedEncoder = nil) {
     if (@available(macOS 26.0, *)) {
-    id encoder = sharedEncoder ? sharedEncoder : mode == Mode::Metal4
-        ? send<id>(buffer, sel_registerName("computeCommandEncoder"))
-        : (id)[(id<MTLCommandBuffer>)buffer blitCommandEncoder];
-    if (!encoder) return false;
-    if (!sharedEncoder) retained.emplace_back(encoder);
-    if (fence && !sharedEncoder) {
-        if (mode == Mode::Metal4)
-            [(id<MTL4ComputeCommandEncoder>)encoder waitForFence:(id<MTLFence>)fence
-                                             beforeEncoderStages:MTLStageBlit];
-        else
-            [(id<MTLBlitCommandEncoder>)encoder waitForFence:(id<MTLFence>)fence];
-    }
-    for (std::size_t i = 0; i != count; ++i) {
-        const auto& copy = copies[i];
-        send<void>(encoder,
-            sel_registerName("copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:"
-                             "sourceSize:toTexture:destinationSlice:destinationLevel:"
-                             "destinationOrigin:"),
-            copy.source, NSUInteger(0), NSUInteger(0),
-            MTLOriginMake(copy.sourceX, copy.sourceY, 0),
-            MTLSizeMake(copy.width, copy.height, 1), copy.destination,
-            NSUInteger(0), NSUInteger(0),
-            MTLOriginMake(copy.destinationX, copy.destinationY, 0));
-    }
-    if (sharedEncoder) {
-        [(id<MTL4ComputeCommandEncoder>)encoder
-            barrierAfterEncoderStages:MTLStageBlit
-            beforeEncoderStages:MTLStageDispatch
-            visibilityOptions:MTL4VisibilityOptionDevice];
+        id<MTL4ComputeCommandEncoder> encoder =
+            sharedEncoder ? sharedEncoder : [buffer computeCommandEncoder];
+        if (!encoder) return false;
+        if (!sharedEncoder) retained.emplace_back(encoder);
+        if (fence && !sharedEncoder)
+            [encoder waitForFence:fence beforeEncoderStages:MTLStageBlit];
+        for (std::size_t i = 0; i != count; ++i) {
+            const auto& copy = copies[i];
+            [encoder copyFromTexture:copy.source sourceSlice:0 sourceLevel:0
+                        sourceOrigin:MTLOriginMake(copy.sourceX, copy.sourceY, 0)
+                          sourceSize:MTLSizeMake(copy.width, copy.height, 1)
+                           toTexture:copy.destination destinationSlice:0 destinationLevel:0
+                   destinationOrigin:MTLOriginMake(copy.destinationX, copy.destinationY, 0)];
+        }
+        if (sharedEncoder) {
+            [encoder barrierAfterEncoderStages:MTLStageBlit
+                           beforeEncoderStages:MTLStageDispatch
+                             visibilityOptions:MTL4VisibilityOptionDevice];
+            return true;
+        }
+        if (fence)
+            [encoder updateFence:fence afterEncoderStages:MTLStageBlit];
+        [encoder endEncoding];
         return true;
-    }
-    if (fence) {
-        if (mode == Mode::Metal4)
-            [(id<MTL4ComputeCommandEncoder>)encoder updateFence:(id<MTLFence>)fence
-                                             afterEncoderStages:MTLStageBlit];
-        else
-            [(id<MTLBlitCommandEncoder>)encoder updateFence:(id<MTLFence>)fence];
-    }
-    send<void>(encoder, sel_registerName("endEncoding"));
-    return true;
     }
     return false;
 }
@@ -944,71 +923,47 @@ struct PassTextures {
     id<MTLTexture> present = nil;
 };
 
-bool computePass(id buffer, id fence, Mode mode, id argumentTable,
+API_AVAILABLE(macos(26.0))
+bool computePass(id<MTL4CommandBuffer> buffer, id<MTLFence> fence, id<MTL4ArgumentTable> table,
                  NSUInteger threadgroupWidth,
                  id<MTLComputePipelineState> pipeline, const PassTextures& textures,
                  id<MTLBuffer> parameterBuffer,
                  NSUInteger parameterOffset, const FgParams& params,
-                 std::vector<Object>& retained, id sharedEncoder = nil,
+                 std::vector<Object>& retained, id<MTL4ComputeCommandEncoder> sharedEncoder = nil,
                  bool depthDependency = false) {
     if (!pipeline || !textures.source || !textures.destination || !parameterBuffer) return false;
     if (@available(macOS 26.0, *)) {
-        if (mode == Mode::Metal4) {
-            id<MTL4ArgumentTable> table = (id<MTL4ArgumentTable>)argumentTable;
-            if (!table) return false;
-            [table setAddress:parameterBuffer.gpuAddress + parameterOffset atIndex:0];
-            const id<MTLTexture> bindings[]{
-                textures.source, textures.destination, textures.auxiliary0,
-                textures.auxiliary0 ? textures.auxiliary1 : nil,
-                textures.auxiliary0 ? (textures.ui ? textures.ui : textures.source) : nil,
-                textures.auxiliary0 ? (textures.scene ? textures.scene : textures.source) : nil,
-                textures.auxiliary0 ? (textures.present ? textures.present : textures.source) : nil};
-            for (NSUInteger i = 0; i < std::size(bindings); ++i)
-                [table setTexture:(bindings[i] ? bindings[i].gpuResourceID : MTLResourceID{})
-                          atIndex:i];
-            id<MTL4ComputeCommandEncoder> encoder =
-                sharedEncoder ? (id<MTL4ComputeCommandEncoder>)sharedEncoder :
-                    [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
-            if (!encoder) return false;
-            if (!sharedEncoder) {
-                retained.emplace_back(encoder);
-                [encoder waitForFence:(id<MTLFence>)fence beforeEncoderStages:MTLStageDispatch];
-            } else if (depthDependency) {
-                // Motion reconstruction consumes the stored normalized depth.
-                [encoder barrierAfterEncoderStages:MTLStageDispatch
-                               beforeEncoderStages:MTLStageDispatch
-                                 visibilityOptions:MTL4VisibilityOptionDevice];
-            }
-            [encoder setComputePipelineState:pipeline];
-            [encoder setArgumentTable:table];
-            [encoder dispatchThreads:MTLSizeMake(params.extent[0], params.extent[1], 1)
-                 threadsPerThreadgroup:MTLSizeMake(threadgroupWidth, 8, 1)];
-            if (!sharedEncoder) {
-                [encoder updateFence:(id<MTLFence>)fence afterEncoderStages:MTLStageDispatch];
-                [encoder endEncoding];
-            }
-            return true;
-        }
-        id<MTLComputeCommandEncoder> encoder =
-            [(id<MTLCommandBuffer>)buffer computeCommandEncoder];
+        if (!table) return false;
+        [table setAddress:parameterBuffer.gpuAddress + parameterOffset atIndex:0];
+        const id<MTLTexture> bindings[]{
+            textures.source, textures.destination, textures.auxiliary0,
+            textures.auxiliary0 ? textures.auxiliary1 : nil,
+            textures.auxiliary0 ? (textures.ui ? textures.ui : textures.source) : nil,
+            textures.auxiliary0 ? (textures.scene ? textures.scene : textures.source) : nil,
+            textures.auxiliary0 ? (textures.present ? textures.present : textures.source) : nil};
+        for (NSUInteger i = 0; i < std::size(bindings); ++i)
+            [table setTexture:(bindings[i] ? bindings[i].gpuResourceID : MTLResourceID{})
+                      atIndex:i];
+        id<MTL4ComputeCommandEncoder> encoder =
+            sharedEncoder ? sharedEncoder : [buffer computeCommandEncoder];
         if (!encoder) return false;
-        retained.emplace_back(encoder);
-        [encoder waitForFence:(id<MTLFence>)fence];
-        [encoder setComputePipelineState:pipeline];
-        [encoder setTexture:textures.source atIndex:0];
-        [encoder setTexture:textures.destination atIndex:1];
-        if (textures.auxiliary0) {
-            [encoder setTexture:textures.auxiliary0 atIndex:2];
-            if (textures.auxiliary1) [encoder setTexture:textures.auxiliary1 atIndex:3];
-            [encoder setTexture:(textures.ui ? textures.ui : textures.source) atIndex:4];
-            [encoder setTexture:(textures.scene ? textures.scene : textures.source) atIndex:5];
-            [encoder setTexture:(textures.present ? textures.present : textures.source) atIndex:6];
+        if (!sharedEncoder) {
+            retained.emplace_back(encoder);
+            [encoder waitForFence:fence beforeEncoderStages:MTLStageDispatch];
+        } else if (depthDependency) {
+            // Motion reconstruction consumes the stored normalized depth.
+            [encoder barrierAfterEncoderStages:MTLStageDispatch
+                           beforeEncoderStages:MTLStageDispatch
+                             visibilityOptions:MTL4VisibilityOptionDevice];
         }
-        [encoder setBuffer:parameterBuffer offset:parameterOffset atIndex:0];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setArgumentTable:table];
         [encoder dispatchThreads:MTLSizeMake(params.extent[0], params.extent[1], 1)
-             threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-        [encoder updateFence:(id<MTLFence>)fence];
-        [encoder endEncoding];
+             threadsPerThreadgroup:MTLSizeMake(threadgroupWidth, 8, 1)];
+        if (!sharedEncoder) {
+            [encoder updateFence:fence afterEncoderStages:MTLStageDispatch];
+            [encoder endEncoding];
+        }
         return true;
     }
     return false;
@@ -1016,7 +971,7 @@ bool computePass(id buffer, id fence, Mode mode, id argumentTable,
 
 bool sameConfiguration(const Configuration& a, const Configuration& b) {
     return a.factory.get() == b.factory.get() &&
-           a.device.get() == b.device.get() && a.mode == b.mode &&
+           a.device.get() == b.device.get() &&
            a.color == b.color && a.ui == b.ui &&
            a.sourceColor == b.sourceColor && a.sourceUi == b.sourceUi &&
            a.transfer == b.transfer && a.cameraPresent == b.cameraPresent &&
@@ -1093,8 +1048,7 @@ struct ExecutionLease::Impl {
         }
     }
 
-    bool makeResident(id buffer, Mode mode) {
-        if (mode != Mode::Metal4) return true;
+    bool makeResident(id buffer) {
         if (@available(macOS 26.0, *)) {
             auto device = (id<MTLDevice>)prepared->configuration->device.get();
             id<MTLResidencySet> set = (id<MTLResidencySet>)residency.get();
@@ -1128,10 +1082,6 @@ ExecutionLease::ExecutionLease(std::shared_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
 ExecutionLease::~ExecutionLease() = default;
 
-Mode PreparedFrame::mode() const noexcept {
-    return impl_->configuration->mode;
-}
-
 bool PreparedFrame::encode(
     void* commandBuffer, void* fence,
     std::shared_ptr<const ExecutionLease>& lease) const noexcept {
@@ -1153,18 +1103,12 @@ bool PreparedFrame::encode(
         @try {
             if (@available(macOS 26.0, *)) {
                 if (!commandBuffer || !impl_ || !impl_->snapshot) return fail("encode_arguments");
-                id buffer = (id)commandBuffer;
+                auto buffer = (id<MTL4CommandBuffer>)commandBuffer;
                 auto& configuration = *impl_->configuration;
                 const NSUInteger threadgroupWidth =
                     configuration.threadgroupWidth(impl_->snapshot->parameters);
-                if (configuration.mode == Mode::Metal4) {
-                    if (![buffer conformsToProtocol:@protocol(MTL4CommandBuffer)])
-                        return fail("encode_command_buffer_type");
-                } else {
-                    if (![buffer conformsToProtocol:@protocol(MTLCommandBuffer)] ||
-                        [(id<MTLCommandBuffer>)buffer device] != configuration.device.get())
-                        return fail("encode_command_buffer_device");
-                }
+                if (![buffer conformsToProtocol:@protocol(MTL4CommandBuffer)])
+                    return fail("encode_command_buffer_type");
                 auto execution = std::make_shared<ExecutionLease::Impl>();
                 execution->prepared = impl_;
                 const id inputs[]{
@@ -1183,7 +1127,7 @@ bool PreparedFrame::encode(
                     // Input ownership plus the single snapshot copy encoder.
                     execution->objects.reserve(std::size(inputs) + 1);
                     for (id object : inputs) execution->objects.emplace_back(object);
-                    if (!execution->makeResident(buffer, configuration.mode))
+                    if (!execution->makeResident(buffer))
                         return fail("snapshot_residency");
                     const std::array<Copy, 2> copies{{
                         {(id<MTLTexture>)impl_->first.get(),
@@ -1197,7 +1141,7 @@ bool PreparedFrame::encode(
                          impl_->snapshot->parameters.motion_subrect_x,
                          impl_->snapshot->parameters.motion_subrect_y}
                     }};
-                    if (!copyTextures(buffer, (id)fence, configuration.mode,
+                    if (!copyTextures(buffer, (id<MTLFence>)fence,
                                       copies.data(), copies.size(), execution->objects))
                         return fail("snapshot_copy");
                     impl_->snapshot->produced = true;
@@ -1383,14 +1327,11 @@ bool PreparedFrame::encode(
                 depthParams.sourceJitterUv[1] = p.jitter_y / float(p.render_height);
 
                 FgParams motionParams{};
-                motionParams.sourceOrigin[0] = p.motion_subrect_x;
-                motionParams.sourceOrigin[1] = p.motion_subrect_y;
                 motionParams.extent[0] = configuration.width;
                 motionParams.extent[1] = configuration.height;
                 const bool displayMotion = (state.creation.flags &
                     YAAGL_FSR_FG_DISPLAY_RESOLUTION_MOTION_VECTORS) != 0;
-                // The generation rectangle is a placement offset, not a source offset.
-                // Resample the complete origin-zero motion domain into the active rect.
+                // Snapshot copies have already consumed the resource subrect origins.
                 motionParams.sourceExtent[0] = impl_->snapshot->motionWidth;
                 motionParams.sourceExtent[1] = impl_->snapshot->motionHeight;
                 // Render-grid samples sit at (texel + 0.5 - J) / renderExtent.
@@ -1409,6 +1350,18 @@ bool PreparedFrame::encode(
                     : (p.motion_height ? p.motion_height : p.render_height);
                 motionParams.outputExtent[0] = configuration.outputWidth;
                 motionParams.outputExtent[1] = configuration.outputHeight;
+                if (displayMotion && !d.independent_subrects &&
+                    impl_->snapshot->motionWidth == state.creation.display_width &&
+                    impl_->snapshot->motionHeight == state.creation.display_height) {
+                    // Full-display motion shares the public color crop. Cropping
+                    // does not scale pixel displacement; packed domains still resample.
+                    motionParams.sourceOrigin[0] = sceneParams.sourceOrigin[0];
+                    motionParams.sourceOrigin[1] = sceneParams.sourceOrigin[1];
+                    motionParams.sourceExtent[0] = configuration.width;
+                    motionParams.sourceExtent[1] = configuration.height;
+                    motionParams.outputExtent[0] = state.creation.display_width;
+                    motionParams.outputExtent[1] = state.creation.display_height;
+                }
                 motionParams.motionScale[0] = p.motion_scale_x;
                 motionParams.motionScale[1] = p.motion_scale_y;
                 motionParams.reconstructCameraMotion = p.reconstruct_camera_motion;
@@ -1472,7 +1425,7 @@ bool PreparedFrame::encode(
                 const bool retainUiView = uiSourceView && uiSourceView.get() != presentView.get();
                 id<MTL4ArgumentTable> argumentTable =
                     (id<MTL4ArgumentTable>)execution->argumentTable.get();
-                if (configuration.mode == Mode::Metal4 && !argumentTable) {
+                if (!argumentTable) {
                     MTL4ArgumentTableDescriptor* descriptor = [MTL4ArgumentTableDescriptor new];
                     @try {
                         descriptor.maxBufferBindCount = 1;
@@ -1500,7 +1453,7 @@ bool PreparedFrame::encode(
                 if (distortionView) execution->objects.push_back(distortionView);
                 execution->objects.push_back(parameterOwner);
                 // Metal4 GPU addresses must be admitted before the residency set commits.
-                if (!execution->makeResident(buffer, configuration.mode))
+                if (!execution->makeResident(buffer))
                     return fail("encode_residency");
 
                 const NSUInteger copyX = d.output_subrect_only ? d.present_x : 0;
@@ -1534,19 +1487,17 @@ bool PreparedFrame::encode(
                         d.distortion_width, d.distortion_height,
                         d.distortion_x, d.distortion_y, 0, 0};
                 Prepass prepass;
-                if (configuration.mode == Mode::Metal4) {
-                    prepass.encoder = [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
-                    if (!prepass.encoder) return fail("encode_prepass");
-                    prepass.fence = (id<MTLFence>)fence;
-                    execution->objects.emplace_back(prepass.encoder);
-                    [prepass.encoder waitForFence:prepass.fence
-                        beforeEncoderStages:MTLStageBlit | MTLStageDispatch];
-                }
-                if (!copyTextures(buffer, (id)fence, configuration.mode,
+                prepass.encoder = [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
+                if (!prepass.encoder) return fail("encode_prepass");
+                prepass.fence = (id<MTLFence>)fence;
+                execution->objects.emplace_back(prepass.encoder);
+                [prepass.encoder waitForFence:prepass.fence
+                    beforeEncoderStages:MTLStageBlit | MTLStageDispatch];
+                if (!copyTextures(buffer, (id<MTLFence>)fence,
                                   baselines.data(), baselineCount, execution->objects,
                                   prepass.encoder))
                     return fail("encode_baseline_copy");
-                if (!computePass(buffer, (id)fence, configuration.mode, argumentTable, threadgroupWidth,
+                if (!computePass(buffer, (id<MTLFence>)fence, argumentTable, threadgroupWidth,
                                  (id<MTLComputePipelineState>)(ui
                                      ? configuration.decodeSceneUiPipeline.get()
                                      : configuration.decodePipeline.get()),
@@ -1558,7 +1509,7 @@ bool PreparedFrame::encode(
                                  execution->objects, prepass.encoder))
                     return fail("encode_scene_decode");
                 if (decodeDistortion && !computePass(
-                        buffer, (id)fence, configuration.mode, argumentTable, threadgroupWidth,
+                        buffer, (id<MTLFence>)fence, argumentTable, threadgroupWidth,
                         (id<MTLComputePipelineState>)configuration.distortionPipeline.get(),
                         {.source = distortionSource,
                          .destination = (id<MTLTexture>)distortion.get()},
@@ -1566,7 +1517,7 @@ bool PreparedFrame::encode(
                         execution->objects, prepass.encoder))
                     return fail("encode_distortion_decode");
                 if (configuration.depthMotionPipeline) {
-                    if (!computePass(buffer, (id)fence, configuration.mode, argumentTable, threadgroupWidth,
+                    if (!computePass(buffer, (id<MTLFence>)fence, argumentTable, threadgroupWidth,
                             (id<MTLComputePipelineState>)configuration.depthMotionPipeline.get(),
                             {.source = (id<MTLTexture>)impl_->snapshot->motion->texture.get(),
                              .destination = (id<MTLTexture>)normalizedMotion.get(),
@@ -1576,14 +1527,14 @@ bool PreparedFrame::encode(
                             execution->objects, prepass.encoder))
                         return fail("encode_depth_motion_normalize");
                 } else {
-                    if (!computePass(buffer, (id)fence, configuration.mode, argumentTable, threadgroupWidth,
+                    if (!computePass(buffer, (id<MTLFence>)fence, argumentTable, threadgroupWidth,
                                      (id<MTLComputePipelineState>)configuration.depthPipeline.get(),
                                      {.source = (id<MTLTexture>)impl_->snapshot->depth->texture.get(),
                                       .destination = (id<MTLTexture>)normalizedDepth.get()},
                                      parameterBuffer, offsetof(ParameterBlock, depth), depthParams,
                                      execution->objects, prepass.encoder))
                         return fail("encode_depth_normalize");
-                    if (!computePass(buffer, (id)fence, configuration.mode, argumentTable, threadgroupWidth,
+                    if (!computePass(buffer, (id<MTLFence>)fence, argumentTable, threadgroupWidth,
                                      (id<MTLComputePipelineState>)configuration.motionPipeline.get(),
                                      {.source = (id<MTLTexture>)impl_->snapshot->motion->texture.get(),
                                       .destination = (id<MTLTexture>)normalizedMotion.get(),
@@ -1697,14 +1648,10 @@ bool PreparedFrame::encode(
                         scheduleHudRowRemoval();
                     }
                 }
-                if (configuration.mode == Mode::Metal4)
-                    [(id<MTL4FXFrameInterpolator>)interpolator.get()
-                        encodeToCommandBuffer:(id<MTL4CommandBuffer>)buffer];
-                else
-                    [(id<MTLFXFrameInterpolator>)interpolator.get()
-                        encodeToCommandBuffer:(id<MTLCommandBuffer>)buffer];
+                [(id<MTL4FXFrameInterpolator>)interpolator.get()
+                    encodeToCommandBuffer:(id<MTL4CommandBuffer>)buffer];
 
-                if (!computePass(buffer, (id)fence, configuration.mode, argumentTable, threadgroupWidth,
+                if (!computePass(buffer, (id<MTLFence>)fence, argumentTable, threadgroupWidth,
                                  (id<MTLComputePipelineState>)configuration.encodePipeline.get(),
                                  {.source = (id<MTLTexture>)output.get(),
                                   .destination = (id<MTLTexture>)outputView.get(),
@@ -1717,37 +1664,21 @@ bool PreparedFrame::encode(
                                  execution->objects))
                     return fail("encode_output_scatter");
                 if (impl_->disableInterpolation) {
-                    if (configuration.mode == Mode::Metal4) {
-                        id<MTL4ComputeCommandEncoder> encoder =
-                            [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
-                        if (!encoder) return fail("encode_disable_hint");
-                        execution->objects.emplace_back(encoder);
-                        [encoder waitForFence:(id<MTLFence>)fence
-                             beforeEncoderStages:MTLStageBlit];
-                        [encoder copyFromBuffer:parameterBuffer
-                                   sourceOffset:offsetof(ParameterBlock, color) +
-                                                offsetof(FgParams, disableHint)
-                                      toBuffer:(id<MTLBuffer>)impl_->disableInterpolation.get()
-                             destinationOffset:impl_->disableInterpolationOffset
-                                          size:sizeof(std::uint32_t)];
-                        [encoder updateFence:(id<MTLFence>)fence
-                            afterEncoderStages:MTLStageBlit];
-                        [encoder endEncoding];
-                    } else {
-                        id<MTLBlitCommandEncoder> encoder =
-                            [(id<MTLCommandBuffer>)buffer blitCommandEncoder];
-                        if (!encoder) return fail("encode_disable_hint");
-                        execution->objects.emplace_back(encoder);
-                        [encoder waitForFence:(id<MTLFence>)fence];
-                        [encoder copyFromBuffer:parameterBuffer
-                                   sourceOffset:offsetof(ParameterBlock, color) +
-                                                offsetof(FgParams, disableHint)
-                                       toBuffer:(id<MTLBuffer>)impl_->disableInterpolation.get()
-                              destinationOffset:d.disable_interpolation_offset
-                                           size:sizeof(std::uint32_t)];
-                        [encoder updateFence:(id<MTLFence>)fence];
-                        [encoder endEncoding];
-                    }
+                    id<MTL4ComputeCommandEncoder> encoder =
+                        [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
+                    if (!encoder) return fail("encode_disable_hint");
+                    execution->objects.emplace_back(encoder);
+                    [encoder waitForFence:(id<MTLFence>)fence
+                         beforeEncoderStages:MTLStageBlit];
+                    [encoder copyFromBuffer:parameterBuffer
+                               sourceOffset:offsetof(ParameterBlock, color) +
+                                            offsetof(FgParams, disableHint)
+                                  toBuffer:(id<MTLBuffer>)impl_->disableInterpolation.get()
+                         destinationOffset:impl_->disableInterpolationOffset
+                                      size:sizeof(std::uint32_t)];
+                    [encoder updateFence:(id<MTLFence>)fence
+                        afterEncoderStages:MTLStageBlit];
+                    [encoder endEncoding];
                 }
                 // A queued command may encode after OFF (or after a subsequent ON).
                 // Its output remains owned by the command, but must not seed new history.
@@ -1950,17 +1881,15 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
             if (!matches(list, true, state->luid)) return finish(Parameter);
             Command command;
             if (!command.open(list)) return finish(Unsupported);
-            Mode mode = Mode::Metal4;
-            if (!supported((id<MTLDevice>)command.value.device, mode,
+            if (!supported((id<MTLDevice>)command.value.device,
                            command.value.compiler))
                 return finish(Unsupported);
-            if (state->hasMode &&
-                (state->mode != mode || state->metalDevice.get() != (id)command.value.device))
+            if (state->providerSelected &&
+                state->metalDevice.get() != (id)command.value.device)
                 return finish(Parameter);
 
             Resources resources;
-            auto implementation = std::make_shared<PreparedFrame::Impl>();
-            implementation->state = state;
+            std::shared_ptr<PreparedFrame::Impl> implementation;
             std::array<std::uint64_t, 8> addresses{};
             std::array<std::uint32_t, 8> states{};
             unsigned resourceCount = 2;
@@ -2004,19 +1933,27 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                 // The first Prepare selects the provider even before the pending
                 // configuration is replayed. Validate its MetalFX eligibility,
                 // but do not create or record snapshots while generation is off.
-                if (!state->generationEnabled && state->hasMode) return finish(Ok);
-                auto configuration = configure(*state, command, *p, depth,
-                    MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid,
-                    p->render_width, p->render_height,
-                    FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
+                if (!state->generationEnabled && state->providerSelected) return finish(Ok);
+                // Prepare only copies snapshots. Reuse validated input requirements
+                // instead of constructing another interpolator for each render size.
+                const auto cached = std::find_if(state->configurations.begin(),
+                    state->configurations.end(), [&](const auto& value) {
+                        return value->device.get() == (id)command.value.device &&
+                            value->depth == depth.pixelFormat;
+                    });
+                auto configuration = cached != state->configurations.end() ? *cached :
+                    configure(*state, command, *p, depth,
+                        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid,
+                        p->render_width, p->render_height,
+                        FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
                 if (!configuration) return finish(Unsupported);
                 if (!state->generationEnabled) {
                     state->configurations.clear();
-                    state->hasMode = true;
-                    state->mode = mode;
+                    state->providerSelected = true;
                     state->metalDevice = Object((id)command.value.device);
                     return finish(Ok);
                 }
+                implementation = std::make_shared<PreparedFrame::Impl>();
                 auto snapshot = std::make_shared<Snapshot>();
                 implementation->configuration = configuration;
                 snapshot->parameters = *p;
@@ -2057,6 +1994,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                     return finish(Parameter);
                 auto found = state->findFrame(frame);
                 if (!found) return finish(Parameter);
+                implementation = std::make_shared<PreparedFrame::Impl>();
                 implementation->kind = PreparedFrame::Impl::Kind::Generate;
                 implementation->generationEpoch = state->generationEpoch;
                 implementation->reset = d->reset != 0;
@@ -2221,6 +2159,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                 if (!implementation->configuration) return finish(Unsupported);
                 implementation->snapshot = *found;
             }
+            implementation->state = state;
             implementation->first = Object((id)resources.values[0].texture);
             implementation->second = Object((id)resources.values[1].texture);
             if (addresses[2])
@@ -2251,8 +2190,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                 return finish(Runtime);
             }
             if (generate) state->eraseFrame(frame);
-            state->hasMode = true;
-            state->mode = mode;
+            state->providerSelected = true;
             state->metalDevice = Object((id)command.value.device);
             return finish(Ok);
         } @catch (NSException*) {

@@ -341,18 +341,23 @@ static ffxReturnCode_t query_impl(ffxContext *handle, ffxQueryDescHeader *desc)
     case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT:
     {
         struct ffxQueryDescUpscaleGetJitterPhaseCount *query = (void *)desc;
-        float ratio;
+        float ratio, phase_count;
         if (!query->renderWidth || !query->displayWidth) return FFX_API_RETURN_ERROR_PARAMETER;
         ratio = (float)query->displayWidth / query->renderWidth;
-        if (query->pOutPhaseCount) *query->pOutPhaseCount = (int32_t)(8.0f * powf(ratio, 2.0f));
+        phase_count = 8.0f * powf(ratio, 2.0f);
+        if ((double)phase_count > INT32_MAX) return FFX_API_RETURN_ERROR_PARAMETER;
+        if (query->pOutPhaseCount) *query->pOutPhaseCount = (int32_t)phase_count;
         return FFX_API_RETURN_OK;
     }
     case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET:
     {
         struct ffxQueryDescUpscaleGetJitterOffset *query = (void *)desc;
+        int32_t remainder;
         uint32_t index;
         if (query->phaseCount <= 0) return FFX_API_RETURN_ERROR_PARAMETER;
-        index = (uint32_t)((query->index % query->phaseCount + query->phaseCount) % query->phaseCount) + 1;
+        remainder = query->index % query->phaseCount;
+        if (remainder < 0) remainder += query->phaseCount;
+        index = (uint32_t)remainder + 1;
         if (query->pOutX) *query->pOutX = radical_inverse(index, 2) - 0.5f;
         if (query->pOutY) *query->pOutY = radical_inverse(index, 3) - 0.5f;
         return FFX_API_RETURN_OK;

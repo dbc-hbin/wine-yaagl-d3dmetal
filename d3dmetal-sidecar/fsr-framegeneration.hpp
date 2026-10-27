@@ -1,7 +1,5 @@
 #pragma once
 
-#include "metalfx-backend.hpp"
-
 #include <cstdint>
 #include <memory>
 
@@ -21,7 +19,6 @@ public:
 
     bool encode(void* commandBuffer, void* fence,
                 std::shared_ptr<const ExecutionLease>& lease) const noexcept;
-    metalfx::CommandMode mode() const noexcept;
 
 private:
     friend std::uint32_t api(std::uint32_t, void*) noexcept;

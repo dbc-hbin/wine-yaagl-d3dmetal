@@ -12,7 +12,7 @@ test("production async pipeline single flight, retirement, root safety and frame
   try {
     const executable = join(directory, "async-pipeline-test");
     const build = spawnSync("xcrun", ["clang++", "-arch", "x86_64", "-std=c++20",
-      "-pthread", "-Wall", "-Wextra", "-Werror", "-framework", "Foundation",
+      "-pthread", "-Wall", "-Wextra", "-Werror", "-Wl,-adhoc_codesign", "-framework", "Foundation",
       join(root, "scripts/native-async-pipeline-test.mm"), "-o", executable],
     { encoding: "utf8", timeout: 120000 });
     assert.equal(build.status, 0, build.stderr || build.error?.message);

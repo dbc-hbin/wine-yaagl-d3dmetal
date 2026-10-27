@@ -148,7 +148,7 @@ static std::shared_ptr<Feature> makeFeature(id<MTLDevice> device, id<MTL4Compile
                     (jittered?FeatureFlagMVJittered:0);
     ci.dynamicOutput=true; ci.outputSubrects=true;
     Error error;
-    auto feature=Feature::create({device,compiler,CommandMode::Metal4},ci,&error);
+    auto feature=Feature::create({device,compiler},ci,&error);
     assert(feature);
     return feature;
 }
@@ -203,6 +203,128 @@ static void cachedExtentRegression(id<MTLDevice> device, id<MTL4Compiler> compil
         }
     [referenceOutput release]; [output release]; [motion release];
     [depth release]; [color release];
+}
+
+static void dynamicExtentHistoryRegression(id<MTLDevice> device, id<MTL4Compiler> compiler) {
+    constexpr unsigned width = 80, height = 64, outWidth = 160, outHeight = 128;
+    CreateInfo creation{};
+    creation.input = {width, height};
+    creation.output = {outWidth, outHeight};
+    creation.featureFlags = FeatureFlagMVLowRes;
+    creation.dynamicOutput = true;
+    Error error;
+    auto feature = Feature::create({device, compiler}, creation, &error);
+    assert(feature);
+    auto color = sharedTexture(device, MTLPixelFormatRGBA16Float, width, height);
+    auto depth = sharedTexture(device, MTLPixelFormatR32Float, width, height);
+    auto motion = sharedTexture(device, MTLPixelFormatRG16Float, width, height);
+    auto output = texture(device, MTLPixelFormatRGBA16Float, outWidth, outHeight,
+                          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+    auto referenceOutput = texture(device, MTLPixelFormatRGBA16Float, outWidth, outHeight,
+                                   MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+    auto descriptor = [MTLFXTemporalScalerDescriptor new];
+    descriptor.inputWidth = width; descriptor.inputHeight = height;
+    descriptor.outputWidth = outWidth; descriptor.outputHeight = outHeight;
+    descriptor.colorTextureFormat = MTLPixelFormatRGBA16Float;
+    descriptor.depthTextureFormat = MTLPixelFormatR32Float;
+    descriptor.motionTextureFormat = MTLPixelFormatRG16Float;
+    descriptor.outputTextureFormat = MTLPixelFormatRGBA16Float;
+    descriptor.inputContentPropertiesEnabled = YES;
+    descriptor.requiresSynchronousInitialization = NO;
+    descriptor.inputContentMinScale =
+        [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:device];
+    descriptor.inputContentMaxScale =
+        [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:device];
+    auto reference = [descriptor newTemporalScalerWithDevice:device compiler:compiler];
+    [descriptor release];
+    assert(reference);
+    const Extent extents[] = {{80,64},{60,48},{60,48},{75,60},{75,60},{80,64},
+                              {60,48},{75,60},{60,48},{64,48},{64,48},{80,64}};
+    for (unsigned n = 0; n < std::size(extents); ++n) {
+        unsigned w = extents[n].width, h = extents[n].height;
+        std::vector<_Float16> colors(width * height * 4), vectors(width * height * 2);
+        std::vector<float> depths(width * height);
+        for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < width; ++x) {
+            unsigned sx = std::min(x, w - 1), sy = std::min(y, h - 1), i = y * width + x;
+            for (unsigned c = 0; c < 3; ++c)
+                colors[i * 4 + c] = float(((sx + n * 2) / 3 + sy / 5 + c) % 7) / 7.f;
+            colors[i * 4 + 3] = 1;
+            depths[i] = .2f + .5f * float((sx + n) % w) / w;
+            vectors[i * 2] = -2.f;
+            vectors[i * 2 + 1] = 0;
+        }
+        // The independent native scaler consumes CPU-clamped capacity textures,
+        // not the sidecar's staging output or reset calculation.
+        [color replaceRegion:MTLRegionMake2D(0,0,width,height) mipmapLevel:0
+            withBytes:colors.data() bytesPerRow:width * 4 * sizeof(_Float16)];
+        [depth replaceRegion:MTLRegionMake2D(0,0,width,height) mipmapLevel:0
+            withBytes:depths.data() bytesPerRow:width * sizeof(float)];
+        [motion replaceRegion:MTLRegionMake2D(0,0,width,height) mipmapLevel:0
+            withBytes:vectors.data() bytesPerRow:width * 2 * sizeof(_Float16)];
+        FrameInfo frame{};
+        frame.color = color; frame.depth = depth; frame.motionVectors = motion; frame.output = output;
+        frame.inputContent = {w,h};
+        frame.colorRect = frame.depthRect = frame.motionRect = {0,0,w,h};
+        frame.outputRect = {0,0,outWidth,outHeight};
+        frame.motionVectorScaleX = frame.motionVectorScaleY = 1;
+        frame.preExposure = 1;
+        frame.jitterOffsetX = n % 2 ? .25f : -.25f;
+        frame.jitterOffsetY = -frame.jitterOffsetX;
+        frame.resetHistory = n == 0 || n == 8;
+        auto lease = execute(device, prepare(feature, frame, {}));
+        auto queue = [device newMTL4CommandQueue];
+        auto allocator = [device newCommandAllocator];
+        auto command = [device newCommandBuffer];
+        auto fence = [device newFence];
+        auto rd = [MTLResidencySetDescriptor new];
+        rd.initialCapacity = 4;
+        NSError* nativeError = nil;
+        auto residency = [device newResidencySetWithDescriptor:rd error:&nativeError];
+        [rd release];
+        assert(residency);
+        for (id<MTLAllocation> allocation : {color, depth, motion, referenceOutput})
+            [residency addAllocation:allocation];
+        [residency commit];
+        [command beginCommandBufferWithAllocator:allocator];
+        [command useResidencySet:residency];
+        auto init = [command computeCommandEncoder];
+        [init updateFence:fence afterEncoderStages:MTLStageDispatch];
+        [init endEncoding];
+        reference.colorTexture = color; reference.depthTexture = depth;
+        reference.motionTexture = motion; reference.outputTexture = referenceOutput;
+        reference.inputContentWidth = w; reference.inputContentHeight = h;
+        reference.preExposure = 1;
+        reference.jitterOffsetX = frame.jitterOffsetX;
+        reference.jitterOffsetY = frame.jitterOffsetY;
+        reference.motionVectorScaleX = reference.motionVectorScaleY = 1;
+        reference.reset = frame.resetHistory || n == 9 || n == 11;
+        reference.fence = fence;
+        [reference encodeToCommandBuffer:command];
+        [command endCommandBuffer];
+        auto completed = dispatch_semaphore_create(0);
+        auto options = [MTL4CommitOptions new];
+        [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            assert(!feedback.error);
+            dispatch_semaphore_signal(completed);
+        }];
+        [queue commit:&command count:1 options:options];
+        assert(dispatch_semaphore_wait(completed,
+            dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC)) == 0);
+        auto actual = pixels<_Float16>(device, output, 4);
+        auto expected = pixels<_Float16>(device, referenceOutput, 4);
+        for (unsigned i = 0; i < actual.size(); ++i) {
+            assert(std::isfinite(float(actual[i])));
+            assert(std::fabs(float(actual[i]) - float(expected[i])) < .003f);
+        }
+        reference.fence = nil;
+        dispatch_release(completed);
+        [options release]; [residency release]; [fence release];
+        [command release]; [allocator release]; [queue release];
+    }
+    feature.reset();
+    [reference release]; [referenceOutput release]; [output release];
+    [motion release]; [depth release]; [color release];
+    puts("SR_DYNAMIC_HISTORY_PASS: native continuity, caller reset and aspect transitions match");
 }
 
 static float inverseSrgb(float value) {
@@ -599,8 +721,13 @@ static void pipelineTransitionRegression(id<MTLDevice> device, id<MTL4Compiler> 
     auto mask=sharedTexture(device,MTLPixelFormatR8Unorm,64,64);
     auto output=texture(device,MTLPixelFormatRGBA16Float,128,128,
         MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite);
-    std::vector<_Float16> colors(64*64*4,.25f), motions(64*64*2,0);
-    for (std::size_t i=3;i<colors.size();i+=4) colors[i]=1;
+    std::vector<_Float16> colors(64*64*4), motions(64*64*2,0);
+    for (unsigned y=0;y<64;++y) for (unsigned x=0;x<64;++x) {
+        const unsigned pixel=(y*64+x)*4;
+        for (unsigned c=0;c<3;++c)
+            colors[pixel+c]=_Float16(.05f+.8f*float((x*3+y*5+c*11)%257)/256.f);
+        colors[pixel+3]=1;
+    }
     std::vector<float> depths(64*64,.5f);
     std::vector<unsigned char> masks(64*64,64);
     [color replaceRegion:MTLRegionMake2D(0,0,64,64) mipmapLevel:0 withBytes:colors.data() bytesPerRow:64*8];
@@ -612,7 +739,7 @@ static void pipelineTransitionRegression(id<MTLDevice> device, id<MTL4Compiler> 
     frame.inputContent={64,64}; frame.colorRect={0,0,64,64};
     frame.depthRect=frame.motionRect=frame.reactiveRect=frame.compositionRect=frame.colorRect;
     frame.outputRect={0,0,128,128}; frame.resetHistory=true;
-    for (unsigned mode=0;mode<4;++mode) {
+    for (unsigned mode : {0u,1u,2u,0u,3u,2u}) {
         FrameOperations ops{};
         ops.sharpening=mode==0;
         ops.sharpness=.5f;
@@ -625,21 +752,11 @@ static void pipelineTransitionRegression(id<MTLDevice> device, id<MTL4Compiler> 
         auto prepared=feature->prepare(frame,textures,&error,ops);
         if (!prepared) std::fprintf(stderr,"pipeline transition: %s\n",error.message.c_str());
         assert(prepared);
-        if (mode==0)
-            assert(feature->impl_->finishPipeline && !feature->impl_->linearizePipeline &&
-                   !feature->impl_->combineMaskPipeline);
-        if (mode==1)
-            assert(feature->impl_->combineMaskPipeline && !feature->impl_->linearizePipeline);
-        if (mode==3)
-            assert(feature->impl_->debugPipeline && !feature->impl_->debugDepthPipeline);
         auto lease=execute(device,prepared);
         auto actual=pixels<_Float16>(device,output,4);
-        if (ops.drawDebugView) {
-            assert(lease->impl_->debugParams && lease->impl_->fsrArgumentTable);
-            assert(!lease->impl_->finishParams);
-        }
         if (ops.combineCompositionMask) {
-            auto combined=pixels<unsigned char>(device,lease->impl_->combinedMask,1);
+            auto combined=pixels<unsigned char>(device,
+                lease->impl_->combinedMask ? lease->impl_->combinedMask : mask,1);
             assert(combined==masks);
         }
         auto reference=makeFeature(device,compiler,true);
@@ -654,6 +771,151 @@ static void pipelineTransitionRegression(id<MTLDevice> device, id<MTL4Compiler> 
     feature.reset();
     [output release]; [mask release]; [motion release]; [depth release]; [color release];
     puts("SR_PIPELINE_TRANSITIONS_PASS: finish-only, masks, transfer and debug match fresh features");
+}
+
+static void compositionMaskRegression(id<MTLDevice> device, id<MTL4Compiler> compiler) {
+    auto feature=makeFeature(device,compiler,true);
+    auto reference=makeFeature(device,compiler,true);
+    auto color=sharedTexture(device,MTLPixelFormatRGBA16Float,64,48);
+    auto depth=sharedTexture(device,MTLPixelFormatR32Float,64,48);
+    auto motion=sharedTexture(device,MTLPixelFormatRG16Float,64,48);
+    auto mask=sharedTexture(device,MTLPixelFormatR8Unorm,64,48);
+    auto zero=sharedTexture(device,MTLPixelFormatR8Unorm,64,48);
+    auto reactive=sharedTexture(device,MTLPixelFormatR8Unorm,64,48);
+    auto floating=sharedTexture(device,MTLPixelFormatR32Float,64,48);
+    auto oversized=sharedTexture(device,MTLPixelFormatR8Unorm,72,52);
+    auto output=texture(device,MTLPixelFormatRGBA16Float,128,96,
+        MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite);
+    auto referenceOutput=texture(device,MTLPixelFormatRGBA16Float,128,96,
+        MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite);
+    std::vector<unsigned char> masks(64*48), zeros(64*48,0), reactions(64*48), large(72*52);
+    std::vector<float> depths(64*48,.5f), floats(64*48);
+    std::vector<_Float16> colors(64*48*4), motions(64*48*2,0);
+    for(unsigned i=0;i<masks.size();++i) {
+        masks[i]=(i*13)%256; reactions[i]=(i*7)%256; floats[i]=float(i%19)/8.f-.5f;
+    }
+    for(unsigned i=0;i<large.size();++i) large[i]=(i*11)%256;
+    [depth replaceRegion:MTLRegionMake2D(0,0,64,48) mipmapLevel:0 withBytes:depths.data() bytesPerRow:64*4];
+    [motion replaceRegion:MTLRegionMake2D(0,0,64,48) mipmapLevel:0 withBytes:motions.data() bytesPerRow:64*4];
+    [mask replaceRegion:MTLRegionMake2D(0,0,64,48) mipmapLevel:0 withBytes:masks.data() bytesPerRow:64];
+    [zero replaceRegion:MTLRegionMake2D(0,0,64,48) mipmapLevel:0 withBytes:zeros.data() bytesPerRow:64];
+    [reactive replaceRegion:MTLRegionMake2D(0,0,64,48) mipmapLevel:0 withBytes:reactions.data() bytesPerRow:64];
+    [floating replaceRegion:MTLRegionMake2D(0,0,64,48) mipmapLevel:0 withBytes:floats.data() bytesPerRow:64*4];
+    [oversized replaceRegion:MTLRegionMake2D(0,0,72,52) mipmapLevel:0 withBytes:large.data() bytesPerRow:72];
+    FrameOperations ops{}; ops.combineCompositionMask=true;
+    for(unsigned mode=0;mode<7;++mode) {
+        for(unsigned i=0;i<64*48;++i) {
+            for(unsigned k=0;k<3;++k) colors[i*4+k]=float((i*7+k*37+mode*53)%251)/250.f;
+            colors[i*4+3]=1;
+        }
+        [color replaceRegion:MTLRegionMake2D(0,0,64,48) mipmapLevel:0 withBytes:colors.data() bytesPerRow:64*8];
+        unsigned w=mode==5?48:64,h=mode==5?36:48;
+        FrameInfo f{};
+        f.color=color; f.depth=depth; f.motionVectors=motion; f.output=output;
+        f.inputContent={w,h}; f.colorRect=f.depthRect=f.motionRect=f.reactiveRect={0,0,w,h};
+        f.compositionRect={mode==4?3u:0u,mode==4?2u:0u,w,h};
+        f.outputRect={0,0,128,96}; f.resetHistory=mode==0;
+        f.jitterOffsetX=float(mode%4)/4.f-.375f; f.jitterOffsetY=-f.jitterOffsetX;
+        f.motionVectorScaleX=w; f.motionVectorScaleY=-float(h);
+        f.compositionMask=mode==3?floating:mode==4?oversized:mask;
+        f.reactiveMask=mode==2?reactive:nullptr;
+        Error error;
+        auto prepared=feature->prepare(f,{color,depth,motion,output,nullptr,
+            f.reactiveMask,f.compositionMask},&error,ops);
+        assert(prepared);
+        auto lease=execute(device,prepared);
+        const bool direct=mode<2 || mode==6;
+        assert((lease->impl_->combinedMask==nil)==direct);
+        auto actual=pixels<_Float16>(device,output,4);
+        // A zero reactive input forces the original max/clamp pass without
+        // changing its result. Keep independent, identically advanced history.
+        f.output=referenceOutput;
+        if (!f.reactiveMask) f.reactiveMask=zero;
+        auto expectedFrame=reference->prepare(f,{color,depth,motion,referenceOutput,nullptr,
+            f.reactiveMask,f.compositionMask},&error,ops);
+        assert(expectedFrame);
+        auto expectedLease=execute(device,expectedFrame);
+        auto expected=pixels<_Float16>(device,referenceOutput,4);
+        for(unsigned i=0;i<actual.size();++i)
+            assert(std::isfinite(float(actual[i])) &&
+                   std::fabs(float(actual[i])-float(expected[i]))<.003f);
+        auto effectiveMask=direct?pixels<unsigned char>(device,mask,1):
+            pixels<unsigned char>(device,lease->impl_->combinedMask,1);
+        assert(effectiveMask==pixels<unsigned char>(device,expectedLease->impl_->combinedMask,1));
+    }
+    [referenceOutput release]; [output release]; [oversized release]; [floating release];
+    [reactive release]; [zero release]; [mask release]; [motion release]; [depth release]; [color release];
+    puts("SR_COMPOSITION_MASK_PASS: direct, both masks, float clamp, offsets and capacity transitions match");
+}
+
+static void copiedInputPaddingRegression(id<MTLDevice> device, id<MTL4Compiler> compiler) {
+    constexpr unsigned width=1920,height=1080,sourceWidth=width+8,sourceHeight=height+8;
+    CreateInfo ci{}; ci.input={width,height}; ci.output={width*2,height*2};
+    ci.dynamicOutput=true; ci.featureFlags=FeatureFlagMVLowRes;
+    Error error;
+    auto feature=Feature::create({device,compiler},ci,&error);
+    assert(feature);
+    auto color=sharedTexture(device,MTLPixelFormatRGBA16Float,sourceWidth,sourceHeight);
+    auto depth=sharedTexture(device,MTLPixelFormatR32Float,sourceWidth,sourceHeight);
+    auto motion=sharedTexture(device,MTLPixelFormatRG16Float,sourceWidth,sourceHeight);
+    auto reactive=sharedTexture(device,MTLPixelFormatR8Unorm,sourceWidth,sourceHeight);
+    auto output=texture(device,MTLPixelFormatRGBA16Float,width*2,height*2,
+        MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite);
+    std::vector<_Float16> colors(sourceWidth*sourceHeight*4),motions(sourceWidth*sourceHeight*2);
+    std::vector<float> depths(sourceWidth*sourceHeight);
+    std::vector<unsigned char> masks(sourceWidth*sourceHeight);
+    for(unsigned y=0;y<sourceHeight;++y) for(unsigned x=0;x<sourceWidth;++x) {
+        auto i=y*sourceWidth+x;
+        for(unsigned k=0;k<3;++k) colors[i*4+k]=float((x*13+y*7+k*53)%251)/250.f;
+        colors[i*4+3]=1;
+        depths[i]=.2f+float((x*13+y*7)%251)/500.f;
+        masks[i]=(x*7+y*11)%256;
+        for(unsigned k=0;k<2;++k) motions[i*2+k]=float(int((x*11+y*3+k)%31)-15)/1024.f;
+    }
+    [color replaceRegion:MTLRegionMake2D(0,0,sourceWidth,sourceHeight) mipmapLevel:0
+        withBytes:colors.data() bytesPerRow:sourceWidth*8];
+    [depth replaceRegion:MTLRegionMake2D(0,0,sourceWidth,sourceHeight) mipmapLevel:0
+        withBytes:depths.data() bytesPerRow:sourceWidth*4];
+    [motion replaceRegion:MTLRegionMake2D(0,0,sourceWidth,sourceHeight) mipmapLevel:0
+        withBytes:motions.data() bytesPerRow:sourceWidth*4];
+    [reactive replaceRegion:MTLRegionMake2D(0,0,sourceWidth,sourceHeight) mipmapLevel:0
+        withBytes:masks.data() bytesPerRow:sourceWidth];
+    // Reuse capacity through repeated full, 90%, and 75% input extents.
+    // The 810-row active extent leaves a partial final doubling-copy block.
+    const Extent extents[]={{width,height},{width*9/10,height*9/10},
+        {width*3/4,height*3/4},{width*9/10,height*9/10},
+        {width,height},{width*9/10,height*9/10},
+        {width*3/4,height*3/4},{width*9/10,height*9/10},
+        {width*3/4,height},{width,height*3/4},
+        {width*3/4+1,height*3/4+1},{width,height}};
+    for(const auto& extent:extents) {
+        unsigned w=extent.width,h=extent.height;
+        FrameInfo f{};
+        f.color=color; f.depth=depth; f.motionVectors=motion; f.output=output;
+        f.inputContent={w,h}; f.colorRect={3,2,w,h}; f.depthRect={3,5,w,h};
+        f.motionRect={7,2,w,h}; f.outputRect={0,0,width*2,height*2};
+        f.reactiveMask=reactive; f.reactiveRect={5,3,w,h};
+        f.motionVectorScaleX=w; f.motionVectorScaleY=-float(h);
+        auto prepared=feature->prepare(f,{color,depth,motion,output,nullptr,reactive,nullptr},&error,{});
+        assert(prepared);
+        auto lease=execute(device,prepared);
+        auto actualColor=pixels<_Float16>(device,lease->impl_->stagedColor,4);
+        auto actualDepth=pixels<float>(device,lease->impl_->stagedDepth,1);
+        auto actualMotion=pixels<_Float16>(device,lease->impl_->stagedMotion,2);
+        auto actualMask=pixels<unsigned char>(device,lease->impl_->stagedReactive,1);
+        for(unsigned y=0;y<height;++y) for(unsigned x=0;x<width;++x) {
+            unsigned sx=std::min(x,w-1),sy=std::min(y,h-1),i=y*width+x;
+            for(unsigned k=0;k<4;++k)
+                assert(actualColor[i*4+k]==colors[((sy+2)*sourceWidth+sx+3)*4+k]);
+            assert(actualDepth[i]==depths[(sy+5)*sourceWidth+sx+3]);
+            for(unsigned k=0;k<2;++k)
+                assert(actualMotion[i*2+k]==motions[((sy+2)*sourceWidth+sx+7)*2+k]);
+            assert(actualMask[i]==masks[(sy+3)*sourceWidth+sx+5]);
+        }
+    }
+    feature.reset();
+    [output release]; [reactive release]; [motion release]; [depth release]; [color release];
+    puts("SR_COPIED_INPUT_PADDING_PASS: full input capacity survives extent changes, odd sizes and independent edges");
 }
 
 static void generatedPaddingRegression(id<MTLDevice> device, id<MTL4Compiler> compiler) {
@@ -680,8 +942,9 @@ static void generatedPaddingRegression(id<MTLDevice> device, id<MTL4Compiler> co
     [composition replaceRegion:MTLRegionMake2D(0,0,96,80) mipmapLevel:0 withBytes:c.data() bytesPerRow:96*4];
     std::shared_ptr<const ExecutionLease> retained;
     std::vector<float> retainedPixels;
-    for(unsigned mode=0;mode<4;++mode) {
-        unsigned w=mode==0?80:64,h=mode==0?64:48;
+    for(unsigned mode=0;mode<7;++mode) {
+        unsigned w=mode==0||mode==4?80:mode==6?79:64;
+        unsigned h=mode==0||mode==5?64:mode==6?63:48;
         auto f=frameInfo(color,depth,motion,output,w,h,160,128,true);
         f.reactiveMask=mode==2?nullptr:reactive;
         f.compositionMask=mode==3?nullptr:composition;
@@ -756,12 +1019,21 @@ static void finishCropRegression(id<MTLDevice> device) {
     [exposure replaceRegion:MTLRegionMake2D(0,0,1,1) mipmapLevel:0
                   withBytes:&exposureValue bytesPerRow:sizeof(exposureValue)];
     NSError* error = nil;
-    auto library = [device newLibraryWithSource:[NSString stringWithUTF8String:kFsrKernelsSource]
-                                       options:nil error:&error];
+    dispatch_data_t data = dispatch_data_create(kFsrKernelsMetallib, sizeof(kFsrKernelsMetallib),
+                                                nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    auto library = [device newLibraryWithData:data error:&error];
+    dispatch_release(data);
     assert(library && !error);
-    auto pipeline = makePipeline(device, library, @"yaagl_fsr_finish");
-    assert(pipeline);
+    std::array<id<MTLComputePipelineState>, 2> pipelines{};
+    for (bool sharpen : {false, true}) {
+        auto constants = [MTLFunctionConstantValues new];
+        [constants setConstantValue:&sharpen type:MTLDataTypeBool atIndex:0];
+        pipelines[sharpen] = makePipeline(device, library, @"yaagl_fsr_finish", constants);
+        [constants release];
+        assert(pipelines[sharpen]);
+    }
     auto queue = [device newCommandQueue];
+    for (bool sharpen : {false, true})
     for (unsigned transfer : {0u, 1u, 2u})
         for (float sharpness : {0.0f, .5f, 1.0f}) {
             std::vector<float> results[2];
@@ -777,13 +1049,13 @@ static void finishCropRegression(id<MTLDevice> device) {
                 params.extent[0] = width; params.extent[1] = height;
                 params.dispatchExtent[0] = ow; params.dispatchExtent[1] = oh;
                 params.transfer = transfer;
-                params.flags = (1u << 2) | (1u << 3) | (centered ? 1u << 4 : 0);
+                params.flags = (1u << 3) | (centered ? 1u << 4 : 0);
                 params.sharpness = sharpness; params.exposure = 1;
                 auto constants = [device newBufferWithBytes:&params length:sizeof(params)
                                                    options:MTLResourceStorageModeShared];
                 auto command = [queue commandBuffer];
                 auto encoder = [command computeCommandEncoder];
-                [encoder setComputePipelineState:pipeline];
+                [encoder setComputePipelineState:pipelines[sharpen]];
                 [encoder setBuffer:constants offset:0 atIndex:0];
                 [encoder setTexture:centered ? source : crop atIndex:0];
                 [encoder setTexture:output atIndex:1];
@@ -811,11 +1083,16 @@ static void finishCropRegression(id<MTLDevice> device) {
                     } else {
                         const unsigned offset = ((y - outputY) * width + x - outputX) * 4;
                         assert(!std::memcmp(pixel, &results[0][offset], 4 * sizeof(float)));
+                        if (!sharpen && transfer == 0)
+                            for (unsigned c = 0; c < 3; ++c)
+                                assert(pixel[c] == float(active[offset + c]));
                         assert(pixel[3] == float(active[offset + 3]));
                     }
                 }
         }
-    [queue release]; [pipeline release]; [library release];
+    [queue release];
+    for (auto pipeline : pipelines) [pipeline release];
+    [library release];
     [exposure release]; [source release]; [crop release];
     puts("SR_FINISH_CROP_PASS: RCAS active edges, centered padding, exposure and alpha preserved");
 }
@@ -832,7 +1109,9 @@ int main() {
         assert(compiler);
         colorRegression(device,compiler);
         cachedExtentRegression(device,compiler);
+        dynamicExtentHistoryRegression(device,compiler);
         generatedPaddingRegression(device,compiler);
+        copiedInputPaddingRegression(device,compiler);
         motionRegression(device,compiler,false,true,false,false);
         motionRegression(device,compiler,false,true,true,false);
         motionRegression(device,compiler,false,true,true,true);
@@ -841,9 +1120,10 @@ int main() {
         tableOwnershipRegression(device,compiler);
         scratchReturnRegression(device,compiler);
         pipelineTransitionRegression(device,compiler);
+        compositionMaskRegression(device,compiler);
         finishCropRegression(device);
 
-        CreateContext context{device, compiler, CommandMode::Metal4};
+        CreateContext context{device, compiler};
         CreateInfo creation{};
         creation.input = {64, 64};
         creation.output = {128, 128};
@@ -930,12 +1210,8 @@ def main():
         source = directory / "fsr-native.mm"
         binary = directory / "fsr-native"
         source.write_text(SOURCE)
-        kernels = (NATIVE / "fsr-kernels.metal").read_text()
-        (directory / "fsr-kernels.inc").write_text(
-            'static const char kFsrKernelsSource[] = R"YAAGL_METAL('
-            + kernels
-            + ')YAAGL_METAL";\n'
-        )
+        subprocess.run(("node", str(NATIVE.parent / "scripts/build-fsr-kernels.mjs"),
+                        str(directory)), check=True)
         subprocess.run(
             (
                 "xcrun",
@@ -944,6 +1220,7 @@ def main():
                 "x86_64",
                 "-std=c++20",
                 "-fno-objc-arc",
+                "-Wl,-adhoc_codesign",
                 "-I",
                 str(NATIVE),
                 "-I",

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Compile the production SR and FG GPU-memory query bodies against the pinned
-SDK and check the D3DMetal DLSS-compatible contract: automatic/MetalFX contexts
-and pre-creation V2 queries report zero usage with success, every error clears
-the output, and native/swapchain contexts keep the native provider's answer.
+"""Exercise production SR jitter queries and SR/FG GPU-memory queries.
+Jitter coverage includes arithmetic boundaries, negative indices and independent
+optional outputs. Memory queries preserve the D3DMetal DLSS-compatible contract:
+automatic/MetalFX contexts report zero usage, errors clear memory outputs, and
+native/swapchain contexts keep the native provider's answer.
 """
 
 import pathlib
@@ -63,6 +64,92 @@ static const char provider_name[] = "MetalFX (FSR 4 API)";
 SR_EPILOGUE = r'''
 static void context_free(const ffxAllocationCallbacks *callbacks, void *memory)
 { (void)callbacks; (void)memory; assert(0 && "live context freed by a query"); }
+
+static void test_jitter_queries(void)
+{
+    static const struct { uint32_t render, display; int32_t count; } phases[] = {
+        {1920, 1920, 8}, {1280, 1920, 18}, {1280, 2560, 32},
+        {3, 4, 14}, {4, 1, 0}, {1, 16383, 2147221504},
+        {1024, 16777215, 2147483392},
+    };
+    static const struct { uint32_t render, display; } invalid[] = {
+        {0, 1920}, {1280, 0}, {1, 16384}, {1, UINT32_MAX},
+    };
+    static const struct { int32_t index, count; uint32_t sample; } offsets[] = {
+        {0, 8, 1}, {1, 8, 2}, {7, 8, 8}, {8, 8, 1},
+        {-1, 8, 8}, {-8, 8, 1}, {-9, 8, 8},
+        {INT32_MAX - 1, INT32_MAX, INT32_MAX},
+        {INT32_MAX, INT32_MAX, 1}, {INT32_MIN, INT32_MAX, INT32_MAX},
+        {-1, INT32_MAX, INT32_MAX}, {INT32_MIN, 1, 1},
+        {INT32_MIN, 8, 1}, {INT32_MAX, 8, 8},
+    };
+    struct ffxQueryDescUpscaleGetJitterPhaseCount phase = {0};
+    struct ffxQueryDescUpscaleGetJitterOffset offset = {0};
+    int32_t count;
+    float x, y;
+    unsigned int i, axis;
+
+    phase.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT;
+    for (i = 0; i < sizeof(phases) / sizeof(phases[0]); ++i)
+    {
+        phase.renderWidth = phases[i].render; phase.displayWidth = phases[i].display;
+        phase.pOutPhaseCount = &count; count = -123;
+        assert(query_impl(NULL, &phase.header) == FFX_API_RETURN_OK);
+        assert(count == phases[i].count);
+        phase.pOutPhaseCount = NULL;
+        assert(query_impl(NULL, &phase.header) == FFX_API_RETURN_OK);
+    }
+    for (i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i)
+    {
+        phase.renderWidth = invalid[i].render; phase.displayWidth = invalid[i].display;
+        phase.pOutPhaseCount = &count; count = -123;
+        assert(query_impl(NULL, &phase.header) == FFX_API_RETURN_ERROR_PARAMETER);
+        assert(count == -123);
+        phase.pOutPhaseCount = NULL;
+        assert(query_impl(NULL, &phase.header) == FFX_API_RETURN_ERROR_PARAMETER);
+    }
+
+    offset.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET;
+    for (i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i)
+    {
+        double expected[2] = {-0.5, -0.5};
+        offset.index = offsets[i].index; offset.phaseCount = offsets[i].count;
+        offset.pOutX = &x; offset.pOutY = &y;
+        assert(query_impl(NULL, &offset.header) == FFX_API_RETURN_OK);
+        for (axis = 0; axis < 2; ++axis)
+        {
+            uint32_t sample = offsets[i].sample, base = axis + 2;
+            double denominator = base;
+            while (sample)
+            {
+                expected[axis] += (sample % base) / denominator;
+                sample /= base; denominator *= base;
+            }
+            assert(fabs((axis ? y : x) - expected[axis]) < 0.000001);
+        }
+        x = y = 123.0f;
+        offset.pOutX = NULL;
+        assert(query_impl(NULL, &offset.header) == FFX_API_RETURN_OK);
+        assert(x == 123.0f && fabs(y - expected[1]) < 0.000001);
+        x = y = 123.0f;
+        offset.pOutX = &x; offset.pOutY = NULL;
+        assert(query_impl(NULL, &offset.header) == FFX_API_RETURN_OK);
+        assert(fabs(x - expected[0]) < 0.000001 && y == 123.0f);
+        x = y = 123.0f;
+        offset.pOutX = NULL;
+        assert(query_impl(NULL, &offset.header) == FFX_API_RETURN_OK);
+        assert(x == 123.0f && y == 123.0f);
+    }
+    offset.pOutX = &x; offset.pOutY = &y;
+    x = y = 123.0f;
+    offset.phaseCount = 0;
+    assert(query_impl(NULL, &offset.header) == FFX_API_RETURN_ERROR_PARAMETER);
+    assert(x == 123.0f && y == 123.0f);
+    offset.phaseCount = INT32_MIN;
+    assert(query_impl(NULL, &offset.header) == FFX_API_RETURN_ERROR_PARAMETER);
+    assert(x == 123.0f && y == 123.0f);
+}
+
 int main(void)
 {
     struct fsr_context live = {0}, stale = {0};
@@ -71,6 +158,7 @@ int main(void)
     struct ffxQueryDescUpscaleGetGPUMemoryUsage v1 = {0};
     struct ffxQueryDescUpscaleGetGPUMemoryUsageV2 v2 = {0}, bad;
 
+    test_jitter_queries();
     live.native = 77; live.references = 1; contexts = &live;
     v1.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
     v1.gpuMemoryUsageUpscaler = &usage;
@@ -119,7 +207,7 @@ int main(void)
     bad = v2; bad.gpuMemoryUsageUpscaler = NULL;
     assert(query_impl(NULL, &bad.header) == FFX_API_RETURN_ERROR_PARAMETER);
     assert(live.references == 1 && locks_held == 0);
-    puts("SR memory query: OK");
+    puts("SR memory and jitter queries: OK");
     return 0;
 }
 '''
@@ -299,8 +387,8 @@ def compile_and_run(code, includes):
         subprocess.run((str(binary),), check=True)
 
 
-class MemoryQueryTest(unittest.TestCase):
-    def test_upscaler_memory_query(self):
+class PublicQueryTest(unittest.TestCase):
+    def test_upscaler_memory_and_jitter_queries(self):
         code = "\n".join((
             SR_PROLOGUE,
             section(SR_SOURCE, "struct fsr_context\n", "static ffxApiMessage global_message;"),

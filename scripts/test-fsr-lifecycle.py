@@ -806,12 +806,211 @@ int main(void)
 '''
 
 
+CONFIGURE = r'''
+#include "yaagl_fsr_fg_bridge.h"
+typedef int LONG;
+typedef pthread_mutex_t CRITICAL_SECTION;
+typedef pthread_mutex_t SRWLOCK;
+#define AcquireSRWLockExclusive EnterCriticalSection
+#define ReleaseSRWLockExclusive LeaveCriticalSection
+static LONG InterlockedCompareExchange(LONG *value, LONG replacement, LONG expected)
+{
+    LONG old = *value;
+    if (old == expected) *value = replacement;
+    return old;
+}
+static LONG InterlockedExchange(LONG *value, LONG replacement)
+{
+    LONG old = *value;
+    *value = replacement;
+    return old;
+}
+struct stable_swapchain;
+struct stable_swapchain_vtbl {
+    void (*set_config)(struct stable_swapchain *, const FfxFrameGenerationConfig *);
+    bool (*wait_for_presents)(struct stable_swapchain *);
+};
+struct stable_swapchain { const struct stable_swapchain_vtbl *lpVtbl; };
+'''
+
+CONFIGURE_BOUNDARIES = r'''
+static SRWLOCK contexts_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct fg_context *contexts;
+static unsigned bridge_on, bridge_off, notifications, swapchain_references = 1;
+static BOOL translator_enabled, reject_activation;
+static FfxFrameGenerationConfig installed_config;
+static struct stable_swapchain *get_stable_swapchain(void *object)
+{
+    ++swapchain_references;
+    return object;
+}
+static void release_swapchain(struct stable_swapchain *swapchain)
+{
+    assert(swapchain && swapchain_references > 1);
+    --swapchain_references;
+}
+static bool wait_presenter(struct stable_swapchain *swapchain)
+{
+    assert(swapchain && !lock_depth);
+    return true;
+}
+static void set_config(struct stable_swapchain *swapchain, const FfxFrameGenerationConfig *config)
+{
+    struct callback_binding *binding = config->frameGenerationCallbackContext;
+    assert(swapchain && !lock_depth);
+    /* The native boundary consumes the snapshot synchronously, before enabled
+     * is published by configure_frame_generation. */
+    if (config->frameGenerationEnabled) {
+        assert(binding && translator_enabled);
+        struct frame_config_snapshot *snapshot = find_frame_config(binding->context, config->frameID);
+        assert(snapshot && snapshot->frame_id == config->frameID);
+        assert(snapshot->hudless.resource == config->HUDLessColor.resource);
+        assert(snapshot->hudless.state == config->HUDLessColor.state);
+    }
+    installed_config = *config;
+    ++notifications;
+}
+static ffxReturnCode_t bridge_call(void *opaque)
+{
+    const struct yaagl_fsr_fg_configure_packet *packet = opaque;
+    assert(packet->header.operation == YAAGL_FSR_FG_CONFIGURE);
+    assert(packet->header.context == 7);
+    if (packet->enabled) {
+        ++bridge_on;
+        if (reject_activation) return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
+    } else ++bridge_off;
+    translator_enabled = packet->enabled;
+    return FFX_API_RETURN_OK;
+}
+/* Callback execution and the native provider are outside this configuration
+ * fixture. Trap accidental entry instead of returning invented success. */
+static ffxReturnCode_t present_callback(ffxCallbackDescFrameGenerationPresent *desc, void *user)
+{
+    (void)desc; (void)user;
+    abort();
+}
+static ffxReturnCode_t generation_callback(ffxDispatchDescFrameGeneration *desc, void *user)
+{
+    (void)desc; (void)user;
+    abort();
+}
+#define native_present_callback present_callback
+#define native_generation_callback generation_callback
+static ffxReturnCode_t native_configure(ffxContext *context, const ffxConfigureDescHeader *desc)
+{
+    (void)context; (void)desc;
+    abort();
+}
+static struct {
+    FfxApiPresentCallbackFunc default_present;
+    ffxReturnCode_t (*configure)(ffxContext *, const ffxConfigureDescHeader *);
+} native = {NULL, native_configure};
+'''
+
+CONFIGURE_MAIN = r'''
+static void exercise_configuration(BOOL notify)
+{
+    const struct stable_swapchain_vtbl vtbl = {set_config, wait_presenter};
+    struct stable_swapchain swapchain = {&vtbl};
+    struct fg_context context = {
+        .allocation = {&allocations, fixture_alloc, fixture_free},
+        .custom_allocation = TRUE, .dispatch_lock = PTHREAD_MUTEX_INITIALIZER,
+        .mode = CONTEXT_METALFX, .translated = 7
+    };
+    IUnknown first = {1}, second = {1};
+    struct ffxConfigureDescFrameGeneration desc = {0};
+    desc.swapChain = &swapchain;
+    desc.flags = notify ? 0 : FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+    desc.frameGenerationEnabled = true;
+    desc.HUDLessColor.resource = &first;
+    desc.frameID = 1;
+    bridge_on = bridge_off = notifications = 0;
+    contexts = &context;
+    reject_activation = TRUE;
+    assert(configure_frame_generation(&context, &desc) == FFX_API_RETURN_ERROR_RUNTIME_ERROR);
+    assert(!context.enabled && !translator_enabled && !context.native_config_valid);
+    assert(!context.frame_config_count && !context.swapchain && first.references == 1);
+    reject_activation = FALSE;
+    assert(configure_frame_generation(&context, &desc) == FFX_API_RETURN_OK);
+    assert(context.enabled && translator_enabled && first.references == 3);
+    struct callback_binding *binding = context.binding;
+    desc.frameID = 2;
+    desc.HUDLessColor.resource = &second;
+    desc.HUDLessColor.state = 23;
+    desc.HUDLessColor.description.width = 1920;
+    assert(configure_frame_generation(&context, &desc) == FFX_API_RETURN_OK);
+    assert(context.binding == binding && bridge_on == 2 && !bridge_off);
+    assert(context.native_config.frameID == 2 && context.hudless.resource == &second);
+    assert(find_frame_config(&context, 2)->hudless.state == 23);
+    assert(first.references == 2 && second.references == 3);
+    assert(notifications == (notify ? 2u : 0u));
+    if (notify) {
+        assert(installed_config.frameID == 2 && installed_config.HUDLessColor.resource == &second);
+        assert(installed_config.HUDLessColor.description.width == 1920);
+        assert(installed_config.frameGenerationCallbackContext == binding);
+    }
+    /* Fill the real fixed snapshot storage, then fail a repeated ON. */
+    for (desc.frameID = 3; desc.frameID <= 64; ++desc.frameID)
+        assert(snapshot_frame_config(&context, &desc) == FFX_API_RETURN_OK);
+    assert(configure_frame_generation(&context, &desc) == FFX_API_RETURN_ERROR_RUNTIME_ERROR);
+    assert(context.enabled && translator_enabled && bridge_on == 2 && !bridge_off);
+    assert(context.native_config.frameID == 2 && context.frame_config_count == 64);
+    assert(notifications == (notify ? 2u : 0u));
+    desc.frameGenerationEnabled = false;
+    assert(configure_frame_generation(&context, &desc) == FFX_API_RETURN_OK);
+    assert(!context.enabled && !translator_enabled && !context.frame_config_count);
+    assert(!context.hudless.resource && first.references == 1 && second.references == 1);
+    assert(configure_frame_generation(&context, &desc) == FFX_API_RETURN_OK);
+    assert(bridge_off == 2 && notifications == (notify ? 4u : 0u));
+    desc.frameGenerationEnabled = true;
+    /* A full snapshot table while disabled forces initial-activation rollback. */
+    for (desc.frameID = 1; desc.frameID <= 64; ++desc.frameID)
+        assert(snapshot_frame_config(&context, &desc) == FFX_API_RETURN_OK);
+    assert(configure_frame_generation(&context, &desc) == FFX_API_RETURN_ERROR_RUNTIME_ERROR);
+    assert(!context.enabled && !translator_enabled && bridge_on == 3 && bridge_off == 3);
+    assert(!context.native_config.frameGenerationEnabled && !context.hudless.resource);
+    clear_frame_configs(&context);
+    assert(configure_frame_generation(&context, &desc) == FFX_API_RETURN_OK);
+    assert(context.enabled && translator_enabled && bridge_on == 4);
+    assert(context.native_config.frameID == 65 && find_frame_config(&context, 65));
+    desc.frameGenerationEnabled = false;
+    assert(configure_frame_generation(&context, &desc) == FFX_API_RETURN_OK);
+    assert(!context.enabled && !translator_enabled && second.references == 1);
+    assert(detach_swapchain(&context) == FFX_API_RETURN_OK);
+    assert(swapchain_references == 1);
+    /* Pending configurations deliberately notify on every call, including OFF,
+     * without publishing selected-mode enabled state or snapshots. */
+    context.mode = MODE_PENDING;
+    unsigned on = bridge_on, off = bridge_off, notified = notifications;
+    for (unsigned i = 0; i < 4; ++i) {
+        desc.frameGenerationEnabled = i < 2;
+        desc.frameID = 100 + i;
+        assert(configure_frame_generation(&context, &desc) == FFX_API_RETURN_OK);
+        assert(context_mode(&context) == MODE_PENDING && !context.enabled);
+        assert(context.native_config.frameID == desc.frameID && !context.frame_config_count);
+        assert(translator_enabled == desc.frameGenerationEnabled);
+    }
+    assert(bridge_on == on + 2 && bridge_off == off + 2 && notifications == notified);
+    assert(second.references == 1 && !context.hudless.resource);
+    retire_frame_configs(&context, desc.frameID);
+    assert(!pthread_mutex_destroy(&context.dispatch_lock));
+    contexts = NULL;
+}
+int main(void)
+{
+    exercise_configuration(TRUE);
+    exercise_configuration(FALSE);
+    assert(allocations == frees);
+}
+'''
+
+
 def compile_and_run(code, cxx=False):
     with tempfile.TemporaryDirectory(prefix="yaagl-fsr-lifecycle-") as directory:
         source = pathlib.Path(directory) / ("lifecycle.cpp" if cxx else "lifecycle.c")
         binary = pathlib.Path(directory) / "lifecycle"
         source.write_text(code)
-        compiler = ("clang++", "-std=c++20", "-arch", "x86_64") if cxx else ("clang", "-std=c11")
+        compiler = ("clang++", "-std=c++20", "-arch", "x86_64", "-Wl,-adhoc_codesign") if cxx else ("clang", "-std=c11")
         subprocess.run((*compiler, "-D_DARWIN_C_SOURCE", "-Wall", "-Wextra",
                         "-Werror", "-pthread", "-I", str(ROOT / "include"),
                         "-iquote", str(ROOT),
@@ -820,6 +1019,22 @@ def compile_and_run(code, cxx=False):
 
 
 class FsrLifecycleTest(unittest.TestCase):
+    def test_selected_metalfx_configuration(self):
+        source = (ROOT / "dlls/amd_fidelityfx_framegeneration_dx12/main.c").read_text()
+        declarations = section(source, "enum context_mode\n", "static SRWLOCK contexts_lock")
+        snapshots = section(source, "static void release_resource(", "static struct fg_context *acquire_context(")
+        initialize = section(source, "static void initialize_packet(", "static ffxReturnCode_t bridge_call(")
+        translation = section(source, "static ffxReturnCode_t configure_translation(", "static ffxReturnCode_t destroy_translation(")
+        allocation = section(source, "static void *allocate_memory(", "static BOOL matching_allocator(")
+        claims = section(source, "static BOOL claim_swapchain(", "struct normalized_dispatch\n")
+        reclaim = section(source, "static void reclaim_native_bindings(", "static ffxReturnCode_t compose_present(")
+        native = section(source, "static ffxReturnCode_t configure_native_callbacks(", "static void release_swapchain(")
+        select = section(source, "static ffxReturnCode_t configure_frame_generation(", "static ffxReturnCode_t validate_public_dispatch(")
+        configure = section(source, "static void build_swapchain_config(", "static void free_context_storage(")
+        compile_and_run(SNAPSHOT + CONFIGURE + declarations + allocation + snapshots
+                        + CONFIGURE_BOUNDARIES + initialize + translation + claims
+                        + reclaim + native + select + configure + CONFIGURE_MAIN)
+
     def test_native_binding_installation(self):
         source = (ROOT / "dlls/amd_fidelityfx_framegeneration_dx12/main.c").read_text()
         binding = section(source, "struct callback_binding\n", "struct callback_scope\n")
@@ -838,7 +1053,7 @@ class FsrLifecycleTest(unittest.TestCase):
         source = (ROOT / "d3dmetal-sidecar/fsr-translator.mm").read_text()
         ownership = section(source, "struct ComGuid {", "struct State {")
         command = section(source, "    auto commandDevice = deviceOwner(commandList, true);",
-                          "    const auto mode = metalfx::CommandMode::Metal4;")
+                          "    const bool newGeneration =")
         resource = section(source, "        auto resourceDevice = deviceOwner(resources[i], true);",
                            "        const auto access = i == 3")
         fixture = section(COM_MAIN, "struct Object {", "int main()")
