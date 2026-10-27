@@ -70,6 +70,11 @@ struct dynamic_unwind_entry
 
 static struct list dynamic_unwind_list = LIST_INIT(dynamic_unwind_list);
 
+/* Cache registration selection only, never caller-owned function contents.
+ * The existing critical section protects the entry and every invalidation. */
+static struct dynamic_unwind_entry *dynamic_unwind_cache;
+static ULONG_PTR dynamic_unwind_cache_pc;
+
 static RTL_CRITICAL_SECTION dynamic_unwind_section;
 static RTL_CRITICAL_SECTION_DEBUG dynamic_unwind_debug =
 {
@@ -82,26 +87,37 @@ static RTL_CRITICAL_SECTION dynamic_unwind_section = { &dynamic_unwind_debug, -1
 
 static RUNTIME_FUNCTION *lookup_dynamic_function_table( ULONG_PTR pc, ULONG_PTR *base, ULONG *count )
 {
-    struct dynamic_unwind_entry *entry;
+    struct dynamic_unwind_entry *entry, *cursor;
     RUNTIME_FUNCTION *ret = NULL;
 
     RtlEnterCriticalSection( &dynamic_unwind_section );
-    LIST_FOR_EACH_ENTRY( entry, &dynamic_unwind_list, struct dynamic_unwind_entry, entry )
+    entry = dynamic_unwind_cache;
+    if (!entry || pc != dynamic_unwind_cache_pc)
     {
-        if (pc >= entry->base && pc < entry->end)
+        entry = NULL;
+        LIST_FOR_EACH_ENTRY( cursor, &dynamic_unwind_list, struct dynamic_unwind_entry, entry )
         {
-            *base = entry->base;
-            if (entry->callback)
+            if (pc >= cursor->base && pc < cursor->end)
             {
-                ret = entry->callback( pc, entry->context );
-                *count = 1;
+                entry = cursor;
+                break;
             }
-            else
-            {
-                ret = entry->table;
-                *count = entry->count;
-            }
-            break;
+        }
+    }
+    if (entry)
+    {
+        *base = entry->base;
+        if (entry->callback)
+        {
+            ret = entry->callback( pc, entry->context );
+            *count = 1;
+        }
+        else
+        {
+            ret = entry->table;
+            *count = entry->count;
+            dynamic_unwind_cache_pc = pc;
+            dynamic_unwind_cache = entry;
         }
     }
     RtlLeaveCriticalSection( &dynamic_unwind_section );
@@ -139,6 +155,7 @@ BOOLEAN CDECL RtlInstallFunctionTableCallback( ULONG_PTR table, ULONG_PTR base, 
     entry->context   = context;
 
     RtlEnterCriticalSection( &dynamic_unwind_section );
+    dynamic_unwind_cache = NULL;
     list_add_tail( &dynamic_unwind_list, &entry->entry );
     RtlLeaveCriticalSection( &dynamic_unwind_section );
 
@@ -169,6 +186,7 @@ NTSTATUS WINAPI RtlAddGrowableFunctionTable( void **table, RUNTIME_FUNCTION *fun
     entry->context   = NULL;
 
     RtlEnterCriticalSection( &dynamic_unwind_section );
+    dynamic_unwind_cache = NULL;
     list_add_tail( &dynamic_unwind_list, &entry->entry );
     RtlLeaveCriticalSection( &dynamic_unwind_section );
 
@@ -193,7 +211,10 @@ void WINAPI RtlGrowFunctionTable( void *table, DWORD count )
         if (entry == table)
         {
             if (count > entry->count && count <= entry->max_count)
+            {
+                dynamic_unwind_cache = NULL;
                 entry->count = count;
+            }
             break;
         }
     }
@@ -216,6 +237,7 @@ void WINAPI RtlDeleteGrowableFunctionTable( void *table )
         if (entry == table)
         {
             to_free = entry;
+            dynamic_unwind_cache = NULL;
             list_remove( &entry->entry );
             break;
         }
@@ -241,6 +263,7 @@ BOOLEAN CDECL RtlDeleteFunctionTable( RUNTIME_FUNCTION *table )
         if (entry->table == table)
         {
             to_free = entry;
+            dynamic_unwind_cache = NULL;
             list_remove( &entry->entry );
             break;
         }

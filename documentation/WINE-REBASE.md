@@ -20,6 +20,55 @@ Historical `patches/wine-p3/` and `patches/wine-tuned/` remain available in the 
 - Retain the PE `__wine_unix_call` export, native-code region registration, `WINEDLLPATH_PREPEND`, Rosetta instruction/fault/code-invalidation and WoW64 behavior, `WINENCPU`, macOS `pipe2` availability handling and Darwin MEM_RESET discard semantics.
 - Integrate these into 11.20's startup, late PEB initialization and virtual-memory reservation implementation. Do not restore old ntdll files wholesale.
 
+### ForgePlay optimization comparison
+
+The dynamic unwind registration cache in `dlls/ntdll/unwind.c` is adapted from
+`wine-11.12-dynamic-unwind-registration-cache.patch` in the
+[ForgePlay v2.4.1 build 12 source release](https://github.com/Facta-Leopard/ForgePlay/releases/tag/v2.4.1).
+The source archive SHA-256 is
+`fdda327e07852186f96d88de8f60ae90ba3b6f2625f8c255aca2eeb558161394`.
+This port keeps one live non-callback registration for an exact PC under the
+existing critical section. Successful registration, growth and deletion
+invalidate it before releasing the lock. The first matching registration still
+wins; callbacks run on every lookup and caller-owned function data is searched
+afresh. The ForgePlay-specific environment switch is not imported.
+
+An x86_64/Rosetta `-O2` comparison used the actual before/after registration and
+function-search code with a pthread critical-section substitute, 100,000 lookups
+per thread, and four runs per variant in ABBA/BAAB order. At 256 registrations,
+repeated lookup of the last registration fell from median 223.35 to 10.145 ns/op
+with one thread and from 542.29 to 35.035 ns/op with four threads. Mixed-PC and
+miss cases do not receive this benefit; the 1,024-registration, four-thread miss
+case was 5.01% slower in this sample. These are registry microbenchmarks, not
+public-API latency, frame-time or game-FPS measurements. Raw results are retained
+locally in `build/forgeplay-candidates/unwind/results.json`.
+
+Both x86 and x64 PE ntdll builds passed. The x64 public unwind suite ran against
+the rebuilt ntdll in a separate prefix: 455,171 checks, no failures or skips.
+Extended dynamic-table tests cover repeated-PC caller-data changes, deletion
+after lookup, and repeated callback invocation. The native fixture additionally
+exercises overlapping registrations and concurrent registration/deletion.
+
+Other candidates are deliberately not duplicate implementations:
+
+- FG already reuses descriptor-matched textures, execution scratch and MetalFX
+  configurations with lease-based retirement. Real private R32Float texture
+  acquire/retire measurements at 1920x1080 and 3840x2160 were respectively
+  3,822.8/4,023.5 ns for new allocations versus 76.2/75.4 ns for existing reuse.
+  This measures CPU allocation overhead, not GPU time or a new improvement.
+  The seven production FG normalization/native Metal regression tests passed.
+- ForgePlay owns presentation deadlines for its over-budget frame rejection.
+  Our AMD presenter callback records work before later Metal replay, and the
+  bridge has no remaining presentation deadline. `frame_time_delta_ms` is not
+  that deadline; no guessed threshold or late replay-only rejection is added.
+- ForgePlay's frame-pair optical-flow cache is not directly transferable to the
+  MetalFX path using game-provided motion/depth and one generated output.
+- The Apple pthread GS overlay and Game Mode support already exist. ForgePlay's
+  optional diagnostic-file optimization has no matching normal per-frame write
+  here. The policy supervisor's `fsync` and locks protect recovery/coordination,
+  not diagnostics, and remain intact. Raw-device preflight is a stall-prevention
+  change without a reproduced matching stall, not a demonstrated speed gain.
+
 ### Server protocol, surfaces, graphics and input
 
 - Preserve upstream `unmount_device` and process/group-affinity protocol changes. The selected source adds only the native cursor window, `SET_CURSOR_OWNER`, and the `get_inproc_sync_fd` shared-memory index. Regenerate the target protocol tables; do not copy old request IDs or tables.

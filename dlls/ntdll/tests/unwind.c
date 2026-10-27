@@ -3785,9 +3785,19 @@ static void test_dynamic_unwind(void)
     ok( base == (ULONG_PTR)code_mem,
         "RtlLookupFunctionEntry returned invalid base, expected: %Ix, got: %Ix\n", (ULONG_PTR)code_mem, base );
 
+    /* A repeated PC must still search the caller-owned function data. */
+    SET_RUNTIME_FUNC_LEN( runtime_func, 8 );
+    func = pRtlLookupFunctionEntry( (ULONG_PTR)code_mem + code_offset + 8, &base, NULL );
+    ok( !func, "RtlLookupFunctionEntry returned stale function %p\n", func );
+    SET_RUNTIME_FUNC_LEN( runtime_func, 16 );
+    func = pRtlLookupFunctionEntry( (ULONG_PTR)code_mem + code_offset + 8, &base, NULL );
+    ok( func == runtime_func, "RtlLookupFunctionEntry did not observe restored function %p\n", func );
+
     /* Test RtlDeleteFunctionTable */
     ok( pRtlDeleteFunctionTable( runtime_func ),
         "RtlDeleteFunctionTable failed for runtime_func = %p (aligned)\n", runtime_func );
+    func = pRtlLookupFunctionEntry( (ULONG_PTR)code_mem + code_offset + 8, &base, NULL );
+    ok( !func, "RtlLookupFunctionEntry returned deleted function %p\n", func );
     ok( !pRtlDeleteFunctionTable( runtime_func ),
         "RtlDeleteFunctionTable returned success for nonexistent table runtime_func = %p\n", runtime_func );
 
@@ -3858,6 +3868,10 @@ static void test_dynamic_unwind(void)
             "RtlLookupFunctionEntry didn't return expected function, got: %p\n", func );
         ok( base == (ULONG_PTR)code_mem,
             "RtlLookupFunctionEntry returned invalid base: %Ix / %Ix\n", (ULONG_PTR)code_mem, base );
+        func = pRtlLookupFunctionEntry( (ULONG_PTR)code_mem + code_offset + 24, &base, NULL );
+        ok( count == 2, "Repeated lookup issued %lu callbacks, expected 2\n", count );
+        ok( func && func->BeginAddress == code_offset + 16,
+            "Repeated callback lookup returned unexpected function %p\n", func );
     }
 
     /* Clean up again */
