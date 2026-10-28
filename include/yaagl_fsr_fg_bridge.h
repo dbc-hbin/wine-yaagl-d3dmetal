@@ -6,7 +6,8 @@
 
 #include <stdint.h>
 
-#define YAAGL_FSR_FG_BRIDGE_VERSION 6u
+#define YAAGL_FSR_FG_BRIDGE_VERSION 7u
+#define YAAGL_FSR_FG_MAX_PENDING_FRAMES 64u
 
 enum yaagl_fsr_fg_create_flags
 {
@@ -156,13 +157,16 @@ struct yaagl_fsr_fg_configure_packet
     uint32_t enabled;
 };
 
-/* Retire one completed or skipped generation callback; encoded work owns its snapshot. */
+/* Retire exactly one completed or skipped generation callback. Return every
+ * remaining Prepare ID so PE can retain its selected config without pinning
+ * unrelated configs between sparse IDs. Encoded work owns its snapshot.
+ */
 struct yaagl_fsr_fg_retire_frame_packet
 {
     struct yaagl_fsr_fg_packet_header header;
     uint64_t frame_id;
-    uint64_t oldest_pending_frame_id;
-    uint32_t has_pending_frame;
+    uint32_t pending_frame_count;
+    uint64_t pending_frame_ids[YAAGL_FSR_FG_MAX_PENDING_FRAMES];
 };
 
 struct yaagl_fsr_fg_destroy_packet

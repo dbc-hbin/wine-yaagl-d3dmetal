@@ -1644,13 +1644,21 @@ FfxErrorCode DestroyBackendContextDX12(FfxInterface* backendInterface, FfxUInt32
 
     // Delete any resources allocated by this context
     BackendContext_DX12::EffectContext& effectContext = backendContext->pEffectContexts[effectContextId];
+    FfxErrorCode firstError = FFX_OK;
     for (uint32_t currentStaticResourceIndex = effectContextId * FFX_MAX_RESOURCE_COUNT; currentStaticResourceIndex < (uint32_t)effectContext.nextStaticResource; ++currentStaticResourceIndex) {
-        if (backendContext->pResources[currentStaticResourceIndex].resourcePtr) {
+        auto& owner = backendContext->pResources[currentStaticResourceIndex];
+        if (owner.resourcePtr) {
             FFX_ASSERT_MESSAGE(false, "FFXInterface: DX12: SDK Resource was not destroyed prior to destroying the backend context. There is a resource leak.");
+            // Terminal teardown visits each slot once. A refused upload must not
+            // block its primary owner or be retried through the parent's link.
+            owner.uploadResourceIndex = 0;
             FfxResourceInternal internalResource = { (int32_t)currentStaticResourceIndex };
             const FfxErrorCode error = DestroyResourceDX12(backendInterface, internalResource, effectContextId);
-            if (error != FFX_OK)
-                return error;
+            if (firstError == FFX_OK)
+                firstError = error;
+            // A refusing application callback retains its resource. The backend
+            // handle dies with this context; never release that resource directly.
+            owner = {};
         }
     }
 
@@ -1681,7 +1689,7 @@ FfxErrorCode DestroyBackendContextDX12(FfxInterface* backendInterface, FfxUInt32
         releaseBackendSharedObjects(backendContext);
     }
 
-    return FFX_OK;
+    return firstError;
 }
 
 // create a internal resource that will stay alive until effect gets shut down

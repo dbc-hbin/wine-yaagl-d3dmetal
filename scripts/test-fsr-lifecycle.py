@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Exercise production FSR loader, COM ownership and FG configuration lifetimes."""
+"""Exercise production FSR loader, COM ownership and FG configuration lifetimes.
+FG retirement covers exact sparse pending IDs and bounded config ownership when
+an orphan Prepare survives thousands of completed frames.
+"""
 
 import pathlib
 import subprocess
@@ -461,6 +464,7 @@ SNAPSHOT = r'''
 #include <time.h>
 #define __declspec(value)
 #include "d3dmetal-sidecar/third-party/fidelityfx/Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h"
+#include "yaagl_fsr_fg_bridge.h"
 #define TRUE 1
 #define FALSE 0
 #define ARRAY_SIZE(value) (sizeof(value) / sizeof((value)[0]))
@@ -495,17 +499,23 @@ static void fixture_free(void *user, void *pointer)
     ++frees;
     free(pointer);
 }
-static uint64_t pending_frame;
-static BOOL pending;
+static uint64_t pending_frames[YAAGL_FSR_FG_MAX_PENDING_FRAMES];
+static unsigned pending_count;
 static ffxReturnCode_t retire_result;
 static ffxReturnCode_t retire_translation_frame(uint64_t context, uint64_t frame,
-                                               uint64_t *oldest, BOOL *has_pending)
+                                               struct yaagl_fsr_fg_retire_frame_packet *packet)
 {
     (void)context;
-    (void)frame;
     assert(lock_depth == 1);
-    *oldest = pending_frame;
-    *has_pending = pending;
+    if (retire_result != FFX_API_RETURN_OK) return retire_result;
+    for (unsigned i = 0; i < pending_count; ++i) {
+        if (pending_frames[i] != frame) continue;
+        pending_frames[i] = pending_frames[--pending_count];
+        break;
+    }
+    packet->pending_frame_count = pending_count;
+    memcpy(packet->pending_frame_ids, pending_frames,
+           pending_count * sizeof(*pending_frames));
     return retire_result;
 }
 '''
@@ -578,16 +588,18 @@ int main(void)
     assert(first.references == 64 && second.references == 2);
     assert(find_frame_config(&context, 191)->hudless.state == 23);
     assert(find_frame_config(&context, 191)->hudless.description.width == 1920);
-    pending = TRUE;
-    pending_frame = 191;
+    pending_count = 1;
+    pending_frames[0] = 191;
     retire_frame_configs(&context, 4096);
     assert(!find_frame_config(&context, 127));
     assert(find_frame_config(&context, 191)->frame_id == 128);
     assert(find_frame_config(&context, 4096)->frame_id == 4096);
+    assert(context.frame_config_count == 2 && first.references == 2 && second.references == 2);
     retire_result = FFX_API_RETURN_ERROR_RUNTIME_ERROR;
-    pending = FALSE;
-    retire_frame_configs(&context, 4096);
+    pending_count = 0;
+    retire_frame_configs(&context, UINT64_MAX);
     assert(find_frame_config(&context, 191)->frame_id == 128);
+    assert(context.frame_config_retirement == 4096);
     retire_result = FFX_API_RETURN_OK;
     retire_frame_configs(&context, 4096);
     assert(!find_frame_config(&context, 4095));
@@ -598,6 +610,74 @@ int main(void)
     context.have_last_prepare_frame_id = TRUE;
     clear_frame_configs(&context);
     assert(!find_frame_config(&context, UINT64_MAX) && !context.have_last_prepare_frame_id);
+    assert(!context.frame_config_retirement);
+    assert(first.references == 1 && second.references == 1);
+
+    /* Every remaining sparse Prepare keeps its exact config regardless of
+     * completion order; completed configs do not accumulate above an orphan. */
+    IUnknown resources[64];
+    uint64_t ids[64];
+    BOOL outstanding[64];
+    uint64_t newest_completed = 0;
+    for (unsigned i = 0; i < ARRAY_SIZE(ids); ++i) {
+        resources[i].references = 1;
+        ids[i] = i == 63 ? UINT64_MAX : (uint64_t)i << 56;
+        outstanding[i] = TRUE;
+        pending_frames[i] = ids[i];
+        desc.frameID = ids[i];
+        desc.HUDLessColor.resource = &resources[i];
+        assert(snapshot_frame_config(&context, &desc) == FFX_API_RETURN_OK);
+    }
+    pending_count = ARRAY_SIZE(ids);
+    for (unsigned i = 0; i < ARRAY_SIZE(ids); ++i) {
+        unsigned index = (i * 17 + 31) % ARRAY_SIZE(ids);
+        uint64_t id = ids[index];
+        if (id > newest_completed) newest_completed = id;
+        outstanding[index] = FALSE;
+        retire_frame_configs(&context, id);
+        assert(context.frame_config_retirement == newest_completed);
+        assert(context.frame_config_count == pending_count + 1);
+        for (unsigned j = 0; j < ARRAY_SIZE(ids); ++j) {
+            assert(resources[j].references ==
+                   (outstanding[j] || ids[j] == newest_completed ? 2u : 1u));
+            if (outstanding[j]) {
+                struct frame_config_snapshot *config = find_frame_config(&context, ids[j]);
+                assert(config && config->frame_id == ids[j] &&
+                       config->hudless.resource == &resources[j]);
+            }
+        }
+    }
+    clear_frame_configs(&context);
+    for (unsigned i = 0; i < ARRAY_SIZE(ids); ++i) assert(resources[i].references == 1);
+
+    desc.HUDLessColor.resource = &first;
+    desc.frameID = 200;
+    assert(snapshot_frame_config(&context, &desc) == FFX_API_RETURN_OK);
+    pending_frames[0] = 201;
+    pending_count = 1;
+    /* Frame 201 uses config 200, not an exact frame/config-ID match. */
+    for (uint64_t id = 202; id != 4298; ++id) {
+        desc.frameID = id;
+        desc.HUDLessColor.resource = &second;
+        assert(snapshot_frame_config(&context, &desc) == FFX_API_RETURN_OK);
+        pending_frames[pending_count++] = id;
+        retire_frame_configs(&context, id);
+        assert(pending_count == 1 && context.frame_config_count == 2);
+        assert(find_frame_config(&context, 201)->frame_id == 200);
+        assert(find_frame_config(&context, 201)->hudless.resource == &first);
+        assert(find_frame_config(&context, id)->frame_id == id);
+        assert(first.references == 2 && second.references == 2);
+    }
+    /* A config newer than every completed frame is still future work. */
+    desc.frameID = 5000;
+    assert(snapshot_frame_config(&context, &desc) == FFX_API_RETURN_OK);
+    retire_frame_configs(&context, 201);
+    assert(!pending_count && context.frame_config_count == 2);
+    assert(!find_frame_config(&context, 201));
+    assert(find_frame_config(&context, 4999)->frame_id == 4297);
+    assert(find_frame_config(&context, 5000)->frame_id == 5000);
+    assert(first.references == 1 && second.references == 3);
+    clear_frame_configs(&context);
     assert(first.references == 1 && second.references == 1);
     assert(!allocations && !frees);
     assert(!pthread_mutex_destroy(&context.dispatch_lock));

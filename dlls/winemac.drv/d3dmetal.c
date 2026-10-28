@@ -68,7 +68,7 @@ struct d3dmetal_macdrv_win_data
     HWND                hwnd;                   /* hwnd that this private data belongs to */
     WineWindow         *cocoa_window;
     WineContentView    *cocoa_view;
-    WineContentView    *client_cocoa_view;
+    WineContentView    *client_cocoa_view;      /* opaque swapchain owner retained by D3DMetal */
     RECT                window_rect;            /* USER window rectangle relative to parent */
     RECT                whole_rect;             /* Mac window rectangle for the whole window relative to parent */
     RECT                client_rect;            /* client area relative to parent */
@@ -91,14 +91,17 @@ void OnMainThread(dispatch_block_t block);
 struct metal_view_surface
 {
     WineMetalView *view;
+    MTLDevice_id device;
     struct macdrv_client_surface *surface;
+    HWND hwnd;
+    unsigned int refs;
     struct metal_view_surface *next;
 };
 
 static pthread_mutex_t metal_view_surfaces_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct metal_view_surface *metal_view_surfaces;
 
-/* The window array owns the original reference; an active metal view owns another.
+/* The window array owns the original reference; the native owner token owns another.
  * Removing an entry transfers its reference to the caller, which releases it
  * after dropping the window lock (detach reacquires it). */
 static BOOL remove_window_surface(struct macdrv_win_data *data, struct macdrv_client_surface *surface)
@@ -114,6 +117,48 @@ static BOOL remove_window_surface(struct macdrv_win_data *data, struct macdrv_cl
         return TRUE;
     }
     return FALSE;
+}
+
+static void release_metal_view_surface(struct metal_view_surface *entry)
+{
+    struct metal_view_surface **cursor;
+    struct macdrv_win_data *data;
+    WineContentView *content;
+    BOOL removed;
+
+    pthread_mutex_lock(&metal_view_surfaces_mutex);
+    if (--entry->refs)
+    {
+        pthread_mutex_unlock(&metal_view_surfaces_mutex);
+        return;
+    }
+    for (cursor = &metal_view_surfaces; *cursor; cursor = &(*cursor)->next)
+        if (*cursor == entry)
+        {
+            *cursor = entry->next;
+            break;
+        }
+    pthread_mutex_unlock(&metal_view_surfaces_mutex);
+
+    content = entry->surface->cocoa_view;
+    TRACE("destroy owner surface %p view %p device %p\n", entry->surface, entry->view, entry->device);
+    if (entry->view) macdrv_view_release_metal_view(entry->view);
+    if (entry->device) macdrv_release_metal_device(entry->device);
+    data = get_win_data(entry->hwnd);
+    removed = remove_window_surface(data, entry->surface);
+    release_win_data(data);
+    if (removed) client_surface_release(&entry->surface->client);
+    client_surface_release(&entry->surface->client);
+    macdrv_release_d3dmetal_content_view(content);
+    free(entry);
+}
+
+/* Called off the Cocoa main thread, including when objc_release() ran there.
+ * Final surface detach can acquire the HWND lock and synchronously dispose its
+ * Cocoa view, so dispatching only the Metal view teardown would not be enough. */
+void macdrv_destroy_d3dmetal_view_owner(void *context)
+{
+    release_metal_view_surface(context);
 }
 
 void macdrv_retain_d3dmetal_client_surface(void *surface)
@@ -136,12 +181,16 @@ static struct d3dmetal_macdrv_win_data *my_get_win_data(HWND hwnd)
     struct macdrv_win_data *data;
     struct d3dmetal_macdrv_win_data *d3dm_data;
     struct macdrv_client_surface *client_surface;
+    struct metal_view_surface *entry;
+    void *owner;
     TRACE("get_win_data %p\n", hwnd);
 
     /* Creating a client surface on each call to get_win_data() means it's no longer idempotent,
      * but D3DMetal/DXMT both call it only when creating a new DXGI swapchain.
      * D3DMetal retains client_cocoa_view, then calls release_win_data() before
-     * creating its Metal device, view and layer.
+     * creating its Metal device, view and layer. Its destructor only releases
+     * that object: it never calls the view/device release callbacks. Return an
+     * NSObject owner token rather than letting the content view outlive them.
      */
     {
         struct client_surface *base = macdrv_CreateClientSurface(hwnd, 0, FALSE);
@@ -165,19 +214,31 @@ static struct d3dmetal_macdrv_win_data *my_get_win_data(HWND hwnd)
         data->d3dmetal_client_surfaces = CFArrayCreateMutable(NULL, 0, NULL);
     }
     d3dm_data = calloc(1, sizeof(*d3dm_data));
-    if (!data->d3dmetal_client_surfaces || !d3dm_data)
+    entry = malloc(sizeof(*entry));
+    if (!data->d3dmetal_client_surfaces || !d3dm_data || !entry)
     {
         release_win_data(data);
         client_surface_release(&client_surface->client);
         free(d3dm_data);
+        free(entry);
         return NULL;
     }
+    *entry = (struct metal_view_surface){.surface = client_surface, .hwnd = hwnd, .refs = 1};
+    if (!(owner = macdrv_create_d3dmetal_view_owner(entry, client_surface->cocoa_view)))
+    {
+        release_win_data(data);
+        client_surface_release(&client_surface->client);
+        free(d3dm_data);
+        free(entry);
+        return NULL;
+    }
+    client_surface_add_ref(&client_surface->client);
     CFArrayAppendValue(data->d3dmetal_client_surfaces, client_surface);
 
     d3dm_data->hwnd = data->hwnd;
     d3dm_data->cocoa_window = data->cocoa_window;
     /* cocoa_view is no longer present in macdrv_win_data. D3DMetal doesn't use it. */
-    d3dm_data->client_cocoa_view = client_surface->cocoa_view;
+    d3dm_data->client_cocoa_view = owner;
     d3dm_data->window_rect = data->rects.window;
     d3dm_data->whole_rect = data->rects.visible;
     d3dm_data->client_rect = data->rects.client;
@@ -203,11 +264,10 @@ static void my_release_win_data(struct d3dmetal_macdrv_win_data *data)
     TRACE("release_win_data %p\n", data);
     if (!data) return;
 
-    /* Keep the surface in the window-owned array until Metal has either
-     * registered its native view or the HWND is destroyed.  D3DMetal calls
-     * get_win_data() while creating the view, so releasing it here races the
-     * following create_metal_view() call and leaves a black window. */
+    /* The snapshot and native caller have separate token references. Drop the
+     * HWND lock before releasing ours: an abandoned snapshot can detach here. */
     release_win_data(data->padding[0]);
+    macdrv_release_d3dmetal_view_owner(data->client_cocoa_view);
     free(data);
 }
 
@@ -231,43 +291,20 @@ static void my_macdrv_release_metal_device(MTLDevice_id d)
 
 static WineMetalView *my_macdrv_view_create_metal_view(WineContentView *v, MTLDevice_id d)
 {
-    struct metal_view_surface *entry;
-    struct macdrv_win_data *data;
-    struct client_surface *surface;
+    struct metal_view_surface *entry = macdrv_get_d3dmetal_view_owner(v);
     WineMetalView *view;
-    BOOL removed;
 
     TRACE("macdrv_view_create_metal_view %p %p\n", v, d);
-    surface = macdrv_get_view_d3dmetal_client_surface(v);
-    /* Pin the surface across the synchronous main-thread call.  On success this
-     * reference belongs to the tracked view; on failure only the unpublished
-     * window-array reference and this temporary reference are rolled back. */
-    if (surface) client_surface_add_ref(surface);
-    if (!(view = macdrv_view_create_metal_view(v, d))) goto failed;
-    if (!surface) return view;
-    if (!(entry = malloc(sizeof(*entry))))
-    {
-        macdrv_view_release_metal_view(view);
-        goto failed;
-    }
+    /* The verified native caller passes the +1 create-device result straight
+     * here and never uses it again. Transfer it even if view creation fails. */
+    entry->device = d;
+    if (!(view = macdrv_view_create_metal_view(entry->surface->cocoa_view, d))) return NULL;
     entry->view = view;
-    entry->surface = impl_from_client_surface(surface);
     pthread_mutex_lock(&metal_view_surfaces_mutex);
     entry->next = metal_view_surfaces;
     metal_view_surfaces = entry;
     pthread_mutex_unlock(&metal_view_surfaces_mutex);
     return view;
-
-failed:
-    if (surface)
-    {
-        data = get_win_data(surface->hwnd);
-        removed = remove_window_surface(data, impl_from_client_surface(surface));
-        release_win_data(data);
-        if (removed) client_surface_release(surface);
-        client_surface_release(surface);
-    }
-    return NULL;
 }
 
 static CAMetalLayer *my_macdrv_view_get_metal_layer(WineMetalView *v)
@@ -279,8 +316,6 @@ static CAMetalLayer *my_macdrv_view_get_metal_layer(WineMetalView *v)
 static void my_macdrv_view_release_metal_view(WineMetalView *v)
 {
     struct metal_view_surface **cursor, *entry = NULL;
-    struct macdrv_win_data *data;
-    BOOL removed;
 
     TRACE("macdrv_view_release_metal_view %p\n", v);
     pthread_mutex_lock(&metal_view_surfaces_mutex);
@@ -289,19 +324,14 @@ static void my_macdrv_view_release_metal_view(WineMetalView *v)
         {
             entry = *cursor;
             *cursor = entry->next;
+            entry->view = NULL;
+            entry->refs++;
             break;
         }
     pthread_mutex_unlock(&metal_view_surfaces_mutex);
 
     macdrv_view_release_metal_view(v);
-    if (!entry) return;
-
-    data = get_win_data(entry->surface->client.hwnd);
-    removed = remove_window_surface(data, entry->surface);
-    release_win_data(data);
-    if (removed) client_surface_release(&entry->surface->client);
-    client_surface_release(&entry->surface->client);
-    free(entry);
+    if (entry) release_metal_view_surface(entry);
 }
 
 static void my_OnMainThread(dispatch_block_t b)

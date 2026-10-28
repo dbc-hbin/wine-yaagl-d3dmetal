@@ -656,6 +656,14 @@ static void scheduleDispatch(FfxOpticalflowContext_Private* context, const FfxPi
 
 static FfxErrorCode dispatch(FfxOpticalflowContext_Private* context, const FfxOpticalflowDispatchDescription* params)
 {
+    if (context->refreshPipelineStates) {
+
+        context->refreshPipelineStates = false;
+
+        const FfxErrorCode errorCode = createPipelineStates(context);
+        FFX_RETURN_ON_ERROR(errorCode == FFX_OK, errorCode);
+    }
+
     context->contextDescription.backendInterface.fpRegisterResource(
         &context->contextDescription.backendInterface,
         &params->opticalFlowVector,
@@ -676,14 +684,6 @@ static FfxErrorCode dispatch(FfxOpticalflowContext_Private* context, const FfxOp
     FfxCommandList commandList = params->commandList;
     int advancedAlgorithmIterations = 7;
     uint32_t opticalFlowBlockSize = 8;
-
-    if (context->refreshPipelineStates) {
-
-        context->refreshPipelineStates = false;
-
-        const FfxErrorCode errorCode = createPipelineStates(context);
-        FFX_RETURN_ON_ERROR(errorCode == FFX_OK, errorCode);
-    }
 
     const FfxApiResourceDescription resourceDescInputColor = context->contextDescription.backendInterface.fpGetResourceDescription(
         &context->contextDescription.backendInterface,
@@ -1013,11 +1013,12 @@ static FfxErrorCode dispatch(FfxOpticalflowContext_Private* context, const FfxOp
 
     context->resourceFrameIndex = (context->resourceFrameIndex + 1) % FFX_OPTICALFLOW_MAX_QUEUED_FRAMES;
 
-    FFX_VALIDATE(context->contextDescription.backendInterface.fpExecuteGpuJobs(&context->contextDescription.backendInterface, commandList, context->effectContextId));
+    const FfxErrorCode executeResult = context->contextDescription.backendInterface.fpExecuteGpuJobs(
+        &context->contextDescription.backendInterface, commandList, context->effectContextId);
+    const FfxErrorCode unregisterResult = context->contextDescription.backendInterface.fpUnregisterResources(
+        &context->contextDescription.backendInterface, commandList, context->effectContextId);
 
-    context->contextDescription.backendInterface.fpUnregisterResources(&context->contextDescription.backendInterface, commandList, context->effectContextId);
-
-    return FFX_OK;
+    return executeResult != FFX_OK ? executeResult : unregisterResult;
 }
 
 FfxErrorCode ffxOpticalflowContextCreate(FfxOpticalflowContext* context, FfxOpticalflowContextDescription* contextDescription)

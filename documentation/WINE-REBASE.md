@@ -74,6 +74,13 @@ Other candidates are deliberately not duplicate implementations:
 - Preserve upstream `unmount_device` and process/group-affinity protocol changes. The selected source adds only the native cursor window, `SET_CURSOR_OWNER`, and the `get_inproc_sync_fd` shared-memory index. Regenerate the target protocol tables; do not copy old request IDs or tables.
 - Preserve shared-window-surface registration, dirty generation, clipping, lifetime and message handling together with the macdrv producer/consumer paths.
 - The external D3DMetal bridge retains its 192-byte function table and 120-byte window-data ABI. Native helpers and Windows x64 DXGI callbacks must keep their distinct calling conventions. Do not change external layout assertions to conceal a merge error.
+- The pinned native swapchain retains/releases the opaque `client_cocoa_view`
+  but omits Metal view/device release callbacks. Return an NSObject owner token,
+  unwrap it when creating the Metal view, and transfer the create-device reference
+  into that owner. Keep the real content view and surface independently alive
+  across HWND detach. Final token release retires both native objects and removes
+  only its own window-array entry; Cocoa-main release must move cleanup off main
+  before synchronous Cocoa dispatch.
 - Keep monitor/fullscreen routing, `macdrv_query_d3dmetal_display`, native cursor ownership, raw-input baseline and warp-consumption behavior while preserving 11.20 Objective-C types, IME interfaces and WineMetalSwapChain autorelease handling.
 - Do not restore Game Mode's automatic native-fullscreen selection or transitions. Keep explicit fullscreen geometry/cursor handling separate from Game Mode. The signed host's `game-policy-supervisor` directly executes its bundled Apple-signed `gamepolicyctl` for a global override, validates its ANSI-colored status, and restores the previous policy after the last monitored game exits. Preserve the tool's original bytes/signature and privileged entitlement checks; never relocate or re-sign it, or reintroduce runtime Xcode/xcrun discovery. Preserve process-exit registration before mutation, same-user coordination and external-policy/recovery handling together.
 
@@ -97,6 +104,13 @@ SR and FG helper shaders, including numerical exposure conversion, are compiled 
 
 Selected MetalFX contexts notify the bridge on an OFF-to-ON transition, not on every enabled configuration. Per-frame snapshots and native swapchain configuration still run, and repeated OFF still drains and clears state. Failed initial activation or snapshot publication retains its rollback. Disabled Prepare validates input and initial provider eligibility without allocating a prepared-frame implementation.
 
+FG bridge version 7 returns the exact pending Prepare IDs during retirement. The
+PE shim retains each pending frame's greatest applicable configuration and the
+latest completed-frame fallback independently. An orphan Prepare must not pin
+every later HUD-less color configuration. Preserve sparse IDs, out-of-order
+completion, direct-dispatch retries and exact native snapshot retirement; a newer
+completed ID is not permission to discard an older pending Prepare.
+
 `d3dmetal-sidecar/layout.json` is beta3-specific format 34 with marker `YAAGLB3SIDEcar\x22`, no additional `binaryPatches`, and 38 dispatch slots. The original four retain their order:
 
 1. `GetContainingOutput`
@@ -113,6 +127,14 @@ Carry SR/FG temporary-owner exception cleanup and publish-after-record Prepare s
 Carry `fsr3-lifetime.cpp`, `yaagl_fsr3_lifetime.h`, `build-fsr3-lifetime.sh` and the pinned FidelityFX CPU source subset together with the PE loader and build/staging manifest changes. The helper has its own static C++ runtime and explicit Microsoft x64 provider table; do not rely on a MinGW class vtable matching the native compiler. Authenticate the native image before using shader/config/ABI helpers or replacing the FSR3 Create slot. Preserve original provider selection and the normal caller contract to retire callbacks/GPU work before destruction. Backend callback snapshots, partial-construction ledgers, upload ownership and transaction rollback are one ownership contract, not independent optional patches. Validate real native-shader output and failure-stage owner balances after a source or native-image update.
 
 The CPU subset comes from AMD FidelityFX-SDK commit `0836aa7f24058b3f8d035a88c0774457d78fc98e`, with its original license notices retained. Shader-permutation implementations and the upstream provider selector are excluded. Debug-message dispatch also stays in the native DLL so its global debug configuration remains effective for both implementations.
+
+Terminal DX12 backend teardown attempts every resource once and releases its
+shared backend objects even when an application deallocator refuses a resource.
+It reports the first failure; refused application-owned allocations remain the
+application's responsibility. Individual resource destruction still retains
+ownership on failure for an explicit retry. Optical Flow execution failure must
+also unregister dynamic resources and restore descriptor cursors before returning
+the execution error.
 
 The sidecar initializes exact-image MetalFX lifetime hooks before creating effects. FG uses the native owning-slot destructor after original object cleanup. BBR uses paired init/destructor ownership conversion, detaches its filter, and waits through notifications for both native prewarm-group and final internal graph-event completion. Keep failure paths, typed-delete pairing, image/class/ivar/IMP checks and recorded ownership together; neither a dealloc-only cycle fix nor an unconditional GPU wait is sufficient. The x86_64 repair leaves unsupported images and ARM untouched.
 

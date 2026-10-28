@@ -207,8 +207,9 @@ struct fg_context
     BOOL native_config_valid;
 
     struct FfxApiResource hudless;
-    struct frame_config_snapshot frame_configs[64];
+    struct frame_config_snapshot frame_configs[YAAGL_FSR_FG_MAX_PENDING_FRAMES];
     unsigned frame_config_count;
+    uint64_t frame_config_retirement;
     uint32_t display_width;
     uint32_t display_height;
     uint32_t max_render_width;
@@ -452,20 +453,12 @@ static ffxReturnCode_t bridge_call(void *packet)
 }
 
 static ffxReturnCode_t retire_translation_frame(uint64_t context, uint64_t frame_id,
-                                                 uint64_t *oldest_pending, BOOL *has_pending)
+                                                struct yaagl_fsr_fg_retire_frame_packet *packet)
 {
-    struct yaagl_fsr_fg_retire_frame_packet packet;
-    ffxReturnCode_t result;
-    memset(&packet, 0, sizeof(packet));
-    initialize_packet(&packet.header, sizeof(packet), YAAGL_FSR_FG_RETIRE_FRAME, context);
-    packet.frame_id = frame_id;
-    result = bridge_call(&packet);
-    if (result == FFX_API_RETURN_OK)
-    {
-        *oldest_pending = packet.oldest_pending_frame_id;
-        *has_pending = packet.has_pending_frame;
-    }
-    return result;
+    memset(packet, 0, sizeof(*packet));
+    initialize_packet(&packet->header, sizeof(*packet), YAAGL_FSR_FG_RETIRE_FRAME, context);
+    packet->frame_id = frame_id;
+    return bridge_call(packet);
 }
 
 static ffxReturnCode_t configure_translation(uint64_t context, BOOL enabled)
@@ -673,48 +666,46 @@ static struct frame_config_snapshot *find_frame_config(
     return best;
 }
 
-/* Keep the newest fallback for the oldest outstanding Prepare, plus every
- * future configuration. A newer callback may finish before an older one. */
+/* Pending Prepares retain their exact selected fallbacks, not every config
+ * above the oldest Prepare. The forward fallback advances independently;
+ * callbacks may finish in any order, including after a much newer frame. */
 static void retire_frame_configs(struct fg_context *context, uint64_t completed_frame)
 {
-    struct frame_config_snapshot *snapshot, *floor = NULL,
+    struct yaagl_fsr_fg_retire_frame_packet pending;
+    struct frame_config_snapshot *snapshot, *floor,
         discard[ARRAY_SIZE(context->frame_configs)];
+    BOOL keep[ARRAY_SIZE(context->frame_configs)] = {FALSE};
     unsigned i, count = 0, kept = 0;
-    uint64_t oldest_pending = 0, boundary = completed_frame;
-    BOOL has_pending = FALSE;
 
     EnterCriticalSection(&context->dispatch_lock);
     /* Keep the native pending-frame snapshot and PE pruning atomic with Prepare. */
-    if (retire_translation_frame(context->translated, completed_frame,
-                                 &oldest_pending, &has_pending) != FFX_API_RETURN_OK)
+    if (retire_translation_frame(context->translated, completed_frame, &pending) !=
+        FFX_API_RETURN_OK)
     {
         LeaveCriticalSection(&context->dispatch_lock);
         return;
     }
-    if (has_pending && oldest_pending < boundary) boundary = oldest_pending;
+    if (completed_frame > context->frame_config_retirement)
+        context->frame_config_retirement = completed_frame;
+    floor = find_frame_config(context, context->frame_config_retirement);
+    if (floor) keep[floor - context->frame_configs] = TRUE;
+    for (i = 0; i < pending.pending_frame_count; ++i)
+    {
+        snapshot = find_frame_config(context, pending.pending_frame_ids[i]);
+        if (snapshot) keep[snapshot - context->frame_configs] = TRUE;
+    }
+
     for (i = 0; i < context->frame_config_count; ++i)
     {
         snapshot = &context->frame_configs[i];
-        if (snapshot->frame_id <= boundary &&
-            (!floor || snapshot->frame_id > floor->frame_id))
-            floor = snapshot;
+        if (keep[i] || snapshot->frame_id > context->frame_config_retirement)
+            context->frame_configs[kept++] = *snapshot;
+        else
+            discard[count++] = *snapshot;
     }
-
-    if (floor)
-    {
-        uint64_t floor_id = floor->frame_id;
-        for (i = 0; i < context->frame_config_count; ++i)
-        {
-            snapshot = &context->frame_configs[i];
-            if (snapshot->frame_id >= floor_id)
-                context->frame_configs[kept++] = *snapshot;
-            else
-                discard[count++] = *snapshot;
-        }
-        memset(context->frame_configs + kept, 0,
-               (context->frame_config_count - kept) * sizeof(*snapshot));
-        context->frame_config_count = kept;
-    }
+    memset(context->frame_configs + kept, 0,
+           (context->frame_config_count - kept) * sizeof(*snapshot));
+    context->frame_config_count = kept;
     LeaveCriticalSection(&context->dispatch_lock);
 
     for (i = 0; i < count; ++i)
@@ -731,6 +722,7 @@ static void clear_frame_configs(struct fg_context *context)
     memcpy(discard, context->frame_configs, count * sizeof(*discard));
     memset(context->frame_configs, 0, count * sizeof(*discard));
     context->frame_config_count = 0;
+    context->frame_config_retirement = 0;
     context->have_last_prepare_frame_id = FALSE;
     LeaveCriticalSection(&context->dispatch_lock);
 

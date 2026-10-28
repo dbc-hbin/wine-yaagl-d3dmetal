@@ -16,6 +16,7 @@
 #include <cwchar>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
@@ -483,6 +484,7 @@ struct Policy {
     AllocationFault resourceFault{}, heapFault{};
     bool failResourceFree{}, failHeapFree{}, throwHeapFree{}, reenter{};
     uint64_t heapRequested{};
+    std::map<ID3D12Resource*, ffxReturnCode_t> resourceRefusals;
 };
 static std::array<Policy, 2> policies;
 struct Creator { unsigned pair; uint32_t effect; bool heap; uint64_t offset{}, size{}; bool aliasable{}; };
@@ -515,6 +517,8 @@ template<unsigned Pair> static ffxReturnCode_t resourceFree(uint32_t effect, ID3
     const auto found = owners.find(resource);
     need(found != owners.end() && !found->second.heap && found->second.pair == Pair && found->second.effect == effect,
          "resource release uses exact accepted creator and effect");
+    const auto refusal = policy.resourceRefusals.find(resource);
+    if (refusal != policy.resourceRefusals.end()) return refusal->second;
     if (std::exchange(policy.failResourceFree, false)) return FFX_API_RETURN_ERROR_MEMORY;
     owners.erase(found); ++policy.resourceFrees; resource->Release();
     return FFX_API_RETURN_OK;
@@ -583,12 +587,12 @@ struct Backend {
     FfxInterface iface{};
     void* scratch{};
     size_t count;
-    explicit Backend(size_t contexts, const BackendAllocationCallbacks& value = {}) : count(contexts) {
+    explicit Backend(size_t contexts, const BackendAllocationCallbacks& value = {}, ID3D12Device* device = proxyDevice) : count(contexts) {
         const size_t size = ffxGetScratchMemorySizeDX12(contexts);
         need(size != 0, "valid scratch size");
         scratch = std::calloc(1, size);
         need(scratch != nullptr, "probe scratch allocation");
-        ok(ffxGetInterfaceDX12WithCallbacks(&iface, proxyDevice, scratch, size, count, value), "actual source interface");
+        ok(ffxGetInterfaceDX12WithCallbacks(&iface, device, scratch, size, count, value), "actual source interface");
     }
     BackendContext_DX12& state() { return *static_cast<BackendContext_DX12*>(scratch); }
     uint32_t create(FfxEffect effect = FFX_EFFECT_OPTICALFLOW, FfxEffectBindlessConfig* bindless = nullptr) {
@@ -1022,6 +1026,188 @@ static void contextIsolation() {
     com.baseline(base);
 }
 
+static void terminalResourceRefusal() {
+    for (const bool shared : {false, true}) for (const bool refusePrimary : {false, true}) {
+        plan = {}; policies = {};
+        const auto base = com.snapshot();
+        Backend backend(shared ? 2 : 1, callbacks(0));
+        const auto id = backend.create();
+        uint32_t survivor = UINT32_MAX;
+        FfxResourceInternal survivorResource{};
+        if (shared) {
+            survivor = backend.create(FFX_EFFECT_FRAMEINTERPOLATION);
+            survivorResource = create(backend, survivor, description(FFX_RESOURCE_INIT_DATA_TYPE_VALUE));
+        }
+        uint32_t constants[4]{};
+        FfxApiConstantBufferAllocation allocation{};
+        ok(backend.state().FallbackConstantAllocator(constants, sizeof(constants), &allocation), "acquire actual shared constant upload owner");
+        const auto sharedReferences = com.snapshot();
+        const auto survivorUsage = shared ? backend.usage(survivor) : FfxApiEffectMemoryUsage{};
+        const auto& state = backend.state();
+        std::vector<FfxGpuJobDescription> retainedJobs(state.pGpuJobs, state.pGpuJobs + state.gpuJobCount);
+        const auto primary = create(backend, id, description(FFX_RESOURCE_INIT_DATA_TYPE_BUFFER));
+        const auto upload = state.pResources[primary.internalIndex].uploadResourceIndex;
+        create(backend, id, description(FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED));
+        const uint32_t resourceEnd = state.pEffectContexts[id].nextStaticResource;
+        auto* primaryPointer = state.pResources[primary.internalIndex].resourcePtr;
+        auto* uploadPointer = state.pResources[upload].resourcePtr;
+        need(upload != 0, "terminal refusal has a linked upload child");
+        auto& policy = policies[0];
+        policy.resourceRefusals.emplace(uploadPointer, FFX_API_RETURN_ERROR_PARAMETER);
+        if (refusePrimary) policy.resourceRefusals.emplace(primaryPointer, FFX_API_RETURN_ERROR_MEMORY);
+        auto expected = shared ? sharedReferences : base;
+        for (const auto& [pointer, error] : policy.resourceRefusals) {
+            (void)error;
+            const auto& record = com.live.at(pointer);
+            expected.emplace(record.id, record.refs);
+        }
+        const auto attempts = policy.freeAttempts;
+        const auto frees = policy.resourceFrees;
+        registerPair(1);
+        const auto result = backend.iface.fpDestroyBackendContext(&backend.iface, id);
+        need(result == static_cast<FfxErrorCode>(refusePrimary ? FFX_ERROR_OUT_OF_MEMORY : FFX_ERROR_INVALID_ARGUMENT),
+             "terminal teardown reports first callback error, not later upload error");
+        need(policy.freeAttempts == attempts + 3 && policy.resourceFrees == frees + 3 - policy.resourceRefusals.size(),
+             "terminal teardown attempts primary, upload and independent owner exactly once without retry");
+        need(policies[1].freeAttempts == 0, "terminal teardown uses captured creators after callback replacement");
+        need(state.refCount == (shared ? 1u : 0u) && !state.pEffectContexts[id].active,
+             "callback refusal cannot keep terminal effect active or retain its backend reference");
+        for (uint32_t i = id * FFX_MAX_RESOURCE_COUNT; i < resourceEnd; ++i)
+            need(!state.pResources[i].resourcePtr && !state.pResources[i].deallocator && !state.pResources[i].uploadResourceIndex,
+                 "terminal handles cannot retain refused owners or stale upload links");
+        need(state.gpuJobCount == retainedJobs.size(), "terminal teardown removes only its own initialization jobs");
+        if (!retainedJobs.empty())
+            need(!std::memcmp(state.pGpuJobs, retainedJobs.data(), retainedJobs.size() * sizeof(FfxGpuJobDescription)),
+                 "surviving effect jobs retain exact identities and order");
+        if (shared) {
+            need(state.device && state.dxgiFactory && state.constantBufferResource && state.constantBufferMutexInitialized,
+                 "nonfinal refusal preserves shared backend objects");
+            memory(backend, survivor, survivorUsage);
+        } else {
+            need(!state.device && !state.dxgiFactory && !state.constantBufferResource && !state.constantBufferMem
+                 && !state.constantBufferMutexInitialized && !state.descHeapRtvCpu && !state.descHeapSrvCpu
+                 && !state.descHeapUavCpu && !state.descHeapUavGpu && !state.descRingBuffer,
+                 "final refusal still releases every shared backend owner");
+        }
+        com.baseline(expected);
+        for (const auto& [pointer, error] : policy.resourceRefusals) {
+            (void)error;
+            need(owners.count(pointer) == 1, "refused resource remains application-owned after terminal teardown");
+        }
+        std::vector<ID3D12Resource*> refused;
+        for (const auto& [pointer, error] : policy.resourceRefusals) { (void)error; refused.push_back(pointer); }
+        policy.resourceRefusals.clear();
+        for (auto* pointer : refused)
+            need(resourceFree<0>(FFX_EFFECT_OPTICALFLOW, pointer) == FFX_API_RETURN_OK,
+                 "application can release its refused owner after backend context teardown");
+        if (shared) {
+            const auto replacement = backend.create();
+            need(replacement == id, "terminal refusal frees its effect slot while a sibling stays live");
+            const auto replacementResource = create(backend, replacement, description(FFX_RESOURCE_INIT_DATA_TYPE_BUFFER));
+            destroy(backend, replacement, replacementResource); backend.destroy(replacement);
+            destroy(backend, survivor, survivorResource); backend.destroy(survivor);
+        }
+        need(owners.empty(), "terminal refusal leaves no backend or application owner after explicit application cleanup");
+        com.baseline(base);
+    }
+}
+
+static decltype(FfxInterface{}.fpExecuteGpuJobs) opticalflowExecute{};
+static bool refuseOpticalflowExecute{};
+static uint32_t opticalflowExecuteCalls{};
+static FfxErrorCode executeThenRefuse(FfxInterface* iface, FfxCommandList list, FfxUInt32 id) {
+    auto& state = *static_cast<BackendContext_DX12*>(iface->scratchBuffer);
+    need(state.gpuJobCount != 0, "optical flow dispatch reaches actual queued GPU work");
+    ok(opticalflowExecute(iface, list, id), "execute actual optical flow GPU jobs before injected error");
+    ++opticalflowExecuteCalls;
+    return refuseOpticalflowExecute ? static_cast<FfxErrorCode>(FFX_ERROR_BACKEND_API_ERROR) : FFX_OK;
+}
+static void opticalflowDispatchFailure() {
+    plan = {}; policies = {};
+    const auto base = com.snapshot();
+    // Command recording needs real driver objects, not construction-only COM
+    // wrappers. The scratch layout and every backend callback remain production.
+    Backend backend(FFX_OPTICALFLOW_CONTEXT_COUNT, {}, realDevice);
+    opticalflowExecute = backend.iface.fpExecuteGpuJobs;
+    backend.iface.fpExecuteGpuJobs = executeThenRefuse;
+    opticalflowExecuteCalls = 0;
+    auto context = std::make_unique<FfxOpticalflowContext>();
+    FfxOpticalflowContextDescription contextDesc{};
+    contextDesc.backendInterface = backend.iface;
+    contextDesc.resolution = {256, 256};
+    ok(ffxOpticalflowContextCreate(context.get(), &contextDesc), "create actual source optical flow context and native shaders");
+    const uint32_t id = 0;
+    need(backend.state().refCount == 1 && backend.state().pEffectContexts[id].active,
+         "optical flow owns the actual single backend effect context");
+    FfxOpticalflowSharedResourceDescriptions shared{};
+    ok(ffxOpticalflowGetSharedResourceDescriptions(context.get(), &shared), "query real optical flow output descriptions");
+    const auto vector = create(backend, id, shared.opticalFlowVector);
+    const auto scd = create(backend, id, shared.opticalFlowSCD);
+    auto colorDesc = description(FFX_RESOURCE_INIT_DATA_TYPE_VALUE, true);
+    colorDesc.resourceDescription.width = contextDesc.resolution.width;
+    colorDesc.resourceDescription.height = contextDesc.resolution.height;
+    colorDesc.resourceDescription.usage = FFX_API_RESOURCE_USAGE_READ_ONLY;
+    colorDesc.initialState = FFX_API_RESOURCE_STATE_COMPUTE_READ;
+    colorDesc.initData.size = contextDesc.resolution.width * contextDesc.resolution.height * 4;
+    const auto color = create(backend, id, colorDesc);
+    ComOwner<ID3D12CommandQueue> queue;
+    ComOwner<ID3D12CommandAllocator> allocator;
+    ComOwner<ID3D12GraphicsCommandList> list;
+    ComOwner<ID3D12Fence> fence;
+    D3D12_COMMAND_QUEUE_DESC queueDesc{}; queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    hr(realDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue.ptr)), "optical flow real command queue");
+    hr(realDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.ptr)), "optical flow real command allocator");
+    hr(realDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.ptr, nullptr, IID_PPV_ARGS(&list.ptr)), "optical flow real command list");
+    hr(list.ptr->Close(), "close initial optical flow command list");
+    hr(realDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.ptr)), "optical flow real completion fence");
+    HANDLE completed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    need(completed != nullptr, "optical flow completion event");
+    FfxOpticalflowDispatchDescription dispatch{};
+    dispatch.commandList = ffxGetCommandListDX12(list.ptr);
+    dispatch.color = ffxGetResourceDX12(backend.state().pResources[color.internalIndex].resourcePtr,
+                                     colorDesc.resourceDescription, colorDesc.name, colorDesc.initialState);
+    dispatch.opticalFlowVector = ffxGetResourceDX12(backend.state().pResources[vector.internalIndex].resourcePtr,
+                                                 shared.opticalFlowVector.resourceDescription, shared.opticalFlowVector.name,
+                                                 shared.opticalFlowVector.initialState);
+    dispatch.opticalFlowSCD = ffxGetResourceDX12(backend.state().pResources[scd.internalIndex].resourcePtr,
+                                              shared.opticalFlowSCD.resourceDescription, shared.opticalFlowSCD.name,
+                                              shared.opticalFlowSCD.initialState);
+    dispatch.backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+    dispatch.minMaxLuminance = {0.f, 100.f};
+    const auto& effect = backend.state().pEffectContexts[id];
+    const auto resourceCursor = effect.nextDynamicResource;
+    const auto uavCursor = effect.nextDynamicUavDescriptor;
+    constexpr uint32_t failedFrames = FFX_MAX_RESOURCE_COUNT / 3 + 2;
+    for (uint32_t frame = 0; frame <= failedFrames; ++frame) {
+        hr(allocator.ptr->Reset(), "reset optical flow allocator after preceding exact fence");
+        hr(list.ptr->Reset(allocator.ptr, nullptr), "reset optical flow command list");
+        dispatch.reset = frame == 0;
+        refuseOpticalflowExecute = frame < failedFrames;
+        const auto result = ffxOpticalflowContextDispatch(context.get(), &dispatch);
+        need(result == static_cast<FfxErrorCode>(refuseOpticalflowExecute ? FFX_ERROR_BACKEND_API_ERROR : FFX_OK),
+             "repeated optical flow execute errors propagate and later successful dispatch recovers");
+        need(opticalflowExecuteCalls == frame + 1, "each optical flow dispatch executes production GPU work exactly once");
+        need(effect.nextDynamicResource == resourceCursor && effect.nextDynamicUavDescriptor == uavCursor
+             && backend.state().gpuJobCount == 0,
+             "every failed or successful optical flow dispatch restores resource/UAV cursors and drains queued jobs");
+        hr(list.ptr->Close(), "close optical flow recorded work");
+        const UINT64 value = frame + 1;
+        hr(fence.ptr->SetEventOnCompletion(value, completed), "subscribe exact optical flow completion before submission");
+        ID3D12CommandList* submitted[]{list.ptr};
+        queue.ptr->ExecuteCommandLists(1, submitted);
+        hr(queue.ptr->Signal(fence.ptr, value), "signal optical flow submission fence");
+        need(WaitForSingleObject(completed, 30000) == WAIT_OBJECT_0 && fence.ptr->GetCompletedValue() >= value,
+             "actual optical flow GPU work completes before command allocator reuse");
+        hr(realDevice->GetDeviceRemovedReason(), "optical flow device remains healthy");
+    }
+    need(CloseHandle(completed), "close optical flow completion event");
+    destroy(backend, id, color); destroy(backend, id, vector); destroy(backend, id, scd);
+    ok(ffxOpticalflowContextDestroy(context.get()), "destroy actual optical flow context after GPU completion");
+    need(backend.state().refCount == 0 && backend.state().gpuJobCount == 0,
+         "optical flow dispatch retry leaves no backend contexts or queued work");
+    com.baseline(base);
+}
+
 struct CpuTrace {
     uint64_t allocations{}, deallocations{};
     static void* alloc(void* user, uint64_t size) {
@@ -1183,6 +1369,8 @@ static const Scenario scenarios[] = {
     {L"upload-identity", "nonadjacent-upload-owner", uploadIdentity},
     {L"alias", "aliasable-placement-ownership", aliasPlacement},
     {L"contexts", "shared-backend-context-isolation", contextIsolation},
+    {L"terminal-refusal", "terminal-resource-refusal-cleanup", terminalResourceRefusal},
+    {L"opticalflow-dispatch", "opticalflow-execute-failure-unregister", opticalflowDispatchFailure},
     {L"serializer", "serializer-real-blob-unwind", serializerOwnership},
 };
 } // namespace backend_probe
@@ -1201,7 +1389,7 @@ int wmain(int argc, wchar_t** argv) {
     const bool all = argc == 4 && !std::wcscmp(argv[1], L"--native") && !std::wcscmp(argv[3], L"--all");
     const bool single = argc == 5 && !std::wcscmp(argv[1], L"--native") && !std::wcscmp(argv[3], L"--scenario");
     if (!all && !single) {
-        std::fprintf(stderr, "usage: fsr3-backend-probe.exe --native <original-native-dll> --all | --scenario <scratch|first-init|heaps|resources|resource-faults|queue|upload-identity|alias|contexts|serializer>\n");
+        std::fprintf(stderr, "usage: fsr3-backend-probe.exe --native <original-native-dll> --all | --scenario <scratch|first-init|heaps|resources|resource-faults|queue|upload-identity|alias|contexts|terminal-refusal|opticalflow-dispatch|serializer>\n");
         return 64;
     }
     bool selected = all;

@@ -34,6 +34,67 @@
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
+static void *macdrv_retain_d3dmetal_content_view(WineContentView *view)
+{
+    return [(id)view retain];
+}
+
+void macdrv_release_d3dmetal_content_view(WineContentView *view)
+{
+    OnMainThread(^{ [(id)view release]; });
+}
+
+/* D3DMetal retains the snapshot's opaque client_cocoa_view and releases only
+ * that object at swapchain destruction. Do not expose the real NSView here. */
+@interface WineD3DMetalViewOwner : NSObject
+{
+@public
+    void *context;
+}
+@end
+
+@implementation WineD3DMetalViewOwner
+- (void) dealloc
+{
+    void *state = context;
+
+    /* Surface detach also synchronously dispatches to Cocoa. OnMainThread()
+     * always queues and waits, so all cleanup must leave the main thread. */
+    if ([NSThread isMainThread])
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            macdrv_destroy_d3dmetal_view_owner(state);
+        });
+    else
+    {
+        macdrv_destroy_d3dmetal_view_owner(state);
+    }
+    [super dealloc];
+}
+@end
+
+void *macdrv_create_d3dmetal_view_owner(void *context, WineContentView *view)
+{
+    WineD3DMetalViewOwner *owner = [[WineD3DMetalViewOwner alloc] init];
+    if (owner)
+    {
+        owner->context = context;
+        /* A client surface can detach before its reference count reaches zero.
+         * Keep the real NSView alive independently of the surface reference. */
+        macdrv_retain_d3dmetal_content_view(view);
+    }
+    return owner;
+}
+
+void *macdrv_get_d3dmetal_view_owner(void *owner)
+{
+    return ((WineD3DMetalViewOwner *)owner)->context;
+}
+
+void macdrv_release_d3dmetal_view_owner(void *owner)
+{
+    [(WineD3DMetalViewOwner *)owner release];
+}
+
 
 @implementation WineMetalLayer
 

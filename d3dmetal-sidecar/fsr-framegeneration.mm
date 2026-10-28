@@ -441,7 +441,7 @@ struct State {
         std::uint64_t id = 0;
         std::shared_ptr<Snapshot> snapshot;
     };
-    std::array<PendingFrame, 64> frames{};
+    std::array<PendingFrame, YAAGL_FSR_FG_MAX_PENDING_FRAMES> frames{};
     std::size_t frameCount = 0;
 
     std::shared_ptr<Snapshot>* findFrame(std::uint64_t id) {
@@ -460,12 +460,6 @@ struct State {
     }
     void clearFrames() {
         while (frameCount) frames[--frameCount].snapshot.reset();
-    }
-    std::uint64_t oldestFrame() const {
-        auto oldest = frames[0].id;
-        for (std::size_t i = 1; i < frameCount; ++i)
-            oldest = std::min(oldest, frames[i].id);
-        return oldest;
     }
     std::shared_ptr<TextureOwner> history;
     std::shared_ptr<Configuration> historyConfiguration;
@@ -1854,9 +1848,9 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                 auto& retire =
                     *static_cast<yaagl_fsr_fg_retire_frame_packet*>(arguments);
                 state->eraseFrame(retire.frame_id);
-                retire.has_pending_frame = state->frameCount != 0;
-                if (retire.has_pending_frame)
-                    retire.oldest_pending_frame_id = state->oldestFrame();
+                retire.pending_frame_count = state->frameCount;
+                for (std::size_t i = 0; i < state->frameCount; ++i)
+                    retire.pending_frame_ids[i] = state->frames[i].id;
                 return finish(Ok);
             }
             if (operation == YAAGL_FSR_FG_CONFIGURE) {

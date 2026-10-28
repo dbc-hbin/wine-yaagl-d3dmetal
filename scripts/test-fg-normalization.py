@@ -10,7 +10,8 @@ FG_CAMERA_NATIVE_MASK=1 additionally
 reads the mover mask only on the UUID-pinned, reviewed MetalFX implementation.
 The history fixture feeds public producer packets through the native registry
 and real Metal4 consumption, substituting COM/D3DMetal transport and context setup.
-It also checks bounded pending metadata, sparse IDs, rollback and queued ownership.
+It also checks exact sparse pending IDs, orphan Prepare retention across a long
+sequence, rollback and queued ownership.
 The barrier fixture exercises real native recording with deliberately invalid
 transport, not successful Wine/GPU submission.
 """
@@ -107,6 +108,7 @@ static struct native_api native;
 static struct fg_context ctx;
 static ffxContext handle;
 static int callbacks, native_calls, bridge_calls, retired, reported, lock_promotes;
+static uint64_t last_retired_frame;
 static ffxReturnCode_t bridge_result;
 static struct yaagl_fsr_fg_prepare_packet last_prepare;
 static struct yaagl_fsr_fg_dispatch_packet last_generation;
@@ -144,7 +146,7 @@ static struct frame_config_snapshot *find_frame_config(struct fg_context *contex
                                                        uint64_t frame_id)
 { (void)context; return snapshot.frame_id == frame_id ? &snapshot : NULL; }
 static void retire_frame_configs(struct fg_context *context, uint64_t frame_id)
-{ (void)context; (void)frame_id; ++retired; }
+{ (void)context; last_retired_frame = frame_id; ++retired; }
 static void initialize_packet(struct yaagl_fsr_fg_packet_header *header,
                               uint32_t size, uint32_t operation, uint64_t context)
 {
@@ -217,6 +219,7 @@ static void reset_state(int mode)
     ctx.translated = 17;
     native.dispatch = native_dispatch;
     callbacks = native_calls = bridge_calls = retired = reported = lock_promotes = 0;
+    last_retired_frame = 0;
     bridge_result = FFX_API_RETURN_OK;
 }
 static struct ffxDispatchDescFrameGenerationPrepareV2 valid_prepare(uint64_t id)
@@ -255,6 +258,7 @@ static ffxDispatchDescFrameGeneration valid_generation(uint64_t id)
 static ffxReturnCode_t mutate_and_dispatch(ffxDispatchDescFrameGeneration *desc, void *user)
 {
     (void)user;
+    desc->frameID += 1000;
     desc->numGeneratedFrames = 2;
     desc->outputs[1].resource = (void *)4;
     desc->outputs[1].state = FFX_API_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -530,6 +534,7 @@ static void check_generation(void)
     binding.generate = mutate_and_dispatch;
     assert(generation_callback(&desc, &binding) == FFX_API_RETURN_ERROR_PARAMETER);
     assert(desc.numGeneratedFrames == 0 && bridge_calls == 0 && retired == 1);
+    assert(desc.frameID == 1031 && last_retired_frame == 31);
     reset_state(CONTEXT_METALFX);
     desc = valid_generation(32);
     binding.generate = NULL;
@@ -4132,13 +4137,33 @@ static void pendingFrameMetadata(JitterRunner& runner) {
         assert(api(YAAGL_FSR_FG_RETIRE_FRAME, &retire) == Ok);
         pending[index] = false;
         assert(!state->findFrame(ids[index]) && state->frameCount == 63 - i);
-        assert(bool(retire.has_pending_frame) == (i != 63));
-        if (i != 63) {
-            unsigned first = 0;
-            while (!pending[first]) ++first;
-            assert(retire.oldest_pending_frame_id == ids[first]);
+        assert(retire.pending_frame_count == state->frameCount);
+        std::array<bool, 64> returned{};
+        for (unsigned j = 0; j < retire.pending_frame_count; ++j) {
+            const auto found = std::find(ids.begin(), ids.end(), retire.pending_frame_ids[j]);
+            assert(found != ids.end());
+            const auto index = found - ids.begin();
+            assert(pending[index] && !returned[index]);
+            returned[index] = true;
         }
+        assert(returned == pending);
     }
+    assert(prepare(201) == Ok);
+    const auto orphan = *state->findFrame(201);
+    recordedHistory.reset();
+    for (std::uint64_t id = 202; id != 458; ++id) {
+        assert(prepare(id) == Ok && state->frameCount == 2);
+        const std::weak_ptr<Snapshot> completed = *state->findFrame(id);
+        recordedHistory.reset();
+        retire.frame_id = id;
+        assert(api(YAAGL_FSR_FG_RETIRE_FRAME, &retire) == Ok);
+        assert(retire.pending_frame_count == 1 && retire.pending_frame_ids[0] == 201);
+        assert(state->frameCount == 1 && *state->findFrame(201) == orphan);
+        assert(completed.expired());
+    }
+    retire.frame_id = 201;
+    assert(api(YAAGL_FSR_FG_RETIRE_FRAME, &retire) == Ok);
+    assert(!retire.pending_frame_count && !state->frameCount);
     historyRecordAvailable = false;
     for (std::uint64_t id = 71; id != 135; ++id)
         assert(prepare(id) == Runtime && !state->frameCount && !recordedHistory);
@@ -4197,7 +4222,7 @@ static void pendingFrameMetadata(JitterRunner& runner) {
     const auto retained = *state->findFrame(71);
     retire.frame_id = 71;
     assert(api(YAAGL_FSR_FG_RETIRE_FRAME, &retire) == Ok);
-    assert(!retire.has_pending_frame && !state->frameCount);
+    assert(!retire.pending_frame_count && !state->frameCount);
     assert(recordedHistory->impl_->snapshot == retained);
     const auto retiredWork = recordedHistory;
     assert(prepare(72) == Ok);

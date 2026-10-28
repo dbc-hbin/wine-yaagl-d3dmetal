@@ -579,5 +579,10 @@ extern void macdrv_retain_d3dmetal_client_surface(void *surface);
 extern void macdrv_release_d3dmetal_client_surface(void *surface);
 extern void *macdrv_get_view_d3dmetal_client_surface(WineContentView *view);
 extern void macdrv_set_view_d3dmetal_client_surface(WineContentView *view, void *client_surface);
+extern void *macdrv_create_d3dmetal_view_owner(void *context, WineContentView *view);
+extern void *macdrv_get_d3dmetal_view_owner(void *owner);
+extern void macdrv_release_d3dmetal_view_owner(void *owner);
+extern void macdrv_destroy_d3dmetal_view_owner(void *context);
+extern void macdrv_release_d3dmetal_content_view(WineContentView *view);
 
 #endif  /* __WINE_MACDRV_COCOA_H */
