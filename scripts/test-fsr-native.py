@@ -22,6 +22,7 @@ SOURCE = r"""
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
+#import <objc/runtime.h>
 // Expose ownership only in this fixture so GPU readbacks cover the actual
 // prepared-frame intermediates, not a duplicate implementation of the kernels.
 #define private public
@@ -629,6 +630,160 @@ static void scratchReturnRegression(id<MTLDevice> device, id<MTL4Compiler> compi
     puts("SR_SCRATCH_RETURN_PASS");
 }
 
+static void parameterExceptionRegression(id<MTLDevice> device, id<MTL4Compiler> compiler) {
+    auto color=sharedTexture(device,MTLPixelFormatRGBA16Float,64,64);
+    auto depth=sharedTexture(device,MTLPixelFormatR32Float,64,64);
+    auto motion=sharedTexture(device,MTLPixelFormatRG16Float,64,64);
+    auto output=texture(device,MTLPixelFormatRGBA16Float,128,128,
+        MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite);
+    std::vector<_Float16> colors(64*64*4), motions(64*64*2,0);
+    std::vector<float> depths(64*64,.5f);
+    for (unsigned i=0;i<64*64;++i) {
+        colors[i*4]=.25f; colors[i*4+1]=.5f; colors[i*4+2]=.75f; colors[i*4+3]=1;
+    }
+    [color replaceRegion:MTLRegionMake2D(0,0,64,64) mipmapLevel:0
+        withBytes:colors.data() bytesPerRow:64*4*sizeof(_Float16)];
+    [depth replaceRegion:MTLRegionMake2D(0,0,64,64) mipmapLevel:0
+        withBytes:depths.data() bytesPerRow:64*sizeof(float)];
+    [motion replaceRegion:MTLRegionMake2D(0,0,64,64) mipmapLevel:0
+        withBytes:motions.data() bytesPerRow:64*2*sizeof(_Float16)];
+    FrameInfo frame{};
+    frame.color=color; frame.depth=depth; frame.motionVectors=motion; frame.output=output;
+    frame.inputContent={64,64}; frame.colorRect=frame.depthRect=frame.motionRect={0,0,64,64};
+    frame.outputRect={0,0,128,128}; frame.resetHistory=true;
+    FrameOperations operations{};
+    operations.sharpening=true;
+    auto observed=[[NSMapTable alloc]
+        initWithKeyOptions:NSPointerFunctionsStrongMemory
+              valueOptions:NSPointerFunctionsWeakMemory|NSPointerFunctionsObjectPointerPersonality
+                  capacity:1];
+    const auto prepareFrame=[&](const std::shared_ptr<Feature>& feature, Error& error) {
+        return feature->prepare(frame,{color,depth,motion,output,nullptr,nullptr,nullptr},
+            &error,operations);
+    };
+    const auto outputValid=[&] {
+        auto result=pixels<_Float16>(device,output,4);
+        for (unsigned c=0;c<4;++c)
+            assert(std::fabs(float(result[(64*128+64)*4+c])-float(colors[c]))<.003f);
+    };
+    auto sample=[MTLFunctionConstantValues new];
+    const SEL setterSelector=@selector(setConstantValue:type:atIndex:);
+    const Method setterMethod=class_getInstanceMethod(object_getClass(sample),setterSelector);
+    const IMP originalSetter=method_getImplementation(setterMethod);
+    [sample release];
+    for (bool throwing : {false,true}) {
+        auto feature=makeFeature(device,compiler,true);
+        Error error;
+        TemporalOutputLayout temporal{};
+        assert(ensureFsrPipelines(*feature->impl_,{},temporal,MTLPixelFormatR32Float,&error));
+        auto library=feature->impl_->fsrLibrary;
+        const SEL functionSelector=@selector(newFunctionWithName:constantValues:error:);
+        const Method functionMethod=class_getInstanceMethod(object_getClass(library),functionSelector);
+        const IMP originalFunction=method_getImplementation(functionMethod);
+        __block id constants=nil;
+        __block NSUInteger incomingOwners=0;
+        const IMP setter=imp_implementationWithBlock(
+            ^(id receiver,const void* value,MTLDataType type,NSUInteger index) {
+                if (type==MTLDataTypeBool && index==0) {
+                    assert(!constants);
+                    incomingOwners=[receiver retainCount];
+                    constants=[receiver retain];
+                    [observed setObject:receiver forKey:@"resource"];
+                    if (throwing) @throw [NSException exceptionWithName:@"SRParameterFixture"
+                        reason:@"injected constants setter failure" userInfo:nil];
+                }
+                reinterpret_cast<void (*)(id,SEL,const void*,MTLDataType,NSUInteger)>(
+                    originalSetter)(receiver,setterSelector,value,type,index);
+            });
+        const IMP function=imp_implementationWithBlock(
+            ^id(id receiver,NSString* name,id values,NSError** failure) {
+                if (receiver==library && [name isEqualToString:@"yaagl_fsr_finish"]) {
+                    assert(!throwing && values==constants);
+                    if (failure) *failure=[NSError errorWithDomain:@"SRParameterFixture" code:1 userInfo:nil];
+                    return nil;
+                }
+                return reinterpret_cast<id (*)(id,SEL,NSString*,id,NSError**)>(originalFunction)(
+                    receiver,functionSelector,name,values,failure);
+            });
+        @try {
+            method_setImplementation(setterMethod,setter);
+            method_setImplementation(functionMethod,function);
+            assert(!prepareFrame(feature,error) && error);
+            assert(constants && [constants retainCount]==incomingOwners);
+        } @finally {
+            method_setImplementation(functionMethod,originalFunction);
+            method_setImplementation(setterMethod,originalSetter);
+            imp_removeBlock(function); imp_removeBlock(setter);
+            [constants release];
+        }
+        assert(![observed objectForKey:@"resource"]);
+        auto prepared=prepareFrame(feature,error);
+        assert(prepared && !error);
+        auto lease=execute(device,prepared);
+        outputValid();
+        lease.reset(); prepared.reset(); feature->markDormant();
+    }
+
+    auto feature=makeFeature(device,compiler,true);
+    Error error;
+    auto prepared=prepareFrame(feature,error);
+    assert(prepared);
+    prepared->impl_->firstLease.reset();
+    for (auto& buffer : feature->impl_->idleBuffers) releaseObject(buffer);
+    __block id<MTLBuffer> pooled=[device newBufferWithLength:sizeof(FsrParams)
+        options:MTLResourceStorageModeShared];
+    assert(pooled && pooled.retainCount==1);
+    feature->impl_->idleBuffers[0]=pooled; // The pool owns the factory's sole +1.
+    [observed setObject:pooled forKey:@"resource"];
+    [pooled retain]; // Observe exact +1 balance even if failed checkout destroys its owner.
+    const SEL contentsSelector=@selector(contents);
+    const Method contentsMethod=class_getInstanceMethod(object_getClass(pooled),contentsSelector);
+    const IMP originalContents=method_getImplementation(contentsMethod);
+    __block unsigned injected=0;
+    const IMP contents=imp_implementationWithBlock(^void*(id receiver) {
+        if (receiver==pooled) {
+            ++injected;
+            @throw [NSException exceptionWithName:@"SRParameterFixture"
+                reason:@"injected checked-out buffer contents failure" userInfo:nil];
+        }
+        return reinterpret_cast<void* (*)(id,SEL)>(originalContents)(receiver,contentsSelector);
+    });
+    auto allocator=[device newCommandAllocator];
+    auto command=[device newCommandBuffer];
+    auto fence=[device newFence];
+    [command beginCommandBufferWithAllocator:allocator];
+    std::shared_ptr<const ExecutionLease> rejected;
+    @try {
+        method_setImplementation(contentsMethod,contents);
+        assert(!prepared->encode(command,fence,rejected,&error) && error && !rejected);
+        assert(injected==1 && pooled.retainCount==1);
+        for (auto buffer : feature->impl_->idleBuffers) assert(buffer!=pooled);
+    } @finally {
+        method_setImplementation(contentsMethod,originalContents);
+        imp_removeBlock(contents);
+        [pooled release];
+    }
+    assert(![observed objectForKey:@"resource"]);
+    [command endCommandBuffer];
+    [fence release]; [command release]; [allocator release];
+    // A fresh checked-out parameter buffer must survive successful encoding and replay.
+    pooled=[device newBufferWithLength:sizeof(FsrParams) options:MTLResourceStorageModeShared];
+    feature->impl_->idleBuffers[0]=pooled;
+    [observed setObject:pooled forKey:@"resource"];
+    auto recovered=execute(device,prepared);
+    assert(recovered->impl_->finishParams==pooled);
+    outputValid();
+    recovered.reset();
+    auto replay=execute(device,prepared);
+    assert(replay->impl_->finishParams==pooled);
+    outputValid();
+    replay.reset(); prepared.reset(); feature->markDormant(); feature.reset();
+    assert(![observed objectForKey:@"resource"]);
+    [observed release];
+    [output release]; [motion release]; [depth release]; [color release];
+    puts("SR_PARAMETER_EXCEPTIONS_PASS: specialization and pooled contents failures recovered; replay completed");
+}
+
 static void tableOwnershipRegression(id<MTLDevice> device, id<MTL4Compiler> compiler) {
     auto feature=makeFeature(device,compiler,true);
     auto color=sharedTexture(device,MTLPixelFormatRGBA8Unorm,64,64);
@@ -1119,6 +1274,7 @@ int main() {
         motionRegression(device,compiler,false,false,true,false);
         tableOwnershipRegression(device,compiler);
         scratchReturnRegression(device,compiler);
+        parameterExceptionRegression(device,compiler);
         pipelineTransitionRegression(device,compiler);
         compositionMaskRegression(device,compiler);
         finishCropRegression(device);

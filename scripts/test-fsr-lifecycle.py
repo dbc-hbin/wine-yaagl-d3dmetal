@@ -1005,6 +1005,378 @@ int main(void)
 '''
 
 
+NATIVE_CREATE = COMMON + r'''
+#include <stdlib.h>
+#define __declspec(attribute)
+#include "d3dmetal-sidecar/third-party/fidelityfx/Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h"
+typedef unsigned char BYTE;
+typedef uint32_t DWORD;
+typedef uint16_t WCHAR;
+typedef int BOOL;
+typedef void *HMODULE;
+typedef struct { uint32_t a; uint16_t b, c; BYTE d[8]; } GUID;
+typedef struct { int32_t e_lfanew; } IMAGE_DOS_HEADER;
+typedef struct { DWORD VirtualAddress, Size; } IMAGE_DATA_DIRECTORY;
+typedef struct {
+    struct {
+        uint16_t Magic;
+        DWORD SizeOfImage;
+        IMAGE_DATA_DIRECTORY DataDirectory[16];
+    } OptionalHeader;
+} IMAGE_NT_HEADERS64;
+typedef struct { DWORD Type, SizeOfData, AddressOfRawData; } IMAGE_DEBUG_DIRECTORY;
+#define TRUE 1
+#define FALSE 0
+#define IMAGE_NT_OPTIONAL_HDR64_MAGIC 0x20b
+#define IMAGE_DIRECTORY_ENTRY_DEBUG 6
+#define IMAGE_DEBUG_TYPE_CODEVIEW 2
+#define FG_METHOD
+#define GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 4
+#define GET_MODULE_HANDLE_EX_FLAG_PIN 1
+#define PAGE_READWRITE 4
+#define ERR(...) ((void)0)
+struct native_api {
+    PfnFfxCreateContext create;
+    PfnFfxDestroyContext destroy;
+};
+static struct native_api native;
+typedef ffxReturnCode_t (*native_swapchain_create_func)(
+    void *, ffxContext *, ffxCreateContextDescHeader *, const ffxAllocationCallbacks **);
+static ffxReturnCode_t native_swapchain_create(
+    void *, ffxContext *, ffxCreateContextDescHeader *, const ffxAllocationCallbacks **);
+static const BYTE *native_swapchain_base;
+static native_swapchain_create_func native_swapchain_create_original;
+static int allow_pin = 1, allow_protection = 1;
+static unsigned pins, protection_restores;
+static BOOL GetModuleHandleExW(DWORD flags, const WCHAR *address, HMODULE *module)
+{
+    assert(flags == (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN));
+    assert((const void *)address == (const void *)native_swapchain_create);
+    *module = NULL;
+    if (!allow_pin) return FALSE;
+    ++pins;
+    return TRUE;
+}
+static BOOL VirtualProtect(void *address, size_t size, DWORD protection, DWORD *previous)
+{
+    (void)address;
+    assert(size == sizeof(void *));
+    *previous = 2;
+    if (protection != PAGE_READWRITE) { assert(protection == 2); ++protection_restores; }
+    return allow_protection;
+}
+static void *InterlockedCompareExchangePointer(void **slot, void *exchange, void *compare)
+{ return __sync_val_compare_and_swap(slot, compare, exchange); }
+static _Thread_local const void *callback_return;
+#define __builtin_return_address(depth) callback_return
+'''
+
+NATIVE_CREATE_MAIN = r'''
+enum scenario { REJECT, SUCCEED, PUBLISHED_ERROR, FREED_ERROR, OTHER_OWNER, OTHER_CALLSITE, EARLY };
+struct ledger {
+    void *pointers[8], *resource;
+    unsigned count, allocs, frees, native_allocs, native_frees, gpu_owners;
+    ffxAllocationCallbacks surviving_callbacks;
+    int nested;
+};
+struct descriptor {
+    ffxApiHeader header;
+    struct ledger *ledger;
+    enum scenario scenario;
+    int concurrent;
+};
+static _Thread_local struct ledger *active_ledger;
+static pthread_mutex_t create_gate = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t creates_changed = PTHREAD_COND_INITIALIZER;
+static unsigned creates_ready;
+static ffxReturnCode_t create_native_swapchain(
+    ffxContext *, ffxCreateContextDescHeader *, const ffxAllocationCallbacks *);
+
+static void *user_allocate(void *opaque, uint64_t size)
+{
+    struct ledger *ledger = opaque;
+    void *memory = malloc(size);
+    assert(ledger == active_ledger && memory && ledger->count < 8);
+    ledger->pointers[ledger->count++] = memory;
+    ++ledger->allocs;
+    if (ledger->nested)
+    {
+        struct ledger nested = {0};
+        struct descriptor desc = {{FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_NEW_DX12, NULL},
+                                  &nested, REJECT, 0};
+        ffxAllocationCallbacks callbacks = {&nested, user_allocate, NULL};
+        ffxContext context = NULL;
+        callbacks.dealloc = ledger->surviving_callbacks.dealloc;
+        ledger->nested = 0;
+        active_ledger = &nested;
+        assert(create_native_swapchain(&context, &desc.header, &callbacks) == FFX_API_RETURN_ERROR_RUNTIME_ERROR);
+        assert(!context && nested.allocs == 1 && nested.frees == 1 && !nested.count);
+        active_ledger = ledger;
+    }
+    return memory;
+}
+
+static void user_deallocate(void *opaque, void *memory)
+{
+    struct ledger *ledger = opaque;
+    unsigned i;
+    assert(ledger == active_ledger);
+    assert(memory != ledger->resource || !ledger->gpu_owners);
+    for (i = 0; i < ledger->count && ledger->pointers[i] != memory; ++i) {}
+    assert(i < ledger->count);
+    ledger->pointers[i] = ledger->pointers[--ledger->count];
+    ++ledger->frees;
+    free(memory);
+}
+
+static void *native_allocate(size_t size)
+{
+    ++active_ledger->native_allocs;
+    return user_allocate(active_ledger, size);
+}
+
+static void native_deallocate(void *memory)
+{
+    ++active_ledger->native_frees;
+    user_deallocate(active_ledger, memory);
+}
+
+static unsigned return_offset(uint64_t type)
+{
+    if (type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WRAP_DX12) return 0x1230d;
+    if (type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_NEW_DX12) return 0x12458;
+    return 0x12579;
+}
+
+static ffxReturnCode_t provider_create(
+    void *provider, ffxContext *output, ffxCreateContextDescHeader *header,
+    const ffxAllocationCallbacks **allocator)
+{
+    struct descriptor *desc = (void *)header;
+    struct ledger *ledger = desc->ledger;
+    const ffxAllocationCallbacks *callbacks = *allocator;
+    void *memory;
+    (void)provider;
+    assert(ledger == active_ledger);
+    if (desc->scenario == EARLY) return FFX_API_RETURN_ERROR_PARAMETER;
+    if (!native_swapchain_base ||
+        header->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION)
+    {
+        assert(callbacks && callbacks->pUserData == ledger && callbacks->alloc == user_allocate);
+        /* A partial effect/backend owner may keep callbacks after create returns. */
+        ledger->surviving_callbacks = *callbacks;
+        ledger->resource = callbacks->alloc(callbacks->pUserData, 24);
+        ledger->gpu_owners = 1;
+        return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
+    }
+    callback_return = native_swapchain_base + return_offset(header->type);
+    if (desc->scenario == OTHER_CALLSITE) callback_return = native_swapchain_base + 0x12457;
+    memory = callbacks->alloc(callbacks->pUserData, 24);
+    if (desc->scenario == OTHER_OWNER)
+    {
+        callback_return = native_swapchain_base + 0x104190;
+        ledger->resource = callbacks->alloc(callbacks->pUserData, 24);
+        ledger->gpu_owners = 1;
+    }
+    if (desc->concurrent)
+    {
+        assert(!pthread_mutex_lock(&create_gate));
+        ++creates_ready;
+        assert(!pthread_cond_broadcast(&creates_changed));
+        while (creates_ready != 8) wait_for(&creates_changed, &create_gate);
+        assert(!pthread_mutex_unlock(&create_gate));
+    }
+    if (desc->scenario == FREED_ERROR) callbacks->dealloc(callbacks->pUserData, memory);
+    if (desc->scenario == SUCCEED || desc->scenario == PUBLISHED_ERROR) *output = memory;
+    return desc->scenario == SUCCEED ? FFX_API_RETURN_OK : FFX_API_RETURN_ERROR_RUNTIME_ERROR;
+}
+
+static ffxReturnCode_t create_native_swapchain(
+    ffxContext *output, ffxCreateContextDescHeader *header, const ffxAllocationCallbacks *callbacks)
+{
+    /* The real export selects either the patched SDK vtable or an untouched
+     * external/effect provider before passing its local Allocator by reference. */
+    if (!native_swapchain_base || header->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION)
+        return provider_create(NULL, output, header, &callbacks);
+    return native_swapchain_create(NULL, output, header, &callbacks);
+}
+
+static ffxReturnCode_t provider_destroy(ffxContext *context, const ffxAllocationCallbacks *callbacks)
+{
+    assert(*context);
+    if (callbacks)
+    {
+        assert(callbacks->pUserData == active_ledger && callbacks->dealloc == user_deallocate);
+        callbacks->dealloc(callbacks->pUserData, *context);
+    }
+    else native_deallocate(*context);
+    *context = NULL;
+    return FFX_API_RETURN_OK;
+}
+
+static void run_create(uint64_t type, enum scenario scenario, int custom, int concurrent, int nested)
+{
+    struct ledger ledger = {0};
+    struct descriptor desc = {{type, NULL}, &ledger, scenario, concurrent};
+    ffxAllocationCallbacks callbacks = {&ledger, user_allocate, user_deallocate};
+    ffxContext output = NULL;
+    ffxReturnCode_t result;
+    ledger.nested = nested;
+    ledger.surviving_callbacks = callbacks;
+    active_ledger = &ledger;
+    result = create_native_swapchain(&output, &desc.header, custom ? &callbacks : NULL);
+    if (scenario == SUCCEED || scenario == PUBLISHED_ERROR)
+    {
+        assert(output && ledger.count == 1 && !ledger.frees);
+        assert(result == (scenario == SUCCEED ? FFX_API_RETURN_OK : FFX_API_RETURN_ERROR_RUNTIME_ERROR));
+        assert(native.destroy(&output, custom ? &callbacks : NULL) == FFX_API_RETURN_OK);
+    }
+    else if (scenario == OTHER_OWNER)
+    {
+        assert(!output && ledger.allocs == 2 && ledger.frees == 1 && ledger.count == 1 && ledger.gpu_owners == 1);
+        ledger.gpu_owners = 0;
+        if (custom) callbacks.dealloc(callbacks.pUserData, ledger.resource);
+        else native_deallocate(ledger.resource);
+    }
+    else if (scenario == OTHER_CALLSITE)
+    {
+        assert(!output && ledger.allocs == 1 && !ledger.frees && ledger.count == 1);
+        if (custom) callbacks.dealloc(callbacks.pUserData, ledger.pointers[0]);
+        else native_deallocate(ledger.pointers[0]);
+    }
+    else
+    {
+        assert(!output && result != FFX_API_RETURN_OK && !ledger.count);
+        assert(ledger.allocs == ledger.frees);
+    }
+    assert(!ledger.count && ledger.allocs == ledger.frees);
+    assert(custom ? !ledger.native_allocs : ledger.native_allocs == ledger.allocs);
+    assert(custom ? !ledger.native_frees : ledger.native_frees == ledger.frees);
+}
+
+static void *create_worker(void *argument)
+{
+    uintptr_t index = (uintptr_t)argument;
+    const uint64_t types[] = {
+        FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WRAP_DX12,
+        FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_NEW_DX12,
+        FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12
+    };
+    run_create(types[index % 3], index % 2 ? REJECT : SUCCEED, index % 3 != 0, 1, 0);
+    return NULL;
+}
+
+int main(void)
+{
+    static const GUID pdb = {0xf977ea5e, 0xeaed, 0x467f,
+        {0x80, 0x0d, 0xe4, 0x37, 0xac, 0x3b, 0x9e, 0x74}};
+    static const BYTE allocation[] = {0x48,0x8b,0x41,0x08,0xba,0x18,0,0,0,0x48,0x8b,0x09,0xff,0xd0,0xeb,0x0b};
+    static const BYTE failure[] = {0x85,0xc0,0x0f,0x84,0x37,0xff,0xff,0xff,0xb8,3,0,0,0,0xeb,5};
+    const uint64_t types[] = {
+        FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WRAP_DX12,
+        FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_NEW_DX12,
+        FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12
+    };
+    BYTE *image = calloc(1, 0x247a000);
+    IMAGE_DOS_HEADER *dos = (void *)image;
+    IMAGE_NT_HEADERS64 *nt = (void *)(image + 128);
+    IMAGE_DEBUG_DIRECTORY *debug = (void *)(image + 4096);
+    DWORD age = 1;
+    void *(*allocate)(size_t) = native_allocate;
+    void (*deallocate)(void *) = native_deallocate;
+    pthread_t workers[8];
+    assert(image);
+    dos->e_lfanew = 128;
+    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt->OptionalHeader.SizeOfImage = 0x247a000;
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG] =
+        (IMAGE_DATA_DIRECTORY){4096, sizeof(*debug)};
+    *debug = (IMAGE_DEBUG_DIRECTORY){IMAGE_DEBUG_TYPE_CODEVIEW, 24, 8192};
+    memcpy(image + 8192, "RSDS", 4);
+    memcpy(image + 8196, &pdb, sizeof(pdb));
+    memcpy(image + 8212, &age, sizeof(age));
+    memcpy(image + 0x122ff, allocation, sizeof(allocation));
+    memcpy(image + 0x1244a, allocation, sizeof(allocation));
+    memcpy(image + 0x1256b, allocation, sizeof(allocation));
+    memcpy(image + 0x125d1, failure, sizeof(failure));
+    *(void **)(image + 0x24657c8) = image + 0x12290;
+    *(void **)(image + 0x106458) = image + 0x6d40;
+    *(void **)(image + 0x24674b0) = image + 0xf25c0;
+    native.create = (PfnFfxCreateContext)(image + 0x1040d0);
+    native.destroy = (PfnFfxDestroyContext)(image + 0x1042b0);
+    assert(native_swapchain_create_base(image, &native) == image);
+    image[8196] ^= 1;
+    assert(!native_swapchain_create_base(image, &native));
+    image[8196] ^= 1;
+    image[8212] = 2;
+    assert(!native_swapchain_create_base(image, &native));
+    image[8212] = 1;
+    ++nt->OptionalHeader.SizeOfImage;
+    assert(!native_swapchain_create_base(image, &native));
+    --nt->OptionalHeader.SizeOfImage;
+    debug->AddressOfRawData = 0x247a000;
+    assert(!native_swapchain_create_base(image, &native));
+    debug->AddressOfRawData = 8192;
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        unsigned offset = return_offset(types[i]) - 14;
+        image[offset] ^= 1;
+        assert(!native_swapchain_create_base(image, &native));
+        image[offset] ^= 1;
+    }
+    image[0x125d9] ^= 1;
+    assert(!native_swapchain_create_base(image, &native));
+    image[0x125d9] ^= 1;
+    native.create = create_native_swapchain;
+    assert(!native_swapchain_create_base(image, &native));
+    native.create = (PfnFfxCreateContext)(image + 0x1040d0);
+    allow_pin = 0;
+    install_native_swapchain_rollback(image, &native);
+    assert(!native_swapchain_base && *(void **)(image + 0x24657c8) == image + 0x12290);
+    allow_pin = 1;
+    allow_protection = 0;
+    install_native_swapchain_rollback(image, &native);
+    assert(!native_swapchain_base && *(void **)(image + 0x24657c8) == image + 0x12290);
+    allow_protection = 1;
+    install_native_swapchain_rollback(image, &native);
+    assert(native_swapchain_base == image && pins == 2 && protection_restores == 1);
+    assert(*(void **)(image + 0x24657c8) == (void *)native_swapchain_create);
+    assert(*(void **)(image + 0x106458) == image + 0x6d40);
+    assert(*(void **)(image + 0x24674b0) == image + 0xf25c0);
+    assert((void *)native_swapchain_create_original == image + 0x12290);
+    native.create = create_native_swapchain;
+    native.destroy = provider_destroy;
+    native_swapchain_create_original = provider_create;
+    memcpy(image + 0x106260, &allocate, sizeof(allocate));
+    memcpy(image + 0x106258, &deallocate, sizeof(deallocate));
+    for (unsigned i = 0; i < 3; ++i)
+        for (int custom = 0; custom < 2; ++custom)
+            for (int scenario = REJECT; scenario <= EARLY; ++scenario)
+                run_create(types[i], scenario, custom, 0, 0);
+    run_create(types[0], REJECT, 1, 0, 1);
+    for (uintptr_t i = 0; i < 8; ++i) assert(!pthread_create(&workers[i], NULL, create_worker, (void *)i));
+    for (unsigned i = 0; i < 8; ++i) assert(!pthread_join(workers[i], NULL));
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        struct ledger ledger = {0};
+        struct descriptor desc = {{i ? types[1] : FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION, NULL},
+                                  &ledger, REJECT, 0};
+        ffxAllocationCallbacks callbacks = {&ledger, user_allocate, user_deallocate};
+        ffxContext output = NULL;
+        native_swapchain_base = i ? NULL : image;
+        active_ledger = &ledger;
+        assert(create_native_swapchain(&output, &desc.header, &callbacks) == FFX_API_RETURN_ERROR_RUNTIME_ERROR);
+        assert(!output && ledger.count == 1 && !ledger.frees && ledger.gpu_owners == 1);
+        ledger.gpu_owners = 0;
+        ledger.surviving_callbacks.dealloc(ledger.surviving_callbacks.pUserData, ledger.resource);
+        assert(!ledger.count && ledger.allocs == ledger.frees);
+    }
+    free(image);
+    puts("Native FG create: exact unpublished rollback, allocator identity, publication and concurrent calls passed");
+}
+'''
+
+
 def compile_and_run(code, cxx=False):
     with tempfile.TemporaryDirectory(prefix="yaagl-fsr-lifecycle-") as directory:
         source = pathlib.Path(directory) / ("lifecycle.cpp" if cxx else "lifecycle.c")
@@ -1019,6 +1391,17 @@ def compile_and_run(code, cxx=False):
 
 
 class FsrLifecycleTest(unittest.TestCase):
+    def test_native_swapchain_failed_create(self):
+        source = (ROOT / "dlls/amd_fidelityfx_framegeneration_dx12/main.c").read_text()
+        sdk = ROOT / "d3dmetal-sidecar/third-party/fidelityfx/Kits/FidelityFX/framegeneration/include/dx12/ffx_api_framegeneration_dx12.h"
+        descriptor_types = "\n".join(line for line in sdk.read_text().splitlines()
+                                   if line.startswith("#define FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_")
+                                   and any(name in line.split()[1] for name in ("WRAP_", "NEW_", "FOR_HWND_")))
+        image = section(source, "static BOOL native_image_matches(", "static FfxApiPresentCallbackFunc native_default_present(")
+        identity = section(source, "static const BYTE *native_swapchain_create_base(", "static BOOL CALLBACK initialize_native(")
+        create = section(source, "struct native_swapchain_create\n", "static void *allocate_memory(")
+        compile_and_run(NATIVE_CREATE + descriptor_types + "\n" + image + identity + create + NATIVE_CREATE_MAIN)
+
     def test_selected_metalfx_configuration(self):
         source = (ROOT / "dlls/amd_fidelityfx_framegeneration_dx12/main.c").read_text()
         declarations = section(source, "enum context_mode\n", "static SRWLOCK contexts_lock")

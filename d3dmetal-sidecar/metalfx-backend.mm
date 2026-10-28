@@ -1128,11 +1128,19 @@ bool ensureFsrPipelines(Feature::Impl& feature, const FrameOperations& operation
         feature.combineMaskPipeline = makePipeline(feature.device, feature.fsrLibrary,
                                                    @"yaagl_fsr_combine_masks");
     if (finish && !feature.finishPipelines[operations.sharpening]) {
-        auto constants = [MTLFunctionConstantValues new];
-        [constants setConstantValue:&operations.sharpening type:MTLDataTypeBool atIndex:0];
-        feature.finishPipelines[operations.sharpening] =
-            makePipeline(feature.device, feature.fsrLibrary, @"yaagl_fsr_finish", constants);
-        [constants release];
+        MTLFunctionConstantValues* constants = nil;
+        @try {
+            constants = [MTLFunctionConstantValues new];
+            [constants setConstantValue:&operations.sharpening type:MTLDataTypeBool atIndex:0];
+            feature.finishPipelines[operations.sharpening] =
+                makePipeline(feature.device, feature.fsrLibrary, @"yaagl_fsr_finish", constants);
+        } @catch (id) {
+            setError(error, ErrorCode::ResourceCreationFailed,
+                     "FSR finish specialization raised an exception");
+            return false;
+        } @finally {
+            [constants release];
+        }
     }
     if (debug && !debugDepth && !feature.debugPipeline)
         feature.debugPipeline = makePipeline(feature.device, feature.fsrLibrary,
@@ -1462,7 +1470,8 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                                         (frame.composition ? 2u : 0u) |
                                         (frame.frame.exposureMode == ExposureMode::Texture ? 8u : 0u) |
                                         (frame.cappedOutput ? 16u : 0u);
-            const auto makeParams = [&](const Rect& source, const Rect& destination,
+            const auto makeParams = [&](id<MTLBuffer>& buffer,
+                                        const Rect& source, const Rect& destination,
                                         const Rect& dispatch, ColorTransfer transfer,
                                         bool padding = false) {
                 FsrParams params{{source.x, source.y},
@@ -1480,13 +1489,17 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                     records[2].dispatchExtent[1] = dispatch.height - source.height;
                 }
                 const auto length = padding ? sizeof(records) : sizeof(params);
-                id<MTLBuffer> buffer = feature.takeBuffer(length);
+                buffer = feature.takeBuffer(length);
                 if (buffer) {
-                    std::memcpy(buffer.contents, records.data(), length);
-                    return buffer;
+                    @try {
+                        std::memcpy(buffer.contents, records.data(), length);
+                    } @catch (id) {
+                        releaseObject(buffer);
+                    }
+                    return;
                 }
-                return [feature.device newBufferWithBytes:records.data() length:length
-                                                   options:MTLResourceStorageModeShared];
+                buffer = [feature.device newBufferWithBytes:records.data() length:length
+                                                    options:MTLResourceStorageModeShared];
             };
             const Rect generatedDispatch{0, 0,
                 static_cast<std::uint32_t>(generation.inputCapacityWidth),
@@ -1498,18 +1511,17 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                         ? ColorTransfer::Linear : frame.operations.colorTransfer;
                 const Rect destination{0, 0, frame.frame.inputContent.width,
                                        frame.frame.inputContent.height};
-                lease->linearizeParams = makeParams(frame.frame.colorRect, destination,
-                                                    generatedDispatch, inputTransfer,
-                                                    !fullInputCapacity);
+                makeParams(lease->linearizeParams, frame.frame.colorRect, destination,
+                           generatedDispatch, inputTransfer, !fullInputCapacity);
             }
             if (frame.resampleDisplayMotion) {
                 const Rect destination{0, 0, frame.scalerMotionRect.width,
                                        frame.scalerMotionRect.height};
-                lease->motionResampleParams = makeParams(frame.frame.motionRect, destination,
-                                                         destination, ColorTransfer::Linear);
+                makeParams(lease->motionResampleParams, frame.frame.motionRect, destination,
+                           destination, ColorTransfer::Linear);
             }
             if (frame.operations.combineCompositionMask && !frame.directComposition)
-                lease->maskParams = makeParams(
+                makeParams(lease->maskParams,
                     frame.frame.reactiveRect,
                     Rect{0, 0, frame.frame.inputContent.width, frame.frame.inputContent.height},
                     generatedDispatch,
@@ -1557,8 +1569,8 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                 const Rect destination{static_cast<std::uint32_t>(frame.frame.outputRect.x + frame.placementX),
                                        static_cast<std::uint32_t>(frame.frame.outputRect.y + frame.placementY),
                                        source.width, source.height};
-                lease->finishParams = makeParams(source, destination, frame.frame.outputRect,
-                                                 outputTransfer);
+                makeParams(lease->finishParams, source, destination, frame.frame.outputRect,
+                           outputTransfer);
             }
             if ((transfer && !lease->linearizeParams) ||
                 (frame.resampleDisplayMotion && !lease->motionResampleParams) ||

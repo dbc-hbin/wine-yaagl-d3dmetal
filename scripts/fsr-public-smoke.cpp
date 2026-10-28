@@ -168,18 +168,31 @@ int main(int argc, char** argv) {
         nullptr, IID_PPV_ARGS(&readback)), "Create readback");
     D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = result; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = readback.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = footprint;
-    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr); hr(list->Close(), "Close");
-    ID3D12CommandList* submitted[]{list.Get()}; queue->ExecuteCommandLists(1, submitted);
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    transition(list.Get(), result, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    for (auto* input : inputs)
+        transition(list.Get(), input, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    hr(list->Close(), "Close");
+    ID3D12CommandList* submitted[]{list.Get()};
     ComPtr<ID3D12Fence> fence; hr(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence");
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr); check(event != nullptr, "CreateEvent");
-    hr(queue->Signal(fence.Get(), 1), "Signal"); hr(fence->SetEventOnCompletion(1, event), "SetEventOnCompletion");
-    check(WaitForSingleObject(event, 60000) == WAIT_OBJECT_0, "GPU completion"); CloseHandle(event);
-    hr(device->GetDeviceRemovedReason(), "GPU device status");
-    void* mapped = nullptr; D3D12_RANGE range{0, SIZE_T(size)}; hr(readback->Map(0, &range, &mapped), "Readback map");
-    auto pixel = static_cast<const unsigned char*>(mapped) + footprint.Offset + (oh/2)*footprint.Footprint.RowPitch + (ow/2)*4;
-    std::printf("%s readback center RGBA=%u,%u,%u,%u\n", fgEnabled ? "SR+FG" : "SR", pixel[0],pixel[1],pixel[2],pixel[3]);
-    check(pixel[0] > 30 && pixel[0] < 100 && pixel[1] > 90 && pixel[1] < 170 && pixel[2] > 145 && pixel[2] < 235, "record/replay color readback");
-    D3D12_RANGE none{0,0}; readback->Unmap(0, &none);
+    // Replay the same recorded native ownership after its first GPU completion.
+    // Both public FSR contexts were already destroyed before either submission.
+    for (UINT64 replay = 1; replay <= 2; ++replay) {
+        hr(fence->SetEventOnCompletion(replay, event), "SetEventOnCompletion");
+        queue->ExecuteCommandLists(1, submitted);
+        hr(queue->Signal(fence.Get(), replay), "Signal");
+        check(WaitForSingleObject(event, 60000) == WAIT_OBJECT_0, "GPU completion");
+        hr(device->GetDeviceRemovedReason(), "GPU device status");
+        void* mapped = nullptr; D3D12_RANGE range{0, SIZE_T(size)};
+        hr(readback->Map(0, &range, &mapped), "Readback map");
+        auto pixel = static_cast<const unsigned char*>(mapped) + footprint.Offset + (oh/2)*footprint.Footprint.RowPitch + (ow/2)*4;
+        std::printf("%s replay=%llu readback center RGBA=%u,%u,%u,%u\n", fgEnabled ? "SR+FG" : "SR",
+            static_cast<unsigned long long>(replay), pixel[0],pixel[1],pixel[2],pixel[3]);
+        check(pixel[0] > 30 && pixel[0] < 100 && pixel[1] > 90 && pixel[1] < 170 && pixel[2] > 145 && pixel[2] < 235, "record/replay color readback");
+        D3D12_RANGE none{0,0}; readback->Unmap(0, &none);
+    }
+    CloseHandle(event);
     hr(allocator->Reset(), "allocator lifetime retirement");
     std::puts(fgEnabled ? "FSR_PUBLIC_SR_FG_PASS" : "FSR_PUBLIC_SR_PASS");
     return 0;

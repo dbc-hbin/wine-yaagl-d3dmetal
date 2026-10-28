@@ -20,7 +20,10 @@ const sourcePaths = [
   "d3dmetal-sidecar/async-pipeline.mm",
   "d3dmetal-sidecar/low-latency.hpp", "d3dmetal-sidecar/low-latency-state.hpp",
   "d3dmetal-sidecar/low-latency.mm", "include/yaagl_nvapi_low_latency.hpp",
+  "d3dmetal-sidecar/cache-lifetime.hpp", "d3dmetal-sidecar/cache-lifetime.mm",
+  "d3dmetal-sidecar/fence-lifetime.hpp", "d3dmetal-sidecar/fence-lifetime.mm",
   "d3dmetal-sidecar/metalfx-contract.hpp",
+  "d3dmetal-sidecar/metalfx-lifetime.hpp", "d3dmetal-sidecar/metalfx-lifetime.mm",
   "d3dmetal-sidecar/metalfx-backend.hpp", "d3dmetal-sidecar/metalfx-backend.mm",
   "d3dmetal-sidecar/d3dmetal-transport.hpp", "d3dmetal-sidecar/d3dmetal-transport.mm",
   "d3dmetal-sidecar/ngx-hooks.hpp", "d3dmetal-sidecar/ngx-hooks.mm",
@@ -47,7 +50,7 @@ const sources = sourcePaths.map((path) => ({
 }));
 const layout = JSON.parse(readFileSync(resolve(sourceDirectory, "layout.json"), "utf8"));
 const hookNames = layout.hooks.map(hook => hook.id);
-if (layout.formatVersion !== 32 || new Set(hookNames).size !== hookNames.length ||
+if (layout.formatVersion !== 34 || new Set(hookNames).size !== hookNames.length ||
     layout.hooks.some((hook, index) => !/^[A-Za-z][A-Za-z0-9]*$/.test(hook.id) ||
         hook.dispatchFieldOffset !== index * layout.dispatch.pointerSize)) {
   throw new Error("unsupported beta3 sidecar dispatch layout");
@@ -83,6 +86,10 @@ const header = [
   `inline constexpr std::uint64_t kCommonSize = ${layout.dispatch.commonSectionNewSize};`,
   `inline constexpr std::uint8_t kUuid[] = { ${bytes(layout.source.machUuid)} };`,
   `inline constexpr std::array<std::uintptr_t, ${hookNames.length}> kTrampolines = { ${layout.hooks.map((hook) => hook.trampolineOffset).join(", ")} };`,
+  "namespace fence {",
+  ...Object.entries(layout.fenceAbi).map(([name, value]) =>
+    `inline constexpr std::uintptr_t k${name} = ${value};`),
+  "} // namespace fence",
   ...spans.map((span, index) => `inline constexpr std::uint8_t kSpan${index}[] = { ${bytes(span.hex)} };`),
   "struct VerificationSpan { std::uintptr_t offset; const std::uint8_t* bytes; std::size_t size; };",
   `inline constexpr std::array<VerificationSpan, ${spans.length}> kVerificationSpans = {{`,

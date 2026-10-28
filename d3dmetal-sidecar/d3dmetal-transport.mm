@@ -130,12 +130,13 @@ MTLPixelFormat temporalMotionFormat(MTLPixelFormat format) noexcept {
 }
 
 struct MotionViewCacheEntry {
-    id<MTLTexture> source = nil;
-    id<MTLTexture> view = nil;
+    NSMapTable* textures = nil;
     MTLPixelFormat sourceFormat = MTLPixelFormatInvalid;
     MTLPixelFormat viewFormat = MTLPixelFormatInvalid;
     MTLTextureType textureType = MTLTextureType2D;
     TextureView range{};
+
+    ~MotionViewCacheEntry() { [textures release]; }
 };
 
 std::mutex gMotionViewCacheMutex;
@@ -143,10 +144,10 @@ std::array<MotionViewCacheEntry, 32> gMotionViewCache{};
 std::size_t gMotionViewCacheNext = 0;
 
 bool sameMotionViewKey(const MotionViewCacheEntry& entry,
-                       id<MTLTexture> source, MTLPixelFormat sourceFormat,
+                       MTLPixelFormat sourceFormat,
                        MTLPixelFormat viewFormat, MTLTextureType textureType,
                        const TextureView& range) noexcept {
-    return entry.source == source && entry.sourceFormat == sourceFormat &&
+    return entry.sourceFormat == sourceFormat &&
            entry.viewFormat == viewFormat && entry.textureType == textureType &&
            std::memcmp(&entry.range, &range, sizeof(range)) == 0;
 }
@@ -155,6 +156,7 @@ bool createNativeSrTextureView(void*& texture, TextureView& range,
                                MTLPixelFormat requestedFormat) noexcept {
     id<MTLTexture> source = reinterpret_cast<id<MTLTexture>>(texture);
     if (!source) return false;
+    id<MTLTexture> createdView = nil;
     @try {
         if (source.textureType != MTLTextureType2D && source.textureType != MTLTextureType2DArray)
             return false;
@@ -177,39 +179,48 @@ bool createNativeSrTextureView(void*& texture, TextureView& range,
 
         std::lock_guard<std::mutex> lock(gMotionViewCacheMutex);
         for (const auto& entry : gMotionViewCache) {
-            if (!entry.view || !sameMotionViewKey(entry, source, sourceFormat, viewFormat,
-                                                  MTLTextureType2D, viewRange))
+            if (!sameMotionViewKey(entry, sourceFormat, viewFormat,
+                                   MTLTextureType2D, viewRange))
                 continue;
-            [entry.view retain];
-            [source release];
-            texture = entry.view;
-            range = viewRange;
-            return true;
+            @autoreleasepool {
+                id<MTLTexture> view = [[entry.textures objectForKey:source] retain];
+                if (!view) continue;
+                [source release];
+                texture = view;
+                range = viewRange;
+                return true;
+            }
         }
 
-        id<MTLTexture> view = [source newTextureViewWithPixelFormat:viewFormat
+        createdView = [source newTextureViewWithPixelFormat:viewFormat
                                                          textureType:MTLTextureType2D
                                                               levels:NSMakeRange(viewRange.firstMip, viewRange.mipCount)
                                                               slices:NSMakeRange(viewRange.firstSlice, viewRange.sliceCount)
                                                              swizzle:MTLTextureSwizzleChannelsDefault];
-        if (!view) return false;
+        if (!createdView) return false;
 
         auto& entry = gMotionViewCache[gMotionViewCacheNext];
         gMotionViewCacheNext = (gMotionViewCacheNext + 1) % gMotionViewCache.size();
-        [entry.source release];
-        [entry.view release];
-        entry.source = [source retain];
-        entry.view = [view retain];
+        // Reuse views owned by recorded work without pinning an obsolete source
+        // texture (and potentially its entire placement heap) in this cache.
+        if (!entry.textures)
+            entry.textures = [[NSMapTable alloc]
+                initWithKeyOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality
+                      valueOptions:NSPointerFunctionsWeakMemory capacity:1];
+        [entry.textures removeAllObjects];
+        [entry.textures setObject:createdView forKey:source];
         entry.sourceFormat = sourceFormat;
         entry.viewFormat = viewFormat;
         entry.textureType = MTLTextureType2D;
         entry.range = viewRange;
-        texture = view;
+        texture = std::exchange(createdView, nil);
         range = viewRange;
         [source release];
         return true;
     } @catch (id) {
         return false;
+    } @finally {
+        [createdView release];
     }
 }
 

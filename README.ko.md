@@ -10,7 +10,7 @@ DLSS는 Apple 원본 `nvngx-on-metalfx.dll`과 Unix 모듈을 사용합니다. �
 
 공식 `wine-11.20` 태그를 기반으로 검증된 소스 `1846c16674b`의 런타임 변경을 이식한 트리입니다. 빌드 입력은 `dlls/`, `server/`, `include/`의 Wine 소스입니다. 유지한 계약과 업스트림 중복 처리 기준은 [이식 기록](documentation/WINE-REBASE.md)에 정리합니다. 과거 P3/tuned 패치 묶음은 원본 커밋에 참고 자료로 보존하며, 이 트리에 다시 적용하거나 복사하지 않습니다.
 
-beta3 훅 계약은 `d3dmetal-sidecar/layout.json`에 정의되어 있습니다. format 32, marker `YAAGLB3SIDEcar\x20`, dispatch 슬롯 27개이며 추가 `binaryPatches`는 없습니다. 처음 네 훅은 `GetContainingOutput`, `SetFullscreenState`, `QueryVideoMemoryInfo`, `ReplayTemporalScale`로 유지합니다. Async 훅 12개는 graphics PSO 생성·조회·해제, MPL 일반·indexed draw, root signature 수명, command list reset·query·수명과 Present를 담당합니다. DX11 훅 5개는 일반·indexed draw, query Begin·End와 context 해제를 담당합니다. `CompleteExecute`는 완료된 FSR 실행의 리소스를 회수하고, 그 뒤에 `PresentResidencyAdd` 호출 지점 훅이 옵니다. 이어지는 저지연 훅 4개는 native NVAPI 조회, Present 완료, swapchain 해제와 device 해제를 담당합니다. `ngx-hooks.mm`은 기록된 FSR 명령을 처리하고, 나머지는 Apple 원본 replay로 전달합니다. FSR SR/FG는 Metal4/MPL transport를 사용합니다.
+beta3 훅 계약은 `d3dmetal-sidecar/layout.json`에 정의되어 있습니다. format 34, marker `YAAGLB3SIDEcar\x22`, dispatch 슬롯 38개이며 추가 `binaryPatches`는 없습니다. 처음 네 훅은 `GetContainingOutput`, `SetFullscreenState`, `QueryVideoMemoryInfo`, `ReplayTemporalScale`로 유지합니다. Async 훅 12개는 graphics PSO 생성·조회·해제, MPL 일반·indexed draw, root signature 수명, command list reset·query·수명과 Present를 담당합니다. DX11 훅 5개 뒤에는 `CompleteExecute`, `PresentResidencyAdd`, 저지연 훅 4개, `CacheFileOpen` / `CacheFileClose`가 이어집니다. 기존 29개 순서를 유지하고 fence 완료 훅 9개를 덧붙입니다. `ngx-hooks.mm`은 기록된 FSR 명령을 처리하고, 나머지는 Apple 원본 replay로 전달합니다. FSR SR/FG는 Metal4/MPL transport를 사용합니다.
 
 `PresentResidencyAdd`는 `DoPresent`의 layer set 등록 호출 `0x16d242`만 교체합니다. 조사한 macOS 27 IOGPU 구현은 등록을 `NSCountedSet`으로 강하게 보유하고 고유 set 32개 제한을 검사합니다. 큐마다 현재 layer set을 한 번만 등록하며, 다른 set으로 바뀌면 이전 등록을 먼저 제거하고 새 set을 추가합니다. 큐의 다른 등록은 유지합니다. 이 호출은 native worker가 직렬화하며, 큐에 연결된 상태는 교체 또는 큐 파괴까지 layer set을 최대 하나만 보유합니다. layer 교체에 따른 등록 누적을 수정한 것이며 실제 게임의 메모리 급증 해결을 입증한 것은 아닙니다. `node --test scripts/test-present-residency.mjs`는 실제 생성된 x86 호출·gate·trampoline과 production 훅을 Foundation의 실제 counting·소유권 동작으로 128회 layer 교체에 걸쳐 검사하며, D3DMetal을 로드하거나 GPU 작업을 실행하지 않습니다.
 
@@ -20,13 +20,26 @@ beta3 훅 계약은 `d3dmetal-sidecar/layout.json`에 정의되어 있습니다.
 
 DXGI 비디오 메모리 조회, 출력 모니터 조회, 전체 화면 진입점과 출력 열거는 원본 메서드를 호출할 때도 Windows x64 호출 규약을 사용합니다. 네이티브 내부 헬퍼는 호스트 ABI를 유지합니다. 이 규약이 섞이면 렌더링 전 Unity 기동 단계에서 크래시가 발생합니다.
 
+캐시 수명 훅은 셰이더 캐시를 교체하지 않고 원본 beta3의 해제 누락을 수정합니다. `Close`는 0 대신 실제 payload 매핑 길이를 넘겨 해제하고, 원본 header/file 정리 후 남은 소유권 필드도 비웁니다. `Open`은 재열기·비활성화 전에 이전의 살아 있는 소유권을 정리하며, 헤더 불일치 실패의 새 자원도 회수합니다. 다른 reader의 실패로 전체 재시도에 들어간 성공한 캐시들도 처리합니다. 빈 경로의 비활성화는 여전히 성공을 반환합니다. Open/Close/View 498바이트를 인증하며, `node --test scripts/test-cache-lifetime.mjs`와 실제 컴파일러의 네 캐시·손상 복구 8가지 GPU readback 시나리오로 검증합니다.
+
+`metalfx-lifetime.mm`은 인증된 x86_64 macOS 27.2 MetalFX에만 프로세스 내부 수명 보정을 적용합니다. FG는 원본 `.cxx_destruct` 후 Apple의 typed cleanup으로 누락된 native device를 해제합니다. BBR은 정상·nil·예외 초기화에서 순환 참조를 비소유 참조로 바꾸고, 소멸 시 분리한 필터를 prewarm group과 마지막 내부 graph event가 모두 완료된 뒤 해제합니다. 알림 기반으로 처리하므로 나중에 제출할 스레드를 막지 않으며, 기록된 명령의 CPU 재실행 소유권도 계속 보장해야 합니다. 클래스·ivar·IMP·함수 바이트·할당자 인증이 어긋나면 MetalFX를 변경하지 않습니다. ARM 비공개 ABI 보정은 구현하지 않았습니다. `node scripts/test-metalfx-lifetime.mjs`는 초기화 실패·제출 전 공개 객체 해제·두 큐·재실행을 포함한 15개 수정 전후 쌍에서 소멸 이벤트와 출력 해시를 비교합니다. 영원히 제출하지 않거나 GPU 실패로 완료 신호가 없는 작업을 임의 취소하는 수정은 아닙니다.
+
+`fence-lifetime.mm`은 대기 중인 알림 block들이 완료 상태를 공동 소유하게 합니다. 최종 취소는 원래 Wine callback 경로로 복제 HANDLE만 닫으며 성공 신호를 보내지 않습니다. ALL/ANY는 모든 등록이 성공해야 완료를 게시하므로 부분 실패가 성공 신호를 만들지 않습니다. NULL-event 대기의 semaphore도 남은 block들이 해제될 때까지 보존합니다. 단일 fence 6개와 다중 fence 3개 진입점에서 HRESULT를 유지하며, `node --test scripts/test-fence-lifetime.mjs`로 동시 완료·취소, 등록 실패, 할당 해제와 동기 대기를 검사합니다.
+
+별도로 인증한 Metal4 queue descriptor 보정은 `feedbackQueue` 대입·교체·복사·소멸의 참조 수를 맞춥니다. `node scripts/test-metal-queue-lifetime.mjs`는 인증 거부와 실제 Metal4 GPU 복사를 검사합니다. SR 뷰 게시와 파라미터 버퍼 인수, FG texture/function/residency 임시 객체는 복구 가능한 예외에도 획득한 참조를 회수합니다. Prepare는 명령 기록에 성공한 뒤에만 대기 메타데이터를 게시합니다. Wine의 Metal-view·tracker 생성 실패는 다른 활성 view를 건드리지 않고 HWND 배열 소유권과 임시 surface 참조를 되돌립니다.
+
+PE FG bridge는 고정된 원본 SDK swapchain provider의 NEW/HWND/WRAP 실패에서 게시되지 않은 할당만 회수합니다. 정확한 native 할당 호출 지점을 추적하고 사용자 callback과 원본 기본 할당자를 유지하며, 외부 provider는 감싸지 않습니다.
+
+FSR3 3.1.6 effect 생성은 비공개 `yaagl_fsr3_lifetime.dll`이 고정된 SDK의 CPU provider, optical flow, frame interpolation과 DX12 backend를 소유합니다. 각 단계는 성공적으로 획득한 자원만 기록하고, 실패하면 scratch 저장소보다 먼저 회수합니다. 업로드 자원은 인접 인덱스를 추정하지 않고 실제 핸들로 소유합니다. CPU callback은 값으로 복사하고 backend마다 resource/heap/constant-buffer callback의 동기화된 스냅샷을 보존하므로, 이후 또는 재진입 등록이 기존 자원의 해제자를 바꾸지 않습니다. 원본 provider 선택, 셰이더 바이트, swapchain 표시, ML과 외부 provider는 유지합니다. 원본 파일 해시와 로드된 실행 영역을 인증한 뒤 FSR3 Create 슬롯만 교체하며, 새 context는 서로 다른 비공개 C++ 레이아웃을 혼용하지 않는 명시적 native ABI proxy를 사용합니다.
+
+`scripts/build-fsr-translator.sh`와 Wine 전체 빌드는 정적 C++ 런타임을 포함한 이 DLL을 원본 native DLL 옆에 넣습니다. Staging은 공개 FFX DLL과 별도로 단일 install export, 아키텍처, 소스 manifest와 산출물 해시를 검사합니다. `scripts/fsr3-provider-probe.cpp`는 공개 native/source FSR3 경로의 생성 실패, callback 소유권과 실제 GPU readback을 다루며, 기존 번역 SR/FG 재실행 검사는 `scripts/fsr-public-smoke.cpp`로 유지합니다.
+
 converter는 원본을 유지합니다. 준비 도구는 `native-sidecar-patch`, `native-sidecar-module`, `final-framework-reseal` 순서로 적용합니다. sidecar 소스는 `d3dmetal-sidecar/`에 있으며, `scripts/build-d3dmetal-sidecar.mjs`가 `libD3DMetalSidecar.dylib`를 빌드하고 `scripts/d3dmetal-sidecar-patch.mjs`가 패치를 담당합니다. 패키징 옵션은 `--sidecar-module`과 `--sidecar-manifest`, manifest 필드는 `nativeSidecarBuild`와 `nativeSidecar`, recipe 필드는 `patches.nativeSidecar`입니다. 내부 C++ namespace `yaagl::pso`와 공개 FSR C API는 유지합니다. 제외한 패치의 이유는 다음과 같이 구분합니다.
 
 | 제외한 패치 | 현재 정책의 근거 |
 |---|---|
 | FP64 codec recipe | 알려진 실패 codec fixture가 beta3 원본 converter에서 컴파일되며 cast 구현도 기존 recipe와 다릅니다. 모든 FP64/constrained-cast 입력의 정상 동작을 증명한 것은 아닙니다. |
 | Stage-lock·compute loser 해제 | beta3 `CompileCompute`가 이미 stage-cache lock을 잡고 중복 할당을 해제합니다. |
-| CacheFile close/munmap | beta3가 파일을 닫고 payload와 header를 unmap한 뒤 상태를 초기화합니다. |
 | CacheFile publication-order | reader가 불완전한 record를 거부하고 cache를 닫거나 다시 엽니다. writer 순서를 기본 구성에서 바꿔야 할 correctness·캐시 재사용 문제는 재현되지 않았습니다. |
 | Legacy fullscreen null/forward call-site | beta3가 native output을 직접 전달합니다. Yaagl 모니터 라우팅은 별도의 sidecar 기능으로 유지합니다. |
 | 매 프레임 present-residency 제거 | 대신 호출 지점 훅이 큐마다 현재 layer set 하나를 유지하고 set이 바뀔 때만 교체합니다. 중복 counted 등록을 피하고 큐의 기본 set 등록을 보존합니다. |

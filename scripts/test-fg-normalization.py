@@ -1020,6 +1020,11 @@ int main() {
 
 
 NATIVE_DESTROY = r'''
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#import <objc/runtime.h>
+#include <dispatch/dispatch.h>
+#include <cassert>
 #include <array>
 #include <algorithm>
 #include <atomic>
@@ -1036,12 +1041,152 @@ NATIVE_DESTROY = r'''
 #define private public
 #include "fsr-framegeneration.hpp"
 #undef private
+// Observe actual ownership without replacing dispatch allocation or release.
+static dispatch_data_t libraryData;
+static bool observeLibraryData = false;
+static unsigned libraryDataReleases = 0;
+static dispatch_data_t createObservedData(const void* bytes, size_t size,
+                                         dispatch_queue_t queue, dispatch_block_t destructor) {
+    auto data = dispatch_data_create(bytes, size, queue, destructor);
+    if (observeLibraryData) { assert(!libraryData); libraryData = data; }
+    return data;
+}
+static void releaseObservedData(dispatch_object_t object) {
+    if (observeLibraryData && (void*)object == (void*)libraryData) ++libraryDataReleases;
+    dispatch_release(object);
+}
+#define dispatch_data_create createObservedData
+#define dispatch_release releaseObservedData
 #include "fsr-framegeneration.mm"
+#undef dispatch_data_create
+#undef dispatch_release
 #include <cassert>
 extern "C" id objc_initWeak(id*, id);
 extern "C" id objc_loadWeakRetained(id*);
 extern "C" void objc_destroyWeak(id*);
 using namespace yaagl::pso::fsr::framegeneration;
+
+static void factoryOwnershipFailures(id<MTLDevice> device) {
+    NSError* error = nil;
+    auto data = dispatch_data_create(kFsrKernelsMetallib, sizeof(kFsrKernelsMetallib),
+        nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    auto library = [device newLibraryWithData:data error:&error];
+    dispatch_release(data);
+    auto function = [library newFunctionWithName:@"yaagl_fg_decode_crop"];
+    assert(library && function && !error);
+    const SEL functionSelector = @selector(newFunctionWithName:);
+    const SEL pipelineSelector = @selector(newComputePipelineStateWithFunction:error:);
+    const Method functionMethod = class_getInstanceMethod(object_getClass(library), functionSelector);
+    const Method pipelineMethod = class_getInstanceMethod(object_getClass(device), pipelineSelector);
+    const IMP originalFunction = method_getImplementation(functionMethod);
+    const IMP originalPipeline = method_getImplementation(pipelineMethod);
+    __block bool raises = false;
+    __block unsigned injected = 0;
+    const IMP replacementFunction = imp_implementationWithBlock(^id(id receiver, NSString* name) {
+        if (receiver == library && [name isEqualToString:@"yaagl_fg_decode_crop"])
+            return [function retain]; // A real cached identity, with a fresh new-family +1.
+        return reinterpret_cast<id (*)(id, SEL, NSString*)>(originalFunction)(
+            receiver, functionSelector, name);
+    });
+    const IMP replacementPipeline = imp_implementationWithBlock(
+        ^id(id receiver, id candidate, NSError** failure) {
+            if (receiver == device && candidate == function) {
+                ++injected;
+                if (raises) @throw [NSException exceptionWithName:@"FGFactoryFixture"
+                    reason:@"injected pipeline factory failure" userInfo:nil];
+                if (failure) *failure = [NSError errorWithDomain:@"FGFactoryFixture" code:1 userInfo:nil];
+                return nil;
+            }
+            return reinterpret_cast<id (*)(id, SEL, id, NSError**)>(originalPipeline)(
+                receiver, pipelineSelector, candidate, failure);
+        });
+    const auto functionOwners = function.retainCount;
+    @try {
+        method_setImplementation(functionMethod, replacementFunction);
+        method_setImplementation(pipelineMethod, replacementPipeline);
+        for (bool throwing : {false, true}) {
+            raises = throwing;
+            for (unsigned attempt = 0; attempt != 8; ++attempt) {
+                bool caught = false;
+                @try {
+                    assert(!makePipeline(device, library, @"yaagl_fg_decode_crop"));
+                } @catch (NSException* exception) {
+                    assert(throwing && [exception.name isEqualToString:@"FGFactoryFixture"]);
+                    caught = true;
+                }
+                assert(caught == throwing && function.retainCount == functionOwners);
+            }
+        }
+        assert(injected == 16);
+    } @finally {
+        method_setImplementation(pipelineMethod, originalPipeline);
+        method_setImplementation(functionMethod, originalFunction);
+        imp_removeBlock(replacementPipeline); imp_removeBlock(replacementFunction);
+    }
+    assert(makePipeline(device, library, @"yaagl_fg_decode_crop"));
+    [function release]; [library release];
+
+    auto weakDescriptors = [[NSHashTable alloc]
+        initWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality
+                capacity:32];
+    for (bool residency : {false, true}) {
+        const SEL selector = residency ? @selector(newResidencySetWithDescriptor:error:)
+                                       : @selector(newTextureWithDescriptor:);
+        const Method method = class_getInstanceMethod(object_getClass(device), selector);
+        const IMP original = method_getImplementation(method);
+        for (bool throwing : {false, true}) {
+            for (unsigned attempt = 0; attempt != 8; ++attempt) {
+                __block id observed = nil;
+                __block NSUInteger incomingOwners = 0;
+                auto observe = ^(id descriptor) {
+                    assert(!observed);
+                    incomingOwners = [descriptor retainCount];
+                    observed = [descriptor retain];
+                    [weakDescriptors addObject:descriptor];
+                    if (throwing) @throw [NSException exceptionWithName:@"FGFactoryFixture"
+                        reason:@"injected descriptor factory failure" userInfo:nil];
+                };
+                const IMP replacement = residency
+                    ? imp_implementationWithBlock(^id(id, id descriptor, NSError** failure) {
+                        observe(descriptor);
+                        if (failure) *failure = [NSError errorWithDomain:@"FGFactoryFixture" code:1 userInfo:nil];
+                        return nil;
+                    })
+                    : imp_implementationWithBlock(^id(id, id descriptor) {
+                        observe(descriptor);
+                        return nil;
+                    });
+                bool caught = false;
+                @try {
+                    method_setImplementation(method, replacement);
+                    if (residency) {
+                        ExecutionLease::Impl execution;
+                        execution.prepared = std::make_shared<PreparedFrame::Impl>();
+                        execution.prepared->configuration = std::make_shared<Configuration>();
+                        execution.prepared->configuration->device = Object(device);
+                        assert(!execution.makeResident(nil));
+                    } else {
+                        assert(!privateTexture(device, MTLPixelFormatR32Float, 64, 64,
+                            MTLTextureUsageShaderRead));
+                    }
+                } @catch (NSException* exception) {
+                    assert(throwing && [exception.name isEqualToString:@"FGFactoryFixture"]);
+                    caught = true;
+                } @finally {
+                    method_setImplementation(method, original);
+                    imp_removeBlock(replacement);
+                }
+                assert(caught == throwing && observed);
+                // The observer's +1 must be the sole replacement for the factory's +1.
+                assert([observed retainCount] == incomingOwners);
+                [observed release];
+            }
+        }
+    }
+    assert(weakDescriptors.allObjects.count == 0);
+    [weakDescriptors release];
+    assert(privateTexture(device, MTLPixelFormatR32Float, 64, 64, MTLTextureUsageShaderRead));
+}
 
 int main() {
     std::array<id, 4> weak{}; // Unused factory, recorded factory, retired history, shared pipeline.
@@ -1060,6 +1205,7 @@ int main() {
         auto compiler = [device newCompilerWithDescriptor:descriptor error:&error];
         [descriptor release];
         assert(device && compiler);
+        factoryOwnershipFailures(device);
         auto state = std::make_shared<State>();
         state->creation.display_width = state->creation.display_height = 136;
         Command command;
@@ -1087,6 +1233,46 @@ int main() {
         snapshot->motion = acquireTexture(state->snapshotMotion, true, device,
             MTLPixelFormatRG16Float, 64, 64, MTLTextureUsageShaderRead);
         snapshot->depthWidth = snapshot->depthHeight = snapshot->motionWidth = snapshot->motionHeight = 64;
+        const SEL librarySelector = @selector(newLibraryWithData:error:);
+        const Method libraryMethod = class_getInstanceMethod(object_getClass(device), librarySelector);
+        assert(libraryMethod);
+        const IMP originalLibrary = method_getImplementation(libraryMethod);
+        for (bool raises : {false, true}) {
+            libraryData = nullptr; libraryDataReleases = 0;
+            __block bool injected = false;
+            const IMP replacement = imp_implementationWithBlock(
+                ^id(id receiver, dispatch_data_t data, NSError** error) {
+                    if (data == libraryData && observeLibraryData) {
+                        injected = true;
+                        if (raises) @throw [NSException exceptionWithName:@"FGLibraryFixture"
+                            reason:@"injected library creation exception" userInfo:nil];
+                        if (error) *error = [NSError errorWithDomain:@"FGLibraryFixture" code:1 userInfo:nil];
+                        return nil;
+                    }
+                    return reinterpret_cast<id (*)(id, SEL, dispatch_data_t, NSError**)>(
+                        originalLibrary)(receiver, librarySelector, data, error);
+                });
+            bool caught = false;
+            observeLibraryData = true;
+            @try {
+                method_setImplementation(libraryMethod, replacement);
+                auto rejected = configure(*state, command, parameters,
+                    (id<MTLTexture>)snapshot->depth->texture.get(), MTLPixelFormatRGBA16Float,
+                    MTLPixelFormatInvalid, 128, 128, FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
+                assert(!rejected && !raises);
+            } @catch (NSException* exception) {
+                assert(raises && [exception.name isEqualToString:@"FGLibraryFixture"]);
+                caught = true;
+            } @finally {
+                observeLibraryData = false;
+                method_setImplementation(libraryMethod, originalLibrary);
+                imp_removeBlock(replacement);
+            }
+            assert(injected && caught == raises && libraryData && libraryDataReleases == 1);
+            assert(!state->kernels.library && state->configurations.empty());
+        }
+        libraryData = nullptr;
+        // The same state must recover through real library creation after either failure.
         for (unsigned i = 0; i < 2; ++i) {
             auto configuration = configure(*state, command, parameters,
                 (id<MTLTexture>)snapshot->depth->texture.get(), MTLPixelFormatRGBA16Float,
@@ -1152,6 +1338,46 @@ int main() {
         id requiredPipeline = objc_loadWeakRetained(&weak[3]);
         assert(requiredPipeline && "recorded snapshot lost its shared pipeline");
         auto queue = [device newMTL4CommandQueue];
+        const SEL residencySelector = @selector(newResidencySetWithDescriptor:error:);
+        const Method residencyMethod = class_getInstanceMethod(object_getClass(device), residencySelector);
+        const IMP originalResidency = method_getImplementation(residencyMethod);
+        for (bool throwing : {false, true}) {
+            __block id descriptor = nil;
+            __block NSUInteger incomingOwners = 0;
+            __block id weakDescriptor = nil;
+            const IMP replacement = imp_implementationWithBlock(
+                ^id(id, id candidate, NSError** error) {
+                    assert(!descriptor);
+                    incomingOwners = [candidate retainCount];
+                    descriptor = [candidate retain];
+                    objc_initWeak(&weakDescriptor, candidate);
+                    if (throwing) @throw [NSException exceptionWithName:@"FGResidencyFixture"
+                        reason:@"injected replay residency failure" userInfo:nil];
+                    if (error) *error = [NSError errorWithDomain:@"FGResidencyFixture" code:1 userInfo:nil];
+                    return nil;
+                });
+            auto allocator = [device newCommandAllocator];
+            auto buffer = [device newCommandBuffer];
+            auto fence = [device newFence];
+            [buffer beginCommandBufferWithAllocator:allocator];
+            std::shared_ptr<const ExecutionLease> rejected;
+            @try {
+                method_setImplementation(residencyMethod, replacement);
+                assert(!recorded->encode(buffer, fence, rejected) && rejected);
+                assert(descriptor && [descriptor retainCount] == incomingOwners);
+                assert(!rejected->impl_->residency);
+            } @finally {
+                method_setImplementation(residencyMethod, originalResidency);
+                imp_removeBlock(replacement);
+                [descriptor release];
+            }
+            id alive = objc_loadWeakRetained(&weakDescriptor);
+            assert(!alive); [alive release]; objc_destroyWeak(&weakDescriptor);
+            // This failure precedes every encoder; no GPU work owns this lease.
+            rejected.reset();
+            [buffer endCommandBuffer];
+            [fence release]; [buffer release]; [allocator release];
+        }
         std::shared_ptr<const ExecutionLease> firstLease;
         for (unsigned replay = 0; replay < 2; ++replay) {
             auto allocator = [device newCommandAllocator];
@@ -1833,6 +2059,158 @@ struct JitterRunner {
             assert(state->scratch->idle.get() == retiredScratch);
         }
         releaseHudRow(state->hudCounted);
+    }
+
+    void standaloneEncoderFailures() {
+        for (unsigned kind = 0; kind != 3; ++kind) {
+            for (bool failFinish : {false, true}) {
+                auto state = std::make_shared<State>();
+                state->creation.display_width = state->creation.display_height = 128;
+                JitterFrame test{.name = "standalone encoder exception", .frame = 1,
+                    .renderWidth = 64, .renderHeight = 64, .jitterX = 0, .jitterY = 0,
+                    .cancellationX = 0, .cancellationY = 0, .pixelsX = 4, .pixelsY = -4,
+                    .previousValid = false};
+                auto prepared = prepare(state, test);
+                if (kind == 0) {
+                    prepared->impl_->kind = PreparedFrame::Impl::Kind::Snapshot;
+                    prepared->impl_->first = uniformTexture(device, MTLPixelFormatR32Float, 64, 64, .5f);
+                    prepared->impl_->second = uniformTexture(device, MTLPixelFormatRG16Float, 64, 64,
+                        std::array<std::uint16_t, 2>{0, 0});
+                    prepared->impl_->snapshot->produced = false;
+                } else if (kind == 2) {
+                    auto hint = [device newBufferWithLength:sizeof(std::uint32_t)
+                                                   options:MTLResourceStorageModeShared];
+                    assert(hint);
+                    prepared->impl_->disableInterpolation = Object(hint);
+                    [hint release];
+                }
+                auto allocator = [device newCommandAllocator];
+                auto buffer = [device newCommandBuffer];
+                auto fence = [device newFence];
+                [buffer beginCommandBufferWithAllocator:allocator];
+                auto init = [buffer computeCommandEncoder];
+                [init updateFence:fence afterEncoderStages:MTLStageDispatch];
+                [init endEncoding];
+                const SEL waitSelector = @selector(waitForFence:beforeEncoderStages:);
+                const SEL pipelineSelector = @selector(setComputePipelineState:);
+                const SEL updateSelector = @selector(updateFence:afterEncoderStages:);
+                const SEL endSelector = @selector(endEncoding);
+                const Class cls = object_getClass(init);
+                const Method methods[] = {
+                    class_getInstanceMethod(cls, waitSelector),
+                    class_getInstanceMethod(cls, pipelineSelector),
+                    class_getInstanceMethod(cls, updateSelector),
+                    class_getInstanceMethod(cls, endSelector)};
+                IMP originals[4]{};
+                for (unsigned i = 0; i != 4; ++i) {
+                    assert(methods[i]); originals[i] = method_getImplementation(methods[i]);
+                }
+                const IMP wait = originals[0], pipeline = originals[1],
+                          update = originals[2], end = originals[3];
+                const id scatterPipeline = prepared->impl_->configuration->encodePipeline.get();
+                __block id target = nil, scatter = nil;
+                __block bool scatterEnded = false, injected = false;
+                __block unsigned closes = 0, updates = 0;
+                IMP replacements[] = {
+                    imp_implementationWithBlock(^(id encoder, id<MTLFence> value, NSUInteger stages) {
+                        reinterpret_cast<void (*)(id, SEL, id, NSUInteger)>(wait)(
+                            encoder, waitSelector, value, stages);
+                        if ((kind == 0 && !target) || (kind == 2 && scatterEnded && !target))
+                            target = encoder;
+                        if (encoder == target && !failFinish) {
+                            injected = true;
+                            @throw [NSException exceptionWithName:@"FGStandaloneFixture"
+                                reason:@"standalone encoder body failure" userInfo:nil];
+                        }
+                    }),
+                    imp_implementationWithBlock(^(id encoder, id value) {
+                        reinterpret_cast<void (*)(id, SEL, id)>(pipeline)(encoder, pipelineSelector, value);
+                        if (value == scatterPipeline) {
+                            scatter = encoder;
+                            if (kind == 1) {
+                                target = encoder;
+                                if (!failFinish) {
+                                    injected = true;
+                                    @throw [NSException exceptionWithName:@"FGStandaloneFixture"
+                                        reason:@"scatter pipeline failure" userInfo:nil];
+                                }
+                            }
+                        }
+                    }),
+                    imp_implementationWithBlock(^(id encoder, id<MTLFence> value, NSUInteger stages) {
+                        if (encoder == target) {
+                            ++updates;
+                            assert(value == fence);
+                            assert(stages == (kind == 1 ? MTLStageDispatch : MTLStageBlit));
+                            if (failFinish) {
+                                injected = true;
+                                @throw [NSException exceptionWithName:@"FGStandaloneFixture"
+                                    reason:@"standalone fence failure" userInfo:nil];
+                            }
+                        }
+                        reinterpret_cast<void (*)(id, SEL, id, NSUInteger)>(update)(
+                            encoder, updateSelector, value, stages);
+                    }),
+                    imp_implementationWithBlock(^(id encoder) {
+                        if (encoder == target) ++closes;
+                        if (encoder == scatter) scatterEnded = true;
+                        reinterpret_cast<void (*)(id, SEL)>(end)(encoder, endSelector);
+                    })
+                };
+                std::shared_ptr<const ExecutionLease> lease;
+                bool encoded = true;
+                @try {
+                    for (unsigned i = 0; i != 4; ++i) {
+                        assert(replacements[i]); method_setImplementation(methods[i], replacements[i]);
+                    }
+                    encoded = prepared->encode(buffer, fence, lease);
+                } @finally {
+                    for (unsigned i = 0; i != 4; ++i) {
+                        method_setImplementation(methods[i], originals[i]);
+                        imp_removeBlock(replacements[i]);
+                    }
+                }
+                assert(!encoded && injected && target && lease && closes == 1 && updates == 1);
+                assert(!state->history);
+                if (kind == 0) assert(!prepared->impl_->snapshot->produced);
+                [buffer endCommandBuffer];
+                auto done = dispatch_semaphore_create(0);
+                auto options = [MTL4CommitOptions new];
+                [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+                    assert(!feedback.error); dispatch_semaphore_signal(done);
+                }];
+                [queue commit:&buffer count:1 options:options];
+                assert(dispatch_semaphore_wait(done,
+                    dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
+                auto residency = lease->impl_->residency;
+                assert(((id<MTLResidencySet>)residency.get()).allocationCount != 0);
+                lease.reset();
+                assert(((id<MTLResidencySet>)residency.get()).allocationCount == 0);
+                [allocator reset];
+                // The same prepared work must remain usable after the failed submission.
+                [buffer beginCommandBufferWithAllocator:allocator];
+                init = [buffer computeCommandEncoder];
+                [init updateFence:fence afterEncoderStages:MTLStageDispatch];
+                [init endEncoding];
+                assert(prepared->encode(buffer, fence, lease));
+                [buffer endCommandBuffer];
+                [options release];
+                options = [MTL4CommitOptions new];
+                [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+                    assert(!feedback.error); dispatch_semaphore_signal(done);
+                }];
+                [queue commit:&buffer count:1 options:options];
+                assert(dispatch_semaphore_wait(done,
+                    dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0);
+                if (kind == 0) assert(prepared->impl_->snapshot->produced);
+                else assert(state->history && state->historyFrame == 1);
+                lease.reset();
+                releaseHudRow(state->hudCounted);
+                [options release]; dispatch_release(done);
+                [fence release]; [buffer release]; [allocator release];
+                ++frames;
+            }
+        }
     }
 
     void profileThreadgroups() {
@@ -2794,6 +3172,7 @@ int main() {
         runner.spatialJitter(true);
         runner.pipelineRequirements();
         runner.prepassFailures();
+        runner.standaloneEncoderFailures();
         runner.profileThreadgroups();
         runner.sceneLifecycle();
         runner.scratchLifecycle();
@@ -3594,6 +3973,124 @@ static void inputOwnership(JitterRunner& runner) {
     assert(!state->snapshotDepth->idle && !state->snapshotMotion->idle);
 }
 
+static void temporaryOffConfigurationReuse(JitterRunner& runner) {
+    fg_history_begin();
+    auto state = std::make_shared<State>();
+    state->creation.display_width = state->creation.display_height = 128;
+    state->creation.max_render_width = state->creation.max_render_height = 128;
+    contexts.emplace(17, state);
+    auto depth = uniformTexture(runner.device, MTLPixelFormatR32Float, 64, 32, .5f);
+    auto motion = uniformTexture(runner.device, MTLPixelFormatRG16Float, 64, 32,
+        std::array<__fp16, 2>{0, 0});
+    auto color = uniformTexture(runner.device, MTLPixelFormatRGBA16Float, 128, 128,
+        std::array<__fp16, 4>{.25f, .5f, .75f, 1});
+    auto output = privateTexture(runner.device, MTLPixelFormatRGBA16Float, 128, 128,
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+    HistoryResource list{historyVtable.data()};
+    HistoryResource resources[] = {
+        {historyVtable.data(), depth.get()}, {historyVtable.data(), motion.get()},
+        {historyVtable.data(), color.get()}, {historyVtable.data(), output.get()}
+    };
+    yaagl_fsr_fg_configure_packet config{};
+    config.header = {sizeof(config), YAAGL_FSR_FG_BRIDGE_VERSION,
+        YAAGL_FSR_FG_CONFIGURE, 0, 17};
+    auto enable = [&](bool value) {
+        config.enabled = value;
+        assert(api(YAAGL_FSR_FG_CONFIGURE, &config) == Ok);
+    };
+    auto prepare = [&](std::uint64_t frame) {
+        assert(fg_history_prepare(frame, 64, 0, false,
+            &list, &resources[0], &resources[1]) == Ok);
+    };
+    SEL selector = @selector(newFrameInterpolatorWithDevice:compiler:);
+    Method method = class_getInstanceMethod([MTLFXFrameInterpolatorDescriptor class], selector);
+    IMP original = method_getImplementation(method);
+    __block unsigned creations = 0;
+    IMP observer = imp_implementationWithBlock(^id(id descriptor, id device, id compiler) {
+        ++creations;
+        return ((id (*)(id, SEL, id, id))original)(descriptor, selector, device, compiler);
+    });
+    method_setImplementation(method, observer);
+    @try {
+        // Initial OFF still selects a provider, without recording GPU work.
+        enable(false);
+        prepare(1);
+        assert(state->providerSelected && !recordedHistory && !state->frameCount);
+        const auto selectedCreations = creations;
+        assert(selectedCreations != 0);
+        enable(true);
+        prepare(2);
+        assert(creations == selectedCreations &&
+            "initial OFF discarded the validated native interpolator");
+        completeHistoryPrepare(runner);
+        assert(fg_history_generate(2, 0, false, &list, &resources[2], &resources[3]) == Ok);
+        const auto staleGeneration = recordedHistory;
+        JitterFrame test{.name = "temporary OFF configuration reuse", .frame = 2,
+            .renderWidth = 64, .renderHeight = 32, .jitterX = 0, .jitterY = -.25f,
+            .cancellationX = 0, .cancellationY = 0, .pixelsX = 0, .pixelsY = 0,
+            .previousValid = false};
+        runner.encode(std::const_pointer_cast<PreparedFrame>(recordedHistory), test);
+        recordedHistory.reset();
+        const auto warmedCreations = creations;
+        enable(false);
+        for (std::uint64_t frame = 3; frame != 67; ++frame) {
+            enable(true);
+            prepare(frame);
+            assert(!recordedHistory->impl_->snapshot->hasPreviousJitter);
+            const auto epoch = state->generationEpoch;
+            enable(false);
+            assert(state->generationEpoch == epoch + 1 && !state->frameCount &&
+                !state->history && !state->hasPreparedJitter);
+            // OFF must not invalidate the recorded producer's resources.
+            completeHistoryPrepare(runner);
+            assert(creations == warmedCreations &&
+                "ON/Prepare/OFF reconstructed a native interpolator");
+        }
+        enable(true);
+        for (std::uint64_t frame : {67, 68}) {
+            prepare(frame);
+            completeHistoryPrepare(runner);
+            assert(fg_history_generate(frame, 0, false,
+                &list, &resources[2], &resources[3]) == Ok);
+            test.frame = frame;
+            test.previousValid = frame == 68;
+            runner.encode(std::const_pointer_cast<PreparedFrame>(recordedHistory), test);
+            assert(encodedCameraReset == (frame == 67));
+            recordedHistory.reset();
+            assert(creations == warmedCreations);
+        }
+        const auto currentHistory = state->history;
+        test.frame = 2;
+        test.previousValid = false;
+        runner.encode(std::const_pointer_cast<PreparedFrame>(staleGeneration), test);
+        assert(state->history == currentHistory && state->historyFrame == 68);
+        // A stale command still encodes against the cached native object. The
+        // next current frame must reset its internal history, then continue.
+        for (std::uint64_t frame : {69, 70}) {
+            prepare(frame);
+            completeHistoryPrepare(runner);
+            assert(fg_history_generate(frame, 0, false,
+                &list, &resources[2], &resources[3]) == Ok);
+            test.frame = frame;
+            test.previousValid = true;
+            runner.encode(std::const_pointer_cast<PreparedFrame>(recordedHistory), test);
+            assert(encodedCameraReset == (frame == 69));
+            recordedHistory.reset();
+            assert(creations == warmedCreations);
+        }
+        yaagl_fsr_fg_destroy_packet destroy{};
+        destroy.header = {sizeof(destroy), YAAGL_FSR_FG_BRIDGE_VERSION,
+            YAAGL_FSR_FG_DESTROY, 0, 17};
+        assert(api(YAAGL_FSR_FG_DESTROY, &destroy) == Ok);
+        assert(state->configurations.empty());
+        std::fprintf(stderr, "FG OFF reuse: 64 cycles, %u native creations, reset/resume passed\n",
+            creations);
+    } @finally {
+        method_setImplementation(method, original);
+        imp_removeBlock(observer);
+    }
+}
+
 static void pendingFrameMetadata(JitterRunner& runner) {
     fg_history_begin();
     auto state = std::make_shared<State>();
@@ -3643,8 +4140,59 @@ static void pendingFrameMetadata(JitterRunner& runner) {
         }
     }
     historyRecordAvailable = false;
-    assert(prepare(71) == Runtime && !state->frameCount && !recordedHistory);
+    for (std::uint64_t id = 71; id != 135; ++id)
+        assert(prepare(id) == Runtime && !state->frameCount && !recordedHistory);
     historyRecordAvailable = true;
+    // Exercise a recoverable same-ABI Metal factory exception. Throwing through
+    // the Windows ResourceBarrier ABI is not a supported recovery mechanism.
+    state->snapshotDepth->clear(); state->snapshotMotion->clear();
+    const auto preparedFrame = state->preparedFrame;
+    const auto preparedJitter = state->preparedJitterUvX;
+    auto weakFailure = [[NSMapTable alloc]
+        initWithKeyOptions:NSPointerFunctionsStrongMemory
+              valueOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality
+                  capacity:2];
+    const SEL textureSelector = @selector(newTextureWithDescriptor:);
+    const Method textureMethod = class_getInstanceMethod(object_getClass(runner.device), textureSelector);
+    const IMP originalTexture = method_getImplementation(textureMethod);
+    __block id failedDescriptor = nil;
+    __block id createdDepth = nil;
+    __block NSUInteger descriptorOwners = 0;
+    const IMP textureFailure = imp_implementationWithBlock(
+        ^id(id receiver, MTLTextureDescriptor* descriptor) {
+            if (descriptor.width == 64 && descriptor.height == 32 &&
+                descriptor.pixelFormat == MTLPixelFormatRG16Float) {
+                assert(!failedDescriptor);
+                descriptorOwners = descriptor.retainCount;
+                failedDescriptor = [descriptor retain];
+                [weakFailure setObject:descriptor forKey:@"descriptor"];
+                @throw [NSException exceptionWithName:@"FGPrepareFixture"
+                    reason:@"injected snapshot motion factory failure" userInfo:nil];
+            }
+            id result = reinterpret_cast<id (*)(id, SEL, id)>(originalTexture)(
+                receiver, textureSelector, descriptor);
+            if (descriptor.width == 64 && descriptor.height == 32 &&
+                descriptor.pixelFormat == MTLPixelFormatR32Float) {
+                createdDepth = result;
+                [weakFailure setObject:result forKey:@"depth"];
+            }
+            return result;
+        });
+    @try {
+        method_setImplementation(textureMethod, textureFailure);
+        assert(prepare(71) == Runtime && !state->frameCount && !state->findFrame(71) &&
+            !recordedHistory);
+        assert(failedDescriptor && [failedDescriptor retainCount] == descriptorOwners);
+        assert(state->preparedFrame == preparedFrame && state->preparedJitterUvX == preparedJitter);
+        assert(createdDepth && state->snapshotDepth->idle.get() == createdDepth);
+    } @finally {
+        method_setImplementation(textureMethod, originalTexture);
+        imp_removeBlock(textureFailure);
+        [failedDescriptor release];
+    }
+    state->snapshotDepth->clear(); state->snapshotMotion->clear();
+    assert(![weakFailure objectForKey:@"descriptor"] && ![weakFailure objectForKey:@"depth"]);
+    [weakFailure release];
     assert(prepare(71) == Ok);
     const auto retained = *state->findFrame(71);
     retire.frame_id = 71;
@@ -3800,6 +4348,7 @@ int main() {
         historyVtable[7] = reinterpret_cast<void*>(&historyGetDevice);
         historyVtable[43] = reinterpret_cast<void*>(&historyLuid);
         historyVtable[26] = reinterpret_cast<void*>(&historyBarrier);
+        temporaryOffConfigurationReuse(runner);
         inputOwnership(runner);
         pendingFrameMetadata(runner);
         dynamicPrepareHistory(runner);

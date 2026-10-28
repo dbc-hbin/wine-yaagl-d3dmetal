@@ -97,12 +97,24 @@ SR and FG helper shaders, including numerical exposure conversion, are compiled 
 
 Selected MetalFX contexts notify the bridge on an OFF-to-ON transition, not on every enabled configuration. Per-frame snapshots and native swapchain configuration still run, and repeated OFF still drains and clears state. Failed initial activation or snapshot publication retains its rollback. Disabled Prepare validates input and initial provider eligibility without allocating a prepared-frame implementation.
 
-`d3dmetal-sidecar/layout.json` is beta3-specific format 32 with marker `YAAGLB3SIDEcar\x20`, no additional `binaryPatches`, and 27 dispatch slots. The original four retain their order:
+`d3dmetal-sidecar/layout.json` is beta3-specific format 34 with marker `YAAGLB3SIDEcar\x22`, no additional `binaryPatches`, and 38 dispatch slots. The original four retain their order:
 
 1. `GetContainingOutput`
 2. `SetFullscreenState`
 3. `QueryVideoMemoryInfo`
 4. `ReplayTemporalScale`
+
+`CacheFileOpen` and `CacheFileClose` follow the existing latency gates. Their native SysV wrappers authenticate all Open/Close/View bytes, fix the zero-length payload unmap, normalize closed header/FILE fields, and retire both failed acquisitions and successful siblings before compiler retry or disabling. Preserve the original empty-path success and cache record/publication policy.
+
+Nine fence gates follow the original 29 slots. Preserve copied-block completion ownership, close-only cancellation through Wine's Event provider, all-input registration commit, NULL-event semaphore ownership, public/unpack HRESULT propagation, native allocator pairing and both CPU lock order and shared-event notification semantics. The authenticated Metal4 queue descriptor setter separately balances feedbackQueue ownership; its copy/destructor methods remain native.
+
+Carry SR/FG temporary-owner exception cleanup and publish-after-record Prepare semantics. Wine failed-view rollback must drop HWND ownership only after removing its own array entry, with releases outside the window lock. Keep the exact-provider NEW/HWND/WRAP allocation adapter separate from source-owned FSR3 effect initialization; never pass a partial source context to the native destructor.
+
+Carry `fsr3-lifetime.cpp`, `yaagl_fsr3_lifetime.h`, `build-fsr3-lifetime.sh` and the pinned FidelityFX CPU source subset together with the PE loader and build/staging manifest changes. The helper has its own static C++ runtime and explicit Microsoft x64 provider table; do not rely on a MinGW class vtable matching the native compiler. Authenticate the native image before using shader/config/ABI helpers or replacing the FSR3 Create slot. Preserve original provider selection and the normal caller contract to retire callbacks/GPU work before destruction. Backend callback snapshots, partial-construction ledgers, upload ownership and transaction rollback are one ownership contract, not independent optional patches. Validate real native-shader output and failure-stage owner balances after a source or native-image update.
+
+The CPU subset comes from AMD FidelityFX-SDK commit `0836aa7f24058b3f8d035a88c0774457d78fc98e`, with its original license notices retained. Shader-permutation implementations and the upstream provider selector are excluded. Debug-message dispatch also stays in the native DLL so its global debug configuration remains effective for both implementations.
+
+The sidecar initializes exact-image MetalFX lifetime hooks before creating effects. FG uses the native owning-slot destructor after original object cleanup. BBR uses paired init/destructor ownership conversion, detaches its filter, and waits through notifications for both native prewarm-group and final internal graph-event completion. Keep failure paths, typed-delete pairing, image/class/ivar/IMP checks and recorded ownership together; neither a dealloc-only cycle fix nor an unconditional GPU wait is sufficient. The x86_64 repair leaves unsupported images and ARM untouched.
 
 Four appended gates implement opt-in fixed-two latency admission: `NvapiQueryInterface`, `CompletePresent`, `LatencySwapchainDestroy` and `LatencyDeviceDestroy`. Keep them together with `low-latency.mm`, its admission state and the NVAPI wire definitions. Native resolver and public Present use Microsoft x64 ABI; completion blocks and destructors use System V, including the base device destructor's hidden construction-vtable argument. The device-destructor hook is not a restored PSO cache. Default-off dispatch goes directly to the original functions. Do not patch the three-byte native Sleep stub or replace the donor NVAPI DLL. The existing Present wrapper is shared with async: latency observes the FFX annotation first, then the async wrapper consumes it even when async compilation is disabled. Only async frame-history updates are conditional; leaving a pending annotation behind can falsely exclude a new device when a swapchain address is reused on the same thread.
 

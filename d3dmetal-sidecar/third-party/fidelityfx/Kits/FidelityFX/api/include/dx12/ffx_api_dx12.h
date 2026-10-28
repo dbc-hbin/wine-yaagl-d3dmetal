@@ -255,6 +255,9 @@ static inline FfxApiResource ffxApiGetResourceDX12(ID3D12Resource* pRes, uint32_
         case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
             res.description.type = FFX_API_RESOURCE_TYPE_TEXTURE3D;
             break;
+        case D3D12_RESOURCE_DIMENSION_UNKNOWN:
+        case D3D12_RESOURCE_DIMENSION_BUFFER:
+            break;
         }
     }
 

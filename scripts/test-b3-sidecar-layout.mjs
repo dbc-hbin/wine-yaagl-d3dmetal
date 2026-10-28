@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -58,6 +59,41 @@ const latency = [
   ["LatencySwapchainDestroy", 0x12ac64, "5541574156"],
   ["LatencyDeviceDestroy", 0x60f54, "5541574156"],
 ];
+const cacheLifetime = [
+  ["CacheFileOpen", 0x93010, "4157415653"],
+  ["CacheFileClose", 0x930f0, "534889fb488b7f08"],
+];
+const fenceLifetime = [
+  ["SingleFenceCompletion", 0xba259, "56574881eca8000000"],
+  ["MultipleFenceCompletion", 0x7783e, "415741564155"],
+  ["DX12NativeFenceCompletion", 0xba6c4, "56574881eca8000000"],
+  ["DX12UnpackFenceCompletion", 0xba99d, "534889fb488b3f"],
+  ["DX11FenceCompletion", 0x1ca86a, "56574881eca8000000"],
+  ["DX11NativeFenceCompletion", 0x1cad78, "56574881eca8000000"],
+  ["DX11UnpackFenceCompletion", 0x1cafb9, "534889fb488b3f"],
+  ["PublicMultipleFenceCompletion", 0x71380, "4883ec388b442460"],
+  ["UnpackMultipleFenceCompletion", 0x81349, "4883ec38488b5708"],
+];
+const cacheBodies = [
+  ["CacheFileOpenBody", 0x93010, 224, "0709631664859b472a3f7096c19df4bf15ce2154bdbfffdaec43fad7e0d37c86"],
+  ["CacheFileCloseBody", 0x930f0, 76, "0f2fb214603171bc57894c2ae33040c0a50cfee8b4df7a43b4ef81f05200325b"],
+  ["CacheFileViewBody", 0x9313c, 198, "0c02d864df800158ec70baf64ee3ce98a941fdf5e75fb4f6538c1e433b7c0802"],
+];
+const fenceBodies = [
+  ["FenceLifetimeBodies", 0x1602d4, 5636, "6e49c52a48cf1cafee4016aaa028a28ed332d46a0f99b1fbd89b7cb3f2cf5b18"],
+  ["MultipleFenceCompletionBody", 0x7783e, 670, "0709624e6b71f4c62b8cd75914f6bd5971327a505f95ce0dbd07d17f7ba2cfb5"],
+  ["PublicFenceCompletionBody", 0xba259, 162, "0aece993cc82eb3446feef6193b1a21a9cccbec9f994f187c19cedfd89b78688"],
+  ["DX12NativeFenceCompletionBody", 0xba6c4, 162, "f45bcced726849d1bd8b2e318015d81d4be4867dd1b03c0a0ff4d7a4965fdce2"],
+  ["DX12UnpackFenceCompletionBody", 0xba99d, 35, "6316e67d9b003c8236d477f6f12ceb3013c43784dbb33fe0a3b9b5a139b9d811"],
+  ["DX11PublicFenceCompletionBody", 0x1ca86a, 162, "acc6596871d50d2421a0d96ad49f4345b62923f9f36104c539f83bb75e6ea3e3"],
+  ["DX11NativeFenceCompletionBody", 0x1cad78, 162, "30a84695eab93e1fb80aa2b59732b9856c6365845c7f407ffd85bb9c5aec53dd"],
+  ["DX11UnpackFenceCompletionBody", 0x1cafb9, 35, "45b684681d8228ac0edcb48435d7adfdddd191a965d41b639e7d8e913e9e705c"],
+  ["PublicMultipleFenceCompletionBody", 0x71380, 34, "13a69fd9ea1602cedc8470ad9077231f76c9431c7958ad87ec60f02d29f200db"],
+  ["UnpackMultipleFenceCompletionBody", 0x81349, 51, "1069ef2731f6a1ac7a9ab7bfc1765be0d5aa1bb3d37f2928b699b693bad895e5"],
+  ["FenceAllocatorImports", 0x39167c, 36, "20de61a2291040b881887c050a7fcb9b66aff305d0ec987844d3168da7367e0c"],
+  ["FenceLockImports", 0x3918da, 12, "ff06a481634ece4af3bd5dffd44e6e870ec2a460c362451cc6f995b3e6349ab9"],
+  ["FenceSemaphoreImports", 0x391778, 30, "9ed1886d30d3cfeb06d6719a365bf567aea3e90ac29a3429b5b75b4b5c1e63ee"],
+];
 const removed = [
   ["Metal4Render", 0x1842b9, "5541574156"],
   ["Render", 0x184353, "5541574156"],
@@ -111,20 +147,59 @@ function assertRetainedRoutes(patched) {
   }
 }
 
-await test("format 32 retains existing gates and adds native latency lifecycle gates", () => {
-  assert.equal(layout.formatVersion, 32);
+await test("format 34 retains all 29 existing gates and appends native fence lifetime gates", () => {
+  assert.equal(layout.formatVersion, 34);
   assert.equal(layout.source.sha256, "a64950e8324cec32c9a442daa1fafd03823bd199fdd84fee5c73679b5fe86660");
   assert.equal(layout.source.machUuid, "4418ec47c3f03285a05615d87d785ffe");
   assert.equal(layout.constructorVerification.markerHex,
-    Buffer.from("YAAGLB3SIDEcar\x20", "ascii").toString("hex"));
+    Buffer.from("YAAGLB3SIDEcar\x22", "ascii").toString("hex"));
   assert.equal(layout.dispatch.pointerSize, 8);
-  const expected = [...retained, ...asynchronous, ...completion, ...presentation, ...latency];
+  const expected = [...retained, ...asynchronous, ...completion, ...presentation, ...latency,
+    ...cacheLifetime, ...fenceLifetime];
   assert.deepEqual(layout.hooks.map(hook => [hook.id, hook.entryOffset, hook.originalHex]), expected);
   assert.deepEqual(layout.hooks.map(hook => hook.dispatchFieldOffset), expected.map((_, index) => index * 8));
   assert.deepEqual(layout.hooks.map(hook => hook.gateOffset), expected.map((_, index) => 0x4e0040 + index * 0x40));
   assert.deepEqual(layout.hooks.filter(hook => hook.callSite).map(hook => hook.id), ["PresentResidencyAdd"]);
   assert.deepEqual(layout.binaryPatches, []);
   assert.equal(sites.length, 5 + expected.length * 3);
+});
+
+await test("constructor verification authenticates complete cache and fence ownership bodies", () => {
+  const patched = applyD3DMetalSidecarPatch(pristine);
+  assert.deepEqual(layout.verificationSpans.map(span => span.id),
+    ["B3TextMarker", ...cacheBodies.map(([id]) => id), ...fenceBodies.map(([id]) => id)]);
+  for (const [id, offset, size, sha256] of [...cacheBodies, ...fenceBodies]) {
+    assert.equal(createHash("sha256").update(pristine.subarray(offset, offset + size)).digest("hex"),
+      sha256, `${id}: pristine ownership contract`);
+    const span = layout.verificationSpans.find(value => value.id === id);
+    assert.equal(span.offset, offset);
+    assert.equal(span.expectedHex.length / 2, size);
+    assert.equal(span.expectedHex, patched.subarray(offset, offset + size).toString("hex"));
+    const corrupt = Buffer.from(patched);
+    corrupt[offset + size - 1] ^= 1;
+    rejects(corrupt);
+  }
+});
+
+await test("native fence ABI includes exact field, calling-boundary and allocator contracts", () => {
+  assert.deepEqual(layout.fenceAbi, {
+    EventInterface: 0x55fc30, UseSharedEvents: 0x55fc10,
+    GetCompletedValue: 0x161366, Wait: 0x1613a6, AddHandler: 0x161478,
+    Allocate: 0x391694, Deallocate: 0x39167c, Lock: 0x3918da, Unlock: 0x3918e0,
+    LockOptions: 0x40000, FenceInterface: 0x4e1ba0, UnknownPrefix: 8,
+    QueryInterface: 0x18, NativeFence: 0x68, MaximumPendingValue: 0x28,
+    DX12PublicFence: 0x58, DX11PublicFence: 0x48, DX11NativeFence: 0x58,
+    CompletedValue: 0x38, PendingVector: 0x60, SignalLock: 0x78, HandlerLock: 0x7c,
+    EventVersion: 0, SetEvent: 0x20, CloseEvent: 0x38,
+    DuplicateEvent: 0x60, DispatchFunction: 0x70,
+    SemaphoreCreate: 0x391784, SemaphoreSignal: 0x39178a,
+    SemaphoreWait: 0x391790, DispatchRelease: 0x391778,
+  });
+  const marker = layout.constructorVerification;
+  for (const hook of layout.hooks) {
+    assert.ok(hook.gateOffset + 0x40 <= marker.markerOffset ||
+      hook.gateOffset >= marker.markerOffset + marker.markerHex.length / 2);
+  }
 });
 
 await test("beta3 canonical gates preserve the input and every unpatched byte", () => {
@@ -236,6 +311,30 @@ await test("the complete former seventeen-hook payload is rejected rather than m
   rejects(legacy);
 });
 
+await test("the complete former format 32 payload is rejected rather than upgraded in place", () => {
+  const legacy = applyD3DMetalSidecarPatch(pristine);
+  for (const hook of layout.hooks.slice(27)) {
+    Buffer.from(hook.originalHex, "hex").copy(legacy, hook.entryOffset);
+    legacy.fill(0, hook.gateOffset, hook.gateOffset + 0x40);
+  }
+  legacy.fill(0, layout.constructorVerification.markerOffset,
+    layout.constructorVerification.markerOffset + layout.constructorVerification.markerHex.length / 2);
+  Buffer.from("YAAGLB3SIDEcar\x20", "ascii").copy(legacy, 0x4e07c0);
+  rejects(legacy);
+});
+
+await test("the complete former 29-gate format 33 payload is rejected", () => {
+  const legacy = applyD3DMetalSidecarPatch(pristine);
+  for (const hook of layout.hooks.slice(29)) {
+    Buffer.from(hook.originalHex, "hex").copy(legacy, hook.entryOffset);
+    legacy.fill(0, hook.gateOffset, hook.gateOffset + 0x40);
+  }
+  legacy.fill(0, layout.constructorVerification.markerOffset,
+    layout.constructorVerification.markerOffset + layout.constructorVerification.markerHex.length / 2);
+  Buffer.from("YAAGLB3SIDEcar\x21", "ascii").copy(legacy, 0x4e07c0);
+  rejects(legacy);
+});
+
 await test("layout identity rejects legacy and self-consistent partial recipes before import", async () => {
   const directory = await mkdtemp(resolve(tmpdir(), "yaagl-layout-identity-"));
   try {
@@ -245,10 +344,13 @@ await test("layout identity rejects legacy and self-consistent partial recipes b
     await copyFile(new URL("./d3dmetal-sidecar-patch.mjs", import.meta.url), patcher);
     const mutations = [
       value => { value.formatVersion = 26; },
+      value => { value.formatVersion = 32; },
       value => { value.hooks.pop(); },
       value => { value.hooks.reverse(); },
       value => { value.patchedPayloadSha256 = "0".repeat(64); },
       value => { value.hooks[0].dispatchFieldOffset = 104; },
+      value => { value.verificationSpans.pop(); },
+      value => { value.fenceAbi.NativeFence += 8; },
     ];
     for (const mutate of mutations) {
       const changed = structuredClone(layout);

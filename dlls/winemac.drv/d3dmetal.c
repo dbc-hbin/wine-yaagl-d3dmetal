@@ -140,8 +140,8 @@ static struct d3dmetal_macdrv_win_data *my_get_win_data(HWND hwnd)
 
     /* Creating a client surface on each call to get_win_data() means it's no longer idempotent,
      * but D3DMetal/DXMT both call it only when creating a new DXGI swapchain.
-     * They do:
-     * get_win_data() -> create_metal_device() -> create_metal_view() -> get_metal_layer() -> release_win_data()
+     * D3DMetal retains client_cocoa_view, then calls release_win_data() before
+     * creating its Metal device, view and layer.
      */
     {
         struct client_surface *base = macdrv_CreateClientSurface(hwnd, 0, FALSE);
@@ -232,26 +232,42 @@ static void my_macdrv_release_metal_device(MTLDevice_id d)
 static WineMetalView *my_macdrv_view_create_metal_view(WineContentView *v, MTLDevice_id d)
 {
     struct metal_view_surface *entry;
+    struct macdrv_win_data *data;
     struct client_surface *surface;
     WineMetalView *view;
+    BOOL removed;
 
     TRACE("macdrv_view_create_metal_view %p %p\n", v, d);
-    if (!(view = macdrv_view_create_metal_view(v, d))) return NULL;
     surface = macdrv_get_view_d3dmetal_client_surface(v);
+    /* Pin the surface across the synchronous main-thread call.  On success this
+     * reference belongs to the tracked view; on failure only the unpublished
+     * window-array reference and this temporary reference are rolled back. */
+    if (surface) client_surface_add_ref(surface);
+    if (!(view = macdrv_view_create_metal_view(v, d))) goto failed;
     if (!surface) return view;
     if (!(entry = malloc(sizeof(*entry))))
     {
         macdrv_view_release_metal_view(view);
-        return NULL;
+        goto failed;
     }
     entry->view = view;
     entry->surface = impl_from_client_surface(surface);
-    client_surface_add_ref(surface);
     pthread_mutex_lock(&metal_view_surfaces_mutex);
     entry->next = metal_view_surfaces;
     metal_view_surfaces = entry;
     pthread_mutex_unlock(&metal_view_surfaces_mutex);
     return view;
+
+failed:
+    if (surface)
+    {
+        data = get_win_data(surface->hwnd);
+        removed = remove_window_surface(data, impl_from_client_surface(surface));
+        release_win_data(data);
+        if (removed) client_surface_release(surface);
+        client_surface_release(surface);
+    }
+    return NULL;
 }
 
 static CAMetalLayer *my_macdrv_view_get_metal_layer(WineMetalView *v)

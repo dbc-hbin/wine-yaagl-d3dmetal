@@ -7,12 +7,12 @@ import { fileURLToPath } from "node:url";
 
 const layoutText = await readFile(new URL("../d3dmetal-sidecar/layout.json", import.meta.url), "utf8");
 const layoutSha256 = createHash("sha256").update(layoutText).digest("hex");
-const expectedLayoutSha256 = "7944e3971a39b26e07fcb278131c4c5b0ff62e09c5dfff1c78748248e702f739";
+const expectedLayoutSha256 = "f2e1c1d237585e02eed81ddded4738d1f962815f1613e4a5cfab8a4a63ecb2c1";
 if (layoutSha256 !== expectedLayoutSha256) {
   throw new Error(`layout corruption: expected SHA-256 ${expectedLayoutSha256}, got ${layoutSha256}`);
 }
 const layout = JSON.parse(layoutText);
-if (layout.formatVersion !== 32) throw new Error(`unsupported beta3 layout format ${layout.formatVersion}`);
+if (layout.formatVersion !== 34) throw new Error(`unsupported beta3 layout format ${layout.formatVersion}`);
 
 export const D3DMETAL_SIDECAR_PATCHED_PAYLOAD_SHA256 =
   layout.patchedPayloadSha256;

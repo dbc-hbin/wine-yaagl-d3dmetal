@@ -65,11 +65,22 @@ const hooks = [
   ["CompletePresent", 0x12b610, "53488b5f20"],
   ["LatencySwapchainDestroy", 0x12ac64, "5541574156"],
   ["LatencyDeviceDestroy", 0x60f54, "5541574156"],
+  ["CacheFileOpen", 0x93010, "4157415653"],
+  ["CacheFileClose", 0x930f0, "534889fb488b7f08"],
+  ["SingleFenceCompletion", 0xba259, "56574881eca8000000"],
+  ["MultipleFenceCompletion", 0x7783e, "415741564155"],
+  ["DX12NativeFenceCompletion", 0xba6c4, "56574881eca8000000"],
+  ["DX12UnpackFenceCompletion", 0xba99d, "534889fb488b3f"],
+  ["DX11FenceCompletion", 0x1ca86a, "56574881eca8000000"],
+  ["DX11NativeFenceCompletion", 0x1cad78, "56574881eca8000000"],
+  ["DX11UnpackFenceCompletion", 0x1cafb9, "534889fb488b3f"],
+  ["PublicMultipleFenceCompletion", 0x71380, "4883ec388b442460"],
+  ["UnpackMultipleFenceCompletion", 0x81349, "4883ec38488b5708"],
 ];
-const formatVersion = 32;
+const formatVersion = 34;
 const gateStart = 0x4e0040;
 const slot = 0x563f18;
-const markerOffset = gateStart + 0x780;
+const markerOffset = gateStart + 0xa00;
 const markerHex = Buffer.concat([
   Buffer.from("YAAGLB3SIDEcar", "ascii"), Buffer.from([formatVersion]),
 ]).toString("hex");
@@ -139,6 +150,36 @@ const hooksOut = hooks.map(([id, entryOffset, originalHex, callSite = false], in
   };
 });
 
+// The wrappers rely on the complete native ownership and false-return
+// contracts, not just their entry instructions. Verify those bodies before
+// the constructor publishes any dispatch pointer.
+const ownershipBodies = [
+  ["CacheFileOpenBody", 0x93010, 0x930f0],
+  ["CacheFileCloseBody", 0x930f0, 0x9313c],
+  ["CacheFileViewBody", 0x9313c, 0x93202],
+  ["FenceLifetimeBodies", 0x1602d4, 0x1618d8],
+  ["MultipleFenceCompletionBody", 0x7783e, 0x77adc],
+  ["PublicFenceCompletionBody", 0xba259, 0xba2fb],
+  ["DX12NativeFenceCompletionBody", 0xba6c4, 0xba766],
+  ["DX12UnpackFenceCompletionBody", 0xba99d, 0xba9c0],
+  ["DX11PublicFenceCompletionBody", 0x1ca86a, 0x1ca90c],
+  ["DX11NativeFenceCompletionBody", 0x1cad78, 0x1cae1a],
+  ["DX11UnpackFenceCompletionBody", 0x1cafb9, 0x1cafdc],
+  ["PublicMultipleFenceCompletionBody", 0x71380, 0x713a2],
+  ["UnpackMultipleFenceCompletionBody", 0x81349, 0x8137c],
+  ["FenceAllocatorImports", 0x39167c, 0x3916a0],
+  ["FenceLockImports", 0x3918da, 0x3918e6],
+  ["FenceSemaphoreImports", 0x391778, 0x391796],
+].map(([id, offset, end]) => {
+  const expected = Buffer.from(bytes.subarray(offset, end));
+  for (const hook of hooksOut) {
+    if (hook.entryOffset >= offset && hook.entryOffset < end) {
+      Buffer.from(hook.entryPatchHex, "hex").copy(expected, hook.entryOffset - offset);
+    }
+  }
+  return { id, offset, expectedHex: expected.toString("hex") };
+});
+
 const layout = {
   formatVersion,
   source: {
@@ -180,9 +221,43 @@ const layout = {
     initialValue: 0,
   },
   hooks: hooksOut,
+  fenceAbi: {
+    EventInterface: 0x55fc30,
+    UseSharedEvents: 0x55fc10,
+    GetCompletedValue: 0x161366,
+    Wait: 0x1613a6,
+    AddHandler: 0x161478,
+    Allocate: 0x391694,
+    Deallocate: 0x39167c,
+    Lock: 0x3918da,
+    Unlock: 0x3918e0,
+    LockOptions: 0x40000,
+    FenceInterface: 0x4e1ba0,
+    UnknownPrefix: 8,
+    QueryInterface: 0x18,
+    NativeFence: 0x68,
+    DX12PublicFence: 0x58,
+    DX11PublicFence: 0x48,
+    DX11NativeFence: 0x58,
+    MaximumPendingValue: 0x28,
+    CompletedValue: 0x38,
+    PendingVector: 0x60,
+    SignalLock: 0x78,
+    HandlerLock: 0x7c,
+    EventVersion: 0,
+    SetEvent: 0x20,
+    CloseEvent: 0x38,
+    DuplicateEvent: 0x60,
+    DispatchFunction: 0x70,
+    SemaphoreCreate: 0x391784,
+    SemaphoreSignal: 0x39178a,
+    SemaphoreWait: 0x391790,
+    DispatchRelease: 0x391778,
+  },
   binaryPatches: [],
   verificationSpans: [
     { id: "B3TextMarker", offset: markerOffset, expectedHex: markerHex },
+    ...ownershipBodies,
   ],
 };
 // Derive the signature-independent output identity from the same recipe that

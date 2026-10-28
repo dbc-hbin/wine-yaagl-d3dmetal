@@ -10,12 +10,15 @@
 #include <cstring>
 
 #include "async-pipeline.hpp"
+#include "cache-lifetime.hpp"
 #include "d3dmetal-transport.hpp"
 #include "fsr-translator.hpp"
 #include "fsr-framegeneration.hpp"
 #include "display-routing.hpp"
+#include "fence-lifetime.hpp"
 #include "layout.hpp"
 #include "low-latency.hpp"
+#include "metalfx-lifetime.hpp"
 #include "ngx-hooks.hpp"
 #include "video-memory.hpp"
 
@@ -108,6 +111,8 @@ __attribute__((constructor)) void initialize() noexcept {
             base = reinterpret_cast<const std::uint8_t*>(header);
         }
         if (base == nullptr) return;
+        static_cast<void>(metalfx_lifetime::initializeQueueDescriptor());
+        static_cast<void>(metalfx_lifetime::initialize());
         static_cast<void>(fsr::initialize(base));
         static_cast<void>(fsr::framegeneration::initialize(base));
         for (std::size_t index = 0; index < kHookCount; ++index) {
@@ -154,6 +159,21 @@ __attribute__((constructor)) void initialize() noexcept {
             .destroySwapchain = original(layout::Hook::LatencySwapchainDestroy),
             .destroyDevice = original(layout::Hook::LatencyDeviceDestroy),
         });
+        const auto cacheHooks = cache_lifetime::initialize({
+            .open = original(layout::Hook::CacheFileOpen),
+            .close = original(layout::Hook::CacheFileClose),
+        });
+        const auto fenceHooks = fence_lifetime::initialize(base, {
+            .single = original(layout::Hook::SingleFenceCompletion),
+            .multiple = original(layout::Hook::MultipleFenceCompletion),
+            .dx12Native = original(layout::Hook::DX12NativeFenceCompletion),
+            .dx12Unpack = original(layout::Hook::DX12UnpackFenceCompletion),
+            .dx11Public = original(layout::Hook::DX11FenceCompletion),
+            .dx11Native = original(layout::Hook::DX11NativeFenceCompletion),
+            .dx11Unpack = original(layout::Hook::DX11UnpackFenceCompletion),
+            .multiplePublic = original(layout::Hook::PublicMultipleFenceCompletion),
+            .multipleUnpack = original(layout::Hook::UnpackMultipleFenceCompletion),
+        });
         dispatchTable = {
             displayHooks.getContainingOutput,
             displayHooks.setFullscreenState,
@@ -168,6 +188,11 @@ __attribute__((constructor)) void initialize() noexcept {
             reinterpret_cast<std::uintptr_t>(&addPresentResidency),
             latencyHooks.queryInterface, latencyHooks.completePresent,
             latencyHooks.destroySwapchain, latencyHooks.destroyDevice,
+            cacheHooks.open, cacheHooks.close,
+            fenceHooks.single, fenceHooks.multiple,
+            fenceHooks.dx12Native, fenceHooks.dx12Unpack,
+            fenceHooks.dx11Public, fenceHooks.dx11Native, fenceHooks.dx11Unpack,
+            fenceHooks.multiplePublic, fenceHooks.multipleUnpack,
         };
         auto& slot = *reinterpret_cast<std::uintptr_t*>(const_cast<std::uint8_t*>(base) + layout::kDataSlot);
         std::atomic_ref<std::uintptr_t>(slot).store(

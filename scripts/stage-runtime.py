@@ -33,6 +33,11 @@ NGX_ALIASES = {'lib/wine/x86_64-windows/nvngx.dll': 'nvngx-on-metalfx.dll',
 SHARED_DYLIB_PATH = 'lib/external/libd3dshared.dylib'
 NGX_UNIX_LINK = '../../external/libd3dshared.dylib'
 PRIVATE_FG_PATH = 'lib/wine/x86_64-windows/amd_fidelityfx_framegeneration_dx12_native.dll'
+FSR3_LIFETIME_PATH = 'lib/wine/x86_64-windows/yaagl_fsr3_lifetime.dll'
+FSR3_LIFETIME_EXPORTS = ((1, 'yaagl_fsr3_install'),)
+FSR3_LIFETIME_SOURCE_PATHS = (
+    'dlls/amd_fidelityfx_framegeneration_dx12/fsr3-lifetime.cpp',
+    'include/yaagl_fsr3_lifetime.h', 'scripts/build-fsr3-lifetime.sh', 'scripts/stage-runtime.py')
 ORIGINAL_FG_SHA256 = '3f5e674a59b400756e98ef31fd583a4eb08ad567ec8dee362886bc96e55ed347'
 ORIGINAL_FG_EXPORTS = ((1, 'ffxConfigure'), (2, 'ffxCreateContext'), (3, 'ffxDestroyContext'),
                        (4, 'ffxDispatch'), (5, 'ffxQuery'))
@@ -42,12 +47,14 @@ FSR_ARTIFACT_PATHS = tuple(f'lib/wine/{arch}/amd_fidelityfx_{module}_dx12.{suffi
 FSR_POLICY = {'implementation': 'builtin-fsr-api-to-metalfx-with-metalfx-frame-interpolation',
               'dll_override': 'amd_fidelityfx_upscaler_dx12,amd_fidelityfx_framegeneration_dx12=b',
               'native_fg_fallback': PRIVATE_FG_PATH, 'default_upscaler': 'metalfx',
+              'native_fg_lifetime': FSR3_LIFETIME_PATH,
               'loader_override': False}
 NGX_POLICY = {'implementation': 'stock-gptk-ngx-to-metalfx', 'aliases': NGX_ALIASES}
 REQUIRED_HOST = ('bin/wine', 'bin/wineserver', 'lib/wine/x86_64-unix/ntdll.so',
                  'lib/wine/x86_64-unix/win32u.so', 'lib/wine/x86_64-unix/winemac.so',
                  'lib/wine/x86_64-unix/winegstreamer.so', game_mode.SUPERVISOR,
-                 game_mode.POLICY_TOOL, game_mode.HOST, game_mode.INFO_PLIST) + FSR_ARTIFACT_PATHS
+                 game_mode.POLICY_TOOL, game_mode.HOST, game_mode.INFO_PLIST,
+                 FSR3_LIFETIME_PATH) + FSR_ARTIFACT_PATHS
 
 
 def digest(path: Path) -> str:
@@ -179,7 +186,7 @@ def check_sources(manifest: dict) -> None:
             raise ValueError(f'build source changed: {entry["path"]}')
 
 
-def check_fsr_pe(path: Path, architecture='x86-64') -> None:
+def check_fsr_pe(path: Path, architecture='x86-64', expected_exports=ORIGINAL_FG_EXPORTS) -> None:
     tool = os.environ.get('WINE_LLVM_READOBJ') or shutil.which('llvm-readobj')
     if not tool and os.environ.get('WINE_MINGW_ROOT'):
         tool = str(Path(os.environ['WINE_MINGW_ROOT']) / 'bin/llvm-readobj')
@@ -187,7 +194,8 @@ def check_fsr_pe(path: Path, architecture='x86-64') -> None:
         raise ValueError('set WINE_LLVM_READOBJ or WINE_MINGW_ROOT for FSR PE validation')
     output = subprocess.check_output([tool, '--coff-exports', str(path)], text=True)
     exports = tuple((int(n), name) for n, name in re.findall(r'Ordinal: (\d+)\s+Name: (\w+)', output))
-    if f'Format: COFF-{architecture}\n' not in output or exports != ORIGINAL_FG_EXPORTS:
+    if (f'Format: COFF-{architecture}\n' not in output or exports != expected_exports or
+            len(re.findall(r'Ordinal: \d+', output)) != len(expected_exports)):
         raise ValueError(f'FSR PE architecture/exports mismatch: {path}')
 
 
@@ -200,6 +208,28 @@ def check_public_fsr(runtime: Path, build: dict) -> None:
         if not expected or not path.is_file() or not under(path, runtime) or digest(path) != expected:
             raise ValueError(f'public FSR DLL differs from source build: {relative}')
         check_fsr_pe(path, 'i386' if '/i386-windows/' in relative else 'x86-64')
+
+
+def check_fsr3_lifetime(runtime: Path, build: dict, current_sources=False) -> None:
+    manifest = build.get('fsr3LifetimeBuildManifest', {})
+    sources = manifest.get('sources')
+    artifact = manifest.get('artifact', {})
+    if (manifest.get('schemaVersion') != 1 or manifest.get('architecture') != 'x86_64' or
+            manifest.get('cxxRuntime') != 'static' or not isinstance(sources, list) or not sources or
+            artifact.get('exports') != list(map(list, FSR3_LIFETIME_EXPORTS)) or
+            Path(artifact.get('path', '')).name != Path(FSR3_LIFETIME_PATH).name):
+        raise ValueError('private FSR3 lifetime build provenance is missing or invalid')
+    if (not set(FSR3_LIFETIME_SOURCE_PATHS) <= {entry['path'] for entry in sources} or
+            any(not re.fullmatch(r'[0-9a-f]{64}', str(entry.get('sha256', ''))) for entry in sources)):
+        raise ValueError('private FSR3 lifetime source provenance is incomplete')
+    path = runtime / FSR3_LIFETIME_PATH
+    expected = build['hostArtifacts'].get(FSR3_LIFETIME_PATH)
+    if (not expected or artifact.get('sha256') != expected or path.is_symlink() or
+            not path.is_file() or not under(path, runtime) or digest(path) != expected):
+        raise ValueError('private FSR3 lifetime DLL differs from source build')
+    check_fsr_pe(path, expected_exports=FSR3_LIFETIME_EXPORTS)
+    if current_sources:
+        check_sources(manifest)
 
 
 def original_fg_provenance(path: Path) -> dict:
@@ -245,6 +275,7 @@ def validate_stage(runtime: Path, current_sources=False) -> dict:
     if not required <= stage['signed_artifacts'].keys():
         raise ValueError('full source runtime artifact inventory is incomplete')
     check_public_fsr(runtime, build)
+    check_fsr3_lifetime(runtime, build, current_sources)
     check_stock(runtime, load_spec())
     fallback = runtime / PRIVATE_FG_PATH
     if digest(fallback) != ORIGINAL_FG_SHA256 or fallback.stat().st_mode & 0o222:

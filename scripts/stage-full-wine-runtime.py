@@ -205,6 +205,7 @@ def main() -> int:
         raise ValueError('installed host differs from the build provenance')
     stage.game_mode.validate(host)
     stage.check_public_fsr(host, build)
+    stage.check_fsr3_lifetime(host, build, current_sources=True)
     for relative in stage.REQUIRED_HOST:
         if relative not in files:
             raise ValueError(f'full source host is missing: {relative}')

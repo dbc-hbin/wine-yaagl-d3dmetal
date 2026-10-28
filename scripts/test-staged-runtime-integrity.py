@@ -120,10 +120,25 @@ class StagedRuntimeIntegrityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.check()
 
+    def fsr3_lifetime_build(self):
+        path = self.tree / stage.FSR3_LIFETIME_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'private FSR3 lifetime producer')
+        return {
+            'hostArtifacts': {stage.FSR3_LIFETIME_PATH: stage.digest(path)},
+            'fsr3LifetimeBuildManifest': {
+                'schemaVersion': 1, 'architecture': 'x86_64', 'cxxRuntime': 'static',
+                'sources': [{'path': relative, 'sha256': stage.digest(stage.ROOT / relative)}
+                            for relative in stage.FSR3_LIFETIME_SOURCE_PATHS],
+                'artifact': {'path': str(path), 'sha256': stage.digest(path),
+                             'exports': [[1, 'yaagl_fsr3_install']]},
+            },
+        }
+
     def test_public_fsr_matches_both_guest_architectures_and_build_bytes(self):
         paths = [f'lib/wine/{arch}-windows/amd_fidelityfx_{module}_dx12.dll'
                  for arch in ('x86_64', 'i386') for module in ('upscaler', 'framegeneration')]
-        build = {'hostArtifacts': {}}
+        build = self.fsr3_lifetime_build()
         for relative in paths:
             path = self.tree / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,6 +178,93 @@ class StagedRuntimeIntegrityTests(unittest.TestCase):
             inspect.return_value = 'Format: COFF-x86-64\n' + exports
             with self.assertRaisesRegex(ValueError, 'architecture/exports mismatch'):
                 stage.check_public_fsr(self.tree, build)
+
+    def test_private_fsr3_lifetime_matches_host_and_helper_build_bytes(self):
+        build = self.fsr3_lifetime_build()
+        path = self.tree / stage.FSR3_LIFETIME_PATH
+        original = path.read_bytes()
+        expected = stage.digest(path)
+        with patch.dict(stage.os.environ, {'WINE_LLVM_READOBJ': '/fixture/llvm-readobj'}), \
+                patch.object(stage.subprocess, 'check_output', return_value=(
+                    'Format: COFF-x86-64\nOrdinal: 1\nName: yaagl_fsr3_install\n')):
+            stage.check_fsr3_lifetime(self.tree, build)
+            path.write_bytes(b'stale helper')
+            # A new stage inventory cannot rebase the source-built helper identity.
+            self.record['signed_artifacts'], self.record['symlinks'] = stage.inventory(self.tree)
+            with self.assertRaisesRegex(ValueError, 'differs from source build'):
+                stage.check_fsr3_lifetime(self.tree, build)
+            path.unlink()
+            with self.assertRaisesRegex(ValueError, 'differs from source build'):
+                stage.check_fsr3_lifetime(self.tree, build)
+            alternate = path.with_name('alternate-lifetime.dll')
+            alternate.write_bytes(original)
+            path.symlink_to(alternate.name)
+            with self.assertRaisesRegex(ValueError, 'differs from source build'):
+                stage.check_fsr3_lifetime(self.tree, build)
+            path.unlink()
+            path.write_bytes(original)
+            build['hostArtifacts'].pop(stage.FSR3_LIFETIME_PATH)
+            with self.assertRaisesRegex(ValueError, 'differs from source build'):
+                stage.check_fsr3_lifetime(self.tree, build)
+            build['hostArtifacts'][stage.FSR3_LIFETIME_PATH] = expected
+            build['fsr3LifetimeBuildManifest']['artifact']['sha256'] = '0' * 64
+            with self.assertRaisesRegex(ValueError, 'differs from source build'):
+                stage.check_fsr3_lifetime(self.tree, build)
+            build['fsr3LifetimeBuildManifest']['artifact']['sha256'] = expected
+            stage.check_fsr3_lifetime(self.tree, build)
+
+    def test_private_fsr3_lifetime_has_only_its_x64_install_export(self):
+        build = self.fsr3_lifetime_build()
+        install = 'Ordinal: 1\nName: yaagl_fsr3_install\n'
+        public = ''.join(f'Ordinal: {ordinal}\nName: {name}\n'
+                         for ordinal, name in stage.ORIGINAL_FG_EXPORTS)
+        with patch.dict(stage.os.environ, {'WINE_LLVM_READOBJ': '/fixture/llvm-readobj'}), \
+                patch.object(stage.subprocess, 'check_output') as inspect:
+            inspect.return_value = 'Format: COFF-x86-64\n' + install
+            stage.check_fsr3_lifetime(self.tree, build)
+            with self.assertRaisesRegex(ValueError, 'architecture/exports mismatch'):
+                stage.check_fsr_pe(self.tree / stage.FSR3_LIFETIME_PATH)
+            for output in ('Format: COFF-i386\n' + install,
+                           'Format: COFF-x86-64\n' + public,
+                           'Format: COFF-x86-64\n' + install + 'Ordinal: 2\nName: extra\n',
+                           'Format: COFF-x86-64\n' + install + 'Ordinal: 2\nName: \nRVA: 0x20\n'):
+                with self.subTest(output=output):
+                    inspect.return_value = output
+                    with self.assertRaisesRegex(ValueError, 'architecture/exports mismatch'):
+                        stage.check_fsr3_lifetime(self.tree, build)
+
+    def test_private_fsr3_lifetime_authenticates_source_provenance(self):
+        build = self.fsr3_lifetime_build()
+        with patch.dict(stage.os.environ, {'WINE_LLVM_READOBJ': '/fixture/llvm-readobj'}), \
+                patch.object(stage.subprocess, 'check_output', return_value=(
+                    'Format: COFF-x86-64\nOrdinal: 1\nName: yaagl_fsr3_install\n')):
+            stage.check_fsr3_lifetime(self.tree, build, current_sources=True)
+            missing = dict(build)
+            missing.pop('fsr3LifetimeBuildManifest')
+            with self.assertRaises(ValueError):
+                stage.check_fsr3_lifetime(self.tree, missing)
+            for field, value in (('sources', []), ('architecture', 'i386'), ('cxxRuntime', 'dynamic')):
+                stale = json.loads(json.dumps(build))
+                stale['fsr3LifetimeBuildManifest'][field] = value
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    stage.check_fsr3_lifetime(self.tree, stale)
+            for relative in stage.FSR3_LIFETIME_SOURCE_PATHS:
+                stale = json.loads(json.dumps(build))
+                stale['fsr3LifetimeBuildManifest']['sources'] = [
+                    entry for entry in stale['fsr3LifetimeBuildManifest']['sources']
+                    if entry['path'] != relative]
+                with self.subTest(missing=relative), self.assertRaises(ValueError):
+                    stage.check_fsr3_lifetime(self.tree, stale)
+            source = build['fsr3LifetimeBuildManifest']['sources'][0]
+            original = source['sha256']
+            source['sha256'] = 'not a source hash'
+            with self.assertRaises(ValueError):
+                stage.check_fsr3_lifetime(self.tree, build)
+            source['sha256'] = '0' * 64
+            with self.assertRaisesRegex(ValueError, 'build source changed'):
+                stage.check_fsr3_lifetime(self.tree, build, current_sources=True)
+            source['sha256'] = original
+            stage.check_fsr3_lifetime(self.tree, build, current_sources=True)
 
     def test_beta2_schema_and_version_rejected(self):
         self.record['stage_schema'] = 6
@@ -505,6 +607,7 @@ class PackageVersionTests(unittest.TestCase):
             f'lib/wine/{arch}-windows/amd_fidelityfx_{module}_dx12.dll':
                 f'{arch} {module} current producer'.encode()
             for arch in ('x86_64', 'i386') for module in ('upscaler', 'framegeneration')}
+        self.fsr_payload[stage.FSR3_LIFETIME_PATH] = b'private FSR3 lifetime producer'
         for relative, payload in self.fsr_payload.items():
             path = self.tree / relative
             path.parent.mkdir(parents=True, exist_ok=True)

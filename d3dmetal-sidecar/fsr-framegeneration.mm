@@ -222,21 +222,24 @@ Object privateTexture(id<MTLDevice> device, MTLPixelFormat format,
                       NSUInteger width, NSUInteger height, MTLTextureUsage usage) {
     MTLTextureDescriptor* descriptor =
         [[MTLTextureDescriptor alloc] init];
-    descriptor.textureType = MTLTextureType2D;
-    descriptor.pixelFormat = format;
-    descriptor.width = width;
-    descriptor.height = height;
-    descriptor.depth = 1;
-    descriptor.mipmapLevelCount = 1;
-    descriptor.arrayLength = 1;
-    descriptor.sampleCount = 1;
-    descriptor.storageMode = MTLStorageModePrivate;
-    descriptor.usage = usage;
-    id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
-    [descriptor release];
-    Object result(texture);
-    [texture release];
-    return result;
+    id<MTLTexture> texture = nil;
+    @try {
+        descriptor.textureType = MTLTextureType2D;
+        descriptor.pixelFormat = format;
+        descriptor.width = width;
+        descriptor.height = height;
+        descriptor.depth = 1;
+        descriptor.mipmapLevelCount = 1;
+        descriptor.arrayLength = 1;
+        descriptor.sampleCount = 1;
+        descriptor.storageMode = MTLStorageModePrivate;
+        descriptor.usage = usage;
+        texture = [device newTextureWithDescriptor:descriptor];
+        return Object(texture);
+    } @finally {
+        [texture release];
+        [descriptor release];
+    }
 }
 
 // MetalFX retains the per-frame resources assigned to the cached interpolator.
@@ -269,12 +272,14 @@ Object makePipeline(id<MTLDevice> device, id<MTLLibrary> library, NSString* name
     NSError* error = nil;
     id<MTLFunction> function = [library newFunctionWithName:name];
     if (!function) return {};
-    id<MTLComputePipelineState> pipeline =
-        [device newComputePipelineStateWithFunction:function error:&error];
-    [function release];
-    Object result(pipeline);
-    [pipeline release];
-    return result;
+    id<MTLComputePipelineState> pipeline = nil;
+    @try {
+        pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+        return Object(pipeline);
+    } @finally {
+        [pipeline release];
+        [function release];
+    }
 }
 
 struct Kernels {
@@ -581,8 +586,12 @@ std::shared_ptr<Configuration> configure(
             NSError* libraryError = nil;
             dispatch_data_t data = dispatch_data_create(kFsrKernelsMetallib, sizeof(kFsrKernelsMetallib),
                                                         nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-            id<MTLLibrary> library = [device newLibraryWithData:data error:&libraryError];
-            dispatch_release(data);
+            id<MTLLibrary> library = nil;
+            @try {
+                library = [device newLibraryWithData:data error:&libraryError];
+            } @finally {
+                dispatch_release(data);
+            }
             kernels.library = Object(library);
             [library release];
             if (!kernels.library) return {};
@@ -867,26 +876,32 @@ bool copyTextures(id<MTL4CommandBuffer> buffer, id<MTLFence> fence, const Copy* 
         id<MTL4ComputeCommandEncoder> encoder =
             sharedEncoder ? sharedEncoder : [buffer computeCommandEncoder];
         if (!encoder) return false;
-        if (!sharedEncoder) retained.emplace_back(encoder);
-        if (fence && !sharedEncoder)
-            [encoder waitForFence:fence beforeEncoderStages:MTLStageBlit];
-        for (std::size_t i = 0; i != count; ++i) {
-            const auto& copy = copies[i];
-            [encoder copyFromTexture:copy.source sourceSlice:0 sourceLevel:0
-                        sourceOrigin:MTLOriginMake(copy.sourceX, copy.sourceY, 0)
-                          sourceSize:MTLSizeMake(copy.width, copy.height, 1)
-                           toTexture:copy.destination destinationSlice:0 destinationLevel:0
-                   destinationOrigin:MTLOriginMake(copy.destinationX, copy.destinationY, 0)];
+        @try {
+            if (!sharedEncoder) retained.emplace_back(encoder);
+            if (fence && !sharedEncoder)
+                [encoder waitForFence:fence beforeEncoderStages:MTLStageBlit];
+            for (std::size_t i = 0; i != count; ++i) {
+                const auto& copy = copies[i];
+                [encoder copyFromTexture:copy.source sourceSlice:0 sourceLevel:0
+                            sourceOrigin:MTLOriginMake(copy.sourceX, copy.sourceY, 0)
+                              sourceSize:MTLSizeMake(copy.width, copy.height, 1)
+                               toTexture:copy.destination destinationSlice:0 destinationLevel:0
+                       destinationOrigin:MTLOriginMake(copy.destinationX, copy.destinationY, 0)];
+            }
+            if (sharedEncoder) {
+                [encoder barrierAfterEncoderStages:MTLStageBlit
+                               beforeEncoderStages:MTLStageDispatch
+                                 visibilityOptions:MTL4VisibilityOptionDevice];
+            }
+        } @finally {
+            if (!sharedEncoder) {
+                @try {
+                    if (fence) [encoder updateFence:fence afterEncoderStages:MTLStageBlit];
+                } @finally {
+                    [encoder endEncoding];
+                }
+            }
         }
-        if (sharedEncoder) {
-            [encoder barrierAfterEncoderStages:MTLStageBlit
-                           beforeEncoderStages:MTLStageDispatch
-                             visibilityOptions:MTL4VisibilityOptionDevice];
-            return true;
-        }
-        if (fence)
-            [encoder updateFence:fence afterEncoderStages:MTLStageBlit];
-        [encoder endEncoding];
         return true;
     }
     return false;
@@ -953,22 +968,28 @@ bool computePass(id<MTL4CommandBuffer> buffer, id<MTLFence> fence, id<MTL4Argume
         id<MTL4ComputeCommandEncoder> encoder =
             sharedEncoder ? sharedEncoder : [buffer computeCommandEncoder];
         if (!encoder) return false;
-        if (!sharedEncoder) {
-            retained.emplace_back(encoder);
-            [encoder waitForFence:fence beforeEncoderStages:MTLStageDispatch];
-        } else if (depthDependency) {
-            // Motion reconstruction consumes the stored normalized depth.
-            [encoder barrierAfterEncoderStages:MTLStageDispatch
-                           beforeEncoderStages:MTLStageDispatch
-                             visibilityOptions:MTL4VisibilityOptionDevice];
-        }
-        [encoder setComputePipelineState:pipeline];
-        [encoder setArgumentTable:table];
-        [encoder dispatchThreads:MTLSizeMake(params.extent[0], params.extent[1], 1)
-             threadsPerThreadgroup:MTLSizeMake(threadgroupWidth, 8, 1)];
-        if (!sharedEncoder) {
-            [encoder updateFence:fence afterEncoderStages:MTLStageDispatch];
-            [encoder endEncoding];
+        @try {
+            if (!sharedEncoder) {
+                retained.emplace_back(encoder);
+                [encoder waitForFence:fence beforeEncoderStages:MTLStageDispatch];
+            } else if (depthDependency) {
+                // Motion reconstruction consumes the stored normalized depth.
+                [encoder barrierAfterEncoderStages:MTLStageDispatch
+                               beforeEncoderStages:MTLStageDispatch
+                                 visibilityOptions:MTL4VisibilityOptionDevice];
+            }
+            [encoder setComputePipelineState:pipeline];
+            [encoder setArgumentTable:table];
+            [encoder dispatchThreads:MTLSizeMake(params.extent[0], params.extent[1], 1)
+                 threadsPerThreadgroup:MTLSizeMake(threadgroupWidth, 8, 1)];
+        } @finally {
+            if (!sharedEncoder) {
+                @try {
+                    [encoder updateFence:fence afterEncoderStages:MTLStageDispatch];
+                } @finally {
+                    [encoder endEncoding];
+                }
+            }
         }
         return true;
     }
@@ -1061,10 +1082,13 @@ struct ExecutionLease::Impl {
             if (!set) {
                 MTLResidencySetDescriptor* descriptor =
                     [[MTLResidencySetDescriptor alloc] init];
-                descriptor.initialCapacity = objects.size();
-                NSError* error = nil;
-                set = [device newResidencySetWithDescriptor:descriptor error:&error];
-                [descriptor release];
+                @try {
+                    descriptor.initialCapacity = objects.size();
+                    NSError* error = nil;
+                    set = [device newResidencySetWithDescriptor:descriptor error:&error];
+                } @finally {
+                    [descriptor release];
+                }
                 if (!set) return false;
                 residency = Object(set);
                 [set release];
@@ -1673,6 +1697,10 @@ bool PreparedFrame::encode(
                         scheduleHudRowRemoval();
                     }
                 }
+                // A stale replay can still advance the reused native interpolator.
+                // Invalidate continuity before encoding, including partial failure.
+                if (!currentGeneration && state.historyConfiguration == impl_->configuration)
+                    state.historyConfiguration.reset();
                 [(id<MTL4FXFrameInterpolator>)interpolator.get()
                     encodeToCommandBuffer:(id<MTL4CommandBuffer>)buffer];
 
@@ -1692,18 +1720,24 @@ bool PreparedFrame::encode(
                     id<MTL4ComputeCommandEncoder> encoder =
                         [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
                     if (!encoder) return fail("encode_disable_hint");
-                    execution->objects.emplace_back(encoder);
-                    [encoder waitForFence:(id<MTLFence>)fence
-                         beforeEncoderStages:MTLStageBlit];
-                    [encoder copyFromBuffer:parameterBuffer
-                               sourceOffset:offsetof(ParameterBlock, color) +
-                                            offsetof(FgParams, disableHint)
-                                  toBuffer:(id<MTLBuffer>)impl_->disableInterpolation.get()
-                         destinationOffset:impl_->disableInterpolationOffset
-                                      size:sizeof(std::uint32_t)];
-                    [encoder updateFence:(id<MTLFence>)fence
-                        afterEncoderStages:MTLStageBlit];
-                    [encoder endEncoding];
+                    @try {
+                        execution->objects.emplace_back(encoder);
+                        [encoder waitForFence:(id<MTLFence>)fence
+                             beforeEncoderStages:MTLStageBlit];
+                        [encoder copyFromBuffer:parameterBuffer
+                                   sourceOffset:offsetof(ParameterBlock, color) +
+                                                offsetof(FgParams, disableHint)
+                                      toBuffer:(id<MTLBuffer>)impl_->disableInterpolation.get()
+                             destinationOffset:impl_->disableInterpolationOffset
+                                          size:sizeof(std::uint32_t)];
+                    } @finally {
+                        @try {
+                            [encoder updateFence:(id<MTLFence>)fence
+                                afterEncoderStages:MTLStageBlit];
+                        } @finally {
+                            [encoder endEncoding];
+                        }
+                    }
                 }
                 // A queued command may encode after OFF (or after a subsequent ON).
                 // Its output remains owned by the command, but must not seed new history.
@@ -1845,7 +1879,8 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                     state->snapshotMotion->clear();
                     state->scene->clear();
                     state->clearFrames();
-                    state->configurations.clear();
+                    // OFF can follow every Prepare without a Generate. Keep the bounded
+                    // interpolator cache; only temporal state and pending work are invalid.
                     state->hasPreparedJitter = false;
                     state->history = {};
                     state->historyConfiguration.reset();
@@ -1973,7 +2008,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
                         FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB, false);
                 if (!configuration) return finish(Unsupported);
                 if (!state->generationEnabled) {
-                    state->configurations.clear();
+                    // Retain the validated configuration for the first enabled Prepare.
                     state->providerSelected = true;
                     state->metalDevice = Object((id)command.value.device);
                     return finish(Ok);
@@ -2206,14 +2241,14 @@ std::uint32_t api(std::uint32_t operation, void* arguments) noexcept {
             auto prepared = std::shared_ptr<const PreparedFrame>(
                 new PreparedFrame(implementation));
 
-            // Publish pending metadata before recording; a rejected record rolls it back.
-            if (!generate && state->generationEnabled)
-                state->frames[state->frameCount++] = {frame, implementation->snapshot};
             if (!record(list, command, resources, prepared, addresses, states,
                         resourceCount, generate)) {
-                if (!generate) state->eraseFrame(frame);
                 return finish(Runtime);
             }
+            // Recording retains the snapshot itself. Publish its lookup metadata
+            // only after every recording step has succeeded.
+            if (!generate && state->generationEnabled)
+                state->frames[state->frameCount++] = {frame, implementation->snapshot};
             if (!generate)
                 state->commitPreparedJitter(*implementation->snapshot, frame);
             if (generate) state->eraseFrame(frame);

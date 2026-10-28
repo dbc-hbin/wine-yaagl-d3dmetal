@@ -22,6 +22,7 @@
 #include "dxgi1_6.h"
 #include "unixlib.h"
 #include "wine/debug.h"
+#include "../../include/yaagl_fsr3_lifetime.h"
 
 #include "../../d3dmetal-sidecar/third-party/fidelityfx/Kits/FidelityFX/api/include/ffx_api.h"
 #include "../../d3dmetal-sidecar/third-party/fidelityfx/Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h"
@@ -116,9 +117,16 @@ struct native_api
     FfxApiPresentCallbackFunc default_present;
 };
 
+typedef ffxReturnCode_t (FG_METHOD *native_swapchain_create_func)(
+    void *, ffxContext *, ffxCreateContextDescHeader *, const ffxAllocationCallbacks **);
+static ffxReturnCode_t FG_METHOD native_swapchain_create(
+    void *, ffxContext *, ffxCreateContextDescHeader *, const ffxAllocationCallbacks **);
+
 static HINSTANCE builtin_instance;
 static INIT_ONCE native_once = INIT_ONCE_STATIC_INIT;
 static struct native_api native;
+static const BYTE *native_swapchain_base;
+static native_swapchain_create_func native_swapchain_create_original;
 static DWORD callback_tls = TLS_OUT_OF_INDEXES;
 static LONG64 next_present_source;
 
@@ -227,37 +235,23 @@ static SRWLOCK debug_lock = SRWLOCK_INIT;
 static ffxApiMessage global_message;
 static uint32_t global_debug_level;
 
-static FfxApiPresentCallbackFunc native_default_present(HMODULE module)
+static BOOL native_image_matches(HMODULE module)
 {
-    /* Native FG binary 3f5e674a59b40075...:
-     * stable set_config substitutes RVA 0xf5600 and NULL user context.
-     * Its presenter runs the callback, then Present, on the same thread.
-     * Pin that private contract to the image's RSDS identity and entry bytes;
-     * other native builds retain their original callback configuration.
-     */
     static const GUID pdb = {0xf977ea5e, 0xeaed, 0x467f,
         {0x80, 0x0d, 0xe4, 0x37, 0xac, 0x3b, 0x9e, 0x74}};
-    static const BYTE entry[] = {
-        0x40, 0x55, 0x53, 0x56, 0x41, 0x56, 0x41, 0x57,
-        0x48, 0x8d, 0xac, 0x24, 0xd0, 0xfe, 0xff, 0xff,
-        0x48, 0x81, 0xec, 0x30, 0x02, 0x00, 0x00
-    };
     const BYTE *base = (const BYTE *)module;
     const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
     const IMAGE_NT_HEADERS64 *nt = (const IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
     const IMAGE_DATA_DIRECTORY *directory;
     const IMAGE_DEBUG_DIRECTORY *debug;
     DWORD size, i;
-    WCHAR option[2];
 
-    if (GetEnvironmentVariableW(L"YAAGL_D3DMETAL_ASYNC", option, ARRAYSIZE(option)) != 1 ||
-        option[0] != '1' || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-        return NULL;
+    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return FALSE;
     size = nt->OptionalHeader.SizeOfImage;
-    if (size != 0x247a000 || memcmp(base + 0xf5600, entry, sizeof(entry))) return NULL;
+    if (size != 0x247a000) return FALSE;
     directory = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
     if (directory->VirtualAddress > size || directory->Size > size - directory->VirtualAddress)
-        return NULL;
+        return FALSE;
     debug = (const IMAGE_DEBUG_DIRECTORY *)(base + directory->VirtualAddress);
     for (i = 0; i < directory->Size / sizeof(*debug); ++i)
     {
@@ -269,16 +263,87 @@ static FfxApiPresentCallbackFunc native_default_present(HMODULE module)
         cv = base + debug[i].AddressOfRawData;
         memcpy(&age, cv + 20, sizeof(age));
         if (!memcmp(cv, "RSDS", 4) && !memcmp(cv + 4, &pdb, sizeof(pdb)) && age == 1)
-            return (FfxApiPresentCallbackFunc)(base + 0xf5600);
+            return TRUE;
     }
-    return NULL;
+    return FALSE;
+}
+
+static FfxApiPresentCallbackFunc native_default_present(HMODULE module)
+{
+    /* Native FG binary 3f5e674a59b40075...:
+     * stable set_config substitutes RVA 0xf5600 and NULL user context.
+     * Its presenter runs the callback, then Present, on the same thread.
+     * Other native builds retain their original callback configuration.
+     */
+    static const BYTE entry[] = {
+        0x40, 0x55, 0x53, 0x56, 0x41, 0x56, 0x41, 0x57,
+        0x48, 0x8d, 0xac, 0x24, 0xd0, 0xfe, 0xff, 0xff,
+        0x48, 0x81, 0xec, 0x30, 0x02, 0x00, 0x00
+    };
+    const BYTE *base = (const BYTE *)module;
+    WCHAR option[2];
+
+    if (GetEnvironmentVariableW(L"YAAGL_D3DMETAL_ASYNC", option, ARRAYSIZE(option)) != 1 ||
+        option[0] != '1' || !native_image_matches(module) ||
+        memcmp(base + 0xf5600, entry, sizeof(entry))) return NULL;
+    return (FfxApiPresentCallbackFunc)(base + 0xf5600);
+}
+
+static const BYTE *native_swapchain_create_base(HMODULE module, const struct native_api *api)
+{
+    static const BYTE allocation[] = {
+        0x48, 0x8b, 0x41, 0x08, 0xba, 0x18, 0x00, 0x00,
+        0x00, 0x48, 0x8b, 0x09, 0xff, 0xd0, 0xeb, 0x0b
+    };
+    static const BYTE failure[] = {
+        0x85, 0xc0, 0x0f, 0x84, 0x37, 0xff, 0xff, 0xff,
+        0xb8, 0x03, 0x00, 0x00, 0x00, 0xeb, 0x05
+    };
+    const BYTE *base = (const BYTE *)module;
+
+    if (!native_image_matches(module) ||
+        (const void *)api->create != base + 0x1040d0 ||
+        (const void *)api->destroy != base + 0x1042b0 ||
+        memcmp(base + 0x122ff, allocation, sizeof(allocation)) ||
+        memcmp(base + 0x1244a, allocation, sizeof(allocation)) ||
+        memcmp(base + 0x1256b, allocation, sizeof(allocation)) ||
+        memcmp(base + 0x125d1, failure, sizeof(failure)) ||
+        *(const void *const *)(base + 0x24657c8) != base + 0x12290) return NULL;
+    return base;
+}
+
+static void install_native_swapchain_rollback(HMODULE module, const struct native_api *api)
+{
+    const BYTE *base = native_swapchain_create_base(module, api);
+    HMODULE pinned;
+    DWORD protection, unused;
+    void **slot;
+
+    if (!base) return;
+    /*
+     * Intercept only the built-in SDK swapchain provider, not ffxCreateContext:
+     * an AMD driver external provider may retain its allocation callbacks.
+     * Native objects/module already have process lifetime; pin this code too
+     * before publishing its address into the native provider's vtable.
+     */
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           (const WCHAR *)native_swapchain_create, &pinned)) return;
+    slot = (void **)(base + 0x24657c8);
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection)) return;
+    native_swapchain_base = base;
+    native_swapchain_create_original = (native_swapchain_create_func)(base + 0x12290);
+    InterlockedCompareExchangePointer(slot, (void *)native_swapchain_create, (void *)(base + 0x12290));
+    if (!VirtualProtect(slot, sizeof(*slot), protection, &unused))
+        ERR("Failed to restore native swapchain provider vtable protection, error %lu.\n", (unsigned long)GetLastError());
 }
 
 static BOOL CALLBACK initialize_native(INIT_ONCE *once, void *parameter, void **result)
 {
     WCHAR *path;
-    DWORD length;
-    HMODULE module;
+    DWORD length, directory;
+    HMODULE module, helper;
+    yaagl_fsr3_install_func install;
+    int installed;
     struct native_api api;
 
     (void)once;
@@ -296,11 +361,11 @@ static BOOL CALLBACK initialize_native(INIT_ONCE *once, void *parameter, void **
         return FALSE;
     }
     module = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
-    free(path);
 
     if (!module || module == builtin_instance)
     {
         if (module) FreeLibrary(module);
+        free(path);
         return FALSE;
     }
 
@@ -314,9 +379,36 @@ static BOOL CALLBACK initialize_native(INIT_ONCE *once, void *parameter, void **
     if (!api.create || !api.destroy || !api.configure || !api.query || !api.dispatch)
     {
         FreeLibrary(module);
+        free(path);
         return FALSE;
     }
+    if (native_image_matches(module))
+    {
+        directory = length;
+        while (directory && path[directory - 1] != '\\' && path[directory - 1] != '/')
+            --directory;
+        if (directory + ARRAYSIZE(YAAGL_FSR3_LIFETIME_DLL) > 32768)
+        {
+            FreeLibrary(module);
+            free(path);
+            return FALSE;
+        }
+        memcpy(path + directory, YAAGL_FSR3_LIFETIME_DLL, sizeof(YAAGL_FSR3_LIFETIME_DLL));
+        helper = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+        install = helper ? (yaagl_fsr3_install_func)GetProcAddress(helper, "yaagl_fsr3_install") : NULL;
+        installed = install ? install(module) : YAAGL_FSR3_INSTALL_ERROR;
+        if (helper) FreeLibrary(helper); /* Successful installation pins itself. */
+        if (installed == YAAGL_FSR3_INSTALL_ERROR)
+        {
+            ERR("Failed to initialize the FSR3 lifetime provider.\n");
+            FreeLibrary(module);
+            free(path);
+            return FALSE;
+        }
+    }
+    free(path);
     api.default_present = native_default_present(module);
+    install_native_swapchain_rollback(module, &api);
 
     /*
      * Keep the module loaded for process lifetime.  Native swapchain objects,
@@ -391,6 +483,94 @@ static ffxReturnCode_t destroy_translation(uint64_t context)
     memset(&packet, 0, sizeof(packet));
     initialize_packet(&packet.header, sizeof(packet), YAAGL_FSR_FG_DESTROY, context);
     return bridge_call(&packet);
+}
+
+struct native_swapchain_create
+{
+    const ffxAllocationCallbacks *callbacks;
+    const BYTE *base;
+    const void *allocation_return;
+    void *unpublished;
+};
+
+static void *native_swapchain_allocate(void *opaque, uint64_t size)
+{
+    struct native_swapchain_create *create = opaque;
+    const void *caller = __builtin_return_address(0);
+    void *memory;
+
+    if (create->callbacks)
+        memory = create->callbacks->alloc(create->callbacks->pUserData, size);
+    else
+    {
+        void *(*allocate)(size_t);
+        memcpy(&allocate, create->base + 0x106260, sizeof(allocate));
+        memory = allocate(size);
+    }
+    if (caller == create->allocation_return) create->unpublished = memory;
+    return memory;
+}
+
+static void native_swapchain_deallocate(void *opaque, void *memory)
+{
+    struct native_swapchain_create *create = opaque;
+
+    if (memory == create->unpublished) create->unpublished = NULL;
+    if (create->callbacks)
+        create->callbacks->dealloc(create->callbacks->pUserData, memory);
+    else
+    {
+        void (*deallocate)(void *);
+        memcpy(&deallocate, create->base + 0x106258, sizeof(deallocate));
+        deallocate(memory);
+    }
+}
+
+static ffxReturnCode_t FG_METHOD native_swapchain_create(
+    void *provider, ffxContext *output, ffxCreateContextDescHeader *desc,
+    const ffxAllocationCallbacks **allocator)
+{
+    struct native_swapchain_create create = {0};
+    ffxAllocationCallbacks tracked = {&create, native_swapchain_allocate, native_swapchain_deallocate};
+    const ffxAllocationCallbacks *tracked_allocator = &tracked;
+    ffxReturnCode_t result;
+    unsigned int allocation_return;
+
+    switch (desc->type)
+    {
+    case FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WRAP_DX12:
+        allocation_return = 0x1230d;
+        break;
+    case FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_NEW_DX12:
+        allocation_return = 0x12458;
+        break;
+    case FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12:
+        allocation_return = 0x12579;
+        break;
+    default:
+        return native_swapchain_create_original(provider, output, desc, allocator);
+    }
+
+    /*
+     * SHA256 3f5e674a59b40075...; provider CreateContext RVA 0x12290.
+     * Each identified call constructs the private InternalFgScContext. It is
+     * never passed to the factory, swapchain, presenter or GPU backend, and
+     * acquires fiSwapChain only on the success path immediately before output
+     * publication. Allocator and its callbacks are synchronous API locals;
+     * neither InternalFgScContext nor the factory stores them.
+     *
+     * Track that callsite, not its allocation size or other callback memory.
+     * A published handle belongs to native.destroy. Failed unpublished calls
+     * leave only this unowned header to reclaim. The effect provider can own
+     * partial GPU/backend state and must not use this rollback.
+     */
+    create.callbacks = *allocator;
+    create.base = native_swapchain_base;
+    create.allocation_return = create.base + allocation_return;
+    result = native_swapchain_create_original(provider, output, desc, &tracked_allocator);
+    if (result != FFX_API_RETURN_OK && !*output && create.unpublished)
+        native_swapchain_deallocate(&create, create.unpublished);
+    return result;
 }
 
 static void *allocate_memory(const ffxAllocationCallbacks *callbacks, size_t size)

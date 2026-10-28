@@ -10,6 +10,7 @@ case "$root" in /*) ;; *) root=$PWD/$root ;; esac
 build_dir=$root/build-x64
 native_dir=$root/build-arm64
 host_dir=$root/host
+lifetime_dir=$root/fsr3-lifetime
 native_server=${WINE_NATIVE_SERVER:-no}
 jobs=${WINE_JOBS:-$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 
@@ -67,6 +68,7 @@ preflight() {
     require_file "$source_dir/configure"
     require_file "$source_dir/dlls/amd_fidelityfx_upscaler_dx12/Makefile.in"
     require_file "$source_dir/dlls/amd_fidelityfx_framegeneration_dx12/Makefile.in"
+    require_file "$source_dir/scripts/build-fsr3-lifetime.sh"
     /usr/bin/git -C "$source_dir" rev-parse --show-toplevel >/dev/null
     load_deps
     "$pkg_config" --exists gnutls freetype2 gstreamer-1.0 gstreamer-video-1.0 \
@@ -161,6 +163,7 @@ build() {
     source_identity > "$root/build-source.json"
     /usr/bin/arch -x86_64 /usr/bin/make -C "$build_dir" -j"$jobs"
     /usr/bin/python3 "$source_dir/scripts/game-mode.py" build "$build_dir"
+    sh "$source_dir/scripts/build-fsr3-lifetime.sh" "$lifetime_dir"
     if [ "$native_server" = yes ]; then
         require_file "$native_dir/Makefile"
         (native_env; /usr/bin/arch -arm64 /usr/bin/make -C "$native_dir" -j"$jobs" server/wineserver)
@@ -177,6 +180,8 @@ install_host() {
     require_file "$root/source-directory"
     [ "$(cat "$root/source-directory")" = "$source_dir" ] || die 'WINE_SOURCE_DIR differs from configure'
     [ "$(cat "$root/build-complete.marker")" = "$native_server" ] || die 'WINE_NATIVE_SERVER differs from build'
+    require_file "$lifetime_dir/lib/wine/x86_64-windows/yaagl_fsr3_lifetime.dll"
+    require_file "$lifetime_dir/build-manifest.json"
     [ ! -e "$host_dir" ] || die "refusing to overwrite $host_dir"
     source_identity > "$root/install-source.json"
     cmp -s "$root/build-source.json" "$root/install-source.json" \
@@ -188,6 +193,8 @@ install_host() {
     fi
     [ -x "$host_dir/bin/wine" ] || die 'Wine install failed'
     /usr/bin/python3 "$source_dir/scripts/game-mode.py" install "$build_dir" --tree "$host_dir"
+    cp "$lifetime_dir/lib/wine/x86_64-windows/yaagl_fsr3_lifetime.dll" \
+        "$host_dir/lib/wine/x86_64-windows/yaagl_fsr3_lifetime.dll"
     /usr/bin/python3 - "$root" "$source_dir" "$native_server" <<'PY'
 import datetime, hashlib, json, os, pathlib, subprocess, sys
 root, source = map(pathlib.Path, sys.argv[1:3])
@@ -204,6 +211,10 @@ data.update(schemaVersion=3, buildKind='full-current-source', wineVersion=versio
             graphicsTarget='gptk-4.0b3')
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+data['fsr3LifetimeBuildManifest'] = json.loads((root / 'fsr3-lifetime/build-manifest.json').read_text())
+lifetime = root / 'host/lib/wine/x86_64-windows/yaagl_fsr3_lifetime.dll'
+if sha(lifetime) != data['fsr3LifetimeBuildManifest']['artifact']['sha256']:
+    raise SystemExit('installed private FSR3 lifetime DLL differs from its build manifest')
 data['hostArtifacts'] = {str(p.relative_to(root / 'host')): sha(p)
                          for p in sorted((root / 'host').rglob('*')) if p.is_file()}
 data['hostSymlinks'] = {str(p.relative_to(root / 'host')): os.readlink(p)
